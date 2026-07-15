@@ -1,0 +1,223 @@
+// shell.js — the unified app shell: left rail, global search, command palette (⌘/Ctrl-K),
+// Gmail-parity keyboard shortcuts, a shortcuts help overlay (?), and view dispatch. Fills in
+// the bus so view modules can trigger re-renders without importing the shell (no cycle).
+
+import { state, initStore, saveSettings } from './store.js';
+import { currentIdentity, displayAddress, displayName } from './identity.js';
+import { PEOPLE } from './seed.js';
+import { esc, icon, brandMark, openModal, closeModal, initials } from './ui.js';
+import { bus } from './bus.js';
+import { openCompose } from './compose.js';
+
+import { render as renderMail, mailKeys } from './views/mail.js';
+import { render as renderChat } from './views/chat.js';
+import { render as renderCalendar } from './views/calendar.js';
+import { render as renderContacts } from './views/contacts.js';
+import { render as renderFiles } from './views/files.js';
+import { render as renderGroups } from './views/groups.js';
+import { render as renderSettings } from './views/settings.js';
+
+const VIEWS = [
+  { id: 'mail', name: 'Mail', icon: 'mail', render: renderMail },
+  { id: 'chat', name: 'Chat', icon: 'chat', render: renderChat },
+  { id: 'calendar', name: 'Calendar', icon: 'calendar', render: renderCalendar },
+  { id: 'contacts', name: 'Contacts', icon: 'contacts', render: renderContacts },
+  { id: 'files', name: 'Files', icon: 'files', render: renderFiles },
+  { id: 'groups', name: 'Groups', icon: 'groups', render: renderGroups },
+  { id: 'settings', name: 'Settings', icon: 'settings', render: renderSettings },
+];
+
+export const SHORTCUTS = [
+  ['⌘K / Ctrl K', 'Command palette'],
+  ['/', 'Search'],
+  ['c', 'Compose'],
+  ['g then m/c/a/p/f/r', 'Go to Mail / Chat / cAlendar / People / Files / gRoups'],
+  ['1 – 7', 'Jump to view'],
+  ['j / k', 'Next / previous conversation'],
+  ['Enter', 'Open conversation'],
+  ['e', 'Archive'],
+  ['#', 'Delete'],
+  ['r', 'Reply'],
+  ['s', 'Star'],
+  ['u', 'Mark unread'],
+  ['x', 'Select conversation'],
+  ['?', 'This help'],
+  ['Esc', 'Close overlay'],
+];
+
+export function mountShell() {
+  initStore();
+  const app = document.getElementById('app');
+  app.classList.remove('hidden');
+  const id = currentIdentity();
+  app.innerHTML = `
+    <nav class="rail">
+      <div class="rail-brand" title="Envoir">${brandMark(30)}</div>
+      <div class="rail-nav" id="rail-nav">
+        ${VIEWS.filter(v => v.id !== 'settings').map(v => `<button class="rail-btn" data-view="${v.id}" title="${v.name}">${icon(v.icon)}<span>${v.name}</span><i class="rail-badge" data-badge="${v.id}"></i></button>`).join('')}
+      </div>
+      <div class="rail-spacer"></div>
+      <button class="rail-btn" data-view="settings" title="Settings">${icon('settings')}<span>Settings</span></button>
+      <button class="rail-id" id="rail-id" title="${esc(displayAddress(id))}">${esc(initials(displayName(id)))}</button>
+    </nav>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="topbar-search">
+          ${icon('search')}
+          <input id="globalsearch" placeholder="Search this view…" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="cmd-open" id="cmdk"><kbd>⌘K</kbd> commands</button>
+        <div class="topbar-right">
+          <span class="net-pill" title="This client's network is simulated">${icon('network')} simulated network</span>
+          <button class="icon-btn" id="theme-toggle" title="Toggle theme">${icon(state.settings.theme === 'dark' ? 'sun' : 'moon')}</button>
+          <button class="btn primary sm" id="quick-compose">${icon('edit')} Compose</button>
+        </div>
+      </header>
+      <main id="view" class="view"></main>
+    </div>`;
+
+  app.querySelectorAll('.rail-btn').forEach(b => b.onclick = () => setView(b.dataset.view));
+  app.querySelector('#rail-id').onclick = () => setView('settings');
+  app.querySelector('#cmdk').onclick = openPalette;
+  const gs = app.querySelector('#globalsearch');
+  gs.oninput = () => { state.ui.search = gs.value; rerenderKeepSearch(); };
+  app.querySelector('#quick-compose').onclick = () => openCompose();
+  app.querySelector('#theme-toggle').onclick = toggleTheme;
+
+  // wire the bus
+  bus.setView = setView;
+  bus.rerender = rerender;
+  bus.openCompose = openCompose;
+  bus.refreshChrome = refreshChrome;
+
+  installKeys();
+  setView(state.view);
+  refreshChrome();
+}
+
+function setView(v) {
+  state.view = v;
+  state.ui.search = '';
+  const nav = document.getElementById('app');
+  const gs = nav.querySelector('#globalsearch'); if (gs) gs.value = '';
+  nav.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.view === v));
+  rerender();
+}
+const rerenderKeepSearch = () => rerender();
+
+function rerender() {
+  const root = document.getElementById('view');
+  const def = VIEWS.find(x => x.id === state.view) || VIEWS[0];
+  // gentle shimmer for the heavier list views on first paint feel
+  def.render(root);
+}
+
+function refreshChrome() {
+  const app = document.getElementById('app');
+  const unread = state.mail.filter(t => t.folder === 'inbox' && !t.read).length;
+  const chatUnread = state.chats.reduce((n, c) => n + (c.unread || 0), 0);
+  const setBadge = (id, n) => { const e = app.querySelector(`[data-badge="${id}"]`); if (e) { e.textContent = n || ''; e.classList.toggle('on', !!n); } };
+  setBadge('mail', unread); setBadge('chat', chatUnread);
+  const t = app.querySelector('#theme-toggle'); if (t) t.innerHTML = icon(state.settings.theme === 'dark' ? 'sun' : 'moon');
+}
+
+function toggleTheme() {
+  state.settings.theme = state.settings.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', state.settings.theme);
+  saveSettings(); refreshChrome();
+}
+
+// ---- Command palette ----------------------------------------------------------------------
+function commands() {
+  const base = [
+    ...VIEWS.map(v => ({ icon: v.icon, label: 'Go to ' + v.name, hint: 'view', run: () => setView(v.id) })),
+    { icon: 'edit', label: 'Compose new message', hint: 'action', run: () => openCompose() },
+    { icon: 'calendar', label: 'New event', hint: 'action', run: () => { setView('calendar'); } },
+    { icon: state.settings.theme === 'dark' ? 'sun' : 'moon', label: 'Toggle theme', hint: 'action', run: toggleTheme },
+    { icon: 'settings', label: 'Settings', hint: 'view', run: () => setView('settings') },
+  ];
+  const people = PEOPLE.map(p => ({ icon: 'contacts', label: p.name, hint: p.address, run: () => { setView('contacts'); } }));
+  return base.concat(people);
+}
+
+function openPalette() {
+  const card = openModal(`
+    <div class="palette">
+      <div class="pal-input">${icon('search')}<input id="palq" placeholder="Search commands, views, people…" autocomplete="off"></div>
+      <div class="pal-list" id="pallist"></div>
+      <div class="pal-foot"><kbd>↑↓</kbd> navigate <kbd>↵</kbd> run <kbd>esc</kbd> close</div>
+    </div>`, { sticky: false });
+  const all = commands();
+  let cur = 0, filtered = all;
+  const listEl = card.querySelector('#pallist');
+  const input = card.querySelector('#palq');
+  const draw = () => {
+    listEl.innerHTML = filtered.map((c, i) => `<button class="pal-item ${i === cur ? 'on' : ''}" data-i="${i}">${icon(c.icon)}<span class="pal-label">${esc(c.label)}</span><span class="pal-hint mono">${esc(c.hint)}</span></button>`).join('') || '<div class="pal-empty">No matches</div>';
+    listEl.querySelectorAll('[data-i]').forEach(b => b.onclick = () => run(Number(b.dataset.i)));
+    const on = listEl.querySelector('.on'); on?.scrollIntoView({ block: 'nearest' });
+  };
+  const run = (i) => { const c = filtered[i]; if (c) { closeModal(); c.run(); } };
+  input.oninput = () => {
+    const q = input.value.trim().toLowerCase();
+    filtered = q ? all.filter(c => (c.label + ' ' + c.hint).toLowerCase().includes(q)) : all;
+    cur = 0; draw();
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); cur = Math.min(filtered.length - 1, cur + 1); draw(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); cur = Math.max(0, cur - 1); draw(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(cur); }
+  };
+  draw();
+  setTimeout(() => input.focus(), 40);
+}
+
+function openShortcuts() {
+  const card = openModal(`<div class="shortcuts-modal">
+    <div class="ev-detail-head"><h2>${icon('command')} Keyboard shortcuts</h2><button class="icon-btn" id="sx">${icon('x')}</button></div>
+    <div class="kbd-grid big">${SHORTCUTS.map(([k, d]) => `<div class="kbd-row"><kbd>${esc(k)}</kbd><span>${esc(d)}</span></div>`).join('')}</div>
+  </div>`, { wide: true });
+  card.querySelector('#sx').onclick = closeModal;
+}
+
+// ---- Keyboard shortcuts -------------------------------------------------------------------
+let gPending = false;
+function installKeys() {
+  document.addEventListener('keydown', (e) => {
+    const typing = /input|textarea|select/i.test(document.activeElement?.tagName || '') || document.activeElement?.isContentEditable;
+    const meta = e.metaKey || e.ctrlKey;
+
+    if (meta && e.key.toLowerCase() === 'k') { e.preventDefault(); if (!document.getElementById('modal').classList.contains('hidden')) return; openPalette(); return; }
+    if (e.key === 'Escape') {
+      if (!document.getElementById('modal').classList.contains('hidden')) closeModal();
+      if (document.getElementById('inspector').classList.contains('show')) document.getElementById('inspector').querySelector('#insp-close')?.click();
+      gPending = false; return;
+    }
+    if (typing || meta) return;
+
+    // go-to prefix
+    if (gPending) {
+      gPending = false;
+      const map = { m: 'mail', c: 'chat', a: 'calendar', p: 'contacts', f: 'files', r: 'groups', s: 'settings' };
+      if (map[e.key]) { e.preventDefault(); setView(map[e.key]); return; }
+    }
+    if (e.key === 'g') { gPending = true; setTimeout(() => gPending = false, 900); return; }
+
+    if (e.key >= '1' && e.key <= '7') { setView(VIEWS[Number(e.key) - 1].id); return; }
+    if (e.key === '/') { e.preventDefault(); openPalette(); return; }
+    if (e.key === '?') { e.preventDefault(); openShortcuts(); return; }
+    if (e.key === 'c') { e.preventDefault(); openCompose(); return; }
+
+    // mail-context keys
+    if (state.view === 'mail') {
+      const k = e.key;
+      if (k === 'j') { e.preventDefault(); mailKeys.move(1); }
+      else if (k === 'k') { e.preventDefault(); mailKeys.move(-1); }
+      else if (k === 'e') { mailKeys.archive(); }
+      else if (k === '#') { mailKeys.trash(); }
+      else if (k === 'r') { e.preventDefault(); mailKeys.reply(); }
+      else if (k === 's') { mailKeys.star(); }
+      else if (k === 'u') { mailKeys.unread(); }
+      else if (k === 'x') { mailKeys.select(); }
+    }
+  });
+}

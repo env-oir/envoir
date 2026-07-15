@@ -1,102 +1,204 @@
-// ui.js — rendering helpers and view builders. Pure DOM, no framework.
+// ui.js — rendering primitives. Pure DOM, no framework. Icons are inline SVG (no external
+// assets). Avatars are deterministic gradients. Includes the MOTE inspector (spec §2.1) and
+// the safety-number visuals (spec §3.4 verification).
 
-import { fmtBytes } from './mesh-sim.js';
+import { fmtBytes } from './seed.js';
 
 export const el = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
-export const esc = (s) => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+export const esc = (s) => (s == null ? '' : String(s)).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
 export const timeAgo = (t) => {
   const s = (Date.now() - t) / 1000;
-  if (s < 60) return 'now';
+  if (s < 45) return 'now';
   if (s < 3600) return Math.floor(s / 60) + 'm';
   if (s < 86400) return Math.floor(s / 3600) + 'h';
-  return Math.floor(s / 86400) + 'd';
+  if (s < 7 * 86400) return Math.floor(s / 86400) + 'd';
+  return new Date(t).toLocaleDateString([], { month: 'short', day: 'numeric' });
 };
+export const fmtClock = (t) => new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+export const fmtDay = (t) => new Date(t).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+export const fmtLong = (t) => new Date(t).toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' }) + ' · ' + fmtClock(t);
 
-export function toast(msg, ms = 2600) {
-  const t = document.getElementById('toast');
-  t.innerHTML = msg; t.classList.remove('hidden');
-  clearTimeout(t._h); t._h = setTimeout(() => t.classList.add('hidden'), ms);
+// ---- Icon set (stroke SVGs) --------------------------------------------------------------
+const P = {
+  inbox: '<path d="M4 13l2.5-8h11L20 13v6H4z"/><path d="M4 13h4l1.5 3h5l1.5-3h4"/>',
+  star: '<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17.8 6.6 20l1-6.1L3.2 9.5l6.1-.9z"/>',
+  clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3.5 2"/>',
+  send: '<path d="M21 3L3 10.5l7 2.5 2.5 7z"/><path d="M21 3l-9 11"/>',
+  edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="M14 6l4 4"/>',
+  archive: '<rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v10h14V9"/><path d="M10 13h4"/>',
+  shield: '<path d="M12 3l7 3v6c0 5-3.5 7.5-7 9-3.5-1.5-7-4-7-9V6z"/>',
+  trash: '<path d="M5 7h14"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/>',
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M4 7l8 6 8-6"/>',
+  chat: '<path d="M4 5h16v11H9l-5 4z"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2.5"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+  contacts: '<circle cx="12" cy="9" r="4"/><path d="M4 20c0-3.5 3.6-5.5 8-5.5s8 2 8 5.5"/>',
+  files: '<path d="M4 5h5l2 2h9v12H4z"/>',
+  groups: '<circle cx="9" cy="9" r="3.2"/><circle cx="17" cy="10" r="2.4"/><path d="M3 20c0-3 2.7-4.8 6-4.8s6 1.8 6 4.8"/><path d="M15.5 20c0-2.2 1.4-3.6 3.2-3.6 1.3 0 2.5.7 3.1 1.9"/>',
+  settings: '<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/>',
+  reply: '<path d="M10 8L4 12l6 4"/><path d="M4 12h9c4 0 7 2 7 6"/>',
+  forward: '<path d="M14 8l6 4-6 4"/><path d="M20 12h-9c-4 0-7 2-7 6"/>',
+  snooze: '<circle cx="12" cy="13" r="7"/><path d="M12 9v4l3 2M9 3h6M5 5l2-1M19 5l-2-1"/>',
+  label: '<path d="M3 6a2 2 0 012-2h8l7 8-7 8H5a2 2 0 01-2-2z"/><circle cx="8" cy="12" r="1.4"/>',
+  more: '<circle cx="6" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="18" cy="12" r="1.6"/>',
+  check: '<path d="M4 12l5 5L20 6"/>',
+  x: '<path d="M6 6l12 12M18 6L6 18"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  verified: '<path d="M12 3l2 1.6 2.5-.4 1 2.4 2.4 1-.4 2.5L22 15l-1.6 2 .4 2.5-2.4 1-1 2.4-2.5-.4L12 21l-2-1.6-2.5.4-1-2.4-2.4-1 .4-2.5L2 15l1.6-2-.4-2.5 2.4-1 1-2.4 2.5.4z"/><path d="M8.5 12l2.2 2.2L15.5 9.5" stroke-width="1.6"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/>',
+  key: '<circle cx="8" cy="14" r="4"/><path d="M11 12l8-8M17 6l2 2M15 8l2 2"/>',
+  moon: '<path d="M20 14a8 8 0 11-9-9 6.5 6.5 0 009 9z"/>',
+  sun: '<circle cx="12" cy="12" r="4.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.5 4.5l1.8 1.8M17.7 17.7l1.8 1.8M19.5 4.5l-1.8 1.8M6.3 17.7l-1.8 1.8"/>',
+  command: '<path d="M9 6a3 3 0 10-3 3h12a3 3 0 10-3-3v12a3 3 0 103-3H6a3 3 0 10-3 3z"/>',
+  network: '<circle cx="12" cy="12" r="2.6"/><circle cx="5" cy="6" r="1.8"/><circle cx="19" cy="6" r="1.8"/><circle cx="5" cy="18" r="1.8"/><circle cx="19" cy="18" r="1.8"/><path d="M6.5 7l3.5 3.5m4 0L17.5 7m0 10L14 13.5m-4 0L6.5 17"/>',
+  info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/>',
+  export: '<path d="M12 3v11M8 7l4-4 4 4"/><path d="M5 15v4h14v-4"/>',
+  import: '<path d="M12 14V3M8 10l4 4 4-4"/><path d="M5 15v4h14v-4"/>',
+  bell: '<path d="M6 9a6 6 0 1112 0c0 6 2 7 2 7H4s2-1 2-7z"/><path d="M10 20a2 2 0 004 0"/>',
+  repeat: '<path d="M4 9a5 5 0 015-5h8l-2-2m2 2l-2 2"/><path d="M20 15a5 5 0 01-5 5H7l2 2m-2-2l2-2"/>',
+};
+export function icon(name, cls = '') {
+  return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 }
 
-// ---- MOTE inspector (the three-layer visualization, spec §2.1) ----
-export function showInspector(mote, plan) {
-  const insp = document.getElementById('inspector');
-  const hops = plan.path.map((h, i) => `<span class="hop" data-h="${i}">${esc(h)}</span>`)
-    .join('<span class="arrow">→</span>');
-  const tierBadge = mote.tier === 'private'
-    ? '<span class="badge priv">● private · mixnet</span>'
-    : (plan.kind === 'legacy' ? '<span class="badge warn">● legacy · gateway</span>' : '<span class="badge fast">● fast · direct</span>');
-
-  insp.innerHTML = `
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-      <h3>MOTE inspector</h3>
-      <button class="btn ghost" id="insp-close">✕</button>
-    </div>
-    <div class="sub">The message object, spec §2 — three nested layers. ${tierBadge}</div>
-
-    <div class="layer outer">
-      <div class="layer-h">◇ OUTER — mixnet / sealed sender</div>
-      <div class="kv"><span class="k">tier</span><span class="v">${mote.tier}</span></div>
-      <div class="kv"><span class="k">onion</span><span class="v">${mote.outer.onion ? 'Sphinx, constant-length' : 'direct'}</span></div>
-      <div class="kv"><span class="k">sender</span><span class="v">hidden (sealed)</span></div>
-      <div class="kv"><span class="k">padded</span><span class="v">yes → size bucket</span></div>
-      <div class="lock">The network sees only this layer: ciphertext to an opaque destination.</div>
-    </div>
-
-    <div class="layer env">
-      <div class="layer-h">▢ ENVELOPE — signed, content-addressed</div>
-      <div class="kv"><span class="k">id</span><span class="v">${esc(mote.envelope.id)}</span></div>
-      <div class="kv"><span class="k">to</span><span class="v">${esc(mote.envelope.to)}</span></div>
-      <div class="kv"><span class="k">kind</span><span class="v">0x${mote.kind.toString(16).padStart(2, '0')}</span></div>
-      <div class="kv"><span class="k">suite</span><span class="v">0x01 (Ed25519/X25519/ChaCha20)</span></div>
-      <div class="kv"><span class="k">ts</span><span class="v">${mote.ts}</span></div>
-      <div class="lock">id = BLAKE3(ciphertext) — content-addressed (SHA-256 stand-in in this demo).</div>
-    </div>
-
-    <div class="layer pay">
-      <div class="layer-h">▣ PAYLOAD — end-to-end encrypted</div>
-      <div class="kv"><span class="k">from</span><span class="v">${esc(mote.payload.from.slice(0, 24))}…</span></div>
-      <div class="kv"><span class="k">signature</span><span class="v">${mote.sigLen ? '✓ real Ed25519, ' + mote.sigLen + ' bytes' : '(unsigned — key unavailable)'}</span></div>
-      <div class="kv"><span class="k">subject</span><span class="v">${esc(mote.payload.headers.subject || '—')}</span></div>
-      <div class="kv"><span class="k">body</span><span class="v">${esc((mote.payload.body || '').slice(0, 40))}…</span></div>
-      <div class="lock">Only the recipient can decrypt this. Sender identity + signature live inside.</div>
-    </div>
-
-    <div style="margin-top:16px"><b style="font-size:12px">Delivery path</b></div>
-    <div class="path">${hops}</div>
-  `;
-  insp.classList.remove('hidden');
-  insp.querySelector('#insp-close').onclick = () => insp.classList.add('hidden');
-  return insp;
-}
-export function litHop(i) {
-  const insp = document.getElementById('inspector');
-  insp?.querySelectorAll('.hop').forEach((h, j) => h.classList.toggle('lit', j <= i));
-}
-export function hideInspector() { document.getElementById('inspector').classList.add('hidden'); }
-
-// ---- Network diagram (roles: node / relay / mixnet / gateway) ----
-export function networkSVG() {
-  return `<svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" fill="none" stroke-width="1.6" font-family="var(--mono)">
-    <style>text{font:11px var(--mono);fill:var(--text-dim)} .n{fill:var(--bg-3);stroke:var(--line-2)} .lbl{fill:var(--text)} .e{stroke:var(--line-2)}</style>
-    <line class="e" x1="90" y1="130" x2="250" y2="70"/><line class="e" x1="90" y1="130" x2="250" y2="190"/>
-    <line class="e" x1="250" y1="70" x2="410" y2="70"/><line class="e" x1="250" y1="190" x2="410" y2="190"/>
-    <line class="e" x1="410" y1="70" x2="550" y2="130"/><line class="e" x1="410" y1="190" x2="550" y2="130"/>
-    <line class="e" x1="410" y1="70" x2="410" y2="190" stroke-dasharray="3 3"/>
-    <circle class="n" cx="90" cy="130" r="30"/><text class="lbl" x="90" y="130" text-anchor="middle">you</text><text x="90" y="178" text-anchor="middle">your node</text>
-    <circle class="n" cx="250" cy="70" r="26"/><text x="250" y="72" text-anchor="middle">relay</text>
-    <rect class="n" x="216" y="164" width="68" height="52" rx="10"/><text x="250" y="194" text-anchor="middle">mixnet</text>
-    <circle class="n" cx="410" cy="70" r="26"/><text x="410" y="72" text-anchor="middle">peer</text>
-    <rect class="n" x="376" y="164" width="68" height="52" rx="10"/><text x="410" y="188" text-anchor="middle">gateway</text><text x="410" y="204" text-anchor="middle" font-size="9">→ SMTP</text>
-    <circle class="n" cx="550" cy="130" r="30"/><text class="lbl" x="550" y="130" text-anchor="middle">them</text><text x="550" y="178" text-anchor="middle">their node</text>
+// ---- Envoir brand mark (inline SVG, from brand/logo-mark.svg) -----------------------------
+export function brandMark(size = 28) {
+  return `<svg width="${size}" height="${size}" viewBox="0 0 128 128" fill="none" aria-label="Envoir">
+    <defs><linearGradient id="em-${size}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#5B9DFF"/><stop offset="1" stop-color="#7C5CFF"/></linearGradient></defs>
+    <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#em-${size})"/>
+    <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke="#fff" stroke-width="5"/>
+    <path d="M33 45 L64 68 L95 45" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="33" cy="45" r="6" fill="#fff"/><circle cx="95" cy="45" r="6" fill="#fff"/><circle cx="64" cy="68" r="7" fill="#fff"/>
+    <path d="M33 45 L95 45" stroke="#fff" stroke-width="2.5" stroke-opacity="0.45" stroke-dasharray="3 5"/>
   </svg>`;
 }
 
-// ---- Key-name pills (spec §3.9.1) — 8 derived words + a distinct checksum word ----
-export function keyNamePills(keyName) {
-  if (!keyName) return '';
-  const words = keyName.words.map((w, i) => `<span data-i="${i + 1}">${esc(w)}</span>`).join('');
-  return `<div class="phrase keyname">${words}<span class="checksum" data-i="✓">${esc(keyName.checksum)}</span></div>`;
+// ---- Avatars: deterministic gradient + initials -----------------------------------------
+export function initials(name) {
+  const parts = (name || '?').replace(/^@/, '').split(/[\s.@]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return (parts[0] || '?').slice(0, 2).toUpperCase();
+}
+export function avatar(p, size = 34, opts = {}) {
+  const hue = p.hue ?? 220;
+  const ring = opts.ring && p.trust === 'verified' ? ' ring' : '';
+  const dot = opts.presence ? `<span class="pres ${opts.presence}"></span>` : '';
+  return `<span class="av${ring}" style="--h:${hue};width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px" title="${esc(p.name)}">${esc(initials(p.name))}${p.trust === 'verified' && opts.badge ? verifiedGlyph() : ''}${dot}</span>`;
+}
+export function verifiedGlyph() { return `<span class="vglyph">${icon('verified')}</span>`; }
+
+export function trustPill(trust) {
+  const map = {
+    verified: `<span class="pill good">${icon('verified')} verified</span>`,
+    tofu: `<span class="pill dim">${icon('lock')} pinned</span>`,
+    unverified: `<span class="pill warn">unverified</span>`,
+    legacy: `<span class="pill legacy">legacy</span>`,
+  };
+  return map[trust] || '';
+}
+
+// ---- Toast --------------------------------------------------------------------------------
+export function toast(msg, opts = {}) {
+  const t = document.getElementById('toast');
+  const ms = opts.ms || 2800;
+  t.innerHTML = `<span>${msg}</span>${opts.action ? `<button class="toast-act">${esc(opts.action)}</button>` : ''}`;
+  t.classList.remove('hidden'); t.classList.add('show');
+  clearTimeout(t._h);
+  if (opts.action && opts.onAction) t.querySelector('.toast-act').onclick = () => { clearTimeout(t._h); t.classList.remove('show'); opts.onAction(); };
+  t._h = setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.classList.add('hidden'), 200); }, ms);
+  return t;
+}
+
+// ---- Modal --------------------------------------------------------------------------------
+export function openModal(html, opts = {}) {
+  const m = document.getElementById('modal');
+  m.innerHTML = `<div class="modal-scrim"></div><div class="modal-card ${opts.wide ? 'wide' : ''} ${opts.compose ? 'compose-card' : ''}">${html}</div>`;
+  m.classList.remove('hidden');
+  requestAnimationFrame(() => m.classList.add('show'));
+  m.querySelector('.modal-scrim').onclick = () => { if (!opts.sticky) closeModal(); };
+  return m.querySelector('.modal-card');
+}
+export function closeModal() {
+  const m = document.getElementById('modal');
+  m.classList.remove('show');
+  setTimeout(() => { m.classList.add('hidden'); m.innerHTML = ''; }, 180);
+}
+
+// ---- Loading shimmer ----------------------------------------------------------------------
+export function shimmerRows(n = 6) {
+  return `<div class="shimmer-wrap">${Array.from({ length: n }, () => `<div class="shimmer-row"><div class="sh-av"></div><div class="sh-lines"><div class="sh-line w70"></div><div class="sh-line w40"></div></div></div>`).join('')}</div>`;
+}
+
+export function emptyState(iconName, title, sub) {
+  return `<div class="empty"><div class="empty-glow">${icon(iconName)}</div><b>${esc(title)}</b><span>${esc(sub)}</span></div>`;
+}
+
+// ---- MOTE inspector (three-layer visualization, spec §2.1) --------------------------------
+export function showInspector(mote, plan) {
+  const insp = document.getElementById('inspector');
+  const hops = plan.path.map((h, i) => `<span class="hop" data-h="${i}">${esc(h)}</span>`).join('<i class="arrow">→</i>');
+  const tierBadge = mote.tier === 'private'
+    ? `<span class="pill priv">${icon('shield')} private · mixnet</span>`
+    : (plan.kind === 'legacy' ? `<span class="pill legacy">legacy · gateway</span>` : (plan.kind === 'group' ? `<span class="pill accent">${icon('groups')} group fan-out</span>` : `<span class="pill accent">fast · direct</span>`));
+  insp.innerHTML = `
+    <div class="insp-head">
+      <div><h3>MOTE inspector</h3><div class="insp-sub">Why this message is private — the object, three sealed layers (spec §2.1). ${tierBadge}</div></div>
+      <button class="icon-btn" id="insp-close" aria-label="Close">${icon('x')}</button>
+    </div>
+    <div class="layer outer">
+      <div class="layer-h">${icon('shield')} OUTER — mixnet / sealed sender</div>
+      <div class="kv"><span class="k">tier</span><span class="v">${esc(mote.tier)}</span></div>
+      <div class="kv"><span class="k">onion</span><span class="v">${mote.outer.onion ? 'Sphinx, constant-length' : 'direct'}</span></div>
+      <div class="kv"><span class="k">sender</span><span class="v">hidden (sealed)</span></div>
+      ${mote.outer.fanout ? `<div class="kv"><span class="k">fan-out</span><span class="v">${esc(mote.outer.fanout)}</span></div>` : ''}
+      <div class="layer-note">The network sees only this layer: ciphertext to an opaque destination.</div>
+    </div>
+    <div class="layer env">
+      <div class="layer-h">${icon('lock')} ENVELOPE — signed, content-addressed</div>
+      <div class="kv"><span class="k">id</span><span class="v">${esc(mote.envelope.id)}</span></div>
+      <div class="kv"><span class="k">to</span><span class="v">${esc(mote.envelope.to)}</span></div>
+      <div class="kv"><span class="k">kind</span><span class="v">0x${mote.kind.toString(16).padStart(2, '0')}</span></div>
+      <div class="kv"><span class="k">suite</span><span class="v">0x01 · Ed25519/X25519/ChaCha20</span></div>
+      <div class="layer-note">id = BLAKE3(ciphertext) — content-addressed (SHA-256 stand-in here).</div>
+    </div>
+    <div class="layer pay">
+      <div class="layer-h">${icon('key')} PAYLOAD — end-to-end encrypted</div>
+      <div class="kv"><span class="k">from</span><span class="v">${esc(mote.payload.from.slice(0, 22))}…</span></div>
+      <div class="kv"><span class="k">signature</span><span class="v">${mote.sigLen ? '✓ real ' + (mote.payload.from ? '' : '') + 'Ed25519/ECDSA, ' + mote.sigLen + ' bytes' : '(unsigned — key unavailable)'}</span></div>
+      <div class="kv"><span class="k">subject</span><span class="v">${esc(mote.payload.headers.subject || '—')}</span></div>
+      <div class="kv"><span class="k">body</span><span class="v">${esc((mote.payload.body || '').slice(0, 46))}…</span></div>
+      <div class="layer-note">Only the recipient can decrypt this. Sender identity + signature live inside.</div>
+    </div>
+    <div class="insp-path-h">Delivery path <span class="sim-tag">simulated network</span></div>
+    <div class="path">${hops}</div>`;
+  insp.classList.remove('hidden');
+  requestAnimationFrame(() => insp.classList.add('show'));
+  insp.querySelector('#insp-close').onclick = hideInspector;
+  return insp;
+}
+export function litHop(i) {
+  document.getElementById('inspector')?.querySelectorAll('.hop').forEach((h, j) => h.classList.toggle('lit', j <= i));
+}
+export function hideInspector() {
+  const insp = document.getElementById('inspector');
+  insp.classList.remove('show');
+  setTimeout(() => insp.classList.add('hidden'), 220);
+}
+
+// ---- Safety-number visuals (spec §3.4) ---------------------------------------------------
+export function safetyWords(safety) {
+  if (!safety) return '';
+  const w = safety.words.map((x, i) => `<span class="sw" data-i="${i + 1}">${esc(x)}</span>`).join('');
+  return `<div class="safety-words">${w}<span class="sw sum" data-i="✓">${esc(safety.checksum)}</span></div>`;
+}
+export function safetyGrid(safety) {
+  if (!safety) return '';
+  const cells = safety.grid.flat().map(b => `<i class="${b ? 'on' : ''}"></i>`).join('');
+  return `<div class="safety-grid">${cells}</div>`;
+}
+export function safetyNumeric(safety) {
+  return safety ? `<div class="safety-num mono">${esc(safety.numeric)}</div>` : '';
 }
 
 export { fmtBytes };
