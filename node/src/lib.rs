@@ -17,11 +17,15 @@
 // `dmtap::mote`, …) keep working after the move into `dmtap-core`.
 pub use dmtap_core::{self, id, identity, keyname, mote, ContentId, Suite, TimestampMs};
 
+// The client-access surface (spec §8): IMAP/POP/SMTP-submission + JMAP + autodiscovery, all
+// projecting the one MOTE store. Implemented in the workspace-shared `dmtap-mail` crate and
+// re-exported here as `dmtap::clients`.
+pub use dmtap_mail as clients;
+
 // Node-only planned modules (see README): the client side that *is* the mesh.
 // pub mod naming;
 // pub mod transport;
 // pub mod messaging;
 // pub mod privacy;
-// pub mod clients;
 // pub mod abuse;
 // pub mod store;

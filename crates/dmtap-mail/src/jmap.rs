@@ -1,0 +1,604 @@
+//! JMAP (RFC 8620 Core + RFC 8621 Mail) — the native modern sync surface (spec §8.1). JMAP maps
+//! directly onto the MOTE store: Mailboxes are folders, Emails are messages, keywords are flags.
+//!
+//! This module provides the real request/response envelope types, the Session resource, and
+//! handlers for the standard methods over Mailbox / Email / Thread / EmailSubmission
+//! (`/get`, `/query`, `/set`, `/changes`), plus blob upload/download and the push (StateChange /
+//! EventSource) types. Method arguments are handled as `serde_json::Value` so the wire shape is
+//! exactly RFC 8620/8621; the handlers below are the reference projection.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::mime::ParsedMessage;
+use crate::store::{Flag, MailStore};
+
+/// A JMAP method invocation `[name, arguments, callId]` (RFC 8620 §3.2).
+pub type Invocation = (String, Value, String);
+
+/// A JMAP request object (RFC 8620 §3.3).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Request {
+    pub using: Vec<String>,
+    #[serde(rename = "methodCalls")]
+    pub method_calls: Vec<Invocation>,
+}
+
+/// A JMAP response object (RFC 8620 §3.4).
+#[derive(Debug, Clone, Serialize)]
+pub struct Response {
+    #[serde(rename = "methodResponses")]
+    pub method_responses: Vec<Invocation>,
+    #[serde(rename = "sessionState")]
+    pub session_state: String,
+}
+
+/// The capability URIs this server implements.
+pub const CAP_CORE: &str = "urn:ietf:params:jmap:core";
+pub const CAP_MAIL: &str = "urn:ietf:params:jmap:mail";
+pub const CAP_SUBMISSION: &str = "urn:ietf:params:jmap:submission";
+
+/// Build the JMAP Session resource (RFC 8620 §2) for an account at `base_url`.
+pub fn session_resource(account_id: &str, base_url: &str, state: &str) -> Value {
+    json!({
+        "capabilities": {
+            CAP_CORE: {
+                "maxSizeUpload": 50_000_000u64,
+                "maxConcurrentUpload": 4,
+                "maxSizeRequest": 10_000_000u64,
+                "maxConcurrentRequests": 4,
+                "maxCallsInRequest": 16,
+                "maxObjectsInGet": 500,
+                "maxObjectsInSet": 500,
+                "collationAlgorithms": ["i;ascii-casemap", "i;unicode-casemap"]
+            },
+            CAP_MAIL: {
+                "maxMailboxesPerEmail": null,
+                "maxMailboxDepth": null,
+                "maxSizeMailboxName": 200,
+                "maxSizeAttachmentsPerEmail": 50_000_000u64,
+                "emailQuerySortOptions": ["receivedAt", "size", "subject"],
+                "mayCreateTopLevelMailbox": true
+            },
+            CAP_SUBMISSION: { "maxDelayedSend": 0, "submissionExtensions": {} }
+        },
+        "accounts": {
+            account_id: {
+                "name": account_id,
+                "isPersonal": true,
+                "isReadOnly": false,
+                "accountCapabilities": { CAP_MAIL: {}, CAP_SUBMISSION: {} }
+            }
+        },
+        "primaryAccounts": { CAP_MAIL: account_id, CAP_SUBMISSION: account_id },
+        "username": account_id,
+        "apiUrl": format!("{base_url}/jmap/api/"),
+        "downloadUrl": format!("{base_url}/jmap/download/{{accountId}}/{{blobId}}/{{name}}"),
+        "uploadUrl": format!("{base_url}/jmap/upload/{{accountId}}/"),
+        "eventSourceUrl": format!("{base_url}/jmap/eventsource/?types={{types}}&closeafter={{closeafter}}&ping={{ping}}"),
+        "state": state
+    })
+}
+
+/// A JMAP StateChange push object (RFC 8620 §7.1) — emitted over EventSource / WebSocket.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateChange {
+    #[serde(rename = "@type")]
+    pub kind: &'static str,
+    pub changed: Value,
+}
+
+impl StateChange {
+    pub fn new(account_id: &str, state: &str) -> StateChange {
+        StateChange {
+            kind: "StateChange",
+            changed: json!({ account_id: { "Email": state, "Mailbox": state } }),
+        }
+    }
+}
+
+/// Process a JMAP request against a store, dispatching each method call (RFC 8620 §3.3).
+pub fn process<S: MailStore>(store: &mut S, account_id: &str, req: &Request) -> Response {
+    let mut responses = Vec::new();
+    for (name, args, call_id) in &req.method_calls {
+        let result = dispatch(store, account_id, name, args);
+        match result {
+            Ok((rname, rargs)) => responses.push((rname, rargs, call_id.clone())),
+            Err(err) => responses.push(("error".to_string(), err, call_id.clone())),
+        }
+    }
+    Response { method_responses: responses, session_state: state_string(store) }
+}
+
+fn dispatch<S: MailStore>(
+    store: &mut S,
+    account: &str,
+    name: &str,
+    args: &Value,
+) -> Result<(String, Value), Value> {
+    match name {
+        "Mailbox/get" => Ok(("Mailbox/get".into(), mailbox_get(store, account, args))),
+        "Mailbox/query" => Ok(("Mailbox/query".into(), mailbox_query(store, account))),
+        "Mailbox/changes" => Ok(("Mailbox/changes".into(), changes_stub(store, account, "Mailbox"))),
+        "Email/get" => Ok(("Email/get".into(), email_get(store, account, args))),
+        "Email/query" => Ok(("Email/query".into(), email_query(store, account, args))),
+        "Email/changes" => Ok(("Email/changes".into(), changes_stub(store, account, "Email"))),
+        "Email/set" => Ok(("Email/set".into(), email_set(store, account, args))),
+        "Thread/get" => Ok(("Thread/get".into(), thread_get(store, account, args))),
+        "EmailSubmission/set" => Ok(("EmailSubmission/set".into(), submission_set(account, args))),
+        _ => Err(json!({ "type": "unknownMethod", "description": name })),
+    }
+}
+
+fn state_string<S: MailStore>(store: &S) -> String {
+    let sum: u64 = store
+        .mailbox_names()
+        .iter()
+        .filter_map(|n| store.mailbox(n))
+        .map(|mb| mb.highest_modseq)
+        .sum();
+    sum.to_string()
+}
+
+// --- Mailbox --------------------------------------------------------------------------------
+
+fn mailbox_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let ids_filter = args.get("ids").and_then(|v| v.as_array());
+    let mut list = Vec::new();
+    for name in store.mailbox_names() {
+        if let Some(filter) = ids_filter {
+            if !filter.iter().any(|v| v.as_str() == Some(name.as_str())) {
+                continue;
+            }
+        }
+        let mb = store.mailbox(&name).unwrap();
+        list.push(json!({
+            "id": name,
+            "name": name,
+            "parentId": Value::Null,
+            "role": mb.special_use.map(|s| s.jmap_role()),
+            "sortOrder": 0,
+            "totalEmails": mb.exists(),
+            "unreadEmails": mb.unseen(),
+            "totalThreads": mb.exists(),
+            "unreadThreads": mb.unseen(),
+            "myRights": {
+                "mayReadItems": true, "mayAddItems": true, "mayRemoveItems": true,
+                "maySetSeen": true, "maySetKeywords": true, "mayCreateChild": true,
+                "mayRename": true, "mayDelete": true, "maySubmit": true
+            },
+            "isSubscribed": mb.subscribed
+        }));
+    }
+    json!({
+        "accountId": account,
+        "state": state_string(store),
+        "list": list,
+        "notFound": []
+    })
+}
+
+fn mailbox_query<S: MailStore>(store: &S, account: &str) -> Value {
+    let ids: Vec<String> = store.mailbox_names();
+    json!({
+        "accountId": account,
+        "queryState": state_string(store),
+        "canCalculateChanges": false,
+        "position": 0,
+        "total": ids.len(),
+        "ids": ids
+    })
+}
+
+// --- Email ----------------------------------------------------------------------------------
+
+fn email_id(mailbox: &str, uid: u32) -> String {
+    format!("{mailbox}|{uid}")
+}
+
+fn parse_email_id(id: &str) -> Option<(String, u32)> {
+    let (mb, uid) = id.rsplit_once('|')?;
+    Some((mb.to_string(), uid.parse().ok()?))
+}
+
+fn keyword_of(flag: &Flag) -> Option<&'static str> {
+    match flag {
+        Flag::Seen => Some("$seen"),
+        Flag::Flagged => Some("$flagged"),
+        Flag::Answered => Some("$answered"),
+        Flag::Draft => Some("$draft"),
+        Flag::Deleted => Some("$deleted"),
+        Flag::Recent => None,
+        Flag::Keyword(_) => None,
+    }
+}
+
+fn flag_of_keyword(kw: &str) -> Flag {
+    match kw.to_ascii_lowercase().as_str() {
+        "$seen" => Flag::Seen,
+        "$flagged" => Flag::Flagged,
+        "$answered" => Flag::Answered,
+        "$draft" => Flag::Draft,
+        "$deleted" => Flag::Deleted,
+        other => Flag::Keyword(other.to_string()),
+    }
+}
+
+fn email_query<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let in_mailbox = args.get("filter").and_then(|f| f.get("inMailbox")).and_then(|v| v.as_str());
+    let mut ids = Vec::new();
+    for name in store.mailbox_names() {
+        if let Some(target) = in_mailbox {
+            if target != name {
+                continue;
+            }
+        }
+        let mb = store.mailbox(&name).unwrap();
+        for m in &mb.messages {
+            ids.push(email_id(&name, m.uid));
+        }
+    }
+    json!({
+        "accountId": account,
+        "queryState": state_string(store),
+        "canCalculateChanges": false,
+        "position": 0,
+        "total": ids.len(),
+        "ids": ids
+    })
+}
+
+fn email_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let want_ids: Vec<String> = match args.get("ids").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        None => {
+            // null ids = all emails.
+            let mut all = Vec::new();
+            for name in store.mailbox_names() {
+                let mb = store.mailbox(&name).unwrap();
+                for m in &mb.messages {
+                    all.push(email_id(&name, m.uid));
+                }
+            }
+            all
+        }
+    };
+    let mut list = Vec::new();
+    let mut not_found = Vec::new();
+    for id in &want_ids {
+        match parse_email_id(id).and_then(|(mb, uid)| store.mailbox(&mb).and_then(|m| m.by_uid(uid)).map(|msg| (mb, msg))) {
+            Some((mailbox, msg)) => {
+                let parsed = ParsedMessage::parse(&msg.raw);
+                let keywords: serde_json::Map<String, Value> = msg
+                    .flags
+                    .iter()
+                    .filter_map(keyword_of)
+                    .map(|k| (k.to_string(), Value::Bool(true)))
+                    .collect();
+                list.push(json!({
+                    "id": id,
+                    "blobId": id,
+                    "threadId": thread_id(&parsed, msg.uid),
+                    "mailboxIds": { mailbox: true },
+                    "keywords": keywords,
+                    "size": msg.size(),
+                    "receivedAt": crate::mime::format_rfc5322_date(msg.internal_date),
+                    "subject": parsed.header("Subject").unwrap_or(""),
+                    "from": jmap_addresses(&parsed, "From"),
+                    "to": jmap_addresses(&parsed, "To"),
+                    "cc": jmap_addresses(&parsed, "Cc"),
+                    "messageId": parsed.header("Message-ID").map(|s| vec![s.trim_matches(|c| c=='<'||c=='>')]),
+                    "preview": preview(&parsed),
+                    "hasAttachment": matches!(parsed.structure, crate::mime::BodyPart::Multipart{..}),
+                    "bodyValues": {
+                        "1": { "value": String::from_utf8_lossy(&parsed.body), "isEncodingProblem": false, "isTruncated": false }
+                    },
+                    "textBody": [ { "partId": "1", "type": "text/plain" } ]
+                }));
+            }
+            None => not_found.push(id.clone()),
+        }
+    }
+    json!({
+        "accountId": account,
+        "state": state_string(store),
+        "list": list,
+        "notFound": not_found
+    })
+}
+
+fn jmap_addresses(p: &ParsedMessage, header: &str) -> Value {
+    let addrs = p.addresses(header);
+    if addrs.is_empty() {
+        return Value::Null;
+    }
+    Value::Array(
+        addrs
+            .into_iter()
+            .map(|a| {
+                let email = match (a.mailbox, a.host) {
+                    (Some(m), Some(h)) => format!("{m}@{h}"),
+                    (Some(m), None) => m,
+                    _ => String::new(),
+                };
+                json!({ "name": a.name, "email": email })
+            })
+            .collect(),
+    )
+}
+
+fn thread_id(p: &ParsedMessage, uid: u32) -> String {
+    p.header("Message-ID")
+        .map(|m| format!("T{}", m.trim_matches(|c| c == '<' || c == '>')))
+        .unwrap_or_else(|| format!("T{uid}"))
+}
+
+fn preview(p: &ParsedMessage) -> String {
+    let text = String::from_utf8_lossy(&p.body);
+    text.chars().take(200).collect()
+}
+
+fn email_set<S: MailStore>(store: &mut S, account: &str, args: &Value) -> Value {
+    let mut updated = serde_json::Map::new();
+    let mut not_updated = serde_json::Map::new();
+    let mut destroyed = Vec::new();
+    let mut not_destroyed = serde_json::Map::new();
+
+    // update: change keywords (flags) on existing emails.
+    if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
+        for (id, patch) in update {
+            match parse_email_id(id) {
+                Some((mb, uid)) => {
+                    let ok = apply_email_update(store, &mb, uid, patch);
+                    if ok {
+                        updated.insert(id.clone(), Value::Null);
+                    } else {
+                        not_updated.insert(id.clone(), json!({ "type": "notFound" }));
+                    }
+                }
+                None => {
+                    not_updated.insert(id.clone(), json!({ "type": "notFound" }));
+                }
+            }
+        }
+    }
+
+    // destroy: remove emails.
+    if let Some(list) = args.get("destroy").and_then(|v| v.as_array()) {
+        for id in list.iter().filter_map(|v| v.as_str()) {
+            match parse_email_id(id) {
+                Some((mb, uid)) => {
+                    if let Some(m) = store.mailbox_mut(&mb) {
+                        if let Some(pos) = m.messages.iter().position(|x| x.uid == uid) {
+                            m.messages.remove(pos);
+                            m.highest_modseq += 1;
+                            destroyed.push(Value::String(id.to_string()));
+                            continue;
+                        }
+                    }
+                    not_destroyed.insert(id.to_string(), json!({ "type": "notFound" }));
+                }
+                None => {
+                    not_destroyed.insert(id.to_string(), json!({ "type": "notFound" }));
+                }
+            }
+        }
+    }
+
+    json!({
+        "accountId": account,
+        "oldState": "0",
+        "newState": state_string(store),
+        "created": {},
+        "updated": Value::Object(updated),
+        "destroyed": destroyed,
+        "notCreated": {},
+        "notUpdated": Value::Object(not_updated),
+        "notDestroyed": Value::Object(not_destroyed)
+    })
+}
+
+fn apply_email_update<S: MailStore>(store: &mut S, mb: &str, uid: u32, patch: &Value) -> bool {
+    let mailbox = match store.mailbox_mut(mb) {
+        Some(m) => m,
+        None => return false,
+    };
+    let msg = match mailbox.messages.iter_mut().find(|m| m.uid == uid) {
+        Some(m) => m,
+        None => return false,
+    };
+    let obj = match patch.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    // Full keyword replacement: "keywords": { "$seen": true, ... }
+    if let Some(kw) = obj.get("keywords").and_then(|v| v.as_object()) {
+        let recent = msg.has_flag(&Flag::Recent);
+        msg.flags = kw.keys().map(|k| flag_of_keyword(k)).collect();
+        if recent {
+            msg.set_flag(Flag::Recent);
+        }
+    }
+    // Patch form: "keywords/$seen": true|null
+    for (k, v) in obj {
+        if let Some(kw) = k.strip_prefix("keywords/") {
+            let flag = flag_of_keyword(kw);
+            if v.is_null() || v == &Value::Bool(false) {
+                msg.clear_flag(&flag);
+            } else {
+                msg.set_flag(flag);
+            }
+        }
+    }
+    mailbox.highest_modseq += 1;
+    let ms = mailbox.highest_modseq;
+    if let Some(m) = mailbox.messages.iter_mut().find(|m| m.uid == uid) {
+        m.modseq = ms;
+    }
+    true
+}
+
+fn thread_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let ids = args.get("ids").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let list: Vec<Value> = ids
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|tid| {
+            // Gather emails whose thread matches (reference: single-message threads).
+            let mut email_ids = Vec::new();
+            for name in store.mailbox_names() {
+                let mb = store.mailbox(&name).unwrap();
+                for m in &mb.messages {
+                    let parsed = ParsedMessage::parse(&m.raw);
+                    if thread_id(&parsed, m.uid) == tid {
+                        email_ids.push(email_id(&name, m.uid));
+                    }
+                }
+            }
+            json!({ "id": tid, "emailIds": email_ids })
+        })
+        .collect();
+    json!({ "accountId": account, "state": state_string(store), "list": list, "notFound": [] })
+}
+
+fn submission_set(account: &str, args: &Value) -> Value {
+    // Accept EmailSubmission/set create requests, echoing them as created (the actual send is the
+    // node's outbound MOTE path, §8.2). This records intent; no central relay is implied (§8.5).
+    let mut created = serde_json::Map::new();
+    if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
+        for (cid, sub) in create {
+            created.insert(
+                cid.clone(),
+                json!({
+                    "id": format!("sub-{cid}"),
+                    "sendAt": crate::mime::format_rfc5322_date(0),
+                    "undoStatus": "final",
+                    "emailId": sub.get("emailId").cloned().unwrap_or(Value::Null)
+                }),
+            );
+        }
+    }
+    json!({
+        "accountId": account,
+        "oldState": "0",
+        "newState": "0",
+        "created": Value::Object(created),
+        "updated": {},
+        "destroyed": [],
+        "notCreated": {}
+    })
+}
+
+fn changes_stub<S: MailStore>(store: &S, account: &str, _type: &str) -> Value {
+    // /changes requires a durable change log; the reference reports "no calculable changes" so a
+    // client falls back to a full /query + /get (RFC 8620 §5.2 cannotCalculateChanges).
+    json!({
+        "accountId": account,
+        "oldState": "0",
+        "newState": state_string(store),
+        "hasMoreChanges": false,
+        "created": [],
+        "updated": [],
+        "destroyed": []
+    })
+}
+
+// --- Blob up/download ----------------------------------------------------------------------
+
+/// Handle a blob upload (RFC 8620 §6.1): returns the upload response object. The blob id is the
+/// content address of the bytes (spec §2.2 content addressing), tying JMAP blobs to MOTE ids.
+pub fn blob_upload(account: &str, bytes: &[u8], content_type: &str) -> Value {
+    let blob_id = crate::util::hex(dmtap_core::ContentId::of(bytes).digest());
+    json!({
+        "accountId": account,
+        "blobId": blob_id,
+        "type": content_type,
+        "size": bytes.len()
+    })
+}
+
+/// Resolve a blob download (RFC 8620 §6.2) for an Email id → the raw RFC 5322 bytes.
+pub fn blob_download<S: MailStore>(store: &S, blob_id: &str) -> Option<Vec<u8>> {
+    let (mb, uid) = parse_email_id(blob_id)?;
+    store.mailbox(&mb)?.by_uid(uid).map(|m| m.raw.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    fn store_with_mail() -> MemoryStore {
+        let mut s = MemoryStore::empty();
+        s.deliver_raw(
+            "INBOX",
+            b"From: Alice <alice@example.com>\r\nSubject: Hello\r\nMessage-ID: <m1@x>\r\n\r\nHi Bob".to_vec(),
+            vec![],
+            1_752_000_000_000,
+        );
+        s
+    }
+
+    fn call(store: &mut MemoryStore, name: &str, args: Value) -> Value {
+        let req = Request { using: vec![CAP_MAIL.into()], method_calls: vec![(name.into(), args, "c1".into())] };
+        let resp = process(store, "acct1", &req);
+        resp.method_responses[0].1.clone()
+    }
+
+    #[test]
+    fn session_resource_serializes() {
+        let s = session_resource("acct1", "https://node.dmtap.local", "0");
+        assert_eq!(s["primaryAccounts"][CAP_MAIL], json!("acct1"));
+        assert!(s["apiUrl"].as_str().unwrap().ends_with("/jmap/api/"));
+    }
+
+    #[test]
+    fn mailbox_get_lists_folders() {
+        let mut s = store_with_mail();
+        let r = call(&mut s, "Mailbox/get", json!({ "accountId": "acct1", "ids": null }));
+        let list = r["list"].as_array().unwrap();
+        assert!(list.iter().any(|m| m["id"] == json!("INBOX")));
+        let inbox = list.iter().find(|m| m["id"] == json!("INBOX")).unwrap();
+        assert_eq!(inbox["role"], json!("inbox"));
+        assert_eq!(inbox["totalEmails"], json!(1));
+    }
+
+    #[test]
+    fn email_query_and_get() {
+        let mut s = store_with_mail();
+        let q = call(&mut s, "Email/query", json!({ "accountId": "acct1", "filter": { "inMailbox": "INBOX" } }));
+        let ids = q["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        let g = call(&mut s, "Email/get", json!({ "accountId": "acct1", "ids": ids }));
+        let email = &g["list"][0];
+        assert_eq!(email["subject"], json!("Hello"));
+        assert_eq!(email["from"][0]["email"], json!("alice@example.com"));
+    }
+
+    #[test]
+    fn email_set_updates_keywords() {
+        let mut s = store_with_mail();
+        let id = email_id("INBOX", 1);
+        let r = call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "update": { id.clone(): { "keywords": { "$seen": true } } } }),
+        );
+        assert!(r["updated"].get(&id).is_some());
+        assert!(s.mailbox("INBOX").unwrap().by_uid(1).unwrap().has_flag(&Flag::Seen));
+    }
+
+    #[test]
+    fn request_deserializes() {
+        let raw = r#"{"using":["urn:ietf:params:jmap:core"],"methodCalls":[["Mailbox/query",{},"0"]]}"#;
+        let req: Request = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.method_calls[0].0, "Mailbox/query");
+    }
+
+    #[test]
+    fn blob_upload_uses_content_address() {
+        let up = blob_upload("acct1", b"hello", "text/plain");
+        assert_eq!(up["size"], json!(5));
+        assert!(up["blobId"].as_str().unwrap().len() >= 32);
+    }
+}

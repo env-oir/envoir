@@ -19,6 +19,11 @@ repository = "https://example.invalid/envoir"
 # Moved out of this crate into the workspace-shared library; the node re-exports it (spec §1, §2, §3.9).
 dmtap-core = { path = "../crates/dmtap-core" }
 
+# --- Client protocol servers (spec §8): IMAP/POP/SMTP-submission + JMAP + autodiscovery, ---
+# projecting the MOTE store for legacy and modern mail clients. The `net` feature adds the
+# blocking TCP listeners the `run` command wires up (a real node terminates TLS first, §8.2).
+dmtap-mail = { path = "../crates/dmtap-mail", features = ["net"] }
+
 # --- Serialization (spec §README, deterministic CBOR RFC 8949 §4.2, bytewise key order) ---
 # ciborium = "0.2"          # CBOR; verify it emits/validates deterministic (core) form
 # serde = { version = "1", features = ["derive"] }
