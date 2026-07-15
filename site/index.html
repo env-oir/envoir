@@ -12,6 +12,12 @@
 <meta property="og:title" content="Envoir — your key is your identity">
 <meta property="og:description" content="Sovereign mail, chat, files and login on one keypair. Open source, MIT, self-hostable. The reference implementation of DMTAP.">
 <meta property="og:type" content="website">
+<meta property="og:site_name" content="Envoir">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Envoir — your key is your identity">
+<meta name="twitter:description" content="Sovereign mail, chat, files and login on one keypair. Open source, MIT, self-hostable.">
+<meta name="theme-color" content="#0a0c11" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f2ee" media="(prefers-color-scheme: light)">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -38,6 +44,7 @@
       <a href="#how">How it works</a>
       <a href="#naming">Naming</a>
       <a href="#identity">One identity</a>
+      <a href="#parity">Parity</a>
       <a href="#privacy">Privacy</a>
       <a href="#open-source">Open source</a>
     </nav>
@@ -59,16 +66,18 @@
         <h1>Your key is your identity. <em>Your node is your provider.</em></h1>
         <p class="lede">
           Envoir is the open-source reference implementation of <strong>DMTAP</strong> —
-          mail, chat, and files on one keypair identity, held on a node you run, moving through
-          a peer mesh and mixnet built so that no one, including us, sees who's talking to whom.
+          mail, chat, and files reachable at one <span class="mono">name@domain</span>, all
+          bound to a single keypair identity held on a node you run, moving through a peer
+          mesh and mixnet designed so that watching the wires never reveals who's talking to whom.
         </p>
         <div class="hero-ctas">
           <a class="btn btn-primary" href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Get the code</a>
           <a class="btn btn-ghost" href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Read the spec →</a>
         </div>
-        <div class="hero-keyname">
-          <span class="label">Your identity, as a name — zero authority, zero signup</span>
-          <span class="readout mono" id="keyname-readout" aria-live="off">maple-heron-otter-cabin-river-slate-amber-quill<span class="cursor">&nbsp;</span></span>
+        <div class="hero-address">
+          <span class="label">Your address, the moment you generate a key — provider-issued or your own domain</span>
+          <span class="readout mono" id="address-readout" aria-live="off">you@envoir.org<span class="cursor">&nbsp;</span></span>
+          <span class="hero-address-note">Same key underneath if it ever rotates — the address doesn't move. <a href="#naming">Why a name, not a key string →</a></span>
         </div>
       </div>
 
@@ -121,7 +130,7 @@
         <div class="ind-box">
           <div class="tt">Name · human, stable</div>
           <div class="vv">abc@def.com</div>
-          <div class="dd">Looked up once, via DNS + key transparency (§3)</div>
+          <div class="dd">Provider-issued or your own domain — looked up once, via DNS + key transparency (§3.8–§3.9)</div>
         </div>
         <div class="arrow" aria-hidden="true"><svg viewBox="0 0 26 14"><path d="M0 7H24M24 7L17 1M24 7L17 13" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></div>
         <div class="ind-box">
@@ -155,45 +164,53 @@
   <section id="naming">
     <div class="wrap">
       <div class="section-head reveal">
-        <p class="eyebrow"><span class="tag">§3</span> naming</p>
-        <h2>Pick as many names as you like. They all point at one key.</h2>
-        <p class="lede">The identity is always the keypair. A name is only a memorable pointer to it — and DMTAP defines a ladder of name forms, from zero-authority to fully human-chosen, that you can hold at the same time.</p>
+        <p class="eyebrow"><span class="tag">§3.9</span> naming</p>
+        <h2>One key. One recommended address. A couple of optional pointers.</h2>
+        <p class="lede">The identity is always the key — that never changes. <span class="mono">name@domain</span> is the address you actually give people: human, and federated so there's no single namespace to squat or fight over. A few other pointers exist for specific jobs; none of them outrank the key.</p>
       </div>
 
-      <div class="ladder reveal">
-        <div class="rung featured">
-          <span class="form">Key-name<br><span class="authority" style="text-align:left;">default</span></span>
-          <span class="example">maple-heron-otter-cabin-river-slate-amber-quill</span>
-          <span class="authority">zero authority</span>
+      <div class="naming-primary reveal bracketed">
+        <span class="np-badge">the headline address · §3.9.1</span>
+        <div class="np-grid">
+          <div class="np-flavor">
+            <span class="np-tt">Provider-issued</span>
+            <span class="np-example mono">you@envoir.org</span>
+            <span class="np-dd">Free, handle-shaped, zero DNS work — yours the moment you claim it (Tier B, §3.8)</span>
+          </div>
+          <div class="np-flavor">
+            <span class="np-tt">Your own domain</span>
+            <span class="np-example mono">you@yourbrand.com</span>
+            <span class="np-dd">Full sovereignty; records auto-published, never hand-edited (Tier C, §3.8)</span>
+          </div>
         </div>
-        <div class="rung">
-          <span class="form">Fingerprint</span>
-          <span class="example">k:7f2a9c1b…</span>
-          <span class="authority">none</span>
+        <p class="np-note">Both flavours are one format, reachable from Gmail and Outlook on day one, and survive key rotation and even a future post-quantum migration — the name binds to your identity's stable anchor, not to whichever key happens to be signing today (§1.5–§1.6, §3.9.1).</p>
+      </div>
+
+      <div class="naming-secondary reveal">
+        <div class="ns-row">
+          <span class="ns-form">@handle</span>
+          <span class="ns-example mono">@thisismyname</span>
+          <span class="ns-note">Optional, opt-in global registry — first-come, small anti-squat cost, audited so it can't be silently repointed (§3.9.2)</span>
         </div>
-        <div class="rung">
-          <span class="form">Handle</span>
-          <span class="example">@thisismyname</span>
-          <span class="authority">thin directory</span>
+        <div class="ns-row">
+          <span class="ns-form">Petname</span>
+          <span class="ns-example mono">“Mom” → a key</span>
+          <span class="ns-note">Local only — a name you give a contact; never leaves your devices (§3.9.3)</span>
         </div>
-        <div class="rung">
-          <span class="form">name@domain</span>
-          <span class="example">me@yourdomain</span>
-          <span class="authority">your DNS</span>
-        </div>
-        <div class="rung">
-          <span class="form">Self-sovereign</span>
-          <span class="example">thisismyname · name-chain</span>
-          <span class="authority">chain ordering</span>
+        <div class="ns-row">
+          <span class="ns-form">Alias / plus-address</span>
+          <span class="ns-example mono">you+news@domain</span>
+          <span class="ns-note">One identity, several names — even an old address you already own can be folded in once it's verified to point back at your key (§3.9.4)</span>
         </div>
       </div>
 
-      <p class="keyname-note reveal">
-        Every identity gets its key-name the instant a key is generated — no directory, no registration, no waiting.
-        It's 8 words drawn from an ~1,024-word list (80 bits), with a <span class="chk">checksum folded into the last word</span>
-        so a mistyped or mistyped name fails closed instead of quietly resolving to someone else's key.
-        Want it adversary-proof forever instead of just memorable? Use the 12-word form.
-      </p>
+      <div class="safety-number reveal">
+        <p class="eyebrow">not an address · §3.4.1</p>
+        <h3>Safety numbers — verifying a key, not naming one</h3>
+        <p>Every key has a fingerprint. Rendered as words from a small, pronounceable list, it's easier to read aloud or scan as a QR code than a string of hex:</p>
+        <p class="sn-words mono">maple · heron · otter · cabin · river · slate · amber · quill</p>
+        <p>Two people compare this out loud, in person, or over a channel they trust, to confirm they both pinned the <em>same</em> key for each other — closing the one gap first-contact pinning leaves open. <strong>It is never typed to reach anyone:</strong> it doesn't route mail, isn't listed among your names, and can't be sent to like an address.</p>
+      </div>
     </div>
   </section>
 
@@ -210,7 +227,7 @@
         <div class="thing reveal" data-d="1">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 6.5 12 13 20 6.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <h3>Mail</h3>
-          <p>Async, store-and-forward, delivered even while your node sleeps — with a gateway bridge into the legacy SMTP world.</p>
+          <p>Async, store-and-forward, delivered even while your node sleeps. A legacy address you already own can be folded in as an alias, so switching doesn't mean losing it (§3.9.4).</p>
         </div>
         <div class="thing reveal" data-d="2">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 5h16v11H8l-4 4V5Z" stroke-linejoin="round"/></svg>
@@ -232,6 +249,42 @@
       <div class="signin-strip reveal">
         <span class="lbl">On any site: <b>“Sign in with Envoir”</b> → enter <span class="mono">alice@yourdomain</span> → approve on your device. No password created, no bearer token to steal.</span>
         <a class="btn btn-ghost btn-mono" href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">DMTAP-Auth, §13 →</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FEATURE PARITY ============ -->
+  <section id="parity">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <p class="eyebrow"><span class="tag">§17</span> feature parity</p>
+        <h2>We checked, feature by feature, against the email you use today</h2>
+        <p class="lede">52 mail, contacts, and calendar features, audited one at a time against the legacy inbox — a sense-check, not a pitch. Where DMTAP genuinely loses a capability, this says so.</p>
+      </div>
+
+      <div class="parity-tally reveal">
+        <div class="pt-stat"><span class="pt-num">34</span><span class="pt-label">clean<br>same or better</span></div>
+        <div class="pt-stat"><span class="pt-num">16</span><span class="pt-label">different<br>works, changed shape</span></div>
+        <div class="pt-stat"><span class="pt-num">2</span><span class="pt-label">n/a<br>legacy premise doesn't survive — correctly</span></div>
+        <div class="pt-stat"><span class="pt-num">1</span><span class="pt-label">harder<br>disclosed, not hidden</span></div>
+      </div>
+
+      <div class="grid-3">
+        <div class="card reveal" data-d="1">
+          <span class="num">§17.1 · #36</span>
+          <h3>Contact verification is the real upgrade</h3>
+          <p>Legacy contacts are unauthenticated names. Here every contact is a key, audited by transparency logs and verifiable out-of-band — the one place parity wasn't the goal, improvement was.</p>
+        </div>
+        <div class="card reveal" data-d="2">
+          <span class="num">§17.1 · #4</span>
+          <h3>Search stays on your device</h3>
+          <p>No provider ever builds a searchable index of your mail. Your always-on node indexes everything locally — the same capability as a server, just held by you instead of them.</p>
+        </div>
+        <div class="card reveal" data-d="3">
+          <span class="num">§17.6</span>
+          <h3>What's still open</h3>
+          <p>Full-fidelity encrypted export/backup and a zero-setup org directory aren't fully specified yet — real gaps, tracked in the open spec rather than glossed over.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -266,10 +319,15 @@
         </ul>
 
         <div class="honest-box reveal">
-          <p class="eyebrow">honest boundary</p>
-          <p><strong>DMTAP targets a global passive adversary</strong> — an observer who can watch traffic but not actively manipulate every hop.</p>
-          <p>It does not claim perfect resistance to a global <em>active</em> adversary with unlimited resources. That's a deliberately drawn line, not a marketing gap: every privacy guarantee here is one we can defend on the spec's own terms.</p>
-          <p>Messages can choose <strong>private</strong> (full mixnet, minutes) or <strong>fast</strong> (fewer hops, seconds, less metadata protection). Default is private.</p>
+          <p class="eyebrow">honest boundary · §6.6</p>
+          <p><strong>DMTAP targets a global passive adversary</strong> — one that can watch traffic everywhere, but not inject, drop, or delay it at will.</p>
+          <ul class="honest-list">
+            <li>A global <em>active</em> adversary with unlimited resources can still degrade anonymity — cover traffic and mixing approach a perfect defense asymptotically, never for free.</li>
+            <li>Large-file bulk transfer trades some of that protection for speed (the <span class="mono">fast</span>/onion tier, not the full mixnet) — a disclosed tradeoff, not a hidden one.</li>
+            <li>A seized or keylogged device exposes its whole synced mailbox, not a slice — mitigated by at-rest encryption and recovery, not eliminated.</li>
+            <li>v0 key transparency is tamper-evident, not yet equivocation-proof across multiple logs — a real, stated tension while KT gossip matures.</li>
+          </ul>
+          <p>Messages default to <strong>private</strong> (full mixnet, minutes); <strong>fast</strong> (fewer hops, seconds) is opt-in and costs some of that protection. Honest, disclosed limits beat a marketing promise of "perfectly anonymous."</p>
         </div>
       </div>
     </div>
@@ -398,6 +456,7 @@ cargo run -p envoir-node -- --help
           <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Naming &amp; directory (§3)</a></li>
           <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Privacy model (§6)</a></li>
           <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">DMTAP-Auth (§13)</a></li>
+          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Feature parity (§17)</a></li>
         </ul>
       </div>
 

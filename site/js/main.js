@@ -1,6 +1,6 @@
 /*
  * Envoir landing page — small progressive-enhancement behaviors:
- * theme toggle (persisted), scroll reveals, and the hero key-name readout.
+ * theme toggle (persisted), scroll reveals, and the hero address readout.
  * No dependencies, no build step.
  */
 (function () {
@@ -55,17 +55,21 @@
     items.forEach(function (el) { io.observe(el); });
   }
 
-  /* ---------------- hero key-name cycling readout ---------------- */
-  function initKeyname() {
-    var el = document.getElementById("keyname-readout");
+  /* ---------------- hero address cycling readout ----------------
+   * Cycles through the two name@domain flavours (provider-issued,
+   * own domain) plus a plus-addressed alias — never the raw key or
+   * its word-encoded safety number, which is a verification aid,
+   * not an address (see #naming / §3.4.1, §3.9). */
+  function initAddress() {
+    var el = document.getElementById("address-readout");
     if (!el) return;
     var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduceMotion) return; // leave the static example word, no cycling
+    if (reduceMotion) return; // leave the static example address, no cycling
 
     var names = [
-      "maple-heron-otter-cabin-river-slate-amber-quill",
-      "cedar-falcon-linden-drift-copper-moss-vale-fern",
-      "birch-plover-sable-anchor-ember-north-loam-crest"
+      "you@envoir.org",
+      "alice@yourbrand.com",
+      "sam+news@envoir.org"
     ];
     var idx = 0;
     var cursor = '<span class="cursor">&nbsp;</span>';
@@ -121,7 +125,7 @@
   function init() {
     initTheme();
     initReveals();
-    initKeyname();
+    initAddress();
     initNavLinks();
   }
 

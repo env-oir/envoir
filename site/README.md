@@ -22,15 +22,21 @@ site/
 ├── index.html        all copy + markup, single page
 ├── css/style.css      design system (tokens, type, components, motion)
 ├── js/mesh.js          canvas hero animation: illustrative mixnet routing
-├── js/main.js          theme toggle, scroll reveals, key-name readout, nav
+├── js/main.js          theme toggle, scroll reveals, hero address readout, nav
 └── assets/favicon.svg  the Envoir mark (from ../brand/logo-mark.svg)
 ```
 
 ## Design notes
 
 - **Type system:** serif for editorial voice (headlines, the manifesto tone), sans for UI
-  chrome, monospace for anything technical — keys, the 8-word key-name, protocol traces, spec
-  section tags. The three are never mixed arbitrarily.
+  chrome, monospace for anything technical — keys, addresses, protocol traces, spec section
+  tags. The three are never mixed arbitrarily.
+- **Addressing accuracy is load-bearing.** `name@domain` (provider-issued or your own domain,
+  §3.9.1 of the spec) is the headline address, shown cycling in the hero. The 8-word rendering
+  of a key's fingerprint (§3.4.1) is a **safety number for out-of-band verification only** — it
+  is deliberately never presented as something you'd give someone to reach you, and the
+  `#naming` section says so explicitly. Don't reintroduce the word-encoding as an "address" in
+  future copy; that was a real inaccuracy this page used to have and was corrected.
 - **Dark-primary, theme-aware:** the site loads dark by default (the deliberate "instrument
   panel" aesthetic) and offers a manual light/dark toggle in the nav, persisted to
   `localStorage`. It does not follow `prefers-color-scheme` automatically, by design — dark is
