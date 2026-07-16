@@ -21,6 +21,15 @@ pub enum MlsError {
     UnexpectedContent,
     /// An operation referenced a member/leaf that is not in the group.
     UnknownMember,
+    /// A Commit this device authored and submitted to the committer was **superseded**: a
+    /// different member's Commit, built from the same base epoch, was ordered ahead of it and
+    /// already advanced the epoch by the time this device tried to merge its own pending Commit.
+    /// `openmls` treats merging a no-longer-pending commit as a silent no-op success, so
+    /// [`Session::advance`](crate::Session::advance) detects this and reports it explicitly rather
+    /// than claiming the (actually-discarded) change went through — the caller must re-derive and
+    /// resubmit its change against the new epoch (spec §5.1: the committer gives a total order, but
+    /// two racing proposers off the same epoch is a real possibility on a leaderless mesh).
+    StaleCommit,
 }
 
 impl std::fmt::Display for MlsError {
@@ -32,6 +41,10 @@ impl std::fmt::Display for MlsError {
             MlsError::Process(e) => write!(f, "MLS message processing error: {e}"),
             MlsError::UnexpectedContent => f.write_str("unexpected MLS message content"),
             MlsError::UnknownMember => f.write_str("member/leaf is not in the group"),
+            MlsError::StaleCommit => f.write_str(
+                "this device's own pending commit was superseded by a concurrently-ordered \
+                 commit from the same base epoch; re-derive and resubmit against the new epoch",
+            ),
         }
     }
 }

@@ -186,11 +186,28 @@ impl Session {
     /// This is the member side of the epoch-ordering seam: MLS produces Commits, the committer
     /// totally-orders them, and members apply them here so every member converges on the same
     /// epoch chain. Returns the number of entries newly applied.
+    ///
+    /// ## Concurrent proposers (§5.1)
+    /// On a leaderless mesh two members can each build a Commit off the *same* base epoch before
+    /// either sees the other's — a genuine race, not hostile input. The committer gives them a
+    /// total order, so only the earlier one can validly land: applying an *earlier* entry first
+    /// advances this device's epoch out from under its *own* still-pending Commit (built against
+    /// the now-stale base epoch). `openmls`'s `merge_pending_commit` treats "no pending commit
+    /// left to merge" as a silent no-op **success**, which would otherwise make this method report
+    /// `Ok` for a Commit that was actually discarded. This is checked for explicitly below and
+    /// surfaced as [`MlsError::StaleCommit`] so the caller knows to re-derive and resubmit —
+    /// never a silent, unnoticed loss.
     pub fn advance(&mut self, committer: &crate::Committer) -> Result<usize, MlsError> {
         let mut applied = 0;
         for entry in committer.entries_after(self.applied_seq) {
             if self.pending_seq == Some(entry.seq) {
-                // We authored this Commit; merge our own pending commit (§5.1 author path).
+                // We authored this Commit; merge our own pending commit (§5.1 author path) — but
+                // only if it is still actually pending (see "Concurrent proposers" above).
+                if self.group.pending_commit().is_none() {
+                    self.pending_seq = None;
+                    self.applied_seq = entry.seq;
+                    return Err(MlsError::StaleCommit);
+                }
                 self.group
                     .merge_pending_commit(self.member.provider())
                     .map_err(|e| MlsError::Group(e.to_string()))?;
@@ -234,7 +251,8 @@ impl Session {
     // --- internals --------------------------------------------------------------------------
 
     /// Deserialize + process one inbound MLS message against this group, returning the processed
-    /// message (content not yet extracted). Fails closed on any codec/processing error.
+    /// message (content not yet extracted). Fails closed on any codec/processing error, and on
+    /// **any panic** raised while `openmls` processes untrusted bytes (see [`catch_decrypt_panic`]).
     fn process(
         &mut self,
         bytes: &[u8],
@@ -244,10 +262,48 @@ impl Session {
         let protocol: ProtocolMessage = msg
             .try_into_protocol_message()
             .map_err(|e| MlsError::Codec(e.to_string()))?;
-        self.group
-            .process_message(self.member.provider(), protocol)
-            .map_err(|e| MlsError::Process(e.to_string()))
+        let group = &mut self.group;
+        let provider = self.member.provider();
+        catch_decrypt_panic(std::panic::AssertUnwindSafe(move || {
+            group.process_message(provider, protocol).map_err(|e| MlsError::Process(e.to_string()))
+        }))
     }
+}
+
+/// Run `f` (an `openmls` call that decrypts/validates an untrusted wire message), converting a
+/// **panic** into [`MlsError::Process`] instead of letting it unwind out of this crate.
+///
+/// This defends against a known footgun in `openmls` 0.8's `PrivateMessageIn::decrypt`
+/// (`framing/private_message_in.rs`): on **any** AEAD tag mismatch — e.g. a bit-flipped/tampered
+/// ciphertext from a hostile sender — it runs `debug_assert!(false, "Ciphertext decryption
+/// failed")` before returning its normal `Err(MessageDecryptionError::AeadError)`. In a
+/// `debug_assertions`-enabled build (the default `cargo test`/dev profile most callers run) that
+/// `debug_assert!` **panics** instead of just logging, even though the surrounding code is already
+/// written to treat this as an ordinary, recoverable decryption failure (a release build never
+/// panics here). This crate's whole contract is fail-closed-on-hostile-input (spec §5), so a
+/// tampered ciphertext must yield an `Err`, never a crash — regardless of build profile.
+///
+/// This is safe to paper over here (rather than something we should leave unhandled): the secret
+/// tree ratchet consumes/advances the target generation's key material *before* the AEAD check
+/// runs, identically in debug and release builds; the `debug_assert!` fires strictly *after* that
+/// mutation, right where `openmls` already intends to return a plain `Err` in production. Catching
+/// the panic and mapping it to the same [`MlsError::Process`] the release build would have produced
+/// changes no group state beyond what already happens on every build profile.
+///
+/// Deliberately does **not** touch the global panic hook: this crate may be linked into a
+/// multi-threaded host (`envoir-node`) where other threads' panics must still print normally;
+/// muting/restoring a process-wide hook around this call would race with them. The cost is that a
+/// caught panic still logs its default backtrace to stderr — noise, not a correctness issue.
+fn catch_decrypt_panic(
+    f: impl std::panic::UnwindSafe
+        + FnOnce() -> Result<openmls::prelude::ProcessedMessage, MlsError>,
+) -> Result<openmls::prelude::ProcessedMessage, MlsError> {
+    std::panic::catch_unwind(f).unwrap_or_else(|_| {
+        Err(MlsError::Process(
+            "panicked while processing a message (treated as a decryption/validation failure)"
+                .to_string(),
+        ))
+    })
 }
 
 /// Serialize any `MlsMessageOut` to its TLS wire bytes (fail-closed on codec error).

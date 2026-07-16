@@ -3,8 +3,16 @@
 //! **multi-device** (two devices of one owner both in the group). Every operation flows through the
 //! [`Committer`] ordering seam (§5.1): a Commit is submitted for a total-order sequence, then every
 //! member advances by applying committed handshakes in that order.
+//!
+//! Deeper coverage below: a **desynced-but-still-a-member** session cannot decrypt a newer epoch
+//! until it resyncs (forward secrecy from a stale-state read, distinct from a *removed* member);
+//! two members **concurrently** building a Commit off the same base epoch (a real possibility on a
+//! leaderless mesh, §5.1) — the committer's total order lets exactly one land, and the loser is
+//! reported, never silently dropped; and a battery of malformed/hostile wire input rejected
+//! fail-closed with **no panic**, including a tampered application ciphertext (an `openmls` 0.8
+//! `debug_assert!` footgun this crate now catches — see `catch_decrypt_panic` in `session.rs`).
 
-use dmtap_mls::{Committer, Handshake, Member, Session};
+use dmtap_mls::{Committer, Handshake, Member, MlsError, Session};
 
 /// Order a member-authored [`Handshake`] through the committer and apply it to every existing
 /// member's view (§5.1): submit for a sequence, tell the author it authored `seq` (so it merges its
@@ -233,4 +241,221 @@ fn multi_device_owner_has_two_leaves_in_the_group() {
     let ct = laptop.create_message(from_laptop).unwrap();
     assert_eq!(phone.receive_message(&ct).unwrap(), from_laptop, "the phone sees the laptop's msg");
     assert_eq!(bob.receive_message(&ct).unwrap(), from_laptop, "Bob sees it too");
+}
+
+
+
+// --- forward secrecy: a desynced (but not removed) member can't read a newer epoch ---------
+
+#[test]
+fn desynced_member_cannot_decrypt_a_newer_epoch_until_it_resyncs() {
+    let mut committer = Committer::new();
+    let alice = Member::new(b"alice".to_vec(), "phone").unwrap();
+    let bob = Member::new(b"bob".to_vec(), "phone").unwrap();
+    let charlie = Member::new(b"charlie".to_vec(), "phone").unwrap();
+    let erin = Member::new(b"erin".to_vec(), "phone").unwrap();
+
+    let mut alice = alice.create_group(GROUP_ID).unwrap();
+    let hs = alice.add_member(&bob.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice], 0, hs);
+    let mut bob = bob.join_from_welcome(&w).unwrap();
+    bob.note_joined_at(committer.head());
+    let hs = alice.add_member(&charlie.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice, &mut bob], 0, hs);
+    let mut charlie = charlie.join_from_welcome(&w).unwrap();
+    charlie.note_joined_at(committer.head());
+    assert_converged(&[&alice, &bob, &charlie]);
+    let epoch_before = charlie.epoch();
+
+    // Alice adds Erin (a new epoch), but this round is only applied to Alice + Bob — Charlie is
+    // still a FULL member of the group (unlike the PCS test: nobody removed her), she has just not
+    // yet synced this Commit. This models an ordinary desync (e.g. a slow/offline device), not a
+    // compromise or eviction.
+    let hs = alice.add_member(&erin.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice, &mut bob], 0, hs);
+    let mut erin = erin.join_from_welcome(&w).unwrap();
+    erin.note_joined_at(committer.head());
+    assert_converged(&[&alice, &bob, &erin]);
+    assert!(charlie.epoch() == epoch_before, "Charlie has not advanced yet");
+    assert!(alice.epoch() > epoch_before, "Alice/Bob/Erin are on a newer epoch");
+
+    // FORWARD SECRECY at the API level: Charlie's still-valid membership and OLD epoch state
+    // cannot open a message encrypted under the NEW epoch's secret — she does not have it yet.
+    let msg = b"only the resynced can read this";
+    let ct = alice.create_message(msg).unwrap();
+    assert_eq!(bob.receive_message(&ct).unwrap(), msg);
+    assert_eq!(erin.receive_message(&ct).unwrap(), msg);
+    assert!(
+        charlie.receive_message(&ct).is_err(),
+        "an old epoch's key material must not decrypt a newer epoch's message"
+    );
+
+    // Unlike a removed member, Charlie recovers once she resyncs: catching up on the committer log
+    // gives her the new epoch's secret, and messages from then on decrypt normally again.
+    charlie.advance(&committer).expect("Charlie can still catch up: she was never removed");
+    assert_converged(&[&alice, &bob, &charlie, &erin]);
+    let after = b"charlie is caught up now";
+    let after_ct = alice.create_message(after).unwrap();
+    assert_eq!(charlie.receive_message(&after_ct).unwrap(), after, "resynced Charlie reads again");
+}
+
+// --- concurrent commits: two members race off the same base epoch --------------------------
+
+#[test]
+fn concurrent_commits_from_the_same_base_epoch_only_one_wins_the_race() {
+    let mut committer = Committer::new();
+    let alice = Member::new(b"alice".to_vec(), "phone").unwrap();
+    let bob = Member::new(b"bob".to_vec(), "phone").unwrap();
+    let charlie = Member::new(b"charlie".to_vec(), "phone").unwrap();
+    let dave = Member::new(b"dave".to_vec(), "phone").unwrap();
+    let erin = Member::new(b"erin".to_vec(), "phone").unwrap();
+
+    let mut alice = alice.create_group(GROUP_ID).unwrap();
+    let hs = alice.add_member(&bob.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice], 0, hs);
+    let mut bob = bob.join_from_welcome(&w).unwrap();
+    bob.note_joined_at(committer.head());
+    let hs = alice.add_member(&charlie.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice, &mut bob], 0, hs);
+    let mut charlie = charlie.join_from_welcome(&w).unwrap();
+    charlie.note_joined_at(committer.head());
+    let hs = alice.add_member(&dave.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice, &mut bob, &mut charlie], 0, hs);
+    let mut dave = dave.join_from_welcome(&w).unwrap();
+    dave.note_joined_at(committer.head());
+    assert_converged(&[&alice, &bob, &charlie, &dave]);
+    let epoch_before = alice.epoch();
+
+    // A leaderless-mesh race (§5.1): Alice and Bob each build a Commit off the SAME base epoch
+    // before either has seen the other's. Alice removes Dave; Bob (independently, concurrently)
+    // adds Erin. Both Handshakes are valid MLS Commits in isolation — the conflict only exists
+    // because they share a base epoch, which the committer's total order must resolve.
+    let dave_leaf = dave.own_leaf_index();
+    let hs_alice = alice.remove_member(dave_leaf).unwrap();
+    let hs_bob = bob.add_member(&erin.publish_key_package().unwrap()).unwrap();
+
+    // The committer orders Alice's Commit first, purely by submission order — a real mesh
+    // committer would make this call; here it's whichever gets submitted first.
+    let seq_alice = committer.submit(hs_alice);
+    alice.note_authored(seq_alice);
+    let seq_bob = committer.submit(hs_bob);
+    bob.note_authored(seq_bob);
+
+    // Alice: merges her OWN commit fine (it was first), then tries to process Bob's — now stale,
+    // since the epoch already moved out from under it. That fails; Alice's own change still landed.
+    assert!(
+        alice.advance(&committer).is_err(),
+        "Alice's advance halts on Bob's now-stale Commit"
+    );
+    assert!(alice.epoch() > epoch_before, "Alice's own (first-ordered) Commit still landed");
+    assert_eq!(alice.roster().len(), 3, "Dave was removed by Alice's winning Commit");
+
+    // Bob: first applies Alice's Commit (a foreign, valid Commit — succeeds, moves Bob's epoch).
+    // Then Bob reaches his OWN entry, but its pending commit was already invalidated by having
+    // just merged Alice's competing one. Bob's Session::advance must NOT report this as a false
+    // success (openmls's merge_pending_commit is a silent no-op once nothing is pending) — it
+    // reports StaleCommit instead, so Bob's caller knows Erin was never actually added and the
+    // change must be re-derived against the new epoch.
+    assert_eq!(
+        bob.advance(&committer),
+        Err(MlsError::StaleCommit),
+        "Bob's own Commit lost the race and must be reported, not silently dropped"
+    );
+    assert_eq!(bob.applied_seq(), committer.head(), "Bob is still fully caught up, not stuck");
+    assert_converged(&[&alice, &bob]);
+    assert_eq!(bob.roster().len(), 3, "Erin was never actually added");
+
+    // Charlie (a bystander, author of neither Commit): applies Alice's winning Commit fine, then
+    // fails trying to process Bob's now-invalid one too — a real mesh committer would not have
+    // ordered an already-stale Commit in the first place (out of scope for this in-process toy
+    // Committer, which does no such validation), but processing it is still fail-closed, not a
+    // panic or silent corruption.
+    let charlie_result = charlie.advance(&committer);
+    assert!(charlie_result.is_err());
+    assert!(matches!(charlie_result, Err(MlsError::Process(_))));
+    assert_eq!(charlie.epoch(), alice.epoch(), "Charlie still converged on the winning epoch");
+
+    // Dave (removed by the winning Commit): applying it evicts him; his session is fail-closed
+    // from then on (mirrors the PCS test), not merely "behind" like Charlie in the previous test.
+    assert!(dave.advance(&committer).is_err());
+    assert!(!dave.is_active(), "Dave was removed by the winning Commit and cannot resync");
+}
+
+// --- malformed / hostile wire input: fail-closed, never panics ------------------------------
+
+#[test]
+fn hostile_and_malformed_messages_are_rejected_never_panic() {
+    let mut committer = Committer::new();
+    let alice = Member::new(b"alice".to_vec(), "phone").unwrap();
+    let bob = Member::new(b"bob".to_vec(), "phone").unwrap();
+    let mut alice = alice.create_group(GROUP_ID).unwrap();
+    let hs = alice.add_member(&bob.publish_key_package().unwrap()).unwrap();
+    let w = hs.welcome.clone().unwrap();
+    order_and_apply(&mut committer, &mut [&mut alice], 0, hs);
+    let mut bob = bob.join_from_welcome(&w).unwrap();
+    bob.note_joined_at(committer.head());
+
+    // Pure noise / not a TLS-encoded MLS message at all.
+    assert!(matches!(
+        bob.receive_message(b"not an mls message at all, just noise"),
+        Err(MlsError::Codec(_))
+    ));
+    // Empty input.
+    assert!(matches!(bob.receive_message(b""), Err(MlsError::Codec(_))));
+
+    // A genuine application ciphertext, but truncated mid-frame.
+    let ct = alice.create_message(b"hello bob").unwrap();
+    let truncated = &ct[..ct.len() / 2];
+    assert!(matches!(bob.receive_message(truncated), Err(MlsError::Codec(_))));
+
+    // A genuine application ciphertext with a single tampered byte (bit-flipped by a hostile
+    // relay). This must be a normal Err — and must NOT panic, even in a debug build where
+    // `openmls` 0.8 hits a `debug_assert!` on the way to reporting the AEAD failure (see
+    // `catch_decrypt_panic` in session.rs). If this line panics, the fail-closed contract is
+    // broken; a caught test failure here would show up as this test aborting the process.
+    let ct2 = alice.create_message(b"another message").unwrap();
+    let mut tampered = ct2.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xFF;
+    assert!(
+        matches!(bob.receive_message(&tampered), Err(MlsError::Process(_))),
+        "a tampered ciphertext must fail closed, not panic"
+    );
+    // That specific generation's secret is now gone even for a *correct* retry (openmls deletes a
+    // generation's key material once it has been used for a decryption attempt, successful or
+    // not, to preserve forward secrecy / block replay) — but Bob's live group state is otherwise
+    // uncorrupted: a FRESH message still decrypts normally.
+    assert!(
+        matches!(bob.receive_message(&ct2), Err(MlsError::Process(_))),
+        "the generation openmls already attempted to decrypt cannot be retried, by design"
+    );
+    let ct3 = alice.create_message(b"state is fine after the attack").unwrap();
+    assert_eq!(bob.receive_message(&ct3).unwrap(), b"state is fine after the attack");
+
+    // A real Commit fed where an application message was expected.
+    let charlie = Member::new(b"charlie".to_vec(), "phone").unwrap();
+    let hs2 = alice.add_member(&charlie.publish_key_package().unwrap()).unwrap();
+    assert!(matches!(bob.receive_message(&hs2.commit), Err(MlsError::UnexpectedContent)));
+
+    // A Commit from a completely unrelated group.
+    let mut other_committer = Committer::new();
+    let carol = Member::new(b"carol".to_vec(), "phone").unwrap();
+    let dan = Member::new(b"dan".to_vec(), "phone").unwrap();
+    let mut carol = carol.create_group(b"a-totally-different-group").unwrap();
+    let hs3 = carol.add_member(&dan.publish_key_package().unwrap()).unwrap();
+    order_and_apply(&mut other_committer, &mut [&mut carol], 0, hs3.clone());
+    assert!(matches!(bob.receive_message(&hs3.commit), Err(MlsError::Process(_))));
+
+    // A malformed / forged KeyPackage handed to add_member.
+    assert!(matches!(
+        alice.add_member(b"not a real key package"),
+        Err(MlsError::Codec(_))
+    ));
+    assert!(matches!(alice.add_member(b""), Err(MlsError::Codec(_))));
 }
