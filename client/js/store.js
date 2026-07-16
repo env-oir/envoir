@@ -5,7 +5,7 @@
 // localStorage so they survive reloads — a real client would sync these as MOTEs across the
 // device cluster (spec §8.5). Views mutate `state` and call the shell's rerender().
 
-import { seedMail, seedChats, seedCalendar, seedFiles, seedGroups, seedSignatures, seedFilters, LABELS, PEOPLE, person } from './seed.js';
+import { seedMail, seedChats, seedCalendar, seedFiles, seedGroups, seedSignatures, seedFilters, seedDevices, seedSessions, LABELS, PEOPLE, person } from './seed.js';
 
 const LS_SETTINGS = 'envoir.settings.v2';
 
@@ -26,10 +26,11 @@ const defaultSettings = {
 export const state = {
   view: 'mail',
   // data (simulated network)
-  mail: [], chats: [], events: [], files: [], groups: [], labels: LABELS, people: PEOPLE,
+  mail: [], chats: [], events: [], files: [], groups: [], devices: [], sessions: [], labels: LABELS, people: PEOPLE,
   // ui selection state
   ui: {
     mailFolder: 'inbox', mailLabel: null, selThread: null, selChat: null, selGroup: null,
+    chatThread: null,               // { cid, idx } open message-thread in Chat, or null
     calView: 'week', calCursor: Date.now(), selEvent: null,
     selected: new Set(),            // multi-select mail ids
     search: '',
@@ -45,6 +46,8 @@ export function initStore() {
   state.events = seedCalendar();
   state.files = seedFiles();
   state.groups = seedGroups();
+  state.devices = seedDevices();
+  state.sessions = seedSessions();
   loadSettings();
   state.ui.selThread = state.mail.find(t => t.folder === 'inbox')?.id || null;
   state.ui.selChat = state.chats[0]?.id || null;
