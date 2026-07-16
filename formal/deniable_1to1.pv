@@ -11,17 +11,32 @@
          NEVER a signature over content  ->  this is what makes it deniable.
 
    This file proves the REACHABILITY properties of the handshake:
-       (S)  secrecy of the first-message plaintext and the session key;
-       (A)  mutual authentication (injective agreement, via IK-certified idk);
+       (S)  secrecy of the first-message plaintext;
+       (A)  mutual authentication (injective agreement), via the IK-certified
+            idk + the shared-key MAC;
        (F)  weak forward secrecy (post-session long-term-key compromise).
 
-   DENIABILITY / repudiation is an INDISTINGUISHABILITY property, not a
-   reachability one, so it is proven in the companion biprocess
-   `deniable_1to1_deniability.pv` (observational equivalence).  It MUST be a
-   separate analysis: a forger who holds the responder's key material breaks
-   third-party-provable authentication *by design* (that IS the deniability),
-   so it cannot coexist with the authentication query in one attacker world.
-   See README.md.
+   DENIABILITY / repudiation is an INDISTINGUISHABILITY property, proven in the
+   companion biprocess `deniable_1to1_deniability.pv` (observational
+   equivalence).  It MUST be a separate analysis: a forger who holds the
+   responder's key material breaks third-party-provable authentication *by
+   design* (that IS the deniability), so it cannot coexist with the
+   authentication query in one attacker world.  See README.md.
+
+   ---- Modelling note on authentication (important) -------------------------
+   The deniable handshake has NO signature over content, so a party's
+   authentication of its peer comes ENTIRELY from the shared DH-derived key
+   (only the two parties can compute it).  ProVerif's handling of the DH
+   commutativity equation does NOT terminate on a correspondence assertion
+   phrased directly over the derived key term `sk` (the clause set diverges).
+   The standard, sound workaround used here: each party places a FRESH
+   authentication nonce INSIDE the shared-key-authenticated AEAD payload
+   (`na` initiator->responder, `nb` responder->initiator) and the events agree
+   on that nonce.  Because the nonce travels only under the AEAD keyed by the
+   shared secret, agreement on the nonce is agreement on a session that only
+   the two key-holders could have produced -- i.e. exactly the mutual
+   authentication we want -- and the correspondence now terminates.
+   ---------------------------------------------------------------------------
 
    Tool: ProVerif.   Run:  proverif deniable_1to1.pv
    ============================================================================ *)
@@ -58,7 +73,7 @@ free c: channel.              (* public Dolev-Yao network                    *)
 free msgAB: bitstring [private].
 
 (* ---------- Events ------------------------------------------------------- *)
-(* IK_A, IK_B, session key  -- carried so agreement is on the derived key.   *)
+(* IK_A, IK_B, and a FRESH authentication nonce (see modelling note).        *)
 event SendInit(sigpub, sigpub, bitstring).   (* A committed to a session      *)
 event RecvResp(sigpub, sigpub, bitstring).   (* B accepted A's first message  *)
 event ConfirmB(sigpub, sigpub, bitstring).   (* B committed to the reply      *)
@@ -66,21 +81,23 @@ event AcceptA(sigpub, sigpub, bitstring).    (* A accepted B's confirmation   *)
 
 (* ===================== QUERIES ========================================== *)
 
-(* (S) Secrecy of the first-message plaintext.  Because a post-session
+(* (S)+(F) Secrecy of the first-message plaintext.  Because a post-session
        long-term-key leak also runs (phase 1 below), a PROVED result here is
-       in fact WEAK FORWARD SECRECY (property F): the message stays secret
-       even after IK/idk of both parties are handed to the attacker. *)
+       WEAK FORWARD SECRECY: the message stays secret even after IK/idk of
+       both parties are handed to the attacker (ek and opk are deleted). *)
 query attacker(msgAB).
 
-(* (A) Mutual authentication as INJECTIVE agreement on the session key:
-       - B accepts A only if A really initiated that exact session key;
-       - A accepts B (on confirmation) only if B really confirmed it.
-       Injectivity => no replay of an accepted session (the one-time prekey
-       `opk` is what makes this hold; see the responder below). *)
-query a: sigpub, b: sigpub, k: bitstring;
-  inj-event(RecvResp(a,b,k)) ==> inj-event(SendInit(a,b,k)).
-query a: sigpub, b: sigpub, k: bitstring;
-  inj-event(AcceptA(a,b,k))  ==> inj-event(ConfirmB(a,b,k)).
+(* (A) Mutual authentication as INJECTIVE agreement on the per-session
+       authentication nonce, in both directions:
+       - B accepts A only if A really initiated that exact session (nonce na);
+       - A accepts B (on key-confirmation) only if B really confirmed (nonce nb).
+       Injectivity => no replay of an accepted session; it holds because the
+       responder consumes a fresh one-time prekey `opk` per session (the
+       spec's 5.2.1 first-message replay defense). *)
+query a: sigpub, b: sigpub, n: bitstring;
+  inj-event(RecvResp(a,b,n)) ==> inj-event(SendInit(a,b,n)).
+query a: sigpub, b: sigpub, n: bitstring;
+  inj-event(AcceptA(a,b,n))  ==> inj-event(ConfirmB(a,b,n)).
 
 (* ===================== ROLES ============================================ *)
 
@@ -88,7 +105,6 @@ query a: sigpub, b: sigpub, k: bitstring;
    IK_B is pinned (KT, spec 3.5).  Verifies B's certified idk and signed
    prekey before use; authenticates B via the returned key-confirmation. *)
 let initiatorA(idkA: dhpriv, IKA: sigpriv, idkcertA: bitstring, IKBpub: sigpub) =
-  (* pull B's advertised bundle from the network and verify it *)
   in(c, (IDKB: dhpub, idkcertB: bitstring, SPKB: dhpub, spksigB: bitstring, OPKB: dhpub));
   if checksign(idkcertB, IKBpub) = (TAG_IDK, IDKB) then       (* idk_b <- IK_B  *)
   if checksign(spksigB,  IKBpub) = (TAG_SPK, SPKB) then       (* spk_b <- IK_B  *)
@@ -97,13 +113,14 @@ let initiatorA(idkA: dhpriv, IKA: sigpriv, idkcertA: bitstring, IKBpub: sigpub) 
   (* X3DH: DH1=idk_a.spk_b  DH2=ek_a.idk_b  DH3=ek_a.spk_b  DH4=ek_a.opk_b *)
   let sk = kdf( dh(idkA, SPKB), dh(ekA, IDKB), dh(ekA, SPKB), dh(ekA, OPKB) ) in
   let AD = (sigpk(IKA), IKBpub) in                            (* IK_A || IK_B  *)
-  event SendInit(sigpk(IKA), IKBpub, sk);
-  out(c, (dhexp(idkA), idkcertA, EKA, OPKB, aead(sk, msgAB, AD)));
+  new na: bitstring;                                          (* auth nonce    *)
+  event SendInit(sigpk(IKA), IKBpub, na);
+  out(c, (dhexp(idkA), idkcertA, EKA, OPKB, aead(sk, (msgAB, na), AD)));
   (* key-confirmation reply authenticates B to A *)
   in(c, ct2: bitstring);
   let AD2 = (IKBpub, sigpk(IKA)) in
-  if adec(sk, ct2, AD2) = CONFIRM then
-    event AcceptA(sigpk(IKA), IKBpub, sk).
+  let (=CONFIRM, nb: bitstring) = adec(sk, ct2, AD2) in
+    event AcceptA(sigpk(IKA), IKBpub, nb).
 
 (* Responder B: publishes a fresh one-time prekey per instance and only
    accepts an init that consumed THAT opk -> single-use => replay-resistant.
@@ -118,12 +135,13 @@ let responderB(idkB: dhpriv, IKB: sigpriv, spkB: dhpriv, idkcertB: bitstring,
   (* B reconstructs the same key from the responder side of each DH *)
   let sk = kdf( dh(spkB, IDKA), dh(idkB, EKA), dh(spkB, EKA), dh(opkB, EKA) ) in
   let AD = (IKApub, sigpk(IKB)) in
-  let m = adec(sk, ct, AD) in                                  (* MAC check     *)
-  event RecvResp(IKApub, sigpk(IKB), sk);
+  let (m: bitstring, na: bitstring) = adec(sk, ct, AD) in      (* MAC check     *)
+  event RecvResp(IKApub, sigpk(IKB), na);
   (* send key-confirmation back to A *)
   let AD2 = (sigpk(IKB), IKApub) in
-  event ConfirmB(IKApub, sigpk(IKB), sk);
-  out(c, aead(sk, CONFIRM, AD2)).
+  new nb: bitstring;
+  event ConfirmB(IKApub, sigpk(IKB), nb);
+  out(c, aead(sk, (CONFIRM, nb), AD2)).
 
 (* ===================== MAIN ============================================= *)
 process
