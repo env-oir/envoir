@@ -2,11 +2,18 @@
 <html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Envoir — sovereign mail, chat, calendar & files</title>
   <meta name="description" content="Envoir — one sovereign identity for mail, chat, calendar, contacts, files, and groups. Your key is your identity — no company holds it, no company can read your data or lock you in." />
   <meta name="theme-color" content="#4C4DFF" />
   <link rel="stylesheet" href="css/app.css" />
+
+  <!-- PWA: installable app shell (manifest.webmanifest + sw.js registered from js/app.js) -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Envoir" />
 
   <!-- Favicons — the Envoir mark (leaning e/at, Aurora Indigo gradient tile), see brand/README.md -->
   <link rel="icon" type="image/svg+xml" href="assets/logo-mark.svg" />

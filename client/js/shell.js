@@ -8,6 +8,7 @@ import { PEOPLE } from './seed.js';
 import { esc, icon, avatar, brandMark, openModal, closeModal, hideInspector, applyStagger } from './ui.js';
 import { bus } from './bus.js';
 import { openCompose } from './compose.js';
+import { onInstallPromptChange } from './pwa.js';
 
 import { render as renderMail, mailKeys } from './views/mail.js';
 import { render as renderChat } from './views/chat.js';
@@ -97,6 +98,10 @@ export function mountShell() {
   installKeys();
   setView(state.view);
   refreshChrome();
+
+  // Keep the Settings "Install app" affordance in sync if the browser offers (or the app
+  // consumes) the install prompt while Settings happens to be the open view.
+  onInstallPromptChange(() => { if (state.view === 'settings') rerender(); });
 }
 
 function setView(v) {

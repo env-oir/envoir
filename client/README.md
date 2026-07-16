@@ -35,8 +35,22 @@ an address*; it is now correctly a verification affordance, never an address.)
   a help overlay (`?`).
 - **Accessible & responsive** — semantic landmarks + ARIA (dialog/listbox/status/`aria-current`),
   a single consistent **focus-visible** ring on every control, a **focus-trapped** modal that
-  restores focus on close, `prefers-reduced-motion` honored throughout, and a **master/detail**
-  layout that collapses to one pane (with a back affordance) from phone width to wide desktop.
+  restores focus on close, `prefers-reduced-motion` honored throughout, a **master/detail**
+  layout that collapses to one pane (with a back affordance) from phone width to wide desktop,
+  and — below 680px — the left rail becomes a **bottom tab bar** (safe-area aware, ≥44px tap
+  targets) down to ~360px phones. Breakpoints: 1100px (mail rail narrows), 900px (two-pane views
+  shed their widest column; the Identity page's label/body rows go single-column), 680px (single
+  pane + bottom tab bar), 360px (extra-narrow phones).
+- **Installable PWA** — `manifest.webmanifest` (standalone display, themed, maskable 512 icon) +
+  a service worker (`sw.js`) that precaches the app shell for offline load (cache-first shell,
+  network-first navigation with an offline fallback to `index.html`), plus a subtle **"Install
+  app"** affordance (Settings → App) wired to `beforeinstallprompt`.
+- **Web Push — content-free wake pings** — Settings → Notifications: request permission,
+  `PushManager.subscribe()` against a demo VAPID-shaped key, and a **"Send test wake-ping"** dev
+  button that posts straight to the service worker to exercise the real push → sync →
+  notification path with no backend. The push payload is *never read* (spec's honest-privacy
+  model): a push means only "something changed, go sync" — sender and content stay end-to-end
+  and travel later, over the mesh, never in the push transport.
 - **Mail** — three-pane, conversation **threading**, folders + color **labels**, star, archive,
   **snooze**, **scheduled send**, **undo send**, drafts, rich compose with **signatures**,
   multi-select **bulk actions**, mark read/unread, per-message **verified badges**, clear
@@ -79,6 +93,7 @@ Mail/Chat/cAlendar/People/Files/gRoups · `1`–`7` jump to view · `j`/`k` next
 | Sign-in demo | **Real signature** over the origin-bound challenge, same key path as mail | Origin binding is the weaker in-page mode; true phishing-resistance needs WebAuthn (§13.3.1) |
 | Files | **Real SHA-256** chunk/manifest hashing of dropped files | Labeled `b3:` to match the spec's BLAKE3 intent; not actually stored/replicated |
 | Network | — | **Entirely simulated**: no peers, no mixnet, no gateway; delivery paths + latency + hop animation are in-memory (`mesh-sim.js`). The UI says "simulated network." |
+| Web Push | **Real** `PushManager.subscribe()` + service-worker `push`/`notificationclick` handling | No live push backend exists here — the applicationServerKey is a demo placeholder, and "Send test wake-ping" (Settings → Notifications) posts straight to the service worker to exercise the exact push → sync → notification path locally, clearly labeled as a simulation of what the user's own node would send |
 | Mail/chat/calendar/contacts/files/groups data | — | Rich in-memory **seed data** (`seed.js`); a real client syncs these as MOTEs over JMAP + libp2p to your node |
 | @handle directory | — | In-memory registry with pre-taken names + a fake key-transparency leaf |
 | Aliases / plus-addressing / RSVP / group posts | Build **real signed MOTEs** | Their *delivery* is simulated |
@@ -95,11 +110,14 @@ css/app.css           the design system — instrument-panel dark/light theme, a
 assets/               brand mark SVGs (copied from ../brand/) + generated favicons/og-image PNGs;
                       assets/make-icons.mjs is the dev-time rasterizer that produced the PNGs
 
-js/app.js             boot: load-or-create identity, then mount the shell
-js/shell.js           unified shell: rail, global search, command palette, keyboard shortcuts, view dispatch
+js/app.js             boot: load-or-create identity, mount the shell, register the service worker
+js/shell.js           unified shell: rail (bottom tab bar on mobile), global search, command palette, keyboard shortcuts, view dispatch
 js/bus.js             tiny late-bound dispatch (rerender/setView) so views and shell don't import in a cycle
 js/store.js           central in-memory state + settings persistence + mail helpers
 js/onboarding.js      create a sovereign identity (name@domain primary + real keypair)
+js/pwa.js             service worker registration, install-prompt capture, Web Push subscribe/permission + local test wake-ping
+sw.js                 service worker: app-shell precache (offline load) + content-free push "wake ping" handling
+manifest.webmanifest  PWA manifest (standalone display, themed, maskable icon)
 
 js/identity.js        REAL Web Crypto identity: keygen, signing, aliases, plus-addressing, safety number
 js/safety.js          deterministic safety-number derivation (words + digits + QR-grid) — key verification

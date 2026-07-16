@@ -29,106 +29,144 @@ export function render(root) {
 
     <section class="id-hero">
       <div class="id-hero-aura"></div>
-      <div class="id-hero-mark">${id._avatarSrc
-        ? `<img class="id-hero-photo" src="${esc(id._avatarSrc)}" alt="${esc(displayName(id))}" referrerpolicy="no-referrer" data-name="${esc(displayName(id))}" data-hue="${id.hue ?? 250}" data-size="72" onerror="window.__avFallback&&window.__avFallback(this)">`
-        : `<span class="av ring" style="--h:${id.hue ?? 250};width:72px;height:72px;font-size:27px" title="${esc(displayName(id))}">${esc(initials(displayName(id)))}</span>`}</div>
-      <div class="id-hero-body">
-        <div class="id-hero-eyebrow">${icon('shield')} Sovereign identity</div>
-        <h1 class="display">${esc(displayName(id))}</h1>
-        <button class="id-addr-copy" id="copyaddr" title="Copy address">
-          <span class="mono">${esc(displayAddress(id))}</span>${icon('copy')}
-        </button>
-        <button class="btn ghost sm" id="editprofile" style="margin-left:8px">${icon('edit')} Edit profile</button>
-        <p class="id-hero-sub">Your <b>key</b> is your identity — no company holds it, so no company can read your data or lock you in. The address and this name/photo are just pointers to the key.</p>
-        <div class="id-hero-stats">
-          <div class="id-stat"><b>${keyAge===0?'today':keyAge+'d'}</b><span>key age</span></div>
-          <div class="id-stat"><b>${state.devices.length}</b><span>devices</span></div>
-          <div class="id-stat"><b>${state.sessions.length}</b><span>app sessions</span></div>
-          <div class="id-stat"><b class="teal">${verified}</b><span>verified contacts</span></div>
+      <div class="id-hero-top">
+        <div class="id-hero-mark">${id._avatarSrc
+          ? `<img class="id-hero-photo" src="${esc(id._avatarSrc)}" alt="${esc(displayName(id))}" referrerpolicy="no-referrer" data-name="${esc(displayName(id))}" data-hue="${id.hue ?? 250}" data-size="76" onerror="window.__avFallback&&window.__avFallback(this)">`
+          : `<span class="av ring" style="--h:${id.hue ?? 250};width:76px;height:76px;font-size:28px" title="${esc(displayName(id))}">${esc(initials(displayName(id)))}</span>`}</div>
+        <div class="id-hero-body">
+          <div class="id-hero-eyebrow">${icon('shield')} Sovereign identity</div>
+          <h1 class="display">${esc(displayName(id))}</h1>
+          <div class="id-hero-actions">
+            <button class="id-addr-copy" id="copyaddr" title="Copy address">
+              <span class="mono">${esc(displayAddress(id))}</span>${icon('copy')}
+            </button>
+            <button class="btn ghost sm" id="editprofile">${icon('edit')} Edit profile</button>
+          </div>
+          <p class="id-hero-sub">Your <b>key</b> is your identity — no company holds it, so no company can read your data or lock you in. The address and this name/photo are just pointers to the key.</p>
         </div>
+      </div>
+      <div class="id-hero-stats">
+        <div class="id-stat"><b>${keyAge===0?'today':keyAge+'d'}</b><span>key age</span></div>
+        <div class="id-stat"><b>${state.devices.length}</b><span>devices</span></div>
+        <div class="id-stat"><b>${state.sessions.length}</b><span>app sessions</span></div>
+        <div class="id-stat"><b class="teal">${verified}</b><span>verified contacts</span></div>
       </div>
     </section>
 
-    <div class="id-cols">
-      <section class="id-card span2">
-        <div class="id-card-h"><h2>${icon('fingerprint')} Your safety number</h2>
-          <button class="btn ghost sm" id="recompute">${icon('rotate')} Recompute</button></div>
-        <p class="id-card-hint">This is how a contact confirms your <b>key</b> is really yours and hasn't been swapped for a look-alike. Read the words aloud, scan the grid, or compare the digits — out-of-band. It's derived from your public key alone: deterministic, unforgeable, never stored.</p>
-        <div class="id-safety">
-          ${safetyGrid(id.safety)}
-          <div class="id-safety-words">${safetyWords(id.safety)}${safetyNumeric(id.safety)}
-            <div class="id-facts">
-              <div class="kvr"><span>Fingerprint</span><b class="mono">${esc(id.fingerprint)}</b></div>
-              <div class="kvr"><span>Algorithm</span><b class="mono">${esc(id.alg)}</b></div>
+    <div class="id-sections">
+
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('fingerprint')}</div>
+          <h2>Safety number</h2>
+          <p>How a contact confirms your <b>key</b> is really yours and hasn't been swapped for a look-alike. Read the words aloud, scan the grid, or compare the digits — out-of-band. Derived from your public key alone: deterministic, unforgeable, never stored.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-row-body-head"><button class="btn ghost sm" id="recompute">${icon('rotate')} Recompute</button></div>
+          <div class="id-safety">
+            ${safetyGrid(id.safety)}
+            <div class="id-safety-words">${safetyWords(id.safety)}${safetyNumeric(id.safety)}
+              <div class="id-facts">
+                <div class="kvr"><span>Fingerprint</span><b class="mono">${esc(id.fingerprint)}</b></div>
+                <div class="kvr"><span>Algorithm</span><b class="mono">${esc(id.alg)}</b></div>
+              </div>
             </div>
           </div>
         </div>
       </section>
 
-      <section class="id-card">
-        <div class="id-card-h"><h2>${icon('laptop')} Devices <span class="list-count">${state.devices.length}</span></h2>
-          <button class="btn ghost sm" id="adddevice">${icon('link')} Link device</button></div>
-        <p class="id-card-hint">One identity, many devices. Each holds a <b>device subkey</b> your root key authorizes; data syncs as encrypted MOTEs across the cluster (spec §8.5). Revoking a device rotates it out — your root identity is untouched.</p>
-        <div class="id-devices" id="devices"></div>
-      </section>
-
-      <section class="id-card">
-        <div class="id-card-h"><h2>${icon('link')} Signed-in apps <span class="list-count">${state.sessions.length}</span></h2></div>
-        <p class="id-card-hint">Apps you signed into with Envoir (DMTAP-Auth, spec §13) — no passwords, a signature from this key. Revoke access anytime; the app can't act as you afterward.</p>
-        <div class="id-sessions" id="sessions"></div>
-      </section>
-
-      <section class="id-card">
-        <div class="id-card-h"><h2>${icon('key')} Recovery</h2></div>
-        <p class="id-card-hint">Honest privacy, not zero-access: if you lose every device you can still get back in — but only <b>you</b> can, never us. Choose the anchors you trust.</p>
-        <div class="id-recovery">
-          <div class="id-rec-row ok"><div class="id-rec-ic">${icon('key')}</div>
-            <div class="id-rec-main"><b>Recovery phrase</b><small>12 words · SLIP-0039 · offline. The universal fallback.</small></div>
-            <button class="btn sm" id="showphrase">${icon('eye')} Reveal</button></div>
-          <div class="id-rec-row ok"><div class="id-rec-ic">${icon('laptop')}</div>
-            <div class="id-rec-main"><b>Trusted devices</b><small>${state.devices.length} devices can co-sign a recovery for a new device.</small></div>
-            <span class="pill good sm">${icon('check')} active</span></div>
-          <div class="id-rec-row"><div class="id-rec-ic">${icon('groups')}</div>
-            <div class="id-rec-main"><b>Social recovery guardians</b><small>Split a recovery share across people you trust (opt-in).</small></div>
-            <button class="btn ghost sm" id="guardians">Set up</button></div>
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('laptop')}</div>
+          <h2>Devices <span class="list-count">${state.devices.length}</span></h2>
+          <p>One identity, many devices. Each holds a <b>device subkey</b> your root key authorizes; data syncs as encrypted MOTEs across the cluster (spec §8.5). Revoking a device rotates it out — your root identity is untouched.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-row-body-head"><button class="btn ghost sm" id="adddevice">${icon('link')} Link device</button></div>
+          <div class="id-devices" id="devices"></div>
         </div>
       </section>
 
-      <section class="id-card span2">
-        <div class="id-card-h"><h2>${icon('rotate')} Key lifecycle &amp; portability</h2></div>
-        <div class="id-lifecycle">
-          <div class="id-life-item">
-            <div class="id-life-h">${icon('shield')} Rotation</div>
-            <p>Rotate the key while keeping continuity — the old key signs the new one, so contacts follow you automatically and history stays readable.</p>
-            <button class="btn sm" id="rotate">${icon('rotate')} Rotate key…</button>
-          </div>
-          <div class="id-life-item">
-            <div class="id-life-h">${icon('globe')} Provider migration</div>
-            <p>Move your whole life — mail, chat, files, contacts — to another provider or your own domain. The key comes with you; nothing is left behind.</p>
-            <button class="btn sm" id="migrate">${icon('globe')} Migrate…</button>
-          </div>
-          <div class="id-life-item">
-            <div class="id-life-h">${icon('download')} Export identity</div>
-            <p>Download the public identity record (address, fingerprint, safety number). The private key never leaves your device.</p>
-            <button class="btn sm" id="exportid">${icon('download')} Export public record</button>
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('link')}</div>
+          <h2>Signed-in apps <span class="list-count">${state.sessions.length}</span></h2>
+          <p>Apps you signed into with Envoir (DMTAP-Auth, spec §13) — no passwords, a signature from this key. Revoke access anytime; the app can't act as you afterward.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-sessions" id="sessions"></div>
+        </div>
+      </section>
+
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('key')}</div>
+          <h2>Recovery</h2>
+          <p>Honest privacy, not zero-access: if you lose every device you can still get back in — but only <b>you</b> can, never us. Choose the anchors you trust.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-recovery">
+            <div class="id-rec-row ok"><div class="id-rec-ic">${icon('key')}</div>
+              <div class="id-rec-main"><b>Recovery phrase</b><small>12 words · SLIP-0039 · offline. The universal fallback.</small></div>
+              <button class="btn sm" id="showphrase">${icon('eye')} Reveal</button></div>
+            <div class="id-rec-row ok"><div class="id-rec-ic">${icon('laptop')}</div>
+              <div class="id-rec-main"><b>Trusted devices</b><small>${state.devices.length} devices can co-sign a recovery for a new device.</small></div>
+              <span class="pill good sm">${icon('check')} active</span></div>
+            <div class="id-rec-row"><div class="id-rec-ic">${icon('groups')}</div>
+              <div class="id-rec-main"><b>Social recovery guardians</b><small>Split a recovery share across people you trust (opt-in).</small></div>
+              <button class="btn ghost sm" id="guardians">Set up</button></div>
           </div>
         </div>
       </section>
 
-      <section class="id-card span2 id-verify-card">
-        <div class="id-card-h"><h2>${icon('verified')} Contact verification</h2>
-          <button class="btn ghost sm" id="goverify">Open contacts ${icon('forward')}</button></div>
-        <div class="id-verify-bars">
-          <button class="id-vbar verified" data-trust="verified"><b>${verified}</b><span>${icon('verified')} verified</span><small>safety number compared</small></button>
-          <button class="id-vbar pinned" data-trust="tofu"><b>${pinned}</b><span>${icon('lock')} pinned</span><small>trusted on first contact</small></button>
-          <button class="id-vbar legacy" data-trust="legacy"><b>${legacy}</b><span>${icon('shield')} legacy</span><small>no end-to-end key</small></button>
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('rotate')}</div>
+          <h2>Key lifecycle &amp; portability</h2>
+          <p>Rotate, migrate, or export — the key always comes with you, and nothing is ever left behind.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-lifecycle">
+            <div class="id-life-row"><div class="id-life-ic">${icon('shield')}</div>
+              <div class="id-life-main"><b>Rotation</b><small>Rotate the key while keeping continuity — the old key signs the new one, so contacts follow you automatically and history stays readable.</small></div>
+              <button class="btn sm" id="rotate">${icon('rotate')} Rotate…</button></div>
+            <div class="id-life-row"><div class="id-life-ic">${icon('globe')}</div>
+              <div class="id-life-main"><b>Provider migration</b><small>Move your whole life — mail, chat, files, contacts — to another provider or your own domain. The key comes with you.</small></div>
+              <button class="btn sm" id="migrate">${icon('globe')} Migrate…</button></div>
+            <div class="id-life-row"><div class="id-life-ic">${icon('download')}</div>
+              <div class="id-life-main"><b>Export identity</b><small>Download the public identity record (address, fingerprint, safety number). The private key never leaves your device.</small></div>
+              <button class="btn sm" id="exportid">${icon('download')} Export</button></div>
+          </div>
         </div>
       </section>
 
-      <section class="id-card span2 danger-card">
-        <div class="set-row between"><div><b>Sign out</b><small>clears this identity from this browser (your key stays recoverable by phrase)</small></div>
-          <button class="btn danger" id="signout">${icon('signout')} Sign out</button></div>
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('verified')}</div>
+          <h2>Contact verification</h2>
+          <p>Where your contacts' keys stand right now — safety-number verified, trusted on first contact, or still on the legacy gateway.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-row-body-head"><button class="btn ghost sm" id="goverify">Open contacts ${icon('forward')}</button></div>
+          <div class="id-verify-bars">
+            <button class="id-vbar verified" data-trust="verified"><b>${verified}</b><span>${icon('verified')} verified</span><small>safety number compared</small></button>
+            <button class="id-vbar pinned" data-trust="tofu"><b>${pinned}</b><span>${icon('lock')} pinned</span><small>trusted on first contact</small></button>
+            <button class="id-vbar legacy" data-trust="legacy"><b>${legacy}</b><span>${icon('shield')} legacy</span><small>no end-to-end key</small></button>
+          </div>
+        </div>
       </section>
+
+      <section class="id-row danger-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('signout')}</div>
+          <h2>Sign out</h2>
+          <p>Clears this identity from this browser. Your key stays recoverable by phrase.</p>
+        </div>
+        <div class="id-row-body">
+          <button class="btn danger" id="signout">${icon('signout')} Sign out</button>
+        </div>
+      </section>
+
     </div>
   </div></div>`;
 
