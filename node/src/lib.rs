@@ -27,10 +27,13 @@ pub use dmtap_mail as clients;
 // identity + store + outbound retry queue (§20.1) + inbound validation (§20.2) + transport (§4),
 // culminating in two in-process nodes exchanging a real end-to-end-encrypted MOTE (§2, §19.3).
 pub mod auth;
+pub mod config;
+pub mod daemon;
 pub mod deniable;
 pub mod group;
 pub mod inbound;
 pub mod journal;
+pub mod keystore;
 pub mod mixdir;
 pub mod naming;
 pub mod node;
@@ -39,6 +42,12 @@ pub mod transport;
 
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, NullJournal, Snapshot};
 pub use node::{Node, SendError};
+
+// The persistent daemon (spec §0.2): durable keystore, env/flag config, and the long-running
+// serve loop with graceful shutdown that turns the reference node into a real process.
+pub use config::NodeConfig;
+pub use daemon::{dmtap_txt_record, run_loop, serve, DaemonError, LoopStats};
+pub use keystore::{Keystore, KeystoreError};
 
 // Real MLS group messaging (spec §5): the node wraps the workspace-shared `dmtap-mls` crate
 // (openmls / RFC 9420) and re-exports its group types here as `dmtap::groups` for callers.

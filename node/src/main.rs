@@ -1,64 +1,120 @@
 //! Envoir reference node — CLI entry point.
 //!
-//! The node is the whole client side (spec §0.2): identity, mailbox, mesh participation,
-//! delivery, messaging, files, and client protocols. It *is* the mesh. See the DMTAP spec
-//! repo (../dmtap/).
+//! The node is the whole client side (spec §0.2): identity, mailbox, mesh participation, delivery,
+//! messaging, files, and client protocols. It *is* the mesh. See the DMTAP spec repo (../dmtap/).
 //!
-//! This is a scaffold: subsystems are stubbed. Build order (spec §10.6):
-//!   identity → mote → naming → transport → messaging → privacy → clients → abuse.
+//! Unlike the earlier scaffold, `init` and `run` are now **real**: `init` writes a durable keystore
+//! to disk (encrypted-at-rest with a passphrase, or a clearly-marked plaintext-for-dev keystore) and
+//! prints the `_dmtap` DNS record to publish; `run` loads that identity + the durable outbound
+//! journal and runs a long-lived daemon with graceful shutdown. Configuration is via environment
+//! (see [`dmtap::config`]).
 
-use dmtap::Suite;
+use std::error::Error;
 
-use dmtap::clients::auth::StaticAuthenticator;
-use dmtap::clients::imap::Session;
-use dmtap::clients::pop3::Pop3Session;
-use dmtap::clients::smtp::SmtpSession;
-use dmtap::clients::store::MemoryStore;
-use dmtap::clients::{autodiscover, net};
+use dmtap::config::NodeConfig;
+use dmtap::keystore::Keystore;
+use dmtap::{daemon, Suite};
 
-/// Demo: run the §8 client servers (IMAP/POP3/SMTP-submission) on localhost against a fresh
-/// in-memory MOTE-store projection, using a fixed demo app-password. A real node terminates TLS
-/// and mounts its own encrypted store; this proves the servers end-to-end.
-fn serve_mail() -> std::io::Result<()> {
-    use std::net::TcpListener;
+/// `init`: generate a new §1.2 root identity + X25519 sealing keypair, persist them to the durable
+/// keystore under the configured data dir, and print the address material + the `_dmtap` DNS TXT
+/// record an operator publishes (§3.2). Refuses to overwrite an existing keystore unless
+/// `ENVOIR_FORCE_INIT` is set (so a re-run never silently destroys an identity).
+fn init_identity(config: &NodeConfig) -> Result<(), Box<dyn Error>> {
+    let path = config.keystore_path();
+    let force = std::env::var("ENVOIR_FORCE_INIT").map(|v| v == "1").unwrap_or(false);
+    if Keystore::exists(&path) && !force {
+        eprintln!(
+            "envoir-node: keystore already exists at {} — refusing to overwrite \
+             (set ENVOIR_FORCE_INIT=1 to replace the identity).",
+            path.display()
+        );
+        return Ok(());
+    }
 
-    // Demo credential bound to a placeholder identity key (spec §8.2 app-passwords).
-    let make_auth = || {
-        let mut a = StaticAuthenticator::new();
-        a.issue("owner@dmtap.local", "app-password", vec![0u8; 32], "demo");
-        a
+    let now = daemon::now_ms();
+    let ks = Keystore::generate(
+        now,
+        config.names.clone(),
+        config.kt_anchors.clone(),
+        config.keypkgs_loc.clone(),
+    )?;
+    ks.save(&path, config.passphrase.as_deref())?;
+
+    let enc = if config.passphrase.is_some() {
+        "encrypted (argon2id + chacha20poly1305)"
+    } else {
+        "PLAINTEXT-for-dev (set ENVOIR_PASSPHRASE to encrypt)"
     };
 
-    let cfg = autodiscover::HostConfig::standard("dmtap.local", "127.0.0.1");
-    println!("Envoir client servers (spec §8) — demo store, user owner@dmtap.local / app-password");
-    println!("IMAP :1143  POP3 :1110  Submission :1587");
-    println!("\nAutodiscovery SRV records a node would publish:\n{}", autodiscover::srv_zone(&cfg));
+    println!("Envoir node — new identity (spec §1.2)\n");
+    println!("  keystore                          : {} [{}]", path.display(), enc);
+    // §3.9.1 / §3.2 base64url — the spec wire encoding for keys (fixes the old hex output).
+    println!("  root identity key (Ed25519, b64url): {}", b64(&ks.ik_public));
+    println!("  key-name (§3.9.1, 8 words)        : {}", dmtap::keyname::encode(&ks.ik_public));
+    println!("  sealing key (X25519 HPKE, b64url) : {}", b64(&ks.seal_public));
+    println!("  default suite                     : {:?}", Suite::Classical);
+    println!("\nPublish this `_dmtap` TXT record so peers can resolve you (spec §3.2):\n");
+    println!("  {}._dmtap.<zone>  TXT  \"{}\"", record_owner(config), daemon::dmtap_txt_record(&ks));
+    println!(
+        "\nNOTE: the `kt=` anchor + `keypkgs=` locator above are operator config \
+         (ENVOIR_KT_ANCHORS / ENVOIR_KEYPKGS_LOC); the recovery policy (§1.4) is a separate object.\n\
+         Start the node with `envoir-node run`."
+    );
+    Ok(())
+}
 
-    let imap = TcpListener::bind("127.0.0.1:1143")?;
-    let pop3 = TcpListener::bind("127.0.0.1:1110")?;
-    let smtp = TcpListener::bind("127.0.0.1:1587")?;
+/// The left-most label an operator would place the TXT record under (a hint; the real owner name is
+/// derived from the claimed name's local-part, §3.2). Falls back to `_self` when no name is set.
+fn record_owner(config: &NodeConfig) -> String {
+    config
+        .names
+        .first()
+        .and_then(|n| n.split('@').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("_self")
+        .to_string()
+}
 
-    let a1 = make_auth;
-    let a2 = make_auth;
-    let a3 = make_auth;
-    let t_imap = std::thread::spawn(move || {
-        let _ = net::serve_imap(imap, move || Session::new(MemoryStore::new(), a1(), true));
-    });
-    let t_pop3 = std::thread::spawn(move || {
-        let _ = net::serve_pop3(pop3, move || Pop3Session::new(MemoryStore::new(), a2(), true));
-    });
-    let t_smtp = std::thread::spawn(move || {
-        let _ = net::serve_smtp(smtp, move || SmtpSession::new(a3(), true));
-    });
-    let _ = t_imap.join();
-    let _ = t_pop3.join();
-    let _ = t_smtp.join();
+/// `record`: reload the keystore and print just the `_dmtap` TXT record (operator convenience).
+fn print_record(config: &NodeConfig) -> Result<(), Box<dyn Error>> {
+    let path = config.keystore_path();
+    if !Keystore::exists(&path) {
+        eprintln!("envoir-node: no keystore at {} — run `envoir-node init` first.", path.display());
+        return Ok(());
+    }
+    let ks = Keystore::load(&path, config.passphrase.as_deref())?;
+    println!("{}._dmtap.<zone>  TXT  \"{}\"", record_owner(config), daemon::dmtap_txt_record(&ks));
+    Ok(())
+}
+
+/// `run` / `serve`: the real long-running daemon. Builds a current-thread tokio runtime and serves
+/// until SIGINT/SIGTERM.
+fn run_daemon(config: NodeConfig) -> Result<(), Box<dyn Error>> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async move { daemon::serve(config).await })?;
+    Ok(())
+}
+
+/// `serve-mail`: start only the §8 client servers on the configured interface (default `0.0.0.0`,
+/// so a container port-map reaches them — the old demo hardcoded `127.0.0.1`) and park. A no-keystore
+/// run still works (the servers use a demo store); `run` is the full node.
+fn serve_mail(config: &NodeConfig) -> Result<(), Box<dyn Error>> {
+    let servers = daemon::start_mail_servers(config)?;
+    println!("Envoir §8 client servers (spec §8) — user {}", config.names.first().map(String::as_str).unwrap_or("owner@dmtap.local"));
+    println!(
+        "  IMAP {}  POP3 {}  SMTP-submission {}",
+        servers.imap_addr, servers.pop3_addr, servers.smtp_addr
+    );
+    println!("Press Ctrl-C to stop.");
+    // Park on the listener threads; they run until the process is signalled.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(daemon::shutdown_signal());
+    println!("envoir-node: serve-mail stopping.");
     Ok(())
 }
 
 /// Demo: two in-process nodes exchange a real end-to-end-encrypted MOTE (spec §2, §19.3, §20).
-/// Alice seals a MOTE to Bob over the in-memory transport; Bob runs the §2.7 validation pipeline,
-/// decrypts, stores it (visible via the §8 mail projection), and acks; Alice's queue reaches ACKED.
+/// The former `run` behavior, kept as `demo` for a zero-setup end-to-end sanity check.
 fn run_delivery_demo() {
     use dmtap::node::Node;
     use dmtap::transport::InMemoryNetwork;
@@ -71,7 +127,6 @@ fn run_delivery_demo() {
     let mut alice = Node::with_identity(alice_ik, dmtap::mote::SealKeypair::generate(), alice_t);
     let mut bob = Node::with_identity(bob_ik, dmtap::mote::SealKeypair::generate(), bob_t);
 
-    // Mutual pinning: each learns the other's identity + sealing key (naming/KeyPackage stand-in).
     let (a_ik, a_seal) = (alice.ik_public(), alice.seal_public());
     let (b_ik, b_seal) = (bob.ik_public(), bob.seal_public());
     alice.add_contact(&b_ik, b_seal);
@@ -89,7 +144,7 @@ fn run_delivery_demo() {
     }
     println!("B: INBOX now holds {} message(s) (IMAP/JMAP-visible)", bob.inbox().exists());
 
-    alice.poll(); // consume Bob's ack
+    alice.poll();
     println!("A: outbound state = {:?} (delivered)", alice.outbound_state(&id).unwrap());
 }
 
@@ -98,67 +153,33 @@ fn hex8(bytes: &[u8]) -> String {
     bytes.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>() + "…"
 }
 
-/// Full-hex encode of a byte string.
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// `init`: create a new §1.2 root identity + its HPKE sealing keypair and show the resulting
-/// address material — the real key generation, with the durable-keystore write and the naming/KT
-/// publish honestly called out as the network-bound seams (this binary carries no keystore/socket
-/// layer; those live in the node runtime and the naming crate).
-fn init_identity() {
-    use dmtap::identity::IdentityKey;
-    use dmtap::mote::SealKeypair;
-
-    // A real Ed25519 root identity (spec §1.2) and the X25519 sealing keypair peers seal to (§5.3).
-    let ik = IdentityKey::generate();
-    let seal = SealKeypair::generate();
-    let ik_pub = ik.public();
-
-    println!("Envoir node — new identity (spec §1.2)\n");
-    println!("  root identity key (Ed25519, hex) : {}", hex(&ik_pub));
-    // The §3.9.1 8-word key-name: the safety-number/verbal fingerprint of the identity key.
-    println!("  key-name (§3.9.1, 8 words)        : {}", dmtap::keyname::encode(&ik_pub));
-    println!("  sealing key (X25519 HPKE, hex)    : {}", hex(seal.public()));
-    println!("  default suite                     : {:?}", Suite::Classical);
-    println!(
-        "\nGenerated in memory. Persisting this identity to a durable keystore and publishing the\n\
-         Identity + KeyPackages to naming/key-transparency (spec §1.2, §3, §5.3) are network-bound\n\
-         steps handled by the node runtime and the `dmtap-naming` crate — not this scaffold binary."
-    );
+/// Unpadded base64url (spec §3.2/§3.9.1) — the wire key encoding.
+fn b64(bytes: &[u8]) -> String {
+    dmtap::names::base64url::encode(bytes)
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    let config = NodeConfig::from_env();
 
-    match cmd {
+    let result: Result<(), Box<dyn Error>> = match cmd {
         "version" => {
-            println!("envoir-node {} (pre-alpha scaffold)", env!("CARGO_PKG_VERSION"));
+            println!("envoir-node {} (pre-alpha)", env!("CARGO_PKG_VERSION"));
             println!("default suite: {:?}", Suite::Classical);
+            Ok(())
         }
-        "init" => {
-            init_identity();
-        }
-        "run" => {
-            // The real `run` starts the libp2p mesh (Kad/Relay/DCUtR/AutoNAT/mDNS), mixnet client,
-            // and MLS delivery service (spec §4/§5) — those transports are a separate frontier
-            // task, abstracted behind `dmtap::transport::Transport`. What IS implemented is the
-            // delivery engine (`dmtap::node`): identity + MOTE store + the §20.1 sender-retry queue
-            // and §20.2 inbound validation. This demo drives it over the in-process transport so
-            // the whole seal → validate → decrypt → ack path is observable end-to-end.
+        "init" => init_identity(&config),
+        "record" => print_record(&config),
+        "run" | "serve" => run_daemon(config),
+        "serve-mail" => serve_mail(&config),
+        "demo" => {
             run_delivery_demo();
-        }
-        "serve-mail" => {
-            if let Err(e) = serve_mail() {
-                eprintln!("serve-mail error: {e}");
-            }
+            Ok(())
         }
         "gateway" => {
-            // A node MAY run in gateway mode if it has a reputable IP + domain (spec §7);
-            // the dedicated implementation lives in ../gateway/.
             eprintln!("run the dedicated `envoir-gateway` binary — see ../gateway/ and spec §7");
+            Ok(())
         }
         _ => {
             println!(
@@ -168,14 +189,26 @@ fn main() {
                  \x20 envoir-node <command>\n\
                  \n\
                  COMMANDS:\n\
-                 \x20 init         create a new identity (keys + recovery policy)\n\
-                 \x20 run          run the node (mesh + mixnet + delivery + clients)\n\
-                 \x20 serve-mail   run the §8 client servers (IMAP/POP/SMTP) on localhost\n\
+                 \x20 init         generate + persist a new identity keystore; print the _dmtap record\n\
+                 \x20 run          run the node daemon (mesh + delivery + §8 clients), until SIGINT/SIGTERM\n\
+                 \x20 record       print this identity's _dmtap DNS TXT record\n\
+                 \x20 serve-mail   run only the §8 client servers (IMAP/POP/SMTP) on the configured bind\n\
+                 \x20 demo         two in-process nodes exchange a real E2E-encrypted MOTE\n\
                  \x20 version      print version and default suite\n\
                  \x20 help         show this help\n\
                  \n\
+                 CONFIG (env): ENVOIR_DATA_DIR, ENVOIR_NODE_BIND, ENVOIR_MAIL_HOST, ENVOIR_IMAP_PORT,\n\
+                 \x20 ENVOIR_POP3_PORT, ENVOIR_SMTP_PORT, ENVOIR_PASSPHRASE, ENVOIR_NAMES,\n\
+                 \x20 ENVOIR_KT_ANCHORS, ENVOIR_KEYPKGS_LOC, ENVOIR_TICK_SECS. See `dmtap::config`.\n\
+                 \n\
                  Spec: ../dmtap/  (the DMTAP spec repo is normative; this binary is a reference)."
             );
+            Ok(())
         }
+    };
+
+    if let Err(e) = result {
+        eprintln!("envoir-node: {e}");
+        std::process::exit(1);
     }
 }

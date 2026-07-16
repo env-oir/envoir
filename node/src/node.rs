@@ -106,8 +106,15 @@ impl std::error::Error for SendError {}
 pub struct Node<T: Transport> {
     /// This node's root identity key (§1.2); its public bytes are its address and `to` target.
     ik: IdentityKey,
-    /// The X25519 KEM keypair correspondents seal payloads to (§5.3, advertised via KeyPackages).
-    seal: SealKeypair,
+    /// The X25519 KEM **secret** correspondents' payloads are sealed to (§5.3). Stored as raw bytes
+    /// (rather than a [`SealKeypair`]) so a persisted sealing key can be reloaded on daemon restart:
+    /// the reference [`SealKeypair`] exposes no `from_secret` constructor, but the HPKE open path
+    /// (via [`RecipientCtx`]) consumes the secret as `&[u8; 32]` regardless — so raw bytes are the
+    /// faithful, round-trippable representation the durable keystore persists (§1.2 identity durability).
+    seal_secret: [u8; 32],
+    /// The matching X25519 **public** sealing key (advertised via KeyPackages, §5.3) — the value
+    /// peers seal to and the node publishes in its `_dmtap` record / KeyPackage bundle.
+    seal_public: [u8; 32],
     /// The MOTE-store projection every mail client is a view of (§8).
     store: MemoryStore,
     /// Dedup / replay set: `id → sender return path`, so a re-delivered `id` is acked without
@@ -171,49 +178,23 @@ impl<T: Transport> Node<T> {
     /// [`NullJournal`] — the outbound queue is **not** durable; use [`with_journal`](Self::with_journal)
     /// for a node that must resume its pending sends across restart (§19.3.3).
     pub fn with_identity(ik: IdentityKey, seal: SealKeypair, transport: T) -> Self {
-        Node {
-            ik,
-            seal,
-            store: MemoryStore::new(),
-            seen: HashMap::new(),
-            outbound: HashMap::new(),
-            contacts: HashSet::new(),
-            directory: HashMap::new(),
-            groups: HashMap::new(),
-            pending_leaf: None,
-            deniable: DeniableState::default(),
-            deniable_admission: DeniableAdmission::new(
-                DeniableAcceptLimits::default(),
-                1_700_000_000_000,
-            ),
-            suite_ratchet: SuiteRatchet::new(),
-            suite_contacts: BTreeSet::new(),
-            mix_directory: MixDirectoryTracker::new(),
-            group_inbox: Vec::new(),
-            transport,
-            now: 1_700_000_000_000,
-            journal: Box::new(NullJournal),
-        }
+        Self::bare(ik, *seal.secret(), *seal.public(), transport, Box::new(NullJournal))
     }
 
-    /// Build a node backed by a durable [`Journal`], **resuming** any previously-persisted outbound
-    /// retry queue and dedup set (spec §19.3.3: the queue MUST survive restart). Rebuild the node
-    /// with the same identity + the same journal after a restart and its pending sends come back;
-    /// call [`retry_pending`](Self::retry_pending) to re-dispatch them.
-    ///
-    /// The identity keys and the delivered-mail store are **not** restored from the journal (that
-    /// state lives elsewhere, see [`crate::journal`]); the caller supplies the identity, and only
-    /// the in-flight delivery state is recovered here.
-    pub fn with_journal(
+    /// The common field initializer shared by every constructor: a node with the given identity +
+    /// raw sealing key bytes over `transport`, backed by `journal`, with all delivery/anti-abuse
+    /// state fresh. Callers that resume from a journal restore that state afterwards.
+    fn bare(
         ik: IdentityKey,
-        seal: SealKeypair,
+        seal_secret: [u8; 32],
+        seal_public: [u8; 32],
         transport: T,
         journal: Box<dyn Journal>,
-    ) -> Result<Self, JournalError> {
-        let snapshot = journal.load()?;
-        let mut node = Node {
+    ) -> Self {
+        Node {
             ik,
-            seal,
+            seal_secret,
+            seal_public,
             store: MemoryStore::new(),
             seen: HashMap::new(),
             outbound: HashMap::new(),
@@ -233,7 +214,40 @@ impl<T: Transport> Node<T> {
             transport,
             now: 1_700_000_000_000,
             journal,
-        };
+        }
+    }
+
+    /// Build a node backed by a durable [`Journal`], **resuming** any previously-persisted outbound
+    /// retry queue and dedup set (spec §19.3.3: the queue MUST survive restart). Rebuild the node
+    /// with the same identity + the same journal after a restart and its pending sends come back;
+    /// call [`retry_pending`](Self::retry_pending) to re-dispatch them.
+    ///
+    /// The identity keys and the delivered-mail store are **not** restored from the journal (that
+    /// state lives elsewhere, see [`crate::journal`]); the caller supplies the identity, and only
+    /// the in-flight delivery state is recovered here.
+    pub fn with_journal(
+        ik: IdentityKey,
+        seal: SealKeypair,
+        transport: T,
+        journal: Box<dyn Journal>,
+    ) -> Result<Self, JournalError> {
+        Self::with_journal_bytes(ik, *seal.secret(), *seal.public(), transport, journal)
+    }
+
+    /// Like [`with_journal`](Self::with_journal) but taking the sealing keypair as **raw bytes** —
+    /// the constructor the daemon uses to rebuild a node from a persisted keystore (the reference
+    /// [`SealKeypair`] has no `from_secret`, and the node only ever needs the secret/public bytes:
+    /// the secret for the HPKE open path, the public to advertise). `seal_public` MUST be the
+    /// X25519 public derived from `seal_secret` (the keystore persists both, captured at generation).
+    pub fn with_journal_bytes(
+        ik: IdentityKey,
+        seal_secret: [u8; 32],
+        seal_public: [u8; 32],
+        transport: T,
+        journal: Box<dyn Journal>,
+    ) -> Result<Self, JournalError> {
+        let snapshot = journal.load()?;
+        let mut node = Self::bare(ik, seal_secret, seal_public, transport, journal);
         for pe in snapshot.outbound {
             let entry = pe.into_entry()?;
             node.outbound.insert(entry.id.as_bytes().to_vec(), entry);
@@ -281,7 +295,7 @@ impl<T: Transport> Node<T> {
 
     /// This node's sealing (X25519) public key, which peers must learn to send to it.
     pub fn seal_public(&self) -> [u8; 32] {
-        *self.seal.public()
+        self.seal_public
     }
 
     /// Record how to reach a peer: pin them as a known contact and learn their sealing key
@@ -414,6 +428,12 @@ impl<T: Transport> Node<T> {
     /// The sender-side state of a tracked outbound MOTE, by `id`.
     pub fn outbound_state(&self, id: &ContentId) -> Option<OutState> {
         self.outbound.get(id.as_bytes()).map(|e| e.state)
+    }
+
+    /// The number of MOTEs currently tracked in the outbound retry queue (§20.1) — how many pending
+    /// sends a restarted daemon resumed from its durable journal (§19.3.3).
+    pub fn outbound_len(&self) -> usize {
+        self.outbound.len()
     }
 
     // --- sending (§20.1 outbound) -----------------------------------------------------------
@@ -585,7 +605,7 @@ impl<T: Transport> Node<T> {
         // classified `known` iff its transport return path is a pinned contact (§2.7 step 5). Bind
         // the recipient context to locals (not `self`) so the accept path can take `&mut self`.
         let our_ik = self.ik.public();
-        let seal_secret = *self.seal.secret();
+        let seal_secret = self.seal_secret;
         let sender_is_known = self.contacts.contains(from);
         let ctx = RecipientCtx { our_ik: &our_ik, seal_secret: &seal_secret, sender_is_known };
         // `ctx` borrows only these locals (not `self`), so the accept path below is free to take
