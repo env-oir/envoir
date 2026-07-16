@@ -1,0 +1,30 @@
+<svg viewBox="0 0 1200 630" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Envoir">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1740"/>
+      <stop offset="1" stop-color="#3a2f8c"/>
+    </linearGradient>
+    <linearGradient id="mk" x1="223" y1="52" x2="467" y2="296" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C4DFF"/>
+      <stop offset=".55" stop-color="#6E4DFF"/>
+      <stop offset="1" stop-color="#9A4DFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <!-- soft glow -->
+  <circle cx="1050" cy="120" r="260" fill="#4C4DFF" opacity="0.16"/>
+  <circle cx="1140" cy="560" r="220" fill="#00E0C7" opacity="0.08"/>
+  <!-- mark tile -->
+  <svg x="110" y="120" width="190" height="190" viewBox="223 52 244 244">
+    <rect x="223" y="52" width="244" height="244" rx="52" fill="url(#mk)"/>
+    <g transform="translate(340 170) skewX(-10) translate(-340 -170)"
+       fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M374 170 A34 34 0 0 0 340 136 A34 34 0 0 0 306 170 A34 34 0 0 0 340 204 A52 34 0 0 0 392 170 A52 58 0 0 0 340 112 A62 58 0 0 0 278 170 A62 66 0 0 0 340 236 A72 66 0 0 0 412 170"/>
+      <path d="M306 170 L374 170"/>
+    </g>
+  </svg>
+  <text x="112" y="450" fill="#ffffff" font-family="'Helvetica Neue', Arial, sans-serif" font-size="118" font-weight="700" letter-spacing="-4">envoir</text>
+  <rect x="118" y="482" width="96" height="9" rx="4" fill="#00E0C7"/>
+  <text x="112" y="546" fill="#d4d1f4" font-family="'Helvetica Neue', Arial, sans-serif" font-size="36" font-weight="500">Sovereign, metadata-private mail, chat &amp; files.</text>
+  <text x="112" y="590" fill="#9a95d8" font-family="'Helvetica Neue', Arial, sans-serif" font-size="27">Open protocol · your keys · your server</text>
+</svg>
