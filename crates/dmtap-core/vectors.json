@@ -1,0 +1,403 @@
+{
+  "format": "dmtap-conformance-vectors/1",
+  "suite": "0x01 (classical): Ed25519 / X25519-HPKE / ChaCha20-Poly1305 / BLAKE3-256",
+  "generated_by": "dmtap-core (reference crate) — examples/gen_vectors.rs",
+  "methodology": "All values computed from FIXED seeds/inputs by the reference crate. Ed25519 is deterministic (RFC 8032); BLAKE3 and CBOR are deterministic. Non-deterministic ops (HPKE ephemeral, keygen) are excluded; their deterministic sub-operations are vectored. CBOR here is the §18 canonical, INTEGER-KEYED (COSE/CWT-style) deterministic encoding (RFC 8949 §4.2, spec §18.1.1/§18.1.2/§18.3.x); signing preimages and content addresses follow §18.9. A second implementer following §18 alone reproduces these bytes.",
+  "vectors": [
+    {
+      "name": "content_address_empty",
+      "operation": "content_address",
+      "input": {
+        "bytes_hex": ""
+      },
+      "expected": {
+        "id_hex": "1eaf1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+      },
+      "note": "empty input"
+    },
+    {
+      "name": "content_address_small",
+      "operation": "content_address",
+      "input": {
+        "bytes_hex": "646d746170"
+      },
+      "expected": {
+        "id_hex": "1e3911f92474633608928ecd79672467a6ba1d3286fc6d2ef7852ab9091f804aa9"
+      },
+      "note": "5-byte ASCII input"
+    },
+    {
+      "name": "content_address_phrase",
+      "operation": "content_address",
+      "input": {
+        "bytes_hex": "7468652061746f6d696320756e6974206f6620444d544150"
+      },
+      "expected": {
+        "id_hex": "1ec00263a7bf299bf0e0db927bae6660c3b033213554f8bc9db593c981b24d031b"
+      },
+      "note": "human-readable phrase"
+    },
+    {
+      "name": "content_address_multi_kib",
+      "operation": "content_address",
+      "input": {
+        "bytes_hex": "0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e60b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6fb20456a8fb4d9fe23486d92b7dc01264b7095badf04294e7398bde2072c51769bc0e50a2f54799ec3e80d32577ca1c6eb10355a7fa4c9ee13385d82a7ccf1163b6085aacff4193e6388add2f71c41668bb0d5fa1f44698eb3d8fd22476c91b6db00254a6f94b9de03284d7297bce1062b50759abfe4092e53789dc2e70c31567ba0c5ea0f34597ea3c8ed12375c81a6cbf0153a5f84a9cef3183d6287acd1f61b40658aafd4f91e43688db2d7fc21466b90b5daff24496e93b8dd02274c7196bbe0052a4f7499bee3082d52779cc1e6"
+      },
+      "expected": {
+        "id_hex": "1effcad60cfaaae98d9f040e4300370180c3f68851125d297b5ddfac639caa3265"
+      },
+      "note": "4096-byte deterministic input, byte[i]=(i*37+11)&0xff"
+    },
+    {
+      "name": "keyname_zero_key",
+      "operation": "keyname_encode",
+      "input": {
+        "pubkey_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected": {
+        "checksum_verifies": true,
+        "name": "fero-lozo-gelo-leki-pifi-kego-fima-sale-kudu"
+      },
+      "note": "all-zero 32-byte key"
+    },
+    {
+      "name": "keyname_key_ones",
+      "operation": "keyname_encode",
+      "input": {
+        "pubkey_hex": "0101010101010101010101010101010101010101010101010101010101010101"
+      },
+      "expected": {
+        "checksum_verifies": true,
+        "name": "pase-kizi-guzi-disa-vuza-gota-dapi-lozo-roni"
+      },
+      "note": "all-0x01 key (distinct from below)"
+    },
+    {
+      "name": "keyname_key_twos",
+      "operation": "keyname_encode",
+      "input": {
+        "pubkey_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      "expected": {
+        "checksum_verifies": true,
+        "name": "vino-kubu-ruka-katu-roli-keze-badu-rero-sazu"
+      },
+      "note": "all-0x02 key (distinct from above → different name)"
+    },
+    {
+      "name": "keyname_real_pubkey",
+      "operation": "keyname_encode",
+      "input": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+      },
+      "expected": {
+        "checksum_verifies": true,
+        "name": "kake-veta-misi-dabu-bimi-pipe-suda-kota-nite"
+      },
+      "note": "key-name of the Ed25519 public key derived from seed 0x11*32"
+    },
+    {
+      "name": "keyname_typo_rejected",
+      "operation": "keyname_verify",
+      "input": {
+        "name": "vuli-teze-baba-lovu-fali-nuge-bafu-kopa-fide"
+      },
+      "expected": {
+        "checksum_verifies": false
+      },
+      "note": "a single mistyped word must fail the folded checksum (fail closed)"
+    },
+    {
+      "name": "safety_number_pair_ab",
+      "operation": "safety_number",
+      "input": {
+        "ik_a_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "ik_b_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0"
+      },
+      "expected": {
+        "fingerprint_hex": "769ff5af12d5a15f2ce5f51d79b20efb1cfadfa8dfa44edd1765d2082ba14e96",
+        "safety_number": "19410 03237 02222 94600 38839 47713"
+      },
+      "note": "safety number of the (seed 0x11, seed 0x22) identity-key pair"
+    },
+    {
+      "name": "safety_number_order_independent",
+      "operation": "safety_number",
+      "input": {
+        "ik_a_hex": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+        "ik_b_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
+      },
+      "expected": {
+        "fingerprint_hex": "769ff5af12d5a15f2ce5f51d79b20efb1cfadfa8dfa44edd1765d2082ba14e96",
+        "safety_number": "19410 03237 02222 94600 38839 47713"
+      },
+      "note": "same pair, keys swapped → MUST equal safety_number_pair_ab (order-independent)"
+    },
+    {
+      "name": "ed25519_rfc8032_test1",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "",
+        "msg_hex": "",
+        "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+      },
+      "expected": {
+        "pubkey_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "sig_hex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+      },
+      "note": "RFC 8032 §7.1 Test 1 cross-check (empty domain, empty message)"
+    },
+    {
+      "name": "ed25519_rfc8032_test2",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "",
+        "msg_hex": "72",
+        "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"
+      },
+      "expected": {
+        "pubkey_hex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "sig_hex": "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+      },
+      "note": "RFC 8032 §7.1 Test 2 cross-check (empty domain, 1-byte message 0x72)"
+    },
+    {
+      "name": "ed25519_domain_separated",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f7061796c6f616400",
+        "msg_hex": "636f6e666f726d616e6365206d65737361676520666f7220646f6d61696e2d736570617261746564207369676e696e67",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "6ef6a7e40078dd292a7d4c8ed2d09cb2a23adefe5c0703f1265482efed2dba071615d76f641622326c41f6bc9e9e0fc69762dacd612808bdf73e54dd5fed580d"
+      },
+      "note": "Ed25519 over (domain || msg) — how dmtap-core signs (sign_domain)"
+    },
+    {
+      "name": "ed25519_verify_ok",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f7061796c6f616400",
+        "msg_hex": "636f6e666f726d616e6365206d65737361676520666f7220646f6d61696e2d736570617261746564207369676e696e67",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "6ef6a7e40078dd292a7d4c8ed2d09cb2a23adefe5c0703f1265482efed2dba071615d76f641622326c41f6bc9e9e0fc69762dacd612808bdf73e54dd5fed580d"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the signature above MUST verify"
+    },
+    {
+      "name": "ed25519_verify_tampered_msg",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f7061796c6f616400",
+        "msg_hex": "626f6e666f726d616e6365206d65737361676520666f7220646f6d61696e2d736570617261746564207369676e696e67",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "6ef6a7e40078dd292a7d4c8ed2d09cb2a23adefe5c0703f1265482efed2dba071615d76f641622326c41f6bc9e9e0fc69762dacd612808bdf73e54dd5fed580d"
+      },
+      "expected": {
+        "valid": false
+      },
+      "note": "flipping one message bit MUST fail verification (fail closed)"
+    },
+    {
+      "name": "ed25519_verify_tampered_sig",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f7061796c6f616400",
+        "msg_hex": "636f6e666f726d616e6365206d65737361676520666f7220646f6d61696e2d736570617261746564207369676e696e67",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "6ff6a7e40078dd292a7d4c8ed2d09cb2a23adefe5c0703f1265482efed2dba071615d76f641622326c41f6bc9e9e0fc69762dacd612808bdf73e54dd5fed580d"
+      },
+      "expected": {
+        "valid": false
+      },
+      "note": "flipping one signature bit MUST fail verification (fail closed)"
+    },
+    {
+      "name": "cbor_identity",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "created via Identity::create_classical, seed 0x11*32, version 0; §18.4.1 integer-keyed",
+        "type": "Identity"
+      },
+      "expected": {
+        "cbor_hex": "a901810102a1015820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370300048005a2016d2f6d6573682f6b6579706b67730258211e4f242fb78e0942ca9cd96887ed930511386f7729427e9b7435ba23370e6100520658211e08a744bb9a1b09722cc94f3794fa5d44251da66ecdb0ad52dce7c0df241736be078171616c696365406578616d706c652e636f6d091b0000018bcfe568000a8158406e9471b42c493099e51def8f326d6d22ad08af43f50385f8f033baa33f8a5067f1d54779ab8df4b7b5ffa52ee1d7d241c1cad7bb4f9f0a727d44ab653e8b4908",
+        "content_id_hex": "1e2b8b83df16578e8357b6bfac5378f0e9cb6980f06d1181b0772811c5bbe34dc1"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a signed single-suite Identity; also its §18.9.4 content address"
+    },
+    {
+      "name": "cbor_device_cert",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "IK seed 0x11*32 signs device key seed 0x22*32; §18.4.2 integer-keyed",
+        "type": "DeviceCert"
+      },
+      "expected": {
+        "cbor_hex": "a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737035820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00468686f6d652d626f78051b0000018bcfe5680007836473656e6464726563766572656c61790858406f00580684430a29519dad174679c91dd34d806da1582b59cc516bd77cc9c20df0ce8ad2cb8447a7e4ef630cd2c88cc31b0146e4a5ef1f0c7edd1b682c78ce06"
+      },
+      "note": "§18-canonical integer-keyed CBOR of an IK-signed DeviceCert"
+    },
+    {
+      "name": "cbor_payload",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "fixed fields; sig is a fixed 64-byte placeholder; §18.3.5 integer-keyed",
+        "type": "Payload"
+      },
+      "expected": {
+        "cbor_hex": "a6015820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370258400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003a40142aabb026568656c6c6f037819746578742f706c61696e3b20636861727365743d7574662d380480044b68656c6c6f20646d746170058158211e81cc03f0e1003bb942ed82565acd2c1a635c7f3169ea9bf75ca9f158f210ce010680"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a MOTE Payload"
+    },
+    {
+      "name": "cbor_envelope",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "fixed ciphertext (48 bytes) + fixed sig placeholders; to = KeyTag; id = content address of ciphertext; §18.3.1 integer-keyed",
+        "type": "Envelope"
+      },
+      "expected": {
+        "cbor_hex": "a9010002010358211e7a557d4e4985f6e3c0b01ad253a8d7ffe2db61c090e9588e0e3cb6f6fdb5ac0004a20001015820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0061b0000018bcfe5680007000a58300b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d60b5840000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a MOTE Envelope; round-trip-checked in the self-test"
+    },
+    {
+      "name": "suite_reject_0x00",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "00"
+      },
+      "expected": {
+        "accepted": false
+      },
+      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+    },
+    {
+      "name": "suite_reject_0x03",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "03"
+      },
+      "expected": {
+        "accepted": false
+      },
+      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+    },
+    {
+      "name": "suite_reject_0x05",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "05"
+      },
+      "expected": {
+        "accepted": false
+      },
+      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+    },
+    {
+      "name": "suite_reject_0xff",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "18ff"
+      },
+      "expected": {
+        "accepted": false
+      },
+      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+    },
+    {
+      "name": "suite_accept_0x01",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "01"
+      },
+      "expected": {
+        "accepted": true
+      },
+      "note": "0x01 (classical) and 0x02 (reserved PQ) are known suite ids and decode"
+    },
+    {
+      "name": "suite_accept_0x02",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "02"
+      },
+      "expected": {
+        "accepted": true
+      },
+      "note": "0x01 (classical) and 0x02 (reserved PQ) are known suite ids and decode"
+    },
+    {
+      "name": "mote_content_address_ok",
+      "operation": "content_address_verify",
+      "input": {
+        "ciphertext_hex": "0b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6",
+        "id_hex": "1e7a557d4e4985f6e3c0b01ad253a8d7ffe2db61c090e9588e0e3cb6f6fdb5ac00"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "id MUST equal the content address of the ciphertext (checked before decryption)"
+    },
+    {
+      "name": "mote_content_address_tampered",
+      "operation": "content_address_verify",
+      "input": {
+        "ciphertext_hex": "f430557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f81d42678cb1d6",
+        "id_hex": "1e7a557d4e4985f6e3c0b01ad253a8d7ffe2db61c090e9588e0e3cb6f6fdb5ac00"
+      },
+      "expected": {
+        "valid": false
+      },
+      "note": "a tampered ciphertext MUST fail the content-address check (drop before decrypt)"
+    },
+    {
+      "name": "mote_sender_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f656e76656c6f70652d73656e64657200",
+        "msg_hex": "1e7a557d4e4985f6e3c0b01ad253a8d7ffe2db61c090e9588e0e3cb6f6fdb5ac00a20001015820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000018bcfe5680000f6",
+        "seed_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": {
+        "pubkey_hex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+        "sig_hex": "c6f9a763628f47adb59e11187449d51e6f9707212a15651a0c0085fcc03fdf9a9e60faf9bc043a30c3fb0ca82dc252aaec4c3e30631feaf8424a7a468461f20b"
+      },
+      "note": "§18.9.1 sender_sig body = id||det_cbor(to)||ts_be64||kind||0xf6 (challenge absent); DS-tag 'DMTAP-v0/envelope-sender\\0'; ephemeral key seed 0x33*32"
+    },
+    {
+      "name": "mote_sender_sig_verify",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f656e76656c6f70652d73656e64657200",
+        "msg_hex": "1e7a557d4e4985f6e3c0b01ad253a8d7ffe2db61c090e9588e0e3cb6f6fdb5ac00a20001015820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00000018bcfe5680000f6",
+        "pubkey_hex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+        "sig_hex": "c6f9a763628f47adb59e11187449d51e6f9707212a15651a0c0085fcc03fdf9a9e60faf9bc043a30c3fb0ca82dc252aaec4c3e30631feaf8424a7a468461f20b"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the sender_sig above MUST verify under the ephemeral key (sender_key, §18.3.1 key 12)"
+    },
+    {
+      "name": "mote_payload_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f7061796c6f616400",
+        "msg_hex": "11c2d36c9cee6fad59624184af7e8afdb372ddbee0defec77b94d5691d6f76be",
+        "payload_hash_hex": "11c2d36c9cee6fad59624184af7e8afdb372ddbee0defec77b94d5691d6f76be",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "38350f0b682ae7ab9d6f2497c83db330b95144a7b6014dc36e37068dbf9a9b45c675dc03df2f1fc3531f9da7a361b5d67bbae7bb1250a6af54ae63d781f14f05"
+      },
+      "note": "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig})) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32"
+    }
+  ]
+}
