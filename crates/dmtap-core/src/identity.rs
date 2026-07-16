@@ -697,6 +697,204 @@ impl RecoveryPolicy {
         }
         verify_domain(&self.ik, RECOVERY_POLICY_DS, &self.signing_body(), &self.sig)
     }
+
+    /// Content address of this policy version (`0x1e ‖ BLAKE3-256(det_cbor(policy))`) — the value a
+    /// guardian counter-signs when approving or vetoing a change (see [`authorize_recovery_change`]).
+    pub fn content_id(&self) -> ContentId {
+        ContentId::of(&self.det_cbor())
+    }
+}
+
+// --- Recovery-weakening quorum + 72h asymmetric veto (§1.4 rules 3–4, §16.8) ---------------
+
+/// §16 recovery-weakening **asymmetric veto window**: 72 hours, in milliseconds. A factor-weakening
+/// change MUST be published and take effect only after this window elapses with no valid veto.
+pub const RECOVERY_VETO_WINDOW_MS: u64 = 72 * 60 * 60 * 1000;
+
+/// DS tag a guardian signs to **approve** a recovery-weakening change (over the next policy's
+/// content-address).
+const RECOVERY_APPROVAL_DS: &[u8] = b"DMTAP-v0/recovery-approval\x00";
+/// DS tag a guardian signs to **veto** a recovery-weakening change (over the next policy's
+/// content-address).
+const RECOVERY_VETO_DS: &[u8] = b"DMTAP-v0/recovery-veto\x00";
+
+/// A recovery-weakening guard failure, each carrying its §21.3 code via [`RecoveryGuardError::code`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RecoveryGuardError {
+    /// A change that removes/weakens a recovery factor is signed by `IK` alone without satisfying
+    /// `rotate_threshold` — the stolen-`IK` takeover defense (§1.4 rule 3).
+    /// `ERR_RECOVERY_WEAKENING_UNQUORUMED` (`0x010E`), FAIL_CLOSED_BLOCK + HALT_ALERT.
+    #[error("recovery-weakening change lacks the rotate_threshold quorum — IK alone must not weaken \
+             recovery (ERR_RECOVERY_WEAKENING_UNQUORUMED, 0x010E)")]
+    WeakeningUnquorumed,
+    /// A factor-weakening change attempts to take effect before its 72 h veto/delay window elapses
+    /// (§1.4 rule 4, §16.8). `ERR_RECOVERY_VETO_WINDOW` (`0x010F`), FAIL_CLOSED_BLOCK — hold until
+    /// the window elapses.
+    #[error("recovery-weakening change is inside its 72h veto window \
+             (ERR_RECOVERY_VETO_WINDOW, 0x010F)")]
+    VetoWindowActive,
+    /// A `rotate_threshold`-backed veto counter-signature aborted the change (§1.4 rule 4). Same
+    /// wire code as the window hold: `ERR_RECOVERY_VETO_WINDOW` (`0x010F`).
+    #[error("recovery-weakening change was vetoed by a rotate_threshold-backed quorum \
+             (ERR_RECOVERY_VETO_WINDOW, 0x010F)")]
+    Vetoed,
+}
+
+impl RecoveryGuardError {
+    /// The normative DMTAP wire error code (§21.3).
+    pub fn code(&self) -> u16 {
+        match self {
+            RecoveryGuardError::WeakeningUnquorumed => 0x010E,
+            RecoveryGuardError::VetoWindowActive | RecoveryGuardError::Vetoed => 0x010F,
+        }
+    }
+}
+
+/// A guardian's counter-signature over a proposed recovery-policy change — used both for an
+/// **approval** ([`sign_recovery_approval`]) and a **veto** ([`sign_recovery_veto`]), distinguished
+/// by domain-separation tag. `guardian` is the guardian's public key; `sig` covers the next
+/// policy's content-address under the relevant DS tag (§18.9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardianApproval {
+    pub guardian: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+/// Produce a guardian's **approval** counter-signature for the proposed `next` policy.
+pub fn sign_recovery_approval(guardian: &IdentityKey, next: &RecoveryPolicy) -> GuardianApproval {
+    GuardianApproval {
+        guardian: guardian.public(),
+        sig: guardian.sign_domain(RECOVERY_APPROVAL_DS, next.content_id().as_bytes()),
+    }
+}
+
+/// Produce a guardian's **veto** counter-signature for the proposed `next` policy.
+pub fn sign_recovery_veto(guardian: &IdentityKey, next: &RecoveryPolicy) -> GuardianApproval {
+    GuardianApproval {
+        guardian: guardian.public(),
+        sig: guardian.sign_domain(RECOVERY_VETO_DS, next.content_id().as_bytes()),
+    }
+}
+
+/// Count **distinct, recognized** guardians whose counter-signature (under `ds`, over `preimage`)
+/// verifies. Signatures from non-guardians or duplicates do not count — a minority/forged set
+/// cannot inflate the quorum.
+fn count_quorum(
+    guardians: &[Vec<u8>],
+    sigs: &[GuardianApproval],
+    ds: &[u8],
+    preimage: &[u8],
+) -> usize {
+    let mut counted: Vec<&[u8]> = Vec::new();
+    for s in sigs {
+        if !guardians.iter().any(|g| g.as_slice() == s.guardian.as_slice()) {
+            continue; // not a recognized guardian
+        }
+        if counted.iter().any(|c| *c == s.guardian.as_slice()) {
+            continue; // already counted this guardian
+        }
+        if verify_domain(&s.guardian, ds, preimage, &s.sig).is_ok() {
+            counted.push(&s.guardian);
+        }
+    }
+    counted.len()
+}
+
+fn predicate_count(p: &MethodPredicate) -> u32 {
+    match p {
+        MethodPredicate::Phrase | MethodPredicate::Ik => 1,
+        MethodPredicate::Devices(n) | MethodPredicate::Guardians(n) => *n as u32,
+    }
+}
+
+/// The **minimum** bar of a threshold: `any_of` is a disjunction (OR), so the easiest predicate
+/// defines the effective bar. A lower minimum is a weaker threshold. An empty threshold (rejected
+/// elsewhere by [`RecoveryPolicy::verify`]) yields `0`.
+fn threshold_min(t: &Threshold) -> u32 {
+    t.any_of.iter().map(predicate_count).min().unwrap_or(0)
+}
+
+/// Whether `cand` is at least as strong a recovery method as `prev` (same kind, not narrowed).
+fn method_at_least_as_strong(prev: &RecoveryMethod, cand: &RecoveryMethod) -> bool {
+    use RecoveryMethod::*;
+    match (prev, cand) {
+        (Phrase { .. }, Phrase { .. }) => true,
+        (Device { label: a, .. }, Device { label: b, .. }) => a == b,
+        (Social { guardians: pg, threshold: pt }, Social { guardians: cg, threshold: ct }) => {
+            ct >= pt && pg.iter().all(|g| cg.contains(g))
+        }
+        _ => false,
+    }
+}
+
+/// Whether the change **weakens** recovery (spec §1.4 rule 3): a method dropped or narrowed (a
+/// guardian/device evicted, a Social threshold lowered), or either threshold's minimum bar lowered.
+///
+/// Additive, non-weakening changes (adding a redundant factor, raising a bar) return `false` and
+/// MAY be signed by `IK` alone without the guardian quorum or the veto delay.
+///
+/// This is a conservative structural detector: it flags every removal or threshold reduction. It
+/// does **not** attempt to model the §1.4 rule 5 *cryptographic* re-key/resharing obligation (that
+/// a rotated-out secret is actually re-keyed) — that is a key-management concern outside this
+/// deterministic core; see the crate docs.
+pub fn recovery_change_is_weakening(prev: &RecoveryPolicy, next: &RecoveryPolicy) -> bool {
+    let methods_weakened = prev
+        .methods
+        .iter()
+        .any(|pm| !next.methods.iter().any(|nm| method_at_least_as_strong(pm, nm)));
+    methods_weakened
+        || threshold_min(&next.recover_threshold) < threshold_min(&prev.recover_threshold)
+        || threshold_min(&next.rotate_threshold) < threshold_min(&prev.rotate_threshold)
+}
+
+/// Authorize a recovery-policy change under the §1.4 rules 3–4 / §16.8 weakening guard. Clock and
+/// veto-window are **explicit parameters** — this core never reads a wall clock (§16.1).
+///
+/// A **non-weakening** change ([`recovery_change_is_weakening`] `== false`) is permitted immediately
+/// (`Ok`) — `IK` alone may sign an additive change with no delay (§1.4 rule 3).
+///
+/// A **weakening** change is fail-closed unless, in order:
+/// 1. it satisfies the `rotate_threshold` guardian quorum — a strict `> n/2` majority of `guardians`
+///    supply a valid [`sign_recovery_approval`] over `next` — else
+///    [`WeakeningUnquorumed`](RecoveryGuardError::WeakeningUnquorumed) (`0x010E`); `IK` alone is
+///    never sufficient (stolen-`IK` defense);
+/// 2. no `rotate_threshold`-backed veto (a strict `> n/2` majority supplying a valid
+///    [`sign_recovery_veto`]) is present — else [`Vetoed`](RecoveryGuardError::Vetoed) (`0x010F`);
+///    the veto is deliberately quorum-gated so a single not-yet-removed factor cannot block its own
+///    eviction;
+/// 3. the 72 h veto window (`announced_at + `[`RECOVERY_VETO_WINDOW_MS`]) has elapsed at `now` —
+///    else [`VetoWindowActive`](RecoveryGuardError::VetoWindowActive) (`0x010F`); a weakening MUST
+///    NOT take effect instantly.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_recovery_change(
+    prev: &RecoveryPolicy,
+    next: &RecoveryPolicy,
+    guardians: &[Vec<u8>],
+    approvals: &[GuardianApproval],
+    vetoes: &[GuardianApproval],
+    announced_at: TimestampMs,
+    now: TimestampMs,
+) -> Result<(), RecoveryGuardError> {
+    if !recovery_change_is_weakening(prev, next) {
+        return Ok(());
+    }
+    let n = guardians.len();
+    let preimage = next.content_id();
+    // Rule 3: weakening needs the rotate_threshold quorum (> n/2), even signed by IK.
+    let approve_q = count_quorum(guardians, approvals, RECOVERY_APPROVAL_DS, preimage.as_bytes());
+    if approve_q * 2 <= n {
+        return Err(RecoveryGuardError::WeakeningUnquorumed);
+    }
+    // Rule 4: a rotate_threshold-backed veto aborts the change (asymmetric — a single factor cannot).
+    let veto_q = count_quorum(guardians, vetoes, RECOVERY_VETO_DS, preimage.as_bytes());
+    if veto_q * 2 > n {
+        return Err(RecoveryGuardError::Vetoed);
+    }
+    // Rule 4: hold until the 72h veto window elapses.
+    if now < announced_at.saturating_add(RECOVERY_VETO_WINDOW_MS) {
+        return Err(RecoveryGuardError::VetoWindowActive);
+    }
+    Ok(())
 }
 
 // --- Name migration (§1.6) -----------------------------------------------------------------
@@ -915,5 +1113,113 @@ mod tests {
         let mut forged = mv.clone();
         forged.to = "a@evil.com".into();
         assert_eq!(forged.verify(), Err(IdentityError::BadSignature));
+    }
+
+    fn policy(ik: &IdentityKey, methods: Vec<RecoveryMethod>, recover: Threshold, rotate: Threshold, ver: u64) -> RecoveryPolicy {
+        let mut p = RecoveryPolicy {
+            suite: Suite::Classical,
+            ik: ik.public(),
+            version: ver,
+            methods,
+            recover_threshold: recover,
+            rotate_threshold: rotate,
+            prev: None,
+            ts: ver,
+            sig: vec![],
+        };
+        p.sign(ik);
+        p
+    }
+
+    #[test]
+    fn additive_change_needs_no_quorum_or_delay() {
+        let ik = IdentityKey::generate();
+        let prev = policy(
+            &ik,
+            vec![RecoveryMethod::Phrase { recovery_key: vec![1] }],
+            Threshold { any_of: vec![MethodPredicate::Phrase] },
+            Threshold { any_of: vec![MethodPredicate::Ik, MethodPredicate::Guardians(2)] },
+            1,
+        );
+        // Adds a redundant device method — strictly additive, not a weakening.
+        let next = policy(
+            &ik,
+            vec![
+                RecoveryMethod::Phrase { recovery_key: vec![1] },
+                RecoveryMethod::Device { device_key: vec![9; 32], label: "phone".into() },
+            ],
+            Threshold { any_of: vec![MethodPredicate::Phrase] },
+            Threshold { any_of: vec![MethodPredicate::Ik, MethodPredicate::Guardians(2)] },
+            2,
+        );
+        assert!(!recovery_change_is_weakening(&prev, &next));
+        // Even with no guardians, no approvals, and now == announced (window not elapsed): OK.
+        assert!(authorize_recovery_change(&prev, &next, &[], &[], &[], 0, 0).is_ok());
+    }
+
+    #[test]
+    fn weakening_change_is_gated_by_quorum_veto_and_window() {
+        let ik = IdentityKey::generate();
+        let guardian_keys: Vec<IdentityKey> = (0..5).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+        let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+
+        let prev = policy(
+            &ik,
+            vec![
+                RecoveryMethod::Phrase { recovery_key: vec![1] },
+                RecoveryMethod::Device { device_key: vec![9; 32], label: "phone".into() },
+            ],
+            Threshold { any_of: vec![MethodPredicate::Guardians(3)] },
+            Threshold { any_of: vec![MethodPredicate::Guardians(3)] },
+            1,
+        );
+        // Weakening: drops the device method AND lowers both thresholds to Guardians(1).
+        let next = policy(
+            &ik,
+            vec![RecoveryMethod::Phrase { recovery_key: vec![1] }],
+            Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+            Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+            2,
+        );
+        assert!(recovery_change_is_weakening(&prev, &next));
+
+        let announced = 1_000_000u64;
+        let after_window = announced + RECOVERY_VETO_WINDOW_MS;
+
+        // (a) No quorum — even past the window — fails closed 0x010E.
+        let e = authorize_recovery_change(&prev, &next, &guardians, &[], &[], announced, after_window).unwrap_err();
+        assert_eq!(e, RecoveryGuardError::WeakeningUnquorumed);
+        assert_eq!(e.code(), 0x010E);
+
+        // A strict majority (3 of 5) of guardians approve.
+        let approvals: Vec<GuardianApproval> =
+            guardian_keys[..3].iter().map(|g| sign_recovery_approval(g, &next)).collect();
+
+        // (b) Quorum met but still inside the 72h window — hold, 0x010F.
+        let e = authorize_recovery_change(&prev, &next, &guardians, &approvals, &[], announced, announced + 1).unwrap_err();
+        assert_eq!(e, RecoveryGuardError::VetoWindowActive);
+        assert_eq!(e.code(), 0x010F);
+
+        // (c) Quorum met + a rotate_threshold-backed veto (3 of 5) — aborted, 0x010F.
+        let vetoes: Vec<GuardianApproval> =
+            guardian_keys[..3].iter().map(|g| sign_recovery_veto(g, &next)).collect();
+        let e = authorize_recovery_change(&prev, &next, &guardians, &approvals, &vetoes, announced, after_window).unwrap_err();
+        assert_eq!(e, RecoveryGuardError::Vetoed);
+
+        // (d) A single-guardian veto is NOT a quorum veto and cannot block (asymmetric veto).
+        let lone_veto = vec![sign_recovery_veto(&guardian_keys[0], &next)];
+        assert!(authorize_recovery_change(&prev, &next, &guardians, &approvals, &lone_veto, announced, after_window).is_ok());
+
+        // (e) Quorum met, no veto, window elapsed — the change is finally authorized.
+        assert!(authorize_recovery_change(&prev, &next, &guardians, &approvals, &[], announced, after_window).is_ok());
+
+        // Forged approvals from non-guardians do not count toward quorum.
+        let outsiders: Vec<GuardianApproval> = (100..103u8)
+            .map(|s| sign_recovery_approval(&IdentityKey::from_seed(&[s; 32]), &next))
+            .collect();
+        assert_eq!(
+            authorize_recovery_change(&prev, &next, &guardians, &outsiders, &[], announced, after_window),
+            Err(RecoveryGuardError::WeakeningUnquorumed)
+        );
     }
 }

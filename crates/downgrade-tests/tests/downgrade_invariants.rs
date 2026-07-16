@@ -62,18 +62,25 @@
 //! conformance-runner / a future node-level harness's job, not this crate's. This is a deliberate
 //! scoping choice, not an oversight — see this crate's task brief.
 
+use dmtap_core::capability::{
+    Capability, CapabilityAnnouncement, CapabilityError, CapabilityToken, CapsVersionTracker,
+};
 use dmtap_core::cbor::{self, CborError, Cv};
 use dmtap_core::deniable::DeniablePayload;
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{
-    IdentityError, IdentityKey, KeyPackageBundleRef, RecoveryMethod, RecoveryPolicy, Threshold,
+    authorize_recovery_change, recovery_change_is_weakening, sign_recovery_approval,
+    sign_recovery_veto, GuardianApproval, IdentityError, IdentityKey, KeyPackageBundleRef,
+    MethodPredicate, RecoveryGuardError, RecoveryMethod, RecoveryPolicy, Threshold,
+    RECOVERY_VETO_WINDOW_MS,
 };
-use dmtap_core::kt::SignedTreeHead;
+use dmtap_core::kt::{identity_leaf_for, InclusionProof, KtError, MerkleTree, SignedTreeHead};
 use dmtap_core::mote::{
     build_mote, validate, DeliveryTag, Envelope, Headers, Hpke, Kind, Manifest, MoteDraft,
     MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair, ENVELOPE_SENDER_DS,
     MOTE_VERSION, PAYLOAD_SIG_DS,
 };
+use dmtap_core::suite::{SuiteRatchet, SuiteRatchetError};
 use dmtap_core::{identity::Identity, Suite};
 
 fn key(seed: u8) -> IdentityKey {
@@ -175,34 +182,54 @@ fn envelope_decoder_rejects_smuggled_key_in_signed_object() {
     assert_eq!(Envelope::from_det_cbor(&leaky), Err(CborError::UnknownKey(63)));
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.1 "Suite high-water-mark ratchet" (§1.3, §2.7 step 8,
-/// `ERR_SUITE_DOWNGRADE` `0x020F`): a receiver must track, per pinned contact, the highest
-/// `Envelope.suite` ever accepted from them and reject anything below that mark. `dmtap-core` has
-/// no per-contact pin/ratchet state at all — `RecipientCtx` carries only `our_ik` / `seal_secret`
-/// / `sender_is_known`, and `mote::validate` checks suite *support* (§2.7 step 1), never a
-/// *contact-specific floor*. This is a real, spec-mandated invariant with no home in the current
-/// public API — it belongs to whatever layer maintains contact/pinning state (not modeled here).
+/// LOCKS §10.7.1 "Suite high-water-mark ratchet" (§1.3, §2.7 step 8, `ERR_SUITE_DOWNGRADE`
+/// `0x020F`): a receiver tracks, per pinned contact, the highest `Envelope.suite` ever accepted
+/// from them and rejects anything below that mark — and MUST NOT ratchet the mark down. Enforced by
+/// [`dmtap_core::suite::SuiteRatchet`]: once a contact is pinned at the PQ suite (`0x02`), a later
+/// object asserting the weaker classical suite (`0x01`) is a downgrade.
 #[test]
-#[ignore = "spec-only: no per-contact suite high-water-mark/ratchet state exists in dmtap-core \
-    (§1.3, §2.7 step 8, ERR_SUITE_DOWNGRADE 0x020F) — RecipientCtx has no pinned-suite field and \
-    mote::validate never compares Envelope.suite against a contact floor. Fill in once such state \
-    is exposed publicly."]
 fn suite_high_water_mark_ratchet_should_reject_downgrade_below_pinned_floor() {
-    unimplemented!("no public suite-ratchet/high-water-mark API exists yet in dmtap-core")
+    let contact = IdentityKey::generate().public();
+    let mut ratchet = SuiteRatchet::new();
+    // Both parties migrated to PQ: the contact's high-water-mark is pinned at suite 0x02.
+    ratchet.accept(&contact, Suite::PqHybrid).expect("first PQ observation pins the mark");
+    assert_eq!(ratchet.high_water_mark(&contact), Some(Suite::PqHybrid));
+
+    // A later Envelope asserting the weaker classical suite (0x01 < 0x02) is a downgrade attempt.
+    let err = ratchet.check(&contact, Suite::Classical).unwrap_err();
+    assert_eq!(err, SuiteRatchetError::SuiteDowngrade);
+    assert_eq!(err.code(), 0x020F);
+
+    // accept() rejects it too and MUST NOT ratchet the high-water-mark down (§21.3 disposition).
+    assert_eq!(
+        ratchet.accept(&contact, Suite::Classical),
+        Err(SuiteRatchetError::SuiteDowngrade)
+    );
+    assert_eq!(ratchet.high_water_mark(&contact), Some(Suite::PqHybrid));
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.1 "Capability-announce anti-rollback" (§10.2,
-/// `ERR_CAPABILITY_ANNOUNCE_ROLLBACK` `0x030A`): a receiver must reject a `system`-MOTE capability
-/// announcement whose `caps_version` is older-than-or-equal-to the last one accepted from that
-/// peer. `dmtap-core` has no `caps_version` field or capability-announcement object anywhere —
-/// `Kind::System` exists as a message-kind discriminator but the announcement payload/anti-rollback
-/// state it would carry is not modeled.
+/// LOCKS §10.7.1 "Capability-announce anti-rollback" (§10.2, `ERR_CAPABILITY_ANNOUNCE_ROLLBACK`
+/// `0x030A`): a receiver rejects a capability announcement whose `caps_version` is
+/// older-than-or-equal-to the last accepted from that peer — a stale replay attempting to suppress
+/// an advertised capability. Enforced by [`dmtap_core::capability::CapsVersionTracker`] over the
+/// signed, versioned [`CapabilityAnnouncement`] object: it retains the highest version per peer and
+/// fails closed on a rollback (retain the higher set; do not roll back).
 #[test]
-#[ignore = "spec-only: no CapabilityAnnouncement/caps_version object exists in dmtap-core (§10.2, \
-    ERR_CAPABILITY_ANNOUNCE_ROLLBACK 0x030A) — only the Kind::System discriminator is modeled, not \
-    the announcement content or the per-peer version-tracking state a rollback check needs."]
 fn capability_announcement_anti_rollback_should_reject_stale_caps_version() {
-    unimplemented!("no public capability-announcement/caps_version API exists yet in dmtap-core")
+    let peer = IdentityKey::generate();
+    let cap = Capability { resource: "ext:mls".into(), ability: "support".into(), caveats: None };
+    let newer = CapabilityAnnouncement::issue(&peer, 7, vec![cap.clone()], 20);
+    let stale = CapabilityAnnouncement::issue(&peer, 5, vec![cap], 10);
+
+    let mut tracker = CapsVersionTracker::new();
+    tracker.accept(&newer).expect("the newer (v7) announcement is accepted and retained");
+    assert_eq!(tracker.last_version(&peer.public()), Some(7));
+
+    // Replaying the older (v5 ≤ 7) announcement is a rollback — reject, retain the higher set.
+    let err = tracker.accept(&stale).unwrap_err();
+    assert_eq!(err, CapabilityError::AnnounceRollback);
+    assert_eq!(err.code(), 0x030A);
+    assert_eq!(tracker.last_version(&peer.public()), Some(7), "the retained floor is unchanged");
 }
 
 // ================================================================================================
@@ -471,65 +498,148 @@ fn forged_signed_tree_head_signature_is_rejected() {
     assert_eq!(forged.verify(), Err(IdentityError::BadSignature));
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.3 "KT ... bad inclusion proof → reject" (§3.5, §18.4.10,
-/// `ERR_KT_PROOF_INVALID` `0x0108`): a verifier must recompute the RFC 6962 Merkle audit path from
-/// an `InclusionProof` and reject if it doesn't reconstruct the pinned STH's `root_hash`.
-/// `dmtap-core::kt::InclusionProof` is decode-only (structural fields + CBOR round-trip); there is
-/// no `verify_against(&SignedTreeHead)`-style function that performs the Merkle-path arithmetic
-/// and fails closed on mismatch.
+/// LOCKS §10.7.3 "KT ... bad inclusion proof → reject" (§3.5, §18.4.10, `ERR_KT_PROOF_INVALID`
+/// `0x0108`): a verifier recomputes the RFC 6962 Merkle audit path from an `InclusionProof` and
+/// rejects if it doesn't reconstruct the pinned STH's `root_hash`. Enforced by
+/// [`InclusionProof::verify_against`] (the RFC 6962 fold) — an honest proof folds to the STH root;
+/// a tampered audit path or a wrong root fails closed.
 #[test]
-#[ignore = "spec-only: dmtap_core::kt::InclusionProof has no Merkle-path verification function \
-    (no verify-against-STH API) — only CBOR decode/round-trip is implemented (§3.5, §18.4.10, \
-    ERR_KT_PROOF_INVALID 0x0108). Fill in once such a function is exposed publicly."]
 fn kt_inclusion_proof_with_bad_audit_path_should_be_rejected() {
-    unimplemented!("no public InclusionProof arithmetic-verification API exists yet in dmtap-core")
+    // Build a real RFC 6962 tree and a genuine inclusion proof for one of its leaves.
+    let mut tree = MerkleTree::new();
+    let leaves: Vec<ContentId> = (0u8..6).map(|n| ContentId::of(&[n; 4])).collect();
+    for l in &leaves {
+        tree.append(l).unwrap();
+    }
+    let sth = SignedTreeHead::issue(&key(0x11), tree.size(), 1_700_000_000_000, tree.root().unwrap());
+    let good = InclusionProof {
+        tree_size: tree.size(),
+        leaf_index: 2,
+        leaf_hash: leaves[2].clone(),
+        audit_path: tree.inclusion_path(2).unwrap(),
+    };
+    assert!(good.verify_against(&sth).is_ok(), "an honest proof folds to the pinned STH root");
+
+    // A tampered audit-path sibling no longer reconstructs the STH root.
+    let mut bad_path = good.clone();
+    bad_path.audit_path[0] = ContentId::of(b"tampered sibling");
+    let err = bad_path.verify_against(&sth).unwrap_err();
+    assert_eq!(err, KtError::ProofInvalid);
+    assert_eq!(err.code(), 0x0108);
+
+    // An honest proof presented against the wrong (forged) STH root also fails closed.
+    let forged_sth =
+        SignedTreeHead::issue(&key(0x11), tree.size(), 1_700_000_000_000, ContentId::of(b"not the root"));
+    assert_eq!(good.verify_against(&forged_sth), Err(KtError::ProofInvalid));
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.3 "KT equivocation → HALT" applied at the leaf level
-/// (§3.5, §18.4.9, `ERR_KT_LEAF_HASH_MISMATCH` `0x0117`): a verifier must reject a proof whose
-/// committed leaf differs from the Identity-entry leaf hash it recomputes for the resolved
-/// identity. `identity_leaf_hash` is exposed as a pure function (already proven deterministic and
-/// tamper-sensitive by `dmtap-core`'s own unit tests) but no library function ties a presented
-/// `InclusionProof.leaf_hash` to it and rejects on mismatch — that comparison is left entirely to
-/// the caller.
+/// LOCKS §10.7.3 "KT equivocation → HALT" applied at the leaf level (§3.5, §18.4.9,
+/// `ERR_KT_LEAF_HASH_MISMATCH` `0x0117`): a verifier rejects a proof whose committed leaf differs
+/// from the Identity-entry leaf hash it recomputes for the resolved identity — the log **indexes** a
+/// binding, it does not **redefine** it. Enforced by [`InclusionProof::verify_identity`]: it
+/// recomputes the §18.4.9 leaf from the resolved `Identity` (via [`identity_leaf_for`]) and rejects
+/// on mismatch, even when the inclusion path itself is arithmetically valid.
 #[test]
-#[ignore = "spec-only: dmtap_core::kt::identity_leaf_hash is a pure hash function only — no \
-    public API compares an InclusionProof's declared leaf_hash against the recomputed value and \
-    rejects on mismatch (§3.5, §18.4.9, ERR_KT_LEAF_HASH_MISMATCH 0x0117). That check is left to \
-    the caller/node, not modeled in dmtap-core."]
 fn kt_leaf_hash_mismatch_should_be_rejected() {
-    unimplemented!("no public leaf-hash-mismatch-rejection API exists yet in dmtap-core")
+    let name = "alice@abc.com";
+    let bundle = KeyPackageBundleRef::new("/mesh/kp", ContentId::of(b"kp"));
+    // The resolved (real) identity a verifier pins ...
+    let real = Identity::create_classical(
+        &key(0x01), 0, vec![], bundle.clone(), ContentId::of(b"rec"), vec![name.into()], None,
+        1_700_000_000_000,
+    );
+    // ... vs a DIFFERENT identity (same name, different `ik`) the log actually committed.
+    let evil = Identity::create_classical(
+        &key(0x02), 0, vec![], bundle, ContentId::of(b"rec"), vec![name.into()], None,
+        1_700_000_000_000,
+    );
+    let evil_leaf = identity_leaf_for(&evil, name).expect("classical ik present");
+
+    let mut tree = MerkleTree::new();
+    let idx = tree.append(&evil_leaf).unwrap();
+    let sth = SignedTreeHead::issue(&key(0x11), tree.size(), 1_700_000_000_000, tree.root().unwrap());
+    let proof = InclusionProof {
+        tree_size: tree.size(),
+        leaf_index: idx,
+        leaf_hash: evil_leaf.clone(),
+        audit_path: tree.inclusion_path(idx).unwrap(),
+    };
+    // The inclusion path IS valid (the evil leaf really is in the tree) ...
+    assert!(proof.verify_against(&sth).is_ok());
+    // ... but the committed leaf ≠ the leaf recomputed for the REAL identity — fail closed 0x0117.
+    let err = proof.verify_identity(&sth, &real, name).unwrap_err();
+    assert_eq!(err, KtError::LeafHashMismatch);
+    assert_eq!(err.code(), 0x0117);
 }
 
 // ================================================================================================
 // §10.7.3 — Capability (§18.7.3)
 // ================================================================================================
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.3 capability **attenuation violation** (a child token whose
-/// `caps` exceed what its `prnt` granted): `dmtap-core::capability::CapabilityToken::verify()` is
-/// explicitly documented to check *only the token's own signature* — "Does not walk the delegation
-/// chain or check attenuation ... — the caller does" (see the doc comment on `verify()`). There is
-/// no public function that follows `prnt` links and rejects a widened child grant
-/// (`ERR_CAPABILITY_DELEGATION_INVALID`, `0x0508`, §13.5).
+/// LOCKS §10.7.3 capability **attenuation violation** (a child token whose `caps` exceed what its
+/// `prnt` granted): `CapabilityToken::verify()` checks only the token's own signature, but the new
+/// [`CapabilityToken::verify_chain`] walks the `prnt` chain and rejects a widened child grant
+/// (`ERR_CAPABILITY_DELEGATION_INVALID`, `0x0508`, §13.5, §18.7.3) — no privilege escalation.
 #[test]
-#[ignore = "spec-only: CapabilityToken::verify() checks only the token's own signature (its own \
-    doc comment says so) — no public attenuation-chain-walking API exists to reject a child token \
-    whose caps exceed its parent's (§18.7.3, §13.5, ERR_CAPABILITY_DELEGATION_INVALID 0x0508)."]
 fn capability_attenuation_violation_should_be_rejected() {
-    unimplemented!("no public attenuation-chain-verification API exists yet in dmtap-core")
+    let root_k = key(0x11);
+    let mid_k = key(0x22);
+    let leaf_aud = key(0x33).public();
+    let read = Capability { resource: "mailbox:calendar".into(), ability: "read".into(), caveats: None };
+    let write = Capability { resource: "mailbox:calendar".into(), ability: "write".into(), caveats: None };
+
+    // Parent grants only `read`; the child, rooted at the parent, tries to widen it to `write`.
+    let parent =
+        CapabilityToken::issue(&root_k, mid_k.public(), vec![read], 1_000, 9_000, b"root".to_vec(), None);
+    let child = CapabilityToken::issue(
+        &mid_k,
+        leaf_aud,
+        vec![write],
+        1_000,
+        9_000,
+        b"child".to_vec(),
+        Some(parent.content_id()),
+    );
+
+    // Signature-only verify() passes — the child is validly self-signed by its own `iss` ...
+    assert!(child.verify().is_ok());
+    // ... but the full chain walk rejects the privilege escalation (child.caps ⊄ parent.caps).
+    let err = child.verify_chain(&[parent]).unwrap_err();
+    assert_eq!(err, CapabilityError::AttenuationViolation);
+    assert_eq!(err.code(), 0x0508);
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.3 **revoked/expired capability → reject** (§13.5, §13.5.1,
-/// `ERR_CAPABILITY_DELEGATION_INVALID` `0x0508` for expired, `ERR_CAPABILITY_REVOKED` `0x050B` for
-/// revoked): `CapabilityToken.nbf`/`.exp` are decoded fields that `verify()` never compares against
-/// a clock, and `CapabilityRevocation` is a standalone signed object with no "is token X covered by
-/// some published revocation" lookup — invocation-time enforcement is not modeled.
+/// LOCKS §10.7.3 **revoked/expired capability → reject** (§13.5, §13.5.1,
+/// `ERR_CAPABILITY_DELEGATION_INVALID` `0x0508` for expired/not-yet-valid, `ERR_CAPABILITY_REVOKED`
+/// `0x050B` for revoked): the new [`CapabilityToken::verify_at`] compares `nbf`/`exp` against a
+/// supplied clock (a parameter — no wall-clock read) and checks a revocation set, failing closed on
+/// each. Expiry and revocation carry distinct codes per §21.3 (a *validly-formed but revoked* grant
+/// is `0x050B`, not `0x0508`).
 #[test]
-#[ignore = "spec-only: CapabilityToken::verify() never compares nbf/exp against a clock, and \
-    CapabilityRevocation has no is-this-token-revoked lookup API (§13.5, §13.5.1, \
-    ERR_CAPABILITY_DELEGATION_INVALID 0x0508 / ERR_CAPABILITY_REVOKED 0x050B)."]
 fn capability_expired_or_revoked_should_be_rejected() {
-    unimplemented!("no public expiry/revocation-enforcement API exists yet in dmtap-core")
+    let iss = key(0x11);
+    let read = Capability { resource: "mailbox:calendar".into(), ability: "read".into(), caveats: None };
+    // Validity window [1_000, 2_000).
+    let token =
+        CapabilityToken::issue(&iss, key(0x22).public(), vec![read], 1_000, 2_000, b"n".to_vec(), None);
+
+    // Inside the window, not revoked: valid.
+    assert!(token.verify_at(1_500, &[]).is_ok());
+
+    // At/after `exp` → expired, 0x0508.
+    let e = token.verify_at(2_000, &[]).unwrap_err();
+    assert_eq!(e, CapabilityError::Expired);
+    assert_eq!(e.code(), 0x0508);
+
+    // Before `nbf` → not yet valid, also 0x0508.
+    let e = token.verify_at(500, &[]).unwrap_err();
+    assert_eq!(e, CapabilityError::NotYetValid);
+    assert_eq!(e.code(), 0x0508);
+
+    // Inside the window but covered by a published revocation (its own content-address) → 0x050B.
+    let e = token.verify_at(1_500, &[token.content_id()]).unwrap_err();
+    assert_eq!(e, CapabilityError::Revoked);
+    assert_eq!(e.code(), 0x050B);
 }
 
 // ================================================================================================
@@ -603,17 +713,85 @@ fn recovery_policy_with_empty_rotate_threshold_is_rejected() {
     assert_eq!(policy.verify(), Err(IdentityError::Malformed("rotate_threshold must not be empty")));
 }
 
-/// NOT YET LIBRARY-TESTABLE — §10.7.3 "Recovery-weakening quorum + veto", the dynamic half
-/// (§1.4 rules 3–4): a `RecoveryPolicy` change that *drops or weakens* a factor requires
-/// `rotate_threshold` quorum even when signed by `IK`, and only takes effect after a 72h
-/// asymmetric veto window (§16). `dmtap-core` implements no "is this new policy a weakening of the
-/// previous one", no quorum-signature-collection flow, and no veto-window/timer state — only the
-/// one structural invariant above (`rotate_threshold` non-empty) is enforced.
+/// LOCKS §10.7.3 "Recovery-weakening quorum + veto", the dynamic half (§1.4 rules 3–4, §16.8): a
+/// `RecoveryPolicy` change that *drops or weakens* a factor requires `rotate_threshold` quorum even
+/// when signed by `IK` (`ERR_RECOVERY_WEAKENING_UNQUORUMED`, `0x010E`), and only takes effect after
+/// a 72h asymmetric veto window (`ERR_RECOVERY_VETO_WINDOW`, `0x010F`). Enforced by
+/// [`authorize_recovery_change`]: [`recovery_change_is_weakening`] detects the weakening,
+/// [`sign_recovery_approval`]/[`sign_recovery_veto`] model the guardian counter-signatures, and the
+/// clock / window are explicit parameters (no wall-clock read).
 #[test]
-#[ignore = "spec-only: no weakening-detection, quorum-collection, or 72h veto-window flow exists \
-    in dmtap-core (§1.4 rules 3-4, §16) — RecoveryPolicy::verify() enforces only the structural \
-    rotate_threshold-non-empty invariant, not the dynamic quorum+veto rule for policy changes that \
-    weaken recovery."]
 fn recovery_weakening_without_quorum_and_veto_window_should_be_rejected() {
-    unimplemented!("no public recovery-weakening quorum/veto-window API exists yet in dmtap-core")
+    let ik = IdentityKey::generate();
+    let guardian_keys: Vec<IdentityKey> =
+        (0..5).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+    let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+
+    let mk = |methods: Vec<RecoveryMethod>, recover: Threshold, rotate: Threshold, ver: u64| {
+        let mut p = RecoveryPolicy {
+            suite: Suite::Classical,
+            ik: ik.public(),
+            version: ver,
+            methods,
+            recover_threshold: recover,
+            rotate_threshold: rotate,
+            prev: None,
+            ts: ver,
+            sig: vec![],
+        };
+        p.sign(&ik);
+        p
+    };
+
+    let prev = mk(
+        vec![
+            RecoveryMethod::Phrase { recovery_key: vec![1] },
+            RecoveryMethod::Device { device_key: vec![9; 32], label: "phone".into() },
+        ],
+        Threshold { any_of: vec![MethodPredicate::Guardians(3)] },
+        Threshold { any_of: vec![MethodPredicate::Guardians(3)] },
+        1,
+    );
+    // Weakening: drops the device method AND lowers both thresholds to Guardians(1).
+    let next = mk(
+        vec![RecoveryMethod::Phrase { recovery_key: vec![1] }],
+        Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+        Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+        2,
+    );
+    assert!(recovery_change_is_weakening(&prev, &next), "dropping a factor is a weakening");
+
+    let announced = 1_000_000u64;
+    let after_window = announced + RECOVERY_VETO_WINDOW_MS;
+
+    // (a) No quorum — even past the window — fails closed: IK alone must not weaken recovery.
+    let e = authorize_recovery_change(&prev, &next, &guardians, &[], &[], announced, after_window)
+        .unwrap_err();
+    assert_eq!(e, RecoveryGuardError::WeakeningUnquorumed);
+    assert_eq!(e.code(), 0x010E);
+
+    // A strict `> n/2` majority (3 of 5) of guardians approve the change.
+    let approvals: Vec<GuardianApproval> =
+        guardian_keys[..3].iter().map(|g| sign_recovery_approval(g, &next)).collect();
+
+    // (b) Quorum met but still inside the 72h veto window — hold, 0x010F.
+    let e = authorize_recovery_change(&prev, &next, &guardians, &approvals, &[], announced, announced + 1)
+        .unwrap_err();
+    assert_eq!(e, RecoveryGuardError::VetoWindowActive);
+    assert_eq!(e.code(), 0x010F);
+
+    // (c) Quorum met + a rotate_threshold-backed veto (3 of 5) — aborted, 0x010F.
+    let vetoes: Vec<GuardianApproval> =
+        guardian_keys[..3].iter().map(|g| sign_recovery_veto(g, &next)).collect();
+    let e = authorize_recovery_change(&prev, &next, &guardians, &approvals, &vetoes, announced, after_window)
+        .unwrap_err();
+    assert_eq!(e, RecoveryGuardError::Vetoed);
+    assert_eq!(e.code(), 0x010F);
+
+    // (d) A lone-guardian veto is NOT a quorum veto and cannot block (asymmetric veto, §1.4 rule 4).
+    let lone_veto = vec![sign_recovery_veto(&guardian_keys[0], &next)];
+    assert!(authorize_recovery_change(&prev, &next, &guardians, &approvals, &lone_veto, announced, after_window).is_ok());
+
+    // (e) Quorum met, no quorum veto, 72h window elapsed — the weakening is finally authorized.
+    assert!(authorize_recovery_change(&prev, &next, &guardians, &approvals, &[], announced, after_window).is_ok());
 }

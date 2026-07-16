@@ -5,6 +5,8 @@
 //! is a *set* (§1.3), so an identity can hold classical and PQ keys simultaneously during
 //! migration.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A DMTAP algorithm suite (spec §1.1).
@@ -62,6 +64,92 @@ impl<'de> Deserialize<'de> for Suite {
     }
 }
 
+// --- Suite high-water-mark ratchet (§1.3, §2.7 step 8) -------------------------------------
+
+/// A [`SuiteRatchet`] downgrade rejection (`ERR_SUITE_DOWNGRADE`, §21.3 `0x020F`).
+///
+/// Disposition per §21.3: `DEFER_REQUESTS + USER_WARN` — a below-high-water-mark MOTE MUST NOT be
+/// accepted and the high-water-mark MUST NOT ratchet down (§10.7.1, §2.7 step 8).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SuiteRatchetError {
+    /// `Envelope.suite` is **below** the sender-contact's pinned suite high-water-mark — a
+    /// downgrade attempt (e.g. a broken classical suite offered after both parties migrated to PQ).
+    #[error(
+        "Envelope.suite is below the contact's pinned suite high-water-mark — suite downgrade \
+         (ERR_SUITE_DOWNGRADE, §21.3 0x020F)"
+    )]
+    SuiteDowngrade,
+}
+
+impl SuiteRatchetError {
+    /// The normative DMTAP wire error code (§21.3).
+    pub fn code(&self) -> u16 {
+        match self {
+            SuiteRatchetError::SuiteDowngrade => 0x020F,
+        }
+    }
+}
+
+/// Per-contact suite **high-water-mark ratchet** (spec §1.3, §2.7 step 8, §10.7.1).
+///
+/// A receiver tracks, per pinned contact (keyed by identity public key), the highest
+/// `Envelope.suite` ever accepted from them. Once a peer is seen at suite epoch `N`, any later
+/// object asserting a suite below that mark is a **downgrade** and is rejected with
+/// [`SuiteRatchetError::SuiteDowngrade`] (`0x020F`). The mark ratchets **up only** — [`observe`]
+/// never lowers it — so a global active adversary cannot replay a weaker suite past two peers who
+/// have already migrated upward.
+///
+/// Suite ordering is the [`Suite`] byte order (`Classical = 0x01` < `PqHybrid = 0x02`), matching
+/// the spec's "suite epoch" monotonicity. This is pure, deterministic state: the ratchet observes a
+/// suite regardless of whether the reference core can *validate* it, because pinning is a distinct
+/// concern from suite support (`mote::validate`'s §2.7 step 1 support check).
+///
+/// [`observe`]: SuiteRatchet::observe
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SuiteRatchet {
+    /// contact identity key → highest suite byte accepted from that contact.
+    floors: BTreeMap<Vec<u8>, u8>,
+}
+
+impl SuiteRatchet {
+    /// A ratchet with no pinned contacts.
+    pub fn new() -> Self {
+        SuiteRatchet { floors: BTreeMap::new() }
+    }
+
+    /// The current high-water-mark for `contact`, or `None` if never seen.
+    pub fn high_water_mark(&self, contact: &[u8]) -> Option<Suite> {
+        self.floors.get(contact).and_then(|b| Suite::from_u8(*b))
+    }
+
+    /// Check `suite` against `contact`'s high-water-mark **without** mutating state: a suite below
+    /// the pinned floor fails closed with `0x020F`. A first-contact (unpinned) suite always passes.
+    pub fn check(&self, contact: &[u8], suite: Suite) -> Result<(), SuiteRatchetError> {
+        match self.floors.get(contact) {
+            Some(&floor) if suite.as_u8() < floor => Err(SuiteRatchetError::SuiteDowngrade),
+            _ => Ok(()),
+        }
+    }
+
+    /// Ratchet the high-water-mark for `contact` **up** to `suite` (never down). Idempotent for a
+    /// suite at or below the current mark.
+    pub fn observe(&mut self, contact: &[u8], suite: Suite) {
+        let e = self.floors.entry(contact.to_vec()).or_insert(0);
+        if suite.as_u8() > *e {
+            *e = suite.as_u8();
+        }
+    }
+
+    /// [`check`](SuiteRatchet::check) then, on success, [`observe`](SuiteRatchet::observe): accept a
+    /// suite from `contact`, rejecting a downgrade below the pinned floor (`0x020F`) and otherwise
+    /// ratcheting the mark up. A rejected downgrade leaves the mark untouched (never ratchets down).
+    pub fn accept(&mut self, contact: &[u8], suite: Suite) -> Result<(), SuiteRatchetError> {
+        self.check(contact, suite)?;
+        self.observe(contact, suite);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +177,37 @@ mod tests {
     fn only_classical_is_supported() {
         assert!(Suite::Classical.is_supported());
         assert!(!Suite::PqHybrid.is_supported());
+    }
+
+    #[test]
+    fn ratchet_rejects_downgrade_below_high_water_mark() {
+        let mut r = SuiteRatchet::new();
+        let peer = b"peer-key".to_vec();
+        // First contact at the higher (PQ) suite pins the mark.
+        assert!(r.accept(&peer, Suite::PqHybrid).is_ok());
+        assert_eq!(r.high_water_mark(&peer), Some(Suite::PqHybrid));
+        // A later classical (0x01 < 0x02) MOTE is a downgrade — reject with 0x020F.
+        let err = r.check(&peer, Suite::Classical).unwrap_err();
+        assert_eq!(err, SuiteRatchetError::SuiteDowngrade);
+        assert_eq!(err.code(), 0x020F);
+        // The rejected downgrade MUST NOT ratchet the mark down.
+        assert_eq!(r.high_water_mark(&peer), Some(Suite::PqHybrid));
+        assert_eq!(r.accept(&peer, Suite::Classical), Err(SuiteRatchetError::SuiteDowngrade));
+        assert_eq!(r.high_water_mark(&peer), Some(Suite::PqHybrid));
+    }
+
+    #[test]
+    fn ratchet_first_contact_and_upgrade_are_accepted() {
+        let mut r = SuiteRatchet::new();
+        let peer = b"peer".to_vec();
+        // Unpinned first contact at classical is fine.
+        assert!(r.accept(&peer, Suite::Classical).is_ok());
+        assert_eq!(r.high_water_mark(&peer), Some(Suite::Classical));
+        // Ratcheting UP to PQ is allowed and sticks.
+        assert!(r.accept(&peer, Suite::PqHybrid).is_ok());
+        assert_eq!(r.high_water_mark(&peer), Some(Suite::PqHybrid));
+        // Distinct contacts are tracked independently.
+        let other = b"other".to_vec();
+        assert!(r.check(&other, Suite::Classical).is_ok());
     }
 }
