@@ -5,6 +5,10 @@ replaceable pointer to it.
 
 ![Identity — safety number, devices, signed-in apps](../img/identity-dark.png)
 
+<p align="center">
+  <img src="../img/identity-mobile.png" width="300" alt="Identity — mobile, single-pane view">
+</p>
+
 ## The key hierarchy
 
 An identity is rooted in a long-term root identity key, held cold and used rarely. Day-to-day,
@@ -40,6 +44,24 @@ until you re-check.
 
 The 8-word encoding is **a verification affordance, not an address** — it is never something you'd
 give someone to reach you, only something you'd read aloud to confirm a key.
+
+## Avatars and profile
+
+Your display name and picture are **self-asserted profile fields** — pointers to you, exactly like
+your address is a pointer to your key. Setting or changing a given/family name or an avatar never
+touches, and never changes, your safety number. Avatars follow one documented ladder, tried in
+order, with the client always showing which rung is active:
+
+1. **A public avatar URL you set yourself** — a link to a photo you host anywhere; always wins if
+   present.
+2. **An opt-in, Gravatar-style avatar** derived from a hash of your address — off by default, and
+   never turned on without you asking for it.
+3. **A deterministic key-identicon** — an image derived directly from your raw public-key bytes
+   (an 8×8 grid, mirrored, hued from the same digest), so it's the same picture everywhere with
+   nothing to upload, it can never collide with anyone else's key, and it reads as the same
+   fingerprint as your safety-number grid. This is the fallback whenever you haven't set a URL and
+   haven't opted into Gravatar.
+4. **Initials**, as the universal last resort if the above all fail to load.
 
 ## Recovery
 

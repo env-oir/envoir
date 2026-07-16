@@ -9,7 +9,7 @@ page — is a client of one or the other.
 ```mermaid
 flowchart LR
     subgraph You["Your device"]
-        Client["Web client (client/)<br/>mail · chat · files · identity<br/>no build step"]
+        Client["Web client (client/)<br/>mail · chat · calendar · contacts<br/>files · identity · PWA, no build step"]
     end
 
     subgraph Node["Your node — envoir-node"]
@@ -20,7 +20,7 @@ flowchart LR
     end
 
     subgraph Mesh["P2P mesh + mixnet"]
-        Transport["libp2p: Kad · Relay · DCUtR · mDNS"]
+        Transport["libp2p (dmtap-p2p): Kad · Circuit Relay v2 · DCUtR<br/>proven on loopback, not yet the node's default"]
         Mix["entry-mix → mix-alpha → mix-beta → exit-mix"]
     end
 
@@ -90,9 +90,14 @@ gateway, and at full DMTAP adoption the gateway becomes unnecessary. See
 ## The mesh and mixnet
 
 The node **is** the mesh — relay and mix roles are capabilities of the node binary, not separate
-services. It builds on **libp2p** (Kademlia DHT, circuit relay v2, AutoNAT/DCUtR hole-punching,
-QUIC/TCP/WebSocket transports) so a node behind CGNAT or on a dynamic IP is reachable by its key,
-not its address.
+services. It builds on **libp2p** (Kademlia DHT, circuit relay v2, DCUtR hole-punching, QUIC/TCP
+transports secured by Noise/Yamux) so a node behind CGNAT or on a dynamic IP is reachable by its
+key, not its address. [`crates/dmtap-p2p`](../crates/dmtap-p2p) implements this transport for
+real — two live libp2p swarms exchanging a sealed MOTE and an ack over the wire, a working
+Kademlia PUT/GET, and a Circuit-Relay-v2 reservation that delivers a frame to a peer with no
+direct address at all, all proven on loopback by dedicated tests. It is not yet the transport
+`envoir-node`'s `run`/`serve-mail` commands use by default — see [roadmap.md](roadmap.md) for
+exactly what's wired into the binary today versus proven at the crate level.
 
 The privacy layer on top is a **mixnet** profiled from Sphinx (packet format) and Loopix/Nym
 (operational design): messages travel as fixed-length, onion-wrapped packets through a 3-hop

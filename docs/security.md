@@ -2,27 +2,32 @@
 
 This page collects everything in the repository that lets you check Envoir's security claims
 yourself, rather than take them on faith: machine-checked formal proofs, fuzzing of every wire
-decoder, a byte-exact conformance suite, and a dedicated downgrade/fail-closed regression suite.
-It closes with the honest gate that stands between this code and any production deployment.
+decoder, a byte-exact conformance suite, and a dedicated downgrade/fail-closed regression suite —
+backed by `cargo test --workspace`, which currently runs **585 passing tests** (0 failing) across
+every crate, the node, and the gateway. It closes with the honest gate that stands between this
+code and any production deployment.
 
 ## Formal (ProVerif) models
 
 [`formal/`](../formal) contains machine-checkable **symbolic (Dolev-Yao) models**, in ProVerif, of
-DMTAP's two most security-critical ceremonies — the same class of artifact used to audit TLS 1.3,
-MLS, and Signal.
+DMTAP's security-critical ceremonies and of the group/transparency/mixing primitives they compose
+— the same class of artifact used to audit TLS 1.3, MLS, and Signal.
 
-| File | Ceremony | Properties checked |
+| File | Ceremony / primitive | Properties checked |
 |---|---|---|
 | `deniable_1to1.pv` | Deniable 1:1 handshake (X3DH + first ratchet message) | Secrecy, injective mutual authentication (replay-resistant), weak forward secrecy |
 | `deniable_1to1_deniability.pv` | Deniable 1:1 repudiation | Observational-equivalence deniability — a judge holding *both* parties' long-term keys cannot distinguish a genuine transcript from one forged by the responder alone |
 | `dmtap_auth.pv` | DMTAP-Auth login ceremony | Unforgeability, replay-resistance, origin-binding (as one injective correspondence), and session key-binding (a captured assertion is useless without the session private key) |
+| `mls_group_keys.pv` | MLS-style group key schedule (bounded 3-epoch instance) | Group-key secrecy, forward secrecy, post-compromise security after a combined removed-member + later-epoch compromise |
+| `kt_append_only.pv` | Key-Transparency log + gossip auditor | Inclusion soundness, no-rollback extension, split-view (equivocation) detection soundness |
+| `mixnet_unlinkability.pv` | One honest mixnet hop, two concurrent inputs | Passive input↔output unlinkability (observational equivalence) |
 
-**Status: all queries verified with ProVerif 2.05 — every query holds, no attack found.** Run
-them yourself:
+**Status: every query obtained a definitive result with ProVerif 2.05 — all security queries
+hold, and the deliberate non-vacuity controls are, as intended, reachable.** Run them yourself:
 
 ```sh
 cd formal
-./run.sh                              # all three models
+./run.sh                              # all six models
 proverif deniable_1to1_deniability.pv # or invoke ProVerif directly (expect "true")
 ```
 
@@ -32,8 +37,14 @@ Diffie-Hellman is modeled by a single commutativity equation, not X25519's small
 behavior. PQXDH (the post-quantum handshake) and the Double Ratchet's per-message healing beyond
 the first exchange are out of scope. Deniability is proved **offline** only, matching the spec's
 own stated limit — online (interactive, real-time-colluding-judge) deniability is weaker and not
-claimed. These models prove the *ceremonies as specified* are sound; they don't prove any
-particular line of Rust is bug-free.
+claimed. The MLS model abstracts the real RFC 9420 key schedule to two one-way KDFs over a bounded
+3-epoch, single-removal instance — not arbitrary membership sequences. The Key-Transparency model
+abstracts a Merkle tree to a hash chain and tree position to a predecessor pointer. The mixnet
+model covers exactly one honest hop against a passive observer — not active attacks, multi-hop
+paths, or colluding hops (see [privacy.md](privacy.md) for that residual). These models prove the
+*ceremonies and primitives as specified* are sound; they don't prove any particular line of Rust
+is bug-free. See [`formal/README.md`](../formal/README.md) for the full, file-by-file property
+statements and every one of these limitations spelled out precisely.
 
 ## Fuzzing
 
@@ -73,14 +84,19 @@ ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the sam
 machine-readable data (`suite.json`), and byte-exact known-answer vectors
 (`vectors/vectors.json`).
 
-- **91 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
+- **104 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
   Clients, Auth).
-- **39 are byte-runnable today** — 33 backed by a committed vector, 6 self-contained CBOR-reject
-  cases — covering content addressing, the 8-word key-name checksum, safety numbers, Ed25519
-  sign/verify (with two RFC 8032 cross-checks), canonical CBOR of the four core signed objects,
-  suite fail-closed behavior, and the MOTE content-address + signature validation order.
-- **45 carry an exact construction recipe and expected error code** for subsystems not yet
-  vectored (mixnet, MLS, gateway, auth) — deferred honestly, not silently skipped.
+- **68 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
+  the 8-word key-name checksum, safety numbers, Ed25519 sign/verify with two RFC 8032
+  cross-checks, canonical CBOR of the four core signed objects, suite fail-closed behavior, and
+  the MOTE content-address + signature validation order) plus one more exercised directly against
+  `dmtap-core`'s public API. Zero failures.
+- **36 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
+  "no Profile/avatar module in `dmtap-core`," "TOFU-pin comparison is caller policy," "no
+  auth-assertion module yet") rather than a silent gap — covering mixnet freshness/replay,
+  MLS/group handshake bytes, key-transparency quorum, device attestation, gateway/DKIM-delegation,
+  auth-assertion, and push-subscription cases not yet reduced to a fixed-input known-answer test
+  in this crate. `cargo run -p conformance-runner` prints every skip and its reason verbatim.
 
 [`crates/conformance-runner`](../crates/conformance-runner) is the reference runner: it drives the
 vector-dispatch loop plus a **drift guard** that fails the build if the committed vectors and what
@@ -110,6 +126,21 @@ suite can only ratchet up, never down; a `private`-tier message that can't build
 its profile's bar is held and retried, never silently sent over the weaker `fast` tier; a cold
 sender's failed anti-abuse challenge gets silently dropped or deferred to a requests area, and is
 never acked (which would falsely confirm delivery to an unproven sender).
+
+This extends past the crypto layer into the two components that talk to hostile networks
+directly:
+
+- **The node's delivery state survives restart without weakening.** The per-contact suite
+  high-water-mark and the outbound retry journal (spec §19.3.3, §4.4.2) are durably persisted by
+  the `node/src/journal.rs` seam (a `FileJournal`, with a `NullJournal` no-op default for a node
+  built without persistence) — a restarted node reloads the same anti-rollback/anti-abuse state
+  rather than starting over at a weaker baseline an attacker could force by causing a crash.
+- **The gateway fails closed against SSRF.** `envoir-gateway`'s outbound MX/MTA-STS resolution
+  (`gateway/src/outbound_tcp.rs`) refuses to connect to a destination that resolves only to a
+  loopback, private, link-local, or cloud-metadata address (including an IPv4-mapped IPv6 address
+  judged by its embedded v4 form) — otherwise a legacy sender could aim the gateway at the
+  operator's own internal network. An explicitly configured pinned address is the one deliberate,
+  documented exemption.
 
 ## The mixnet anonymity simulator
 

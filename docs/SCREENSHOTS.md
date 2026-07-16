@@ -36,13 +36,19 @@ up, including on error or Ctrl-C.
 
 | App | Files |
 |---|---|
-| client | `onboarding-safety.png`\*, `onboarding-identity.png`\*, `mail-dark.png`, `mail-light.png`, `path-graph.png`, `chat-dark.png`, `chat-light.png`, `files-dark.png`, `files-light.png`, `identity-dark.png`, `identity-light.png` |
+| client | `onboarding-safety.png`\*, `onboarding-identity.png`\*, `mail-dark.png`, `mail-light.png`, `mail-mobile.png`, `path-graph.png`, `chat-dark.png`, `chat-light.png`, `chat-mobile.png`, `calendar-dark.png`, `calendar-light.png`, `calendar-mobile.png`, `contacts-dark.png`, `contacts-mobile.png`, `files-dark.png`, `files-light.png`, `identity-dark.png`, `identity-light.png`, `identity-mobile.png` |
 | console | `console-overview-dark.png`, `console-overview-light.png`, `console-members-dark.png`, `console-directory-dark.png`, `console-billing-dark.png` |
 | superadmin | `superadmin-overview-dark.png`, `superadmin-overview-light.png`, `superadmin-fleet-dark.png`, `superadmin-abuse-dark.png`, `superadmin-billing-dark.png` |
 | status | `status-operational.png`, `status-light.png`, `status-degraded.png`, `status-outage.png`, `status-user.png` |
 | site | `landing-hero.png`, `landing-hero-light.png` |
 
 \* non-required "bonus" shots.
+
+Note: the `-mobile.png` shots (a narrow-viewport capture of the same view) and the `calendar-*` /
+`contacts-*` shots document the client's Calendar/Contacts parity and its responsive layout down
+to phone width; `docs/screenshotter/apps/client.mjs` is still being extended with the capture
+calls for these views, so re-running `npm run screenshotter` today will not yet regenerate them —
+until then, treat the images already committed in `docs/img/` as current.
 
 ## Environment overrides
 

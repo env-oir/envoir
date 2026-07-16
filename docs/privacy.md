@@ -135,8 +135,8 @@ any repudiation protocol; no cryptography changes that.
 
 ## Further reading
 
-- [security.md](security.md) — formal (ProVerif) proofs of the two hardest ceremonies, fuzzing,
-  conformance, and the audit gate.
+- [security.md](security.md) — six formal (ProVerif) models covering the hardest ceremonies and
+  the composed group/transparency/mixing primitives, fuzzing, conformance, and the audit gate.
 - [protocol.md](protocol.md) — the full DMTAP protocol this page summarizes.
 - The spec itself: `06-privacy.md` in the sibling `dmtap` repository, especially §6.9 (falsifiable
   security-property table) and §6.10 (the netsim measurements).

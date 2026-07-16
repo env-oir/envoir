@@ -109,7 +109,7 @@ needs a way to rate-limit strangers without deanonymizing them. DMTAP's answer (
 **anonymous but accountable**: ARC-style Privacy Pass rate-limit tokens, a memory-hard
 proof-of-work fallback, and an optional, real-money **postage** stamp that also funds gateway
 operators. None of this is a cryptocurrency — see the
-[FAQ](faq.md#is-there-a-token-or-cryptocurrency).
+[FAQ](faq.md).
 
 ## Operators and the seam
 

@@ -45,10 +45,12 @@ perfectly — hardened against a *global active* one. Read [privacy.md](privacy.
 quantified version of this answer; don't trust a shorter one, including this one.
 
 **Is this audited?**
-Not yet. Formal (ProVerif) proofs exist for the two hardest cryptographic ceremonies, every wire
-decoder is fuzzed, and a 91-case conformance suite exists — but none of that substitutes for the
-independent external audit the project treats as a hard gate before any production deployment.
-See [security.md](security.md).
+Not yet. Six machine-checked ProVerif models cover the deniable-1:1 handshake, DMTAP-Auth
+sign-in, MLS group keys, key-transparency append-only logs, and mixnet unlinkability; every wire
+decoder is fuzzed; a 104-case conformance suite exists (68 executing and passing today); and
+`cargo test --workspace` runs 585 passing tests — but none of that substitutes for the independent
+external audit the project treats as a hard gate before any production deployment. See
+[security.md](security.md).
 
 **What license is this under?**
 MIT (see [`LICENSE-MIT`](../LICENSE-MIT)). Apache-2.0 dual-licensing (for its explicit patent

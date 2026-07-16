@@ -21,7 +21,7 @@ anything chain-like at all is an optional, off-by-default self-sovereign naming 
 [protocol.md](protocol.md#naming--key-transparency)) — nothing else depends on it. Anti-abuse for
 cold contact instead uses anonymous Privacy-Pass-style rate-limit tokens, proof-of-work, and an
 optional real-money postage stamp — never a coin. See
-[FAQ](faq.md#is-there-a-token-or-cryptocurrency).
+[FAQ](faq.md).
 
 ## What you get
 
@@ -29,14 +29,17 @@ optional real-money postage stamp — never a coin. See
 |---|---|---|
 | Mail | Three-pane inbox, threading, labels, snooze, scheduled/undo send, per-message transport-path provenance | [features/mail.md](features/mail.md) |
 | Chat | DMs (deniable X3DH + Double Ratchet) and channels (signed MLS groups) on the same MOTE substrate | [features/chat.md](features/chat.md) |
+| Calendar | Month/week/day + agenda, recurring events, peer-to-peer meeting invitations + RSVP | [features/calendar.md](features/calendar.md) |
+| Contacts | Per-contact key verification — TOFU-pinned vs. verified via safety number — not just a name and photo | [features/contacts.md](features/contacts.md) |
 | Files | Content-addressed, end-to-end encrypted, any size; a shared folder *is* a group | [features/files.md](features/files.md) |
-| Identity | Safety numbers, linked devices, recovery phrase, decentralized login (DMTAP-Auth) | [features/identity.md](features/identity.md) |
+| Identity | Safety numbers, avatars/profile, linked devices, recovery phrase, decentralized login (DMTAP-Auth) | [features/identity.md](features/identity.md) |
 | Transport provenance | Know which trust boundaries a message crossed, without weakening the mixnet | [features/transport-traceability.md](features/transport-traceability.md) |
+| PWA & mobile | Installable app, offline app-shell load, content-free Web Push wake-pings, responsive to ~360px | [pwa-and-push.md](pwa-and-push.md) |
 | Self-hosting | Run your own domain, node, and optionally your own gateway — for $0 | [features/self-hosting.md](features/self-hosting.md) |
 
 Calendar and contacts ride the same substrate as additional MOTE kinds (JSCalendar/JSContact over
-JMAP, with CalDAV/CardDAV compatibility) — see [protocol.md](protocol.md#messaging--files) and
-[features/mail.md](features/mail.md#calendar--contacts).
+JMAP, with CalDAV/CardDAV compatibility) — see [protocol.md](protocol.md#messaging--files),
+[features/calendar.md](features/calendar.md), and [features/contacts.md](features/contacts.md).
 
 ## Map of the docs
 
@@ -44,8 +47,9 @@ JMAP, with CalDAV/CardDAV compatibility) — see [protocol.md](protocol.md#messa
 - [Architecture](architecture.md) — client ↔ node ↔ mesh/mixnet ↔ gateway, and where an operator's billing seam sits.
 - [Privacy & threat model](privacy.md) — the honest guarantee, stated as a falsifiable claim with its residual.
 - [Protocol](protocol.md) — DMTAP itself: MOTE, naming, MLS, mixnet, DMTAP-Auth, the gateway.
-- [Security](security.md) — formal models, fuzzing, conformance suite, downgrade tests, the audit gate.
-- Features: [Mail](features/mail.md) · [Chat](features/chat.md) · [Files](features/files.md) · [Identity](features/identity.md) · [Transport provenance](features/transport-traceability.md) · [Self-hosting](features/self-hosting.md)
+- [Security](security.md) — 6 formal ProVerif models, fuzzing, conformance suite, downgrade tests, the audit gate.
+- [PWA & push](pwa-and-push.md) — installable/offline app shell, content-free Web Push, the honest iOS/APNs residual.
+- Features: [Mail](features/mail.md) · [Chat](features/chat.md) · [Calendar](features/calendar.md) · [Contacts](features/contacts.md) · [Files](features/files.md) · [Identity](features/identity.md) · [Transport provenance](features/transport-traceability.md) · [Self-hosting](features/self-hosting.md)
 - [FAQ](faq.md)
 - [Contributing](contributing.md)
 - [Roadmap](roadmap.md) — what's real today vs. planned.
@@ -62,7 +66,7 @@ JMAP, with CalDAV/CardDAV compatibility) — see [protocol.md](protocol.md#messa
 | `crates/dmtap-mls` | MLS group messaging (handshake ordering, committer) |
 | `crates/dmtap-mail` | IMAP/POP3/SMTP-submission/JMAP client-protocol servers |
 | `crates/dmtap-naming` | Naming/addressing + key transparency |
-| `crates/dmtap-p2p` | Mesh transport |
+| `crates/dmtap-p2p` | The real libp2p mesh transport (TCP/QUIC+Noise+Yamux, Kademlia, Circuit Relay v2 + DCUtR), proven on loopback — not yet the node binary's default transport |
 | `crates/dmtap-seam` | The operator seam — the contract a hosted operator implements |
 | `crates/conformance-runner` | Runs the implementation against the spec's conformance catalog |
 | `crates/netsim`, `crates/downgrade-tests` | Mixnet anonymity simulation + downgrade/fail-closed regression suite |

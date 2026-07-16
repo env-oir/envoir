@@ -37,16 +37,17 @@ never a coin.
 |---|---|
 | **Mail** | Three-pane inbox, threading, labels, snooze, scheduled/undo send, per-message **transport-path provenance** |
 | **Chat** | DMs (deniable X3DH + Double Ratchet) and channels (signed MLS groups) on the same MOTE substrate |
-| **Calendar** | Month/week/day views, recurring events, peer-to-peer invitations + RSVP |
-| **Contacts** | Per-contact key verification — TOFU-pinned vs. verified via safety number |
+| **Calendar** | Month/week/day views + agenda, recurring events, meetings with invitees, peer-to-peer invitations + RSVP |
+| **Contacts** | Per-contact key verification — TOFU-pinned vs. verified via safety number — not just a name and photo |
 | **Files** | Content-addressed, end-to-end encrypted, any size; a shared folder *is* a group |
 | **Groups** | A group has an address (`team@envoir.org`); broadcast vs. channel, members + roles |
-| **Identity** | Safety number (words/digits/QR-grid), linked devices, signed-in apps, recovery phrase |
+| **Identity** | Safety number (words/digits/QR-grid), avatars/profile, linked devices, signed-in apps, recovery phrase |
+| **Installable & offline** | A PWA: home-screen install, offline app-shell load, content-free Web Push wake-pings |
 
 This repository is a **reference implementation / preview** — a real client compiles the Rust core
 to WASM and speaks to a real mesh; today's web client simulates the network (clearly labeled) so the
-whole protocol is demonstrable end to end in a browser. See [Security & honesty](#security--honesty)
-for exactly what's real.
+whole protocol is demonstrable end to end in a browser, installable and fully responsive down to
+phone width. See [Security & honesty](#security--honesty) for exactly what's real.
 
 ## Mail
 
@@ -58,6 +59,7 @@ gateway rather than pure-mesh.
 <p align="center">
   <img src="docs/img/mail-dark.png#gh-dark-mode-only" width="860" alt="Mail — dark theme">
   <img src="docs/img/mail-light.png#gh-light-mode-only" width="860" alt="Mail — light theme">
+  <img src="docs/img/mail-mobile.png" width="260" alt="Mail — responsive mobile view">
 </p>
 
 ## Chat
@@ -71,6 +73,32 @@ non-repudiable). Click the badge for the tradeoff, spelled out in full.
 <p align="center">
   <img src="docs/img/chat-dark.png#gh-dark-mode-only" width="860" alt="Chat — Deniable 1:1 badge, dark theme">
   <img src="docs/img/chat-light.png#gh-light-mode-only" width="860" alt="Chat — Deniable 1:1 badge, light theme">
+  <img src="docs/img/chat-mobile.png" width="260" alt="Chat — responsive mobile view">
+</p>
+
+## Calendar
+
+Month, week, and day views with an always-visible agenda rail, recurring events, and per-event
+reminders. Adding invitees turns an event into a **meeting**; invitations and RSVPs travel as
+peer-to-peer MOTEs — free/busy is a message, not a query against a central calendar server. See
+[docs/features/calendar.md](docs/features/calendar.md).
+
+<p align="center">
+  <img src="docs/img/calendar-dark.png#gh-dark-mode-only" width="860" alt="Calendar — month view, dark theme">
+  <img src="docs/img/calendar-light.png#gh-light-mode-only" width="860" alt="Calendar — month view, light theme">
+  <img src="docs/img/calendar-mobile.png" width="260" alt="Calendar — responsive mobile view">
+</p>
+
+## Contacts
+
+An address book where the **key**, not the name or photo, is what's being verified: every card
+shows **verified** (safety-number checked), **TOFU-pinned**, or **legacy**, plus a gradient
+avatar, opt-in Gravatar-style picture, or key-derived identicon. See
+[docs/features/contacts.md](docs/features/contacts.md).
+
+<p align="center">
+  <img src="docs/img/contacts-dark.png" width="860" alt="Contacts — cards with key-verification status">
+  <img src="docs/img/contacts-mobile.png" width="260" alt="Contacts — responsive mobile view">
 </p>
 
 ## Transport-path provenance
@@ -98,29 +126,45 @@ cap. A shared folder is simply a **group**: drop a file, and everyone with membe
 
 Your key is the security boundary; the address is just a pointer to it. The Identity view surfaces
 the **safety number** (words, digits, and a scannable grid, derived deterministically from your
-public key alone), your linked devices, your signed-in apps, and recovery.
+public key alone), your **avatar and profile** (a public URL, an opt-in Gravatar-style picture, or
+a deterministic key-identicon as the fallback — never something that changes your safety number),
+your linked devices, your signed-in apps, and recovery. See
+[docs/features/identity.md](docs/features/identity.md#avatars-and-profile).
 
 <p align="center">
   <img src="docs/img/identity-dark.png" width="860" alt="Identity — safety number, devices, signed-in apps">
+  <img src="docs/img/identity-mobile.png" width="260" alt="Identity — responsive mobile view">
 </p>
+
+## Installable, offline, and mobile
+
+The client is a real **Progressive Web App**: `manifest.webmanifest` + a service worker that
+precaches the app shell so it opens even offline, an install affordance wired to the browser's own
+install prompt, and **content-free Web Push** — a wake-up ping whose payload is deliberately never
+read, so it can only ever mean "your node has something new, go sync," never who or what. The
+whole UI is responsive down to ~360px phones, with a bottom tab bar below 680px. See
+[docs/pwa-and-push.md](docs/pwa-and-push.md) for the full model, including its one disclosed
+residual: on iOS, Apple's own **APNs** unavoidably sits in the delivery path for *any* web app's
+push, Envoir included — the ping stays content-free through it, but its existence and timing are
+visible to Apple as the platform operator, exactly as for any other web app.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     subgraph You["Your device"]
-        Client["Web client (client/)<br/>mail · chat · files · identity<br/>no build step"]
+        Client["Web client (client/)<br/>mail · chat · calendar · contacts<br/>files · identity · PWA, no build step"]
     end
 
     subgraph Node["Your node — envoir-node"]
         Identity_["identity + safety number"]
         Mailbox["MOTE store / mailbox"]
         Messaging["messaging<br/>deniable 1:1 + MLS groups"]
-        Journal["outbound retry journal"]
+        Journal["outbound retry journal<br/>restart-safe anti-rollback state"]
     end
 
     subgraph Mesh["P2P mesh + mixnet"]
-        Transport["libp2p: Kad · Relay · DCUtR · mDNS"]
+        Transport["libp2p (dmtap-p2p): Kad · Circuit Relay v2 · DCUtR<br/>proven on loopback, not yet the node's default"]
         Mix["entry-mix → mix-α → mix-β → exit-mix"]
     end
 
@@ -162,11 +206,11 @@ functional standalone — the operator seam and any hosted operator are optional
 | [`crates/dmtap-mls`](crates/dmtap-mls) | MLS group messaging |
 | [`crates/dmtap-mail`](crates/dmtap-mail) | Client protocol servers: IMAP/POP3/SMTP-submission, JMAP, autodiscovery |
 | [`crates/dmtap-naming`](crates/dmtap-naming) | Naming/addressing + key-transparency |
-| [`crates/dmtap-p2p`](crates/dmtap-p2p) | Mesh transport (libp2p) |
+| [`crates/dmtap-p2p`](crates/dmtap-p2p) | The real libp2p mesh transport (TCP/QUIC+Noise+Yamux, Kademlia, Circuit Relay v2 + DCUtR), proven on loopback — not yet the node binary's default |
 | [`crates/dmtap-seam`](crates/dmtap-seam) | The **operator seam**: the contract a hosted operator implements |
 | [`crates/conformance-runner`](crates/conformance-runner) | Runs the implementation against the spec's conformance catalog |
 | [`crates/netsim`](crates/netsim), [`crates/downgrade-tests`](crates/downgrade-tests) | Network simulation + downgrade-attack regressions |
-| [`client/`](client) | Web client — mail, chat, calendar, contacts, files, groups, identity |
+| [`client/`](client) | Web client — mail, chat, calendar, contacts, files, groups, identity; installable PWA with offline shell + push |
 | [`console/`](console) | Open-source **domain admin** console (org-level, never sees member keys) |
 | [`status/`](status) | Public + personal status page |
 | [`superadmin/`](superadmin) | Fleet operator console — content-blind by construction |
@@ -204,6 +248,15 @@ python3 -m http.server 8095
 
 `console/`, `status/`, `superadmin/`, and `site/` each run the same way — see their own `README.md`.
 
+## Self-hosting
+
+Self-hosting is not a crippled tier — every protocol feature, client, and privacy guarantee is
+available with no operator at all; a hosted operator only ever sells convenience (see
+[docs/features/self-hosting.md](docs/features/self-hosting.md)). Beyond the `cargo run` commands
+above, a `deploy/` directory (reference Docker/compose and process-supervision examples for
+`envoir-node` and `envoir-gateway`) is being added alongside this documentation pass — check this
+repo's root for it, and see its own `README.md` once merged for the exact steps.
+
 ## Spec
 
 The normative specification is **not** in this repository — it lives in the sibling
@@ -218,14 +271,21 @@ against the spec's own conformance catalog.
 Envoir's privacy model is **honest, not absolute**: recovery is a first-class, versioned, signed
 policy (spec §1.4) built from phrase, linked-device, and Shamir'd social-guardian factors that the
 owner composes and rotates — never a silent key-escrow backdoor. (The web client's onboarding shows
-a 12-word demo phrase; a real client uses the full SLIP-0039 word list.) The two security-critical
-messaging ceremonies (deniable 1:1 and DMTAP-Auth sign-in) have machine-checked **ProVerif symbolic
-models** in [`formal/`](formal) (secrecy, mutual authentication, forward secrecy, deniability,
-replay/origin-binding — see its README for exact property statements and honest limitations); the
-wire-format decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); and
-[`integration/`](integration) includes dedicated adversarial tests. None of this substitutes for an
-**independent external security audit**, which has not yet happened and is the gate before any
-production deployment. Treat everything here as pre-alpha.
+a 12-word demo phrase; a real client uses the full SLIP-0039 word list.) Six ceremonies and
+composed primitives — the deniable 1:1 handshake and its offline deniability, DMTAP-Auth sign-in,
+the MLS group key schedule, key-transparency append-only logs, and mixnet unlinkability — have
+machine-checked **ProVerif symbolic models** in [`formal/`](formal) (secrecy, mutual
+authentication, forward secrecy, deniability, replay/origin-binding, post-compromise security,
+inclusion/no-rollback/split-view soundness — see its README for exact property statements and
+honest limitations); the wire-format
+decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **104-case conformance
+suite** runs 68 cases to a pass today (0 failures, the other 36 each skipped with a documented
+reason) via [`crates/conformance-runner`](crates/conformance-runner); the gateway fails closed
+against **SSRF** on its outbound DNS/MX resolution; the node's anti-rollback/anti-abuse state
+survives a restart instead of resetting to a weaker baseline; and `cargo test --workspace` runs
+**585 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None
+of this substitutes for an **independent external security audit**, which has not yet happened and
+is the gate before any production deployment. Treat everything here as pre-alpha.
 
 ## License
 

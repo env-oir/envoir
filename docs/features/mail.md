@@ -54,13 +54,12 @@ deferred as transport concerns — see the crate's own capability matrix in
 
 Not separate central services — additional MOTE kinds stored on the same node, end-to-end
 encrypted, synced across your device cluster, and shared/invited via the same MLS groups as
-everything else:
-
-- **Native** — events and contacts as JSCalendar (RFC 8984) and JSContact (RFC 9553), synced via
-  JMAP alongside mail. Invitations and RSVPs ride as MOTEs between participants — free/busy and
-  scheduling are messages, not a server query.
-- **Compatibility** — CalDAV (RFC 4791) and CardDAV (RFC 6352) servers project the same store as
-  iCalendar/vCard for Apple Calendar/Contacts, Thunderbird, and DAVx⁵.
+everything else: events as JSCalendar (RFC 8984) and contacts as JSContact (RFC 9553), both synced
+via JMAP alongside mail, with CalDAV (RFC 4791) / CardDAV (RFC 6352) compatibility servers for
+Apple Calendar/Contacts, Thunderbird, and DAVx⁵. Invitations and RSVPs ride as MOTEs between
+participants — free/busy and scheduling are messages, not a server query. See
+[features/calendar.md](calendar.md) and [features/contacts.md](contacts.md) for the full feature
+set of each, now at parity with Mail and Chat in the web client.
 
 ## Try it
 
