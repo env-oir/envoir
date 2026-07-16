@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+#
+# Envoir node — reference DMTAP client (identity, MOTE store, mesh, §8 mail projection).
+# See deploy/README.md for the honest status of what `envoir-node` actually does at runtime
+# (this is a pre-alpha reference implementation, not a production mail server).
+#
+# BUILD CONTEXT: this Dockerfile expects the *workspace root* (the repo root, one level above
+# this `deploy/` directory) as its build context, because the crate lives in a Cargo workspace
+# and needs its sibling members to resolve. See docker-compose.yml (`context: ..`) or, to build
+# by hand from the repo root:
+#
+#   docker build -f deploy/Dockerfile.node -t envoir-node .
+#
+# Verified against the real workspace: `cargo build --release -p envoir-node` builds the
+# `envoir-node` binary (node/src/main.rs) with no invented flags or features.
+#
+# Builder pin: the crate manifests declare rust-version = "1.75", but with no Cargo.lock
+# committed upstream, cargo resolves the newest semver-compatible transitive deps at build
+# time — and as of this writing that pulls in a `zeroize_derive` version requiring the
+# `edition2024` feature, which only stabilized in Rust 1.85. 1.90-slim-bookworm is pinned here
+# because it was verified (via `docker build`) to compile the workspace; 1.82-slim-bookworm was
+# tried first and failed with exactly that edition2024 error. Generate and commit your own
+# Cargo.lock for a reproducible, possibly-older-toolchain-compatible build.
+
+FROM rust:1.90-slim-bookworm AS builder
+WORKDIR /src
+
+# Copy only the Cargo workspace members envoir-node's build graph needs. The root Cargo.toml
+# declares `members = ["node", "gateway", "integration", "crates/*"]`; ALL of those paths must
+# exist for Cargo to parse the workspace manifest at all (even though `-p envoir-node` only
+# *compiles* node's own dependency subset: dmtap-core, dmtap-mail, dmtap-mls, dmtap-naming,
+# dmtap-auth, dmtap-deniable). `integration` and the unused crates (dmtap-p2p, dmtap-seam,
+# conformance-runner, downgrade-tests, netsim) are copied for that manifest-resolution reason,
+# not because their code is built into this image.
+COPY Cargo.toml ./Cargo.toml
+COPY node ./node
+COPY gateway ./gateway
+COPY crates ./crates
+COPY integration ./integration
+
+# No Cargo.lock is committed upstream (repo .gitignore excludes it), so this is a fresh
+# dependency resolution at build time, not a pinned/reproducible one — see deploy/README.md.
+RUN cargo build --release -p envoir-node
+
+# ---------------------------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+# envoir-node's actual runtime dependencies, verified against the crates it links:
+#   - rustls (ring provider) + embedded webpki-roots for the mail-client TLS surfaces pulled in
+#     via dmtap-mail's "net" feature — no system OpenSSL/ca-certificates needed.
+#   - the raw-socket DNS/SMTP code lives in the *gateway*, not the node.
+# So the runtime image needs nothing beyond glibc + libgcc, both already in debian-slim.
+RUN groupadd --system --gid 10001 envoir \
+    && useradd --system --uid 10001 --gid envoir --home-dir /data --shell /usr/sbin/nologin envoir \
+    && mkdir -p /data \
+    && chown -R envoir:envoir /data
+
+COPY --from=builder /src/target/release/envoir-node /usr/local/bin/envoir-node
+
+USER envoir
+WORKDIR /data
+
+# IMAP 1143, POP3 1110, SMTP-submission 1587 — the fixed ports `serve-mail` binds (node/src/main.rs).
+# IMPORTANT (see deploy/README.md): serve-mail hard-codes these to bind on 127.0.0.1 inside the
+# process, so a plain `-p`/`ports:` publish will NOT make them reachable from outside the
+# container (Docker's port-publish DNATs to the container's external interface, not its loopback).
+# EXPOSE is documentation of intent, not a claim that publishing works out of the box.
+EXPOSE 1143 1110 1587
+
+ENTRYPOINT ["/usr/local/bin/envoir-node"]
+# `serve-mail` is the only subcommand that behaves like a long-running server (it blocks forever);
+# `init`, `run`, and `version` each do one thing and exit — invoke them with
+# `docker compose run --rm node <subcommand>` instead of relying on the default CMD.
+CMD ["serve-mail"]
