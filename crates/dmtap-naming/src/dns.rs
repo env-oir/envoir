@@ -355,4 +355,109 @@ mod tests {
             Err(ResolveError::MalformedDns(_))
         ));
     }
+
+    // ── Adversarial / oversized input — fail closed, never panic (§3.2) ──────────────────────────
+
+    #[test]
+    fn oversized_classical_ik_rejected() {
+        // A 64-byte "ik" under the classical suite (which requires exactly 32) must fail closed,
+        // symmetric with the already-covered truncated-key case.
+        let txt = format!(
+            "v=dmtap1; suite=1; ik={}; id={}; kt=x; keypkgs=y",
+            base64url::encode(&[7u8; 64]),
+            base64url::encode(sample_id().as_bytes()),
+        );
+        assert!(matches!(DmtapTxtRecord::parse(&txt), Err(ResolveError::MalformedDns(_))));
+    }
+
+    #[test]
+    fn oversized_kt_anchor_list_parses_without_panic() {
+        // A TXT record advertising a large multi-log quorum set must not panic or hang — DNS is an
+        // attacker-observable input and a resolver must stay fail-closed-but-alive under a
+        // pathological (if not protocol-violating) record shape.
+        let many_anchors: Vec<String> =
+            (0..5_000).map(|i| format!("https://kt-{i}.example/log")).collect();
+        let txt = format!(
+            "v=dmtap1; suite=1; ik={}; id={}; kt={}; keypkgs=/kp",
+            base64url::encode(&[7u8; 32]),
+            base64url::encode(sample_id().as_bytes()),
+            many_anchors.join(","),
+        );
+        let r = DmtapTxtRecord::parse(&txt).expect("a large but well-formed record still parses");
+        assert_eq!(r.kt.len(), 5_000);
+    }
+
+    #[test]
+    fn oversized_keypkgs_locator_parses_without_panic() {
+        let huge_locator = "/mesh/kp/".to_string() + &"a".repeat(1_000_000);
+        let txt = format!(
+            "v=dmtap1; suite=1; ik={}; id={}; kt=https://kt/log; keypkgs={huge_locator}",
+            base64url::encode(&[7u8; 32]),
+            base64url::encode(sample_id().as_bytes()),
+        );
+        let r = DmtapTxtRecord::parse(&txt).expect("a huge (but syntactically valid) value parses");
+        assert_eq!(r.keypkgs, huge_locator);
+    }
+
+    #[test]
+    fn many_bogus_extra_fields_are_tolerated_without_panic() {
+        // Thousands of unknown `key=value` extras (forward-compatible DNS pointer, §3.2) must be
+        // ignored, not cause quadratic blowup or a panic.
+        let extras: String = (0..2_000).map(|i| format!("x{i}=v{i}; ")).collect();
+        let txt = format!(
+            "{extras}v=dmtap1; suite=1; ik={}; id={}; kt=https://kt/log; keypkgs=/kp",
+            base64url::encode(&[7u8; 32]),
+            base64url::encode(sample_id().as_bytes()),
+        );
+        let r = DmtapTxtRecord::parse(&txt).expect("unknown extras are ignored, not fatal");
+        assert_eq!(r.suite, 1);
+    }
+
+    #[test]
+    fn embedded_control_bytes_fail_closed_or_are_inert_never_panic() {
+        // A field value carrying stray control characters / an embedded NUL (still valid UTF-8,
+        // and thus a legal Rust &str an attacker-controlled DNS answer could carry) must not panic
+        // the parser — it is simply bad base64url and fails closed.
+        let txt = "v=dmtap1; suite=1; ik=not\0valid\nbase64; id=x; kt=x; keypkgs=y";
+        assert!(matches!(DmtapTxtRecord::parse(txt), Err(ResolveError::MalformedDns(_))));
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_txt_fail_closed_without_panic() {
+        assert!(matches!(DmtapTxtRecord::parse(""), Err(ResolveError::MalformedDns(_))));
+        assert!(matches!(DmtapTxtRecord::parse("   ;  ; \t"), Err(ResolveError::MalformedDns(_))));
+    }
+
+    #[test]
+    fn svcb_oversized_params_parse_without_panic() {
+        let many_params: String = (0..5_000).map(|i| format!(" p{i}=v{i}")).collect();
+        let svcb = format!("1 .{many_params}");
+        let r = DmtapSvcbRecord::parse(&svcb).expect("a large but well-formed SVCB still parses");
+        assert_eq!(r.params.len(), 5_000);
+    }
+
+    #[test]
+    fn svcb_unterminated_quote_and_garbage_do_not_panic() {
+        // An unterminated quote, stray parens, and empty/garbage tokens must all fail gracefully
+        // (either a clean parse of best-effort tokens, or a typed error) — never panic.
+        for garbage in [
+            r#"1 . ( kt="unterminated )"#,
+            "1 . ((( )))",
+            "1 . =====",
+            ") ( 1 . kt=x",
+            "",
+            "   ",
+            "1",
+        ] {
+            let _ = DmtapSvcbRecord::parse(garbage); // must not panic regardless of Ok/Err
+        }
+    }
+
+    #[test]
+    fn svcb_extremely_long_single_token_does_not_panic() {
+        let long_target = "a".repeat(500_000);
+        let svcb = format!("1 {long_target}");
+        let r = DmtapSvcbRecord::parse(&svcb).expect("a long target token still parses");
+        assert_eq!(r.target.len(), 500_000);
+    }
 }

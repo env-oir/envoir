@@ -432,6 +432,48 @@ mod tests {
     }
 
     #[test]
+    fn quorum_treats_a_stale_sth_as_no_attestation_not_an_error() {
+        // §3.5.2(a): a stale STH must count as if that log had not attested at all — it should
+        // never surface as ERR_KT_STH_STALE from inside a quorum check, only ever fold into
+        // ERR_KT_LOG_QUORUM_UNMET if too many logs end up excluded this way.
+        let name = "hank@example.com";
+        let (id, txt) = make_identity(name, 8, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+
+        let build = || {
+            let mut r = InMemoryResolver::new(NOW).with_quorum().with_freshness(3_600_000);
+            r.set_txt("hank._dmtap.example.com", &txt);
+            r.publish_identity(id.clone());
+            r
+        };
+
+        // 2 fresh + 1 stale: the stale log is excluded, but 2/3 is still a strict majority.
+        let mut r = build();
+        for s in 0..2u8 {
+            let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[80 + s; 32]));
+            log.append_identity(name, &id).unwrap();
+            log.set_issued_at(NOW); // fresh relative to the verifier's NOW
+            r.pin_log(log);
+        }
+        let mut stale = InMemoryKtLog::new(IdentityKey::from_seed(&[82; 32]));
+        stale.append_identity(name, &id).unwrap();
+        stale.set_issued_at(0); // far in the past — outside the 1h window
+        r.pin_log(stale);
+        let res = r.resolve(name).expect("2 fresh of 3 is still a strict majority");
+        assert_eq!(res.attested_by.len(), 2, "the stale log does not count toward the quorum");
+
+        // All 3 stale: every log is excluded as "no attestation" -> sub-quorum, fail closed. The
+        // error is the QUORUM failure, not a per-log staleness error — staleness is folded away.
+        let mut r2 = build();
+        for s in 0..3u8 {
+            let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[90 + s; 32]));
+            log.append_identity(name, &id).unwrap();
+            log.set_issued_at(0);
+            r2.pin_log(log);
+        }
+        assert_eq!(r2.resolve(name), Err(ResolveError::KtQuorumUnmet));
+    }
+
+    #[test]
     fn stale_sth_rejected_when_freshness_enforced() {
         let name = "fred@example.com";
         let (id, txt) = make_identity(name, 6, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));

@@ -86,6 +86,34 @@ fn audit_path(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     }
 }
 
+/// RFC 6962 `SUBPROOF(m, D, b)` for a consistency proof (§18.4.11): the audit path proving the
+/// first `m` leaves of `leaves` are a genuine prefix. `b` tracks whether the recursion is still on
+/// the exact boundary subtree (an optimization RFC 6962 uses to omit a redundant hash there).
+/// Ported verbatim from the identical fold this crate's `InclusionProof` verification already
+/// exercises — same node/leaf hashing, so a consistency proof folds under exactly the same rules
+/// an inclusion proof does.
+fn subproof(m: usize, leaves: &[[u8; 32]], b: bool) -> Vec<[u8; 32]> {
+    let n = leaves.len();
+    if m == n {
+        if b {
+            Vec::new()
+        } else {
+            vec![mth(leaves)]
+        }
+    } else {
+        let k = split_point(n);
+        if m <= k {
+            let mut p = subproof(m, &leaves[..k], b);
+            p.push(mth(&leaves[k..]));
+            p
+        } else {
+            let mut p = subproof(m - k, &leaves[k..], false);
+            p.push(mth(&leaves[..k]));
+            p
+        }
+    }
+}
+
 /// Verify an RFC 6962 inclusion proof against an STH `root_hash` (spec §18.4.10). Folds
 /// `proof.leaf_hash` with `proof.audit_path` using the node rule and checks it reconstructs
 /// `root` at exactly `proof.tree_size`. This is the arithmetic [`InclusionProof`] carries but
@@ -184,6 +212,21 @@ impl MerkleTree {
         }
         Some(audit_path(idx, &self.leaves).into_iter().map(as_content_id).collect())
     }
+
+    /// The RFC 6962 consistency-proof nodes proving the current tree extends its own prefix of
+    /// size `first` (§18.4.11, §3.5.2(a)/(d)): the append-only evidence a log presents between two
+    /// STHs it issued at different sizes. `None` if `first == 0` or `first` exceeds the current
+    /// size — a proof against a nonexistent prefix is meaningless (an empty path for `first ==
+    /// size`, the trivial no-growth case).
+    pub fn consistency_path(&self, first: u64) -> Option<Vec<ContentId>> {
+        let m = first as usize;
+        let n = self.leaves.len();
+        if m == 0 || m > n {
+            return None;
+        }
+        let path = if m == n { Vec::new() } else { subproof(m, &self.leaves, true) };
+        Some(path.into_iter().map(as_content_id).collect())
+    }
 }
 
 #[cfg(test)]
@@ -279,5 +322,26 @@ mod tests {
             audit_path: vec![],
         };
         assert!(!verify_inclusion(&p, &t.root().unwrap()));
+    }
+
+    // ── consistency_path — the §18.4.11 append-only proof this crate's KT logs emit ─────────────
+
+    #[test]
+    fn consistency_path_bounds_and_trivial_cases() {
+        let mut t = MerkleTree::new();
+        for i in 0..6 {
+            t.append(&leaf(i)).unwrap();
+        }
+        // Nonexistent prefixes fail closed rather than yielding a plausible-looking empty proof.
+        assert_eq!(t.consistency_path(0), None, "first == 0 is not a valid prefix");
+        assert_eq!(t.consistency_path(7), None, "first > size is not a valid prefix");
+        // The trivial no-growth case: consistency with the tree's own current size is an empty
+        // path (there is nothing to prove — the trees are identical).
+        assert_eq!(t.consistency_path(6), Some(Vec::new()));
+        // A genuine growth prefix yields a nonempty path across non-power-of-two sizes too.
+        for first in 1u64..6 {
+            let path = t.consistency_path(first).expect("valid prefix must yield a path");
+            assert!(!path.is_empty(), "first={first} of size 6 needs at least one sibling hash");
+        }
     }
 }

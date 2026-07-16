@@ -4,8 +4,10 @@
 //! last-resort replay defense.
 
 use dmtap_core::deniable::{DeniableInit, DeniableMessage, DeniablePayload};
+use dmtap_core::id::ContentId;
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::{Headers, Kind};
+use dmtap_core::suite::Suite;
 
 use crate::{initiate, DeniableError, DeniableIdentity, DeniableResponder};
 
@@ -344,6 +346,92 @@ fn forged_idk_certification_is_rejected() {
     let (_a, mut init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
     init.idk_a[0] ^= 0xff; // certificate no longer matches the (mutated) idk_a
     assert!(matches!(bob.accept(&init), Err(DeniableError::BadCertification)));
+}
+
+#[test]
+fn exhausted_one_time_prekey_rejects_a_second_independent_initiator() {
+    // Two different, independent initiators both pick the SAME advertised one-time prekey (the
+    // published bundle only ever offers its first opk). Whichever arrives second must be
+    // rejected: a one-time prekey is never legitimately consumed twice, even by two honest
+    // parties racing on the same bundle — the concrete prekey-exhaustion failure mode.
+    let (alice, mut bob) = setup(1);
+    let carol = DeniableIdentity::new(ik(0xC0));
+
+    let (_a, init_a) =
+        initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "from alice")).unwrap();
+    let (_c, init_c) =
+        initiate(&carol, bob.bundle(), &payload(&carol.ik_public(), "from carol")).unwrap();
+    assert_eq!(init_a.opk_ref, init_c.opk_ref, "both reference the bundle's only opk");
+
+    // Alice arrives first and legitimately consumes the opk.
+    bob.accept(&init_a).expect("first arrival consumes the one-time prekey");
+    assert_eq!(bob.opks_remaining(), 0, "the prekey pool is now exhausted");
+
+    // Carol's independently-built init, referencing the now-spent opk, must be rejected rather
+    // than silently reusing key material that Alice's session already derived.
+    assert!(matches!(bob.accept(&init_c), Err(DeniableError::X3dhFailed)));
+}
+
+#[test]
+fn malformed_ephemeral_key_length_fails_closed() {
+    // `ek_a` carries no certification (only `idk_a` does), so a length-tampered value must be
+    // caught by the raw key-length check rather than slip past as a truncated/extended X25519
+    // point — fail closed, no panic.
+    let (alice, mut bob) = setup(2);
+    let (_a, mut init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
+    init.ek_a = vec![0u8; 10];
+    assert!(matches!(bob.accept(&init), Err(DeniableError::BadKeyLength)));
+}
+
+#[test]
+fn malformed_message_header_ratchet_key_fails_closed_no_panic() {
+    // The embedded first Double-Ratchet message's `dh` (ratchet public key) is likewise
+    // unauthenticated cleartext until the AEAD tag proves it; a wrong-length value must fail
+    // closed at the key-parsing boundary rather than panic deeper in the ratchet.
+    let (alice, mut bob) = setup(0); // last-resort path — no opk bookkeeping to entangle
+    let (_a, mut init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
+    init.msg.dh = vec![0u8; 5];
+    assert!(matches!(bob.accept(&init), Err(DeniableError::BadKeyLength)));
+}
+
+#[test]
+fn wrong_spk_ref_rejected() {
+    // `spk_ref` must name the responder's CURRENT signed prekey; a stale/wrong reference (a
+    // rotated or simply incorrect spk) is rejected before any DH is even attempted.
+    let (alice, mut bob) = setup(2);
+    let (_a, mut init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
+    init.spk_ref = ContentId::of(b"not the responder's real spk");
+    assert!(matches!(bob.accept(&init), Err(DeniableError::X3dhFailed)));
+}
+
+#[test]
+fn initiate_rejects_unimplemented_pq_suite_bundle() {
+    // Only the classical suite (0x01, X3DH) is implemented; a bundle claiming suite 0x02
+    // (PQXDH) MUST fail closed rather than silently falling back to classical DH, exactly as
+    // `dmtap-core` fails closed on the PQ identity suite (module doc).
+    let (_alice, bob) = setup(1);
+    let mut pq_bundle = bob.bundle().clone();
+    pq_bundle.suite = Suite::PqHybrid;
+    let carol = DeniableIdentity::new(ik(0xC1));
+    // `DeniableSession` (the `Ok` side) carries no `Debug` impl, so match instead of
+    // `unwrap_err()` (which would require `T: Debug` too).
+    let err = match initiate(&carol, &pq_bundle, &payload(&carol.ik_public(), "x")) {
+        Err(e) => e,
+        Ok(_) => panic!("a PQXDH (0x02) bundle must not be accepted by the classical-only client"),
+    };
+    assert!(matches!(err, DeniableError::UnsupportedSuite(0x02)));
+}
+
+#[test]
+fn accept_rejects_unimplemented_pq_suite_init() {
+    let (alice, mut bob) = setup(1);
+    let (_a, mut init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
+    init.suite = Suite::PqHybrid;
+    let err = match bob.accept(&init) {
+        Err(e) => e,
+        Ok(_) => panic!("a PQXDH (0x02) init must not be accepted by the classical-only responder"),
+    };
+    assert!(matches!(err, DeniableError::UnsupportedSuite(0x02)));
 }
 
 #[test]

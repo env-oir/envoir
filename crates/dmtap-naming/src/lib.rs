@@ -43,8 +43,8 @@ pub use dns::{DmtapSvcbRecord, DmtapTxtRecord};
 pub use error::ResolveError;
 pub use keypackage::{InMemoryKeyPackages, KeyPackageSource};
 pub use kt::{
-    check_freshness, detect_equivocation, verify_attestation, verify_quorum, InMemoryKtLog, KtLog,
-    KtProof, UnreachableLog,
+    check_freshness, detect_equivocation, verify_attestation, verify_quorum,
+    verify_sth_consistency, InMemoryKtLog, KtLog, KtProof, UnreachableLog,
 };
 pub use merkle::{verify_inclusion, MerkleTree};
 pub use resolver::{DmtapName, InMemoryResolver, KtMode, PinnedResolution, Resolver};

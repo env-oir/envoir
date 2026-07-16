@@ -18,7 +18,10 @@
 
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{Identity, IdentityKey};
-use dmtap_core::kt::{identity_leaf_hash, InclusionProof, SignedTreeHead};
+use dmtap_core::kt::{
+    identity_leaf_hash, verify_consistency as core_verify_consistency, ConsistencyProof,
+    InclusionProof, SignedTreeHead,
+};
 use dmtap_core::{Suite, TimestampMs};
 
 use crate::error::ResolveError;
@@ -96,6 +99,15 @@ impl InMemoryKtLog {
     pub fn sth(&self) -> SignedTreeHead {
         let root = self.tree.root().unwrap_or_else(|| ContentId::of(b""));
         SignedTreeHead::issue(&self.log_key, self.tree.size(), self.issued_at, root)
+    }
+
+    /// Build the RFC 6962 consistency proof (§18.4.11) that the log's *current* tree is an
+    /// append-only extension of its own earlier state at size `first` — the wire object a verifier
+    /// checks with [`verify_sth_consistency`]. `None` if `first` is not a valid earlier size (`0`
+    /// or greater than the current size).
+    pub fn consistency_proof(&self, first_size: u64) -> Option<ConsistencyProof> {
+        let proof_path = self.tree.consistency_path(first_size)?;
+        Some(ConsistencyProof { first_size, second_size: self.tree.size(), proof_path })
     }
 }
 
@@ -264,6 +276,28 @@ pub fn check_freshness(
     } else {
         Ok(())
     }
+}
+
+/// Verify that `new`'s tree is a genuine append-only extension of `old`'s, both signed by the
+/// **same pinned log** (§3.5.2(a)/(d)) — the append-only-violation evidence for equivocation. A
+/// consistency proof is only meaningful between two heads of one log, so both STH signatures are
+/// checked against `pinned_log_id` first (a proof relating an unpinned or mismatched log proves
+/// nothing about *this* log's history); the RFC 6962 fold itself is `dmtap-core`'s
+/// [`core_verify_consistency`]. Any failure — a forged/tampered proof path, a genuinely forked or
+/// non-extending history, or a tree that shrank — fails closed as `ERR_KT_STH_INCONSISTENT`
+/// (`0x0110`), HALT_ALERT: the log must be treated as equivocating, never silently trusted.
+pub fn verify_sth_consistency(
+    pinned_log_id: &[u8],
+    old: &SignedTreeHead,
+    new: &SignedTreeHead,
+    proof: &ConsistencyProof,
+) -> Result<(), ResolveError> {
+    if old.log_id.as_slice() != pinned_log_id || new.log_id.as_slice() != pinned_log_id {
+        return Err(ResolveError::KtProofInvalid);
+    }
+    old.verify().map_err(|_| ResolveError::KtProofInvalid)?;
+    new.verify().map_err(|_| ResolveError::KtProofInvalid)?;
+    core_verify_consistency(old, new, proof).map_err(|_| ResolveError::KtSthInconsistent)
 }
 
 #[cfg(test)]
@@ -464,5 +498,100 @@ mod tests {
             check_dns_matches_identity(&ik.public(), &ContentId::of(b"nope"), &id),
             Err(ResolveError::DnsIdentityMismatch(_))
         ));
+    }
+
+    // ── STH consistency (§18.4.11, §3.5.2(a)/(d)) — the append-only-violation / forged-proof and
+    // ── forked-history (split-view) rejections `ResolveError::KtSthInconsistent` exists for. ────
+
+    #[test]
+    fn consistency_accepted_for_honest_append_only_growth() {
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[70; 32]));
+        log.append_leaf(&ContentId::of(b"a"));
+        log.append_leaf(&ContentId::of(b"b"));
+        let old_sth = log.sth();
+        log.append_leaf(&ContentId::of(b"c"));
+        log.append_leaf(&ContentId::of(b"d"));
+        let new_sth = log.sth();
+        let proof = log.consistency_proof(old_sth.tree_size).expect("valid prefix");
+        assert!(verify_sth_consistency(&log.log_id(), &old_sth, &new_sth, &proof).is_ok());
+    }
+
+    #[test]
+    fn consistency_rejects_a_forged_proof_path() {
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[71; 32]));
+        log.append_leaf(&ContentId::of(b"a"));
+        log.append_leaf(&ContentId::of(b"b"));
+        let old_sth = log.sth();
+        log.append_leaf(&ContentId::of(b"c"));
+        log.append_leaf(&ContentId::of(b"d"));
+        let new_sth = log.sth();
+        let mut proof = log.consistency_proof(old_sth.tree_size).expect("valid prefix");
+        assert!(!proof.proof_path.is_empty(), "size 2 -> 4 needs at least one consistency node");
+        proof.proof_path[0] = ContentId::of(b"forged consistency node");
+        assert_eq!(
+            verify_sth_consistency(&log.log_id(), &old_sth, &new_sth, &proof),
+            Err(ResolveError::KtSthInconsistent)
+        );
+    }
+
+    #[test]
+    fn consistency_rejects_a_forked_non_extending_history() {
+        // The same log key signs an "old" head over [a, b], then presents a "new" larger tree
+        // whose first two leaves have been REWRITTEN ([a, X, c, d]) rather than genuinely extended
+        // ([a, b, c, d]) — a forked / non-append-only history, i.e. the log showed two different
+        // pasts under one signing identity (§3.5.2(d)). The consistency proof folds against the
+        // forked tree's own structure but must NOT reconstruct the honest old root.
+        let key = IdentityKey::from_seed(&[72; 32]);
+
+        let mut honest = InMemoryKtLog::new(IdentityKey::from_seed(&[72; 32]));
+        honest.append_leaf(&ContentId::of(b"a"));
+        honest.append_leaf(&ContentId::of(b"b"));
+        let old_sth = honest.sth(); // size 2, root over [a, b], signed by `key`
+
+        let mut forked = InMemoryKtLog::new(IdentityKey::from_seed(&[72; 32]));
+        forked.append_leaf(&ContentId::of(b"a"));
+        forked.append_leaf(&ContentId::of(b"X")); // diverges from the honest "b" at the same index
+        forked.append_leaf(&ContentId::of(b"c"));
+        forked.append_leaf(&ContentId::of(b"d"));
+        let new_sth = forked.sth(); // size 4, signed by the SAME `key`
+
+        let proof = forked.consistency_proof(2).expect("valid prefix of the forked tree");
+        assert_eq!(
+            verify_sth_consistency(&key.public(), &old_sth, &new_sth, &proof),
+            Err(ResolveError::KtSthInconsistent),
+            "a forked history must not verify as a consistent extension of the honest one"
+        );
+    }
+
+    #[test]
+    fn consistency_rejects_wrong_pinned_log_id() {
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[73; 32]));
+        log.append_leaf(&ContentId::of(b"a"));
+        log.append_leaf(&ContentId::of(b"b"));
+        let old_sth = log.sth();
+        log.append_leaf(&ContentId::of(b"c"));
+        let new_sth = log.sth();
+        let proof = log.consistency_proof(old_sth.tree_size).unwrap();
+        let other = IdentityKey::from_seed(&[0xbb; 32]).public();
+        assert_eq!(
+            verify_sth_consistency(&other, &old_sth, &new_sth, &proof),
+            Err(ResolveError::KtProofInvalid),
+            "a consistency proof against an unpinned log id proves nothing"
+        );
+    }
+
+    #[test]
+    fn consistency_rejects_tampered_sth_signature() {
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[74; 32]));
+        log.append_leaf(&ContentId::of(b"a"));
+        let mut old_sth = log.sth();
+        log.append_leaf(&ContentId::of(b"b"));
+        let new_sth = log.sth();
+        let proof = log.consistency_proof(1).unwrap();
+        old_sth.sig[0] ^= 0xff; // tamper the earlier STH's own signature
+        assert_eq!(
+            verify_sth_consistency(&log.log_id(), &old_sth, &new_sth, &proof),
+            Err(ResolveError::KtProofInvalid)
+        );
     }
 }
