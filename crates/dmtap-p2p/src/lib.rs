@@ -35,9 +35,16 @@
 //!
 //! ## Honest scope (loopback only)
 //! The comprehensive test drives two real libp2p swarms on `127.0.0.1` exchanging a real sealed
-//! MOTE + ack across the wire, plus a Kademlia PUT/GET. Relay + DCUtR are **wired and live in the
-//! swarm** but a true NAT-traversed / relayed path is not exercised on loopback (both peers are
-//! directly reachable) — see the crate tests for exactly what is proven.
+//! MOTE + ack across the wire, plus a Kademlia PUT/GET. Circuit-Relay-v2 is proven for real on
+//! loopback too — a reservation, then a frame delivered over a relayed connection to a peer that
+//! never advertises a direct address at all (see [`tests::relay_v2_reservation_and_relayed_connection_delivers_a_frame`]).
+//! DCUtR is wired and *attempts* a hole-punch automatically once a relayed connection is up
+//! (observed empirically), but a genuine NAT-traversed upgrade needs two peers behind distinct
+//! NATs — not reproducible on loopback, so it is an honest `#[ignore]` (see
+//! [`tests::dcutr_hole_punch_upgrade_needs_real_nat_infra`]). The test suite also covers
+//! connection-close/re-dial resilience, oversized-frame hardening (fails closed, no panic), and
+//! large-message round-tripping near the configured size cap — see the crate tests for exactly
+//! what is proven and what each honest gap is.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -62,8 +69,23 @@ const FRAME_PROTOCOL: &str = "/dmtap/frame/1.0.0";
 const IDENTIFY_PROTOCOL: &str = "/dmtap/id/1.0.0";
 /// How long a blocking Kademlia call waits for its query to resolve before giving up.
 const KAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a blocking connectivity check ([`Libp2pTransport::is_connected`]) waits for the swarm
+/// task to answer before reporting `false`. The swarm task only stalls this long if it is gone.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle-connection keep-alive so a connection used for a MOTE stays up for the returning ack.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on a single wire request (a [`WireFrame`]) the frame protocol will read off the
+/// wire. Spec §16.4 inlines a MOTE body up to the "Normal" file tier (4 MiB) before a file falls
+/// back to the chunked bulk path, so the cap must clear that with headroom for the CBOR envelope
+/// + `from` field; anything larger is presumed hostile/malformed and the codec fails the read
+/// closed (never allocates past this bound). Deliberately well under the raw-TCP transport's own
+/// 16 MiB `MAX_FRAME` bound (`envoir_node::transport`) so the two transports' failure envelopes
+/// agree in spirit without coupling the crates.
+const MAX_REQUEST_SIZE: u64 = 8 * 1024 * 1024;
+/// Upper bound on a response: the frame protocol's response is only ever the empty
+/// [`WireReceipt`] marker, so this is deliberately tiny — a peer sending anything larger is
+/// misbehaving, not merely slow.
+const MAX_RESPONSE_SIZE: u64 = 4 * 1024;
 
 /// A boxed, thread-safe error for transport construction (libp2p builder + bind failures).
 pub type BuildError = Box<dyn std::error::Error + Send + Sync>;
@@ -74,11 +96,35 @@ pub type BuildError = Box<dyn std::error::Error + Send + Sync>;
 /// exactly the `(from, frame)` pair the [`Transport`] contract moves. Serialized as CBOR by
 /// [`request_response::cbor`]. Kept as its own serializable mirror because [`Frame`] lives in
 /// `envoir-node` and is transport-agnostic (no serde dependency there).
+///
+/// Every `Vec<u8>` field is `#[serde(with = "serde_bytes")]`: plain serde serializes a `Vec<u8>`
+/// as a generic sequence (CBOR array, ~1-2 bytes of overhead *per byte* of payload) rather than a
+/// compact CBOR byte string. For a MOTE `body` that can legitimately be megabytes (spec §16.4),
+/// that blowup silently eats most of [`MAX_REQUEST_SIZE`]'s budget before the real payload gets
+/// anywhere near the configured cap — `serde_bytes` is what makes the size limit mean what its
+/// doc comment says.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireFrame {
-    Mote { from: Vec<u8>, body: Vec<u8> },
-    Ack { from: Vec<u8>, id: Vec<u8> },
-    Group { from: Vec<u8>, group_id: Vec<u8>, body: Vec<u8> },
+    Mote {
+        #[serde(with = "serde_bytes")]
+        from: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+    },
+    Ack {
+        #[serde(with = "serde_bytes")]
+        from: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        id: Vec<u8>,
+    },
+    Group {
+        #[serde(with = "serde_bytes")]
+        from: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        group_id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        body: Vec<u8>,
+    },
 }
 
 impl WireFrame {
@@ -134,12 +180,29 @@ struct MeshBehaviour {
 enum Command {
     /// Register how to reach a peer: seed Kademlia with its address so a dial can find it.
     AddPeer { peer: PeerId, addr: Multiaddr },
+    /// Declare `addr` as one of *this* node's externally-reachable addresses (§4.3 rung 3): a
+    /// node that chooses to act as a public Circuit-Relay-v2 server needs at least one confirmed
+    /// external address to hand out in a reservation ack, or the reservation is accepted at the
+    /// protocol level but the client-side listener fails closed with `NoAddressesInReservation`
+    /// and never reports a dialable circuit address. Deliberately **not** automatic on every
+    /// bound listener: a NAT'd node auto-declaring its LAN address as "external" would hand peers
+    /// a useless address, so this is an opt-in the operator of a genuinely public relay makes.
+    AddExternalAddress { addr: Multiaddr },
     /// Send one frame to a connected/dialable peer (best-effort; drives the sender-retry machine).
     Send { peer: PeerId, wire: Box<WireFrame> },
     /// Store a value under `key` in the DHT (§4.2 location record PUT).
     KadPut { key: Vec<u8>, value: Vec<u8>, reply: std::sync::mpsc::Sender<bool> },
     /// Resolve `key` from the DHT (§4.2 location record GET).
     KadGet { key: Vec<u8>, reply: std::sync::mpsc::Sender<Option<Vec<u8>>> },
+    /// Force-close any open connection(s) to `peer`. Used both defensively (a peer that violates
+    /// the frame protocol, e.g. an oversized/malformed request, is disconnected rather than kept
+    /// around as a trusted stream — see [`handle_event`]'s `InboundFailure::Io` arm) and to
+    /// simulate/recover from a connection blip in tests (re-dial resilience, §20.1).
+    Disconnect { peer: PeerId },
+    /// Report whether the swarm currently has an open connection to `peer` (test/inspection aid
+    /// for connection-lifecycle behaviour; not needed by the delivery path itself, which only
+    /// cares whether `send` succeeds).
+    IsConnected { peer: PeerId, reply: std::sync::mpsc::Sender<bool> },
 }
 
 // --- The transport ---------------------------------------------------------------------------
@@ -173,8 +236,13 @@ impl Libp2pTransport {
     /// Blocks only briefly to build the swarm and start listening; the swarm then runs in the
     /// background. Use [`wait_for_listener`](Self::wait_for_listener) to learn the bound address.
     pub fn new(local_addr: impl Into<Vec<u8>>, listen_on: &[Multiaddr]) -> Result<Self, BuildError> {
+        // >1 worker thread matters, not just for parallelism: Kademlia's background bootstrap /
+        // bucket-refresh queries and the frame request-response protocol otherwise compete for
+        // the SAME single thread, and a burst of Kademlia activity can starve an in-flight
+        // frame write/read for hundreds of milliseconds (observed empirically) — a real latency
+        // hazard for larger MOTEs, not just a test artifact.
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
+            .worker_threads(2)
             .enable_all()
             .build()?;
 
@@ -239,6 +307,14 @@ impl Libp2pTransport {
         self.handle().add_peer(addr, peer_id, multiaddr);
     }
 
+    /// Declare `addr` (typically one of this node's own [`listeners`](Self::listeners)) as an
+    /// externally-reachable address, opting this node in to serving as a public Circuit-Relay-v2
+    /// relay (§4.3 rung 3) for others. See [`Command::AddExternalAddress`] for why this is opt-in
+    /// rather than automatic.
+    pub fn add_external_address(&self, addr: Multiaddr) {
+        let _ = self.cmd_tx.send(Command::AddExternalAddress { addr });
+    }
+
     /// A cheap, cloneable control handle that can learn new routes at runtime — kept usable *after*
     /// the transport is moved into a [`Node`] (which takes it by value). This is how a node learns a
     /// peer's location record mid-flight (e.g. between a `RETRY` and a re-dispatch, §20.1).
@@ -268,6 +344,23 @@ impl Libp2pTransport {
             return None;
         }
         rx.recv_timeout(KAD_TIMEOUT).ok().flatten()
+    }
+
+    /// Force-close any open connection to `peer`. A best-effort nudge, not a ban: the frame
+    /// protocol will happily re-dial `peer` on the next [`Transport::send`] if its address is
+    /// still known (that re-dial is exactly what proves connection-close resilience, §20.1).
+    pub fn disconnect_peer(&self, peer: PeerId) {
+        let _ = self.cmd_tx.send(Command::Disconnect { peer });
+    }
+
+    /// Whether the swarm currently holds an open connection to `peer`. Blocks briefly on the
+    /// swarm task; `false` on timeout (swarm gone) as well as on a genuinely absent connection.
+    pub fn is_connected(&self, peer: PeerId) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.cmd_tx.send(Command::IsConnected { peer, reply: tx }).is_err() {
+            return false;
+        }
+        rx.recv_timeout(QUERY_TIMEOUT).unwrap_or(false)
     }
 }
 
@@ -332,7 +425,11 @@ fn build_swarm() -> Result<Swarm<MeshBehaviour>, BuildError> {
             // client that never becomes a server without external "confirmed reachability").
             kad.set_mode(Some(kad::Mode::Server));
 
-            let frame = request_response::cbor::Behaviour::<WireFrame, WireReceipt>::new(
+            let frame_codec = request_response::cbor::codec::Codec::default()
+                .set_request_size_maximum(MAX_REQUEST_SIZE)
+                .set_response_size_maximum(MAX_RESPONSE_SIZE);
+            let frame = request_response::Behaviour::with_codec(
+                frame_codec,
                 [(StreamProtocol::new(FRAME_PROTOCOL), ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
@@ -397,6 +494,9 @@ fn handle_command(swarm: &mut Swarm<MeshBehaviour>, pending: &mut PendingKad, cm
             swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
             swarm.add_peer_address(peer, addr);
         }
+        Command::AddExternalAddress { addr } => {
+            swarm.add_external_address(addr);
+        }
         Command::Send { peer, wire } => {
             // request-response dials using addresses supplied by the behaviours (Kademlia) if not
             // already connected, then delivers the frame. Best-effort: failures surface as an
@@ -418,6 +518,13 @@ fn handle_command(swarm: &mut Swarm<MeshBehaviour>, pending: &mut PendingKad, cm
         Command::KadGet { key, reply } => {
             let qid = swarm.behaviour_mut().kad.get_record(kad::RecordKey::new(&key));
             pending.gets.insert(qid, reply);
+        }
+        Command::Disconnect { peer } => {
+            // Best-effort: a peer already gone is not an error.
+            let _ = swarm.disconnect_peer_id(peer);
+        }
+        Command::IsConnected { peer, reply } => {
+            let _ = reply.send(swarm.is_connected(&peer));
         }
     }
 }
@@ -456,6 +563,19 @@ fn handle_event(
                 // Transport-level receipt; DMTAP delivery semantics ride a separate Frame::Ack.
             }
         },
+        // A request we couldn't even read (truncated by the codec's size cap, or plain garbage
+        // that fails CBOR decode) is a protocol violation, not a transient hiccup — fail closed
+        // and drop the connection rather than keep talking to a peer that just misbehaved. Other
+        // `InboundFailure` reasons (`Timeout`/`ConnectionClosed`/`UnsupportedProtocols`/
+        // `ResponseOmission`) are not evidence of hostile behaviour and are left alone; the
+        // sender's own retry/ack machinery (§20.1) already tolerates a dropped request.
+        SwarmEvent::Behaviour(MeshBehaviourEvent::Frame(request_response::Event::InboundFailure {
+            peer,
+            error: request_response::InboundFailure::Io(_),
+            ..
+        })) => {
+            let _ = swarm.disconnect_peer_id(peer);
+        }
         SwarmEvent::Behaviour(MeshBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
             id,
             result,

@@ -43,5 +43,9 @@ libp2p = { version = "0.56", features = [
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 futures = "0.3"
 
-# Wire encoding for the request-response frame carrier.
+# Wire encoding for the request-response frame carrier. `serde_bytes` matters, not just style:
+# without it a plain `Vec<u8>` serializes over CBOR as a generic sequence (one map/array entry
+# per byte, ~2x+ overhead) instead of a compact CBOR byte string, silently eating into the
+# request size budget (`MAX_REQUEST_SIZE`) well before the logical payload gets anywhere near it.
 serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
