@@ -46,6 +46,15 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 
+# --- Public Suffix List for RFC 7489 §3.2 DMARC organizational-domain determination ---
+# `psl` is a self-contained, `#![no_std]`, forbid(unsafe) crate that EMBEDS a compiled snapshot of
+# Mozilla's Public Suffix List (no build-time fetch, no runtime data file); the exact snapshot is
+# pinned in Cargo.lock. Used by `dmarc::organizational_domain` to compute the registrable
+# "public-suffix + 1 label", so `attacker.co.uk` and `victim.co.uk` are correctly treated as
+# distinct registrants rather than folded together under relaxed alignment. See dmarc.rs module docs
+# for the residual (fixed-snapshot) narrowing and the strict-alignment fail-closed guard.
+psl = "2.1.219"
+
 [dev-dependencies]
 # Self-signed cert generation for the in-process loopback TLS tests only (never at runtime).
 rcgen = "0.13"

@@ -154,21 +154,34 @@ impl GatewayAttestation {
         Ok(GatewayAttestation { disc, domain, selector, recv_at, msg_digest, legacy_from, seq, sig })
     }
 
-    /// Verify this attestation (§18.9.11, §7.2a) — **fail-closed**. `published_key` is the
-    /// `_dmtap-gw` public key the verifier looked up under **this entry's own `domain`**
-    /// (`None` ⇒ the domain published no key or is untrusted). `rfc5322_bytes` is the decrypted
-    /// legacy body the recipient reconstructed. Rejects if:
+    /// Verify this attestation (§18.9.11, §7.2a) — **fail-closed**. `expected_domain` is the domain
+    /// the verifier requires this entry to be anchored to — for the entry that bridged mail *for the
+    /// recipient* this is the recipient's own domain (the §18.3.11 key-1 binding, now enforced here
+    /// rather than only documented). `published_key` is the `_dmtap-gw` public key the verifier
+    /// looked up under **this entry's own `domain`** (`None` ⇒ the domain published no key or is
+    /// untrusted). `rfc5322_bytes` is the decrypted legacy body the recipient reconstructed. Rejects
+    /// if:
     /// - the discriminator is not a known bridge kind ([`ProvenanceError::Invalid`]),
+    /// - the entry's `domain` is not the `expected_domain` ([`ProvenanceError::KeyUntrusted`] — the
+    ///   entry is anchored to a domain outside the recipient's trusted gateway set, so a signature
+    ///   valid for domain A cannot be presented as covering domain B),
     /// - the digest does not bind these exact bytes ([`ProvenanceError::Invalid`]),
     /// - no key is published under the domain ([`ProvenanceError::KeyUntrusted`]),
     /// - the signature does not verify under that key ([`ProvenanceError::Invalid`]).
     pub fn verify(
         &self,
+        expected_domain: &str,
         published_key: Option<&[u8]>,
         rfc5322_bytes: &[u8],
     ) -> Result<(), ProvenanceError> {
         if self.disc != DISC_LEGACY_BRIDGE {
             return Err(ProvenanceError::Invalid);
+        }
+        // Bind the entry to the domain the verifier expects (§18.3.11 key 1). Fail closed on a
+        // mismatch so an attestation genuinely signed for domain A cannot be replayed as covering a
+        // different recipient domain B — even if A's key is published and the signature is valid.
+        if !self.domain.eq_ignore_ascii_case(expected_domain) {
+            return Err(ProvenanceError::KeyUntrusted);
         }
         // Bind to the delivered content: recompute the digest and compare (constant work, no early
         // return on content). A lifted attestation fails here even with a valid signature.
@@ -604,8 +617,8 @@ mod tests {
     fn bridged_message_carries_a_verifiable_attestation_chain() {
         let k = key("host.net");
         let att = GatewayAttestation::sign(&k, RFC, Some("a@gmail.com"), 1_700_000_000_000, 0);
-        // Verifies under the published key over the exact bytes.
-        att.verify(Some(&k.public()), RFC).unwrap();
+        // Verifies under the published key over the exact bytes, anchored to its own domain.
+        att.verify("host.net", Some(&k.public()), RFC).unwrap();
 
         // Assembled into a client-facing record: gateway-touched, one hop, round-trips.
         let rec = ProvenanceRecord::assemble(
@@ -629,7 +642,7 @@ mod tests {
         let decoded = GatewayAttestation::from_det_cbor(&att.det_cbor()).unwrap();
         assert_eq!(decoded, att);
         assert_eq!(decoded.seq, Some(3));
-        decoded.verify(Some(&k.public()), RFC).unwrap();
+        decoded.verify("host.net", Some(&k.public()), RFC).unwrap();
     }
 
     #[test]
@@ -640,23 +653,23 @@ mod tests {
         // (a) flipped signature byte.
         let mut bad_sig = att.clone();
         bad_sig.sig[0] ^= 0xff;
-        assert_eq!(bad_sig.verify(Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
+        assert_eq!(bad_sig.verify("host.net", Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
 
         // (b) attestation lifted onto different content — digest no longer binds.
         assert_eq!(
-            att.verify(Some(&k.public()), b"different bytes entirely"),
+            att.verify("host.net", Some(&k.public()), b"different bytes entirely"),
             Err(ProvenanceError::Invalid)
         );
 
         // (c) a mutated signed field (recv_at) invalidates the signature.
         let mut bad_field = att.clone();
         bad_field.recv_at = 999;
-        assert_eq!(bad_field.verify(Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
+        assert_eq!(bad_field.verify("host.net", Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
 
         // (d) unknown discriminator is rejected outright, never silently accepted.
         let mut bad_disc = att.clone();
         bad_disc.disc = 7;
-        assert_eq!(bad_disc.verify(Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
+        assert_eq!(bad_disc.verify("host.net", Some(&k.public()), RFC), Err(ProvenanceError::Invalid));
     }
 
     #[test]
@@ -664,13 +677,29 @@ mod tests {
         let k = key("host.net");
         let att = GatewayAttestation::sign(&k, RFC, None, 100, 0);
         // No key published under the domain ⇒ untrusted (0x0602), not silently trusted.
-        assert_eq!(att.verify(None, RFC), Err(ProvenanceError::KeyUntrusted));
+        assert_eq!(att.verify("host.net", None, RFC), Err(ProvenanceError::KeyUntrusted));
         assert_eq!(ProvenanceError::KeyUntrusted.code(), 0x0602);
         assert_eq!(ProvenanceError::Invalid.code(), 0x0601);
 
-        // A different domain's key does not verify this entry.
+        // A different domain's key does not verify this entry (domain matches, key is wrong).
         let other = key("evil.example");
-        assert_eq!(att.verify(Some(&other.public()), RFC), Err(ProvenanceError::Invalid));
+        assert_eq!(att.verify("host.net", Some(&other.public()), RFC), Err(ProvenanceError::Invalid));
+    }
+
+    #[test]
+    fn attestation_for_one_domain_cannot_be_presented_for_another() {
+        // An attestation genuinely signed (and key-published) for domain A must be rejected when a
+        // verifier presents it as covering a different recipient domain B — the §18.3.11 key-1
+        // binding, enforced fail-closed inside `verify` (not merely documented).
+        let a = key("alpha.example");
+        let att = GatewayAttestation::sign(&a, RFC, None, 100, 0);
+        // Presented for its own domain with its own key ⇒ verifies.
+        att.verify("alpha.example", Some(&a.public()), RFC).unwrap();
+        // Presented as covering domain B (even with A's real, published key) ⇒ KeyUntrusted.
+        assert_eq!(
+            att.verify("beta.example", Some(&a.public()), RFC),
+            Err(ProvenanceError::KeyUntrusted)
+        );
     }
 
     #[test]
@@ -722,10 +751,10 @@ mod tests {
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].seq, None); // seq 0 omitted
         assert_eq!(chain[1].seq, Some(1));
-        chain[0].verify(Some(&g1.public()), RFC).unwrap();
-        chain[1].verify(Some(&g2.public()), RFC).unwrap();
-        // Cross-check: entry 1 does NOT verify under g1's key (wrong domain anchor).
-        assert_eq!(chain[1].verify(Some(&g1.public()), RFC), Err(ProvenanceError::Invalid));
+        chain[0].verify("relay.example", Some(&g1.public()), RFC).unwrap();
+        chain[1].verify("host.net", Some(&g2.public()), RFC).unwrap();
+        // Cross-check: entry 1 does NOT verify under g1's key (wrong signing key, right domain).
+        assert_eq!(chain[1].verify("host.net", Some(&g1.public()), RFC), Err(ProvenanceError::Invalid));
     }
 
     #[test]
@@ -748,7 +777,7 @@ mod tests {
             .bridge(BridgeDirection::Inbound, "host.net", RFC, Some("a@gmail.com"), 5, &[])
             .unwrap();
         assert_eq!(meter.count(), 1);
-        att.verify(Some(&pubkey), RFC).unwrap();
+        att.verify("host.net", Some(&pubkey), RFC).unwrap();
         let ev = &meter.events()[0];
         assert_eq!(ev.account, "acct-42");
         assert_eq!(ev.msg_digest, att.msg_digest);

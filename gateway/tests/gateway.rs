@@ -923,11 +923,11 @@ fn inbound_stamps_a_verifiable_gateway_provenance_record() {
     let key = published.resolve_gw_key(DOMAIN, GW_SELECTOR);
     bridged
         .gateway_attestation
-        .verify(key.as_deref(), &data)
+        .verify(DOMAIN, key.as_deref(), &data)
         .expect("gateway attestation verifies over the exact bytes");
     // Lifted onto different bytes → digest no longer binds → rejected.
     assert_eq!(
-        bridged.gateway_attestation.verify(key.as_deref(), b"different bytes"),
+        bridged.gateway_attestation.verify(DOMAIN, key.as_deref(), b"different bytes"),
         Err(ProvenanceError::Invalid)
     );
     assert_eq!(bridged.gateway_attestation.legacy_from.as_deref(), Some("sender@gmail.com"));
@@ -1083,6 +1083,48 @@ fn dmarc_enforce_rejects_an_unaligned_reject_policy_message() {
 }
 
 #[test]
+fn dmarc_enforce_rejects_a_message_with_multiple_from_headers() {
+    // RFC 7489 §6.6.1: a message with more than one RFC5322.From header MUST NOT be evaluated as
+    // single-origin. The gateway fails it closed to a reject under Enforce, rather than arbitrarily
+    // aligning against one From (the old last-header/first-address pick a spoofer could exploit).
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    // A DMARC resolver must be configured for DMARC to run at all; the specific record does not
+    // matter because a multi-From message is refused before any per-domain policy lookup succeeds.
+    let dmarc = InMemoryDmarcResolver::new().with_txt("_dmarc.first.example", &["v=DMARC1; p=none"]);
+    let gw = base_gw.with_dmarc(Box::new(dmarc), DmarcHandling::Enforce);
+
+    // Two From headers — one "benign" (p=none), one the attacker wants a downstream client to show.
+    let two_from = b"From: real@first.example\r\nFrom: eve@evil.example\r\nTo: bob@example.org\r\nSubject: hi\r\n\r\nbody\r\n";
+    assert_eq!(
+        gw.evaluate_dmarc(two_from, None, "sender@spoofer.example"),
+        envoir_gateway::dmarc::DmarcVerdict::Fail {
+            disposition: envoir_gateway::dmarc::DmarcDisposition::Reject
+        },
+        "multiple From headers are a fail-closed reject, not an arbitrary single-From alignment"
+    );
+
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW);
+    s.feed_line("EHLO spoofer.example");
+    assert_eq!(s.feed_line("MAIL FROM:<phisher@spoofer.example>").code, 250);
+    assert_eq!(s.feed_line(&format!("RCPT TO:<{}>", recip.email)).code, 250);
+    s.feed_line("DATA");
+    for line in String::from_utf8(two_from.to_vec()).unwrap().lines() {
+        s.feed_line(line);
+    }
+    let reply = s.feed_line(".");
+    assert_eq!(reply.code, 550, "a multi-From message is refused under DMARC Enforce (RFC 7489 §6.6.1)");
+    assert!(delivery.captured.lock().unwrap().is_none(), "no MOTE was built for the multi-From message");
+}
+
+#[test]
 fn dmarc_pass_via_spf_alignment_delivers_normally() {
     let recip = TestRecipient::new("bob@example.org");
     let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
@@ -1178,12 +1220,12 @@ fn three_hop_gateway_chain_each_verifies_only_under_its_own_domain_and_the_recor
     assert_eq!(chain[2].seq, Some(2));
 
     // Each hop verifies under its OWN domain's key over the exact bridged bytes...
-    chain[0].verify(Some(&k1.public()), RFC).expect("hop 0 verifies under relay-one's key");
-    chain[1].verify(Some(&k2.public()), RFC).expect("hop 1 verifies under relay-two's key");
-    chain[2].verify(Some(&k3.public()), RFC).expect("hop 2 (recipient domain) verifies under its own key");
+    chain[0].verify("relay-one.example", Some(&k1.public()), RFC).expect("hop 0 verifies under relay-one's key");
+    chain[1].verify("relay-two.example", Some(&k2.public()), RFC).expect("hop 1 verifies under relay-two's key");
+    chain[2].verify(DOMAIN, Some(&k3.public()), RFC).expect("hop 2 (recipient domain) verifies under its own key");
     // ...and cross-domain verification fails (a hop never verifies under a DIFFERENT domain's key).
-    assert!(chain[2].verify(Some(&k1.public()), RFC).is_err());
-    assert!(chain[0].verify(Some(&k3.public()), RFC).is_err());
+    assert!(chain[2].verify(DOMAIN, Some(&k1.public()), RFC).is_err());
+    assert!(chain[0].verify("relay-one.example", Some(&k3.public()), RFC).is_err());
 
     // Assembled into the client-facing record: all three hops present, gateway-touched, round-trips.
     let record = ProvenanceRecord::assemble(Tier::Fast, Profile::NotApplicable, None, None, chain.clone());

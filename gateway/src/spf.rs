@@ -18,6 +18,11 @@
 //! - **`a`/`mx` are IPv4-only.** [`crate::dns`] has no AAAA decoder (see its module docs), so `a`
 //!   and `mx` mechanisms only ever match an IPv4 connecting sender; a literal `ip6:` mechanism still
 //!   works (it needs no DNS lookup). An IPv6 sender can only match via `ip6`, `include`, or `all`.
+//! - **The void-lookup cap (RFC 7208 §4.6.4) IS enforced**, separately from the aggregate lookup
+//!   ceiling: an `a`/`mx`/`exists` mechanism (or a per-MX-host `A` lookup) that resolves to no
+//!   records (NXDOMAIN/NODATA) is a "void lookup", and more than two of them across one evaluation
+//!   is `PermError` — bounding a record that fans out to many non-existent names, which the 10
+//!   *resolving*-lookup budget alone does not catch.
 //! - **A single aggregate 10-lookup ceiling**, not RFC 7208 §4.6.4's per-clause carve-outs (e.g. the
 //!   separate "at most 10 MX names further resolved" rule). Every DNS query this evaluator issues —
 //!   the record fetch for a recursed `include`/`redirect` target, each `a`/`mx`/`exists`/`ptr`
@@ -195,6 +200,11 @@ impl SpfResolver for DnsSpfResolver {
 
 /// The aggregate DNS-lookup budget (RFC 7208 §4.6.4 intent; see module docs on the simplification).
 const DEFAULT_MAX_LOOKUPS: u32 = 10;
+/// The void-lookup cap (RFC 7208 §4.6.4): a query returning NXDOMAIN or NODATA (no relevant
+/// records) is a "void lookup"; more than two of them across the whole evaluation is `PermError`.
+/// This bounds the amplification of a record that fans out to many non-existent names — a limit the
+/// aggregate lookup budget alone does not impose (10 *resolving* lookups vs 2 *empty* ones).
+const DEFAULT_MAX_VOID_LOOKUPS: u32 = 2;
 /// A recursion-depth guard for `include`/`redirect` chains, independent of the lookup budget (which
 /// already bounds it in practice, but this catches a pathological zero-cost cycle defensively).
 const MAX_CHAIN_DEPTH: u32 = 10;
@@ -463,12 +473,27 @@ struct Evaluator<'r> {
     resolver: &'r dyn SpfResolver,
     lookups: u32,
     max_lookups: u32,
+    void_lookups: u32,
+    max_void_lookups: u32,
 }
 
 impl<'r> Evaluator<'r> {
     fn charge_lookup(&mut self) -> Result<(), SpfResult> {
         self.lookups += 1;
         if self.lookups > self.max_lookups {
+            Err(SpfResult::PermError)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Charge a void lookup (a DNS query that returned no relevant records — NXDOMAIN/NODATA) and
+    /// fail closed with `PermError` once more than [`DEFAULT_MAX_VOID_LOOKUPS`] have occurred
+    /// (RFC 7208 §4.6.4). Call this on the empty-result branch of an `a`/`mx`/`exists` lookup (and
+    /// each empty per-MX-host `A` lookup), which is exactly where a void arises.
+    fn charge_void(&mut self) -> Result<(), SpfResult> {
+        self.void_lookups += 1;
+        if self.void_lookups > self.max_void_lookups {
             Err(SpfResult::PermError)
         } else {
             Ok(())
@@ -578,6 +603,11 @@ impl<'r> Evaluator<'r> {
                 }
                 match self.resolver.lookup_a(&normalize(&target)) {
                     Err(()) => MechOutcome::Abort(SpfResult::TempError),
+                    Ok(ips) if ips.is_empty() => match self.charge_void() {
+                        // NXDOMAIN/NODATA for the `a` target (RFC 7208 §4.6.4 void lookup).
+                        Ok(()) => MechOutcome::NoMatch,
+                        Err(e) => MechOutcome::Abort(e),
+                    },
                     Ok(ips) => {
                         if ips.iter().any(|a| ipv4_in_cidr(v4, *a, *cidr4)) {
                             MechOutcome::Match
@@ -600,12 +630,25 @@ impl<'r> Evaluator<'r> {
                     Err(()) => return MechOutcome::Abort(SpfResult::TempError),
                     Ok(h) => h,
                 };
+                if hosts.is_empty() {
+                    // No MX records at all (NXDOMAIN/NODATA) — a void lookup (RFC 7208 §4.6.4).
+                    return match self.charge_void() {
+                        Ok(()) => MechOutcome::NoMatch,
+                        Err(e) => MechOutcome::Abort(e),
+                    };
+                }
                 for host in hosts {
                     if let Err(e) = self.charge_lookup() {
                         return MechOutcome::Abort(e);
                     }
                     match self.resolver.lookup_a(&normalize(&host)) {
                         Err(()) => return MechOutcome::Abort(SpfResult::TempError),
+                        Ok(ips) if ips.is_empty() => {
+                            // This MX host resolves to no address — a void lookup (§4.6.4).
+                            if let Err(e) = self.charge_void() {
+                                return MechOutcome::Abort(e);
+                            }
+                        }
                         Ok(ips) => {
                             if ips.iter().any(|a| ipv4_in_cidr(v4, *a, *cidr4)) {
                                 return MechOutcome::Match;
@@ -630,13 +673,12 @@ impl<'r> Evaluator<'r> {
                 }
                 match self.resolver.lookup_a(&normalize(target)) {
                     Err(()) => MechOutcome::Abort(SpfResult::TempError),
-                    Ok(ips) => {
-                        if !ips.is_empty() {
-                            MechOutcome::Match
-                        } else {
-                            MechOutcome::NoMatch
-                        }
-                    }
+                    Ok(ips) if ips.is_empty() => match self.charge_void() {
+                        // `exists` target does not resolve (RFC 7208 §4.6.4 void lookup).
+                        Ok(()) => MechOutcome::NoMatch,
+                        Err(e) => MechOutcome::Abort(e),
+                    },
+                    Ok(_ips) => MechOutcome::Match,
                 }
             }
         }
@@ -648,7 +690,13 @@ impl<'r> Evaluator<'r> {
 /// does not expand, see module docs — so `sender` is otherwise inert here but kept in the API for
 /// fidelity/future use).
 pub fn check_host(resolver: &dyn SpfResolver, ip: IpAddr, domain: &str, sender: &str) -> SpfResult {
-    let mut ev = Evaluator { resolver, lookups: 0, max_lookups: DEFAULT_MAX_LOOKUPS };
+    let mut ev = Evaluator {
+        resolver,
+        lookups: 0,
+        max_lookups: DEFAULT_MAX_LOOKUPS,
+        void_lookups: 0,
+        max_void_lookups: DEFAULT_MAX_VOID_LOOKUPS,
+    };
     ev.check_host(domain, ip, sender, 0)
 }
 
@@ -855,6 +903,34 @@ mod tests {
         }
         r = r.with_txt("next12.example", &["v=spf1 ip4:203.0.113.0/24 -all"]);
         assert_eq!(check_host(&r, v4("203.0.113.1"), "next0.example", "a@x"), SpfResult::PermError);
+    }
+
+    #[test]
+    fn more_than_two_void_lookups_is_permerror() {
+        // RFC 7208 §4.6.4: more than two void lookups (NXDOMAIN/NODATA) ⇒ PermError. Three `a:`
+        // targets that resolve to no address are three void lookups; the third trips the cap.
+        let r = InMemorySpfResolver::new()
+            .with_txt("void.example", &["v=spf1 a:v1.example a:v2.example a:v3.example -all"]);
+        assert_eq!(check_host(&r, v4("9.9.9.9"), "void.example", "a@x"), SpfResult::PermError);
+    }
+
+    #[test]
+    fn two_void_lookups_are_within_the_cap() {
+        // Exactly two voids is allowed; nothing matches, so evaluation falls through to `-all`
+        // (Fail), NOT PermError — proving the cap triggers on the THIRD void, not earlier.
+        let r = InMemorySpfResolver::new()
+            .with_txt("ok.example", &["v=spf1 a:v1.example a:v2.example -all"]);
+        assert_eq!(check_host(&r, v4("9.9.9.9"), "ok.example", "a@x"), SpfResult::Fail);
+    }
+
+    #[test]
+    fn void_mx_host_lookups_count_toward_the_cap() {
+        // Void applies to per-MX-host A lookups too: an MX with three exchange hosts that each
+        // resolve to no address is three voids ⇒ PermError.
+        let r = InMemorySpfResolver::new()
+            .with_txt("mxvoid.example", &["v=spf1 mx -all"])
+            .with_mx("mxvoid.example", &["h1.example", "h2.example", "h3.example"]);
+        assert_eq!(check_host(&r, v4("9.9.9.9"), "mxvoid.example", "a@x"), SpfResult::PermError);
     }
 
     #[test]

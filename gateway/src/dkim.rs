@@ -66,13 +66,19 @@ pub fn sign(key: &DkimKey, message: &[u8], t: u64) -> String {
     // 1. Body hash over the relaxed-canonicalized body (RFC 6376 §3.4.4).
     let bh = b64::encode(&Sha256::digest(canonicalize_body(body)));
 
-    // 2. Choose which of the signed-header set are actually present, preserving SIGNED_HEADERS order.
-    let present: Vec<&str> = SIGNED_HEADERS
+    // 2. Choose which of the signed-header set are actually present, preserving SIGNED_HEADERS order,
+    //    then **oversign `from`** (RFC 6376 §5.4.2 / §8.15, M3AAWG best practice): list it once more
+    //    than it appears. A verifier consuming instances bottom-up (see `assemble_signed_headers`)
+    //    thereby binds not just the present From but the ABSENCE of any second From — an attacker who
+    //    appends another From then fails verification, since the extra h= entry now resolves to their
+    //    added header instead of the null string it was signed over.
+    let mut h_names: Vec<&str> = SIGNED_HEADERS
         .iter()
         .copied()
         .filter(|h| find_header(&headers, h).is_some())
         .collect();
-    let h_tag = present.join(":");
+    h_names.push("from");
+    let h_tag = h_names.join(":");
 
     // 3. Build the DKIM-Signature header value with an empty b= (the value signed over itself).
     let dkim_header_base = format!(
@@ -80,13 +86,9 @@ pub fn sign(key: &DkimKey, message: &[u8], t: u64) -> String {
         key.domain, key.selector, t, h_tag, bh
     );
 
-    // 4. Assemble the signing input: each signed header (relaxed), then the DKIM-Signature header
-    //    itself (relaxed, empty b=) with NO trailing CRLF (RFC 6376 §3.7).
-    let mut signing_input = Vec::new();
-    for h in &present {
-        let (name, value) = find_header(&headers, h).expect("filtered to present headers");
-        signing_input.extend_from_slice(canonicalize_header(name, value).as_bytes());
-    }
+    // 4. Assemble the signing input: each signed header (relaxed, bottom-up per-name), then the
+    //    DKIM-Signature header itself (relaxed, empty b=) with NO trailing CRLF (RFC 6376 §3.7).
+    let mut signing_input = assemble_signed_headers(&headers, &h_names);
     signing_input.extend_from_slice(
         canonicalize_header("DKIM-Signature", &dkim_header_base)
             .trim_end_matches("\r\n")
@@ -130,14 +132,18 @@ pub fn verify(message: &[u8], public_key: &[u8]) -> Result<(), DkimError> {
     let h_tag = get("h").ok_or(DkimError::MalformedSignature)?;
     let b_tag = get("b").ok_or(DkimError::MalformedSignature)?;
 
-    // Rebuild the signing input: signed headers, then the DKIM-Signature header with b= emptied.
-    let mut signing_input = Vec::new();
-    for h in h_tag.split(':') {
-        let h = h.trim();
-        if let Some((name, value)) = find_header(&headers, h) {
-            signing_input.extend_from_slice(canonicalize_header(name, value).as_bytes());
-        }
+    let h_names: Vec<&str> = h_tag.split(':').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    // RFC 6376 §5.4: `from` MUST be signed. Reject a signature whose h= omits it outright — a
+    // signature over only `subject` (etc.) would otherwise "verify" while leaving the
+    // identity-bearing From entirely unbound, which DMARC alignment would then wrongly trust.
+    if !h_names.iter().any(|n| n.eq_ignore_ascii_case("from")) {
+        return Err(DkimError::FromFieldNotSigned);
     }
+
+    // Rebuild the signing input: signed headers (bottom-up per-name instance, RFC 6376 §5.4.2 — see
+    // `assemble_signed_headers` for the oversigning-correct semantics), then the DKIM-Signature
+    // header with b= emptied.
+    let mut signing_input = assemble_signed_headers(&headers, &h_names);
     let dkim_emptied = empty_b_value(&dkim_value);
     signing_input.extend_from_slice(
         canonicalize_header("DKIM-Signature", &dkim_emptied)
@@ -297,6 +303,8 @@ pub enum DkimError {
     UnsupportedAlgorithm,
     #[error("unsupported canonicalization (expected relaxed/relaxed)")]
     UnsupportedCanonicalization,
+    #[error("DKIM h= tag does not cover the mandatory From header (RFC 6376 §5.4)")]
+    FromFieldNotSigned,
     #[error("malformed DKIM-Signature header")]
     MalformedSignature,
     #[error("body hash (bh=) does not match")]
@@ -355,6 +363,32 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<(&'a s
         .rev()
         .find(|(n, _)| n.trim().eq_ignore_ascii_case(name))
         .map(|(n, v)| (n.as_str(), v.as_str()))
+}
+
+/// Assemble the canonicalized signing bytes for an ordered `h=` name list, honoring RFC 6376
+/// §5.4.2's multiple-instance rule: repeated instances of the same field name are consumed from the
+/// **bottom of the message upward**, one physical instance per repetition. An `h=` entry with no
+/// remaining instance contributes the **null string** (nothing) — which is precisely what lets
+/// oversigning (listing a name once more than it appears) detect a later-added instance: the extra
+/// entry, signed over the null string, instead binds the attacker's added header at verify time and
+/// the signature fails. This replaces the previous `find_header`-per-entry loop, which always
+/// resolved every repeat of a name to the single bottom-most instance (so a repeated `from` bound
+/// nothing new and oversigning was inert).
+fn assemble_signed_headers(headers: &[(String, String)], h_names: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (k, name) in h_names.iter().enumerate() {
+        let key = name.trim();
+        // How many earlier h= entries already claimed this name ⇒ which repetition this is (0-based).
+        let occurrence = h_names[..k].iter().filter(|m| m.trim().eq_ignore_ascii_case(key)).count();
+        // The `occurrence`-th instance of `key` counting from the BOTTOM of the message (§5.4.2);
+        // `None` (fewer instances than h= entries) ⇒ the null string, contributing nothing.
+        let instance =
+            headers.iter().rev().filter(|(n, _)| n.trim().eq_ignore_ascii_case(key)).nth(occurrence);
+        if let Some((n, v)) = instance {
+            out.extend_from_slice(canonicalize_header(n, v).as_bytes());
+        }
+    }
+    out
 }
 
 /// Relaxed header canonicalization (RFC 6376 §3.4.2): lowercase name, unfold, compress internal
@@ -517,6 +551,45 @@ mod tests {
         assert_eq!(
             verify_with_resolver(&msg, &StaticDkimKeys::new()),
             DkimVerdict::KeyUnavailable { domain: "sender.example".into(), selector: "s1".into() }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_signature_whose_h_omits_from() {
+        // RFC 6376 §5.4: `from` MUST be covered. Rewrite a genuine signature's h= to drop `from`
+        // (body/bh untouched, so the bh check still passes and we reach the from-coverage check).
+        let key = DkimKey::from_seed("sender.example", "s1", &[7u8; 32]);
+        let header = sign(&key, MSG, 1_752_600_000);
+        let start = header.find("h=").expect("h= tag present");
+        let end = start + header[start..].find(';').expect("h= is terminated by ';'");
+        let rewritten = format!("{}h=subject{}", &header[..start], &header[end..]);
+        let mut msg = rewritten.into_bytes();
+        msg.extend_from_slice(MSG);
+        assert_eq!(verify(&msg, &key.public_bytes()), Err(DkimError::FromFieldNotSigned));
+    }
+
+    #[test]
+    fn oversigned_from_detects_an_appended_from_header() {
+        // The signer oversigns `from` (h= lists it once more than it appears). A genuine message
+        // verifies; an attacker who appends a second From — not covered without oversigning — then
+        // fails verification, because the extra h= entry now binds their added header (RFC 6376
+        // §5.4.2). This FAILS against the pre-fix behavior (no oversign + last-instance-per-name),
+        // where the added From slipped through unbound.
+        let key = DkimKey::from_seed("sender.example", "s1", &[8u8; 32]);
+        let pubk = key.public_bytes();
+        let header = sign(&key, MSG, 1_752_600_000);
+
+        let mut signed = header.clone().into_bytes();
+        signed.extend_from_slice(MSG);
+        assert_eq!(verify(&signed, &pubk), Ok(()), "the genuine oversigned message verifies");
+
+        let mut tampered = b"From: eve@evil.example\r\n".to_vec();
+        tampered.extend_from_slice(header.as_bytes());
+        tampered.extend_from_slice(MSG);
+        assert_eq!(
+            verify(&tampered, &pubk),
+            Err(DkimError::SignatureInvalid),
+            "an appended From is caught by oversigning"
         );
     }
 
