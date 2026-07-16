@@ -17,7 +17,9 @@ use dmtap_mail::smtp::build_mote_draft;
 
 use crate::attestation::{Attestation, AttestationKey};
 use crate::dkim::{verify_with_resolver, DkimKeyResolver, DkimVerdict};
+use crate::dmarc::{self, DmarcDisposition, DmarcTxtResolver, DmarcVerdict};
 use crate::provenance::{GatewayAttestation, Profile, ProvenanceRecord, Tier};
+use crate::spf::{self, SpfOutcome, SpfResolver, SpfResult};
 
 /// A recipient's DMTAP key material, resolved from `RCPT TO` (§3 `resolve`, run by the gateway on
 /// the recipient's behalf, §19.7.1 step 2).
@@ -300,6 +302,40 @@ pub enum DkimPolicy {
     Enforce,
 }
 
+/// How the inbound gateway treats the SPF verdict for a legacy `MAIL FROM` (spec item 1, RFC 7208,
+/// evaluated at `MAIL FROM` by [`MxSession`] — see [`InboundGateway::evaluate_spf`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpfPolicy {
+    /// Evaluate SPF and make the outcome available (via [`InboundGateway::evaluate_spf`]) but never
+    /// reject on it. The honest default: SPF alone is a weak, forwarding-fragile signal, so this
+    /// gateway does not unilaterally bounce on it unless explicitly asked to enforce.
+    #[default]
+    Annotate,
+    /// Reject (`550`) a hard `Fail` (RFC 7208 `-all`-style) sender before `DATA`, and defer (`451`)
+    /// a genuine DNS `TempError` so the sender's queue retries rather than the gateway guessing.
+    /// Every other result (`Pass`/`SoftFail`/`Neutral`/`None`/`PermError`) still proceeds to
+    /// `DATA` — `SoftFail`/`Neutral`/`PermError` are advisory-only per RFC 7208 and are DMARC's (or
+    /// a dedicated spam scorer's) territory, not a hard SMTP-level bounce on their own.
+    Enforce,
+}
+
+/// How the inbound gateway treats the combined DMARC verdict (spec item 2, RFC 7489, evaluated once
+/// the full message is in hand — see [`InboundGateway::evaluate_dmarc`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DmarcHandling {
+    /// Evaluate DMARC and make the verdict available (via [`InboundGateway::evaluate_dmarc`]) but
+    /// never reject on it.
+    #[default]
+    Annotate,
+    /// Reject (`550`) a message whose effective DMARC policy is `p=reject` (or an organizational
+    /// domain's `sp=reject`) and which fails SPF+DKIM alignment. A `quarantine` verdict is **not**
+    /// turned into an SMTP-level rejection: a stateless bridge with no mailbox has nowhere to
+    /// quarantine a message into (a documented, honest narrowing — quarantine is still surfaced in
+    /// the verdict for a caller with somewhere to route it; this gateway's only SMTP-level lever is
+    /// accept/refuse).
+    Enforce,
+}
+
 /// The inbound gateway: MX for one or more domains, stateless (§7.4).
 pub struct InboundGateway {
     /// The gateway's own identity key. An inbound legacy MOTE is *from* the gateway (legacy-origin);
@@ -315,6 +351,14 @@ pub struct InboundGateway {
     dkim_resolver: Option<Box<dyn DkimKeyResolver>>,
     /// What to do with the DKIM verdict (see [`DkimPolicy`]).
     dkim_policy: DkimPolicy,
+    /// Optional SPF resolver (spec item 1, RFC 7208). `None` ⇒ SPF is never evaluated.
+    spf_resolver: Option<Box<dyn SpfResolver>>,
+    /// What to do with the SPF verdict (see [`SpfPolicy`]).
+    spf_policy: SpfPolicy,
+    /// Optional `_dmarc` TXT resolver (spec item 2, RFC 7489). `None` ⇒ DMARC is never evaluated.
+    dmarc_resolver: Option<Box<dyn DmarcTxtResolver>>,
+    /// What to do with the DMARC verdict (see [`DmarcHandling`]).
+    dmarc_policy: DmarcHandling,
 }
 
 /// Why an inbound message could not be wrapped/delivered — mapped to an SMTP reply by the session.
@@ -362,6 +406,10 @@ impl InboundGateway {
             abuse,
             dkim_resolver: None,
             dkim_policy: DkimPolicy::Annotate,
+            spf_resolver: None,
+            spf_policy: SpfPolicy::Annotate,
+            dmarc_resolver: None,
+            dmarc_policy: DmarcHandling::Annotate,
         }
     }
 
@@ -370,6 +418,23 @@ impl InboundGateway {
     pub fn with_dkim(mut self, resolver: Box<dyn DkimKeyResolver>, policy: DkimPolicy) -> Self {
         self.dkim_resolver = Some(resolver);
         self.dkim_policy = policy;
+        self
+    }
+
+    /// Enable inbound SPF verification (spec item 1, RFC 7208): evaluate the `MAIL FROM` (or
+    /// `HELO`) domain's SPF record against the connecting peer IP via `resolver`, applying `policy`
+    /// to the verdict at `MAIL FROM` time (see [`Self::evaluate_spf`] / [`MxSession`]).
+    pub fn with_spf(mut self, resolver: Box<dyn SpfResolver>, policy: SpfPolicy) -> Self {
+        self.spf_resolver = Some(resolver);
+        self.spf_policy = policy;
+        self
+    }
+
+    /// Enable inbound DMARC verification (spec item 2, RFC 7489): resolve `_dmarc` policy via
+    /// `resolver` and apply `policy` to the combined SPF+DKIM alignment verdict.
+    pub fn with_dmarc(mut self, resolver: Box<dyn DmarcTxtResolver>, policy: DmarcHandling) -> Self {
+        self.dmarc_resolver = Some(resolver);
+        self.dmarc_policy = policy;
         self
     }
 
@@ -387,18 +452,113 @@ impl InboundGateway {
         }
     }
 
-    /// Apply the DKIM policy as a pre-delivery gate. Returns `Err(reply)` only under
-    /// [`DkimPolicy::Enforce`] when a present signature fails to verify; otherwise `Ok(())`.
-    fn dkim_gate(&self, data: &[u8]) -> Result<(), SmtpReply> {
-        if self.dkim_resolver.is_none() || self.dkim_policy == DkimPolicy::Annotate {
+    /// Apply the DKIM policy as a pre-delivery gate against an already-computed verdict. Returns
+    /// `Err(reply)` only under [`DkimPolicy::Enforce`] when a present signature fails to verify;
+    /// otherwise `Ok(())`. (Takes the verdict rather than `data` so [`Self::accept_message_with_spf`]
+    /// computes it exactly once and reuses it for the DMARC gate too.)
+    fn dkim_gate(&self, verdict: &DkimVerdict) -> Result<(), SmtpReply> {
+        if self.dkim_policy != DkimPolicy::Enforce {
             return Ok(());
         }
-        match self.verify_inbound_dkim(data) {
+        match verdict {
             DkimVerdict::Fail(_) => {
                 Err(SmtpReply::new(550, "5.7.20 DKIM signature present but does not verify"))
             }
             // Pass, NoSignature, KeyUnavailable → not hard-bounced here (unsigned/unaligned mail is
-            // DMARC-`p=` territory, a documented seam) — deliver and let recipient policy decide.
+            // DMARC-`p=` territory, now real — see `dmarc_gate` — rather than a documented seam).
+            _ => Ok(()),
+        }
+    }
+
+    /// Evaluate SPF (spec item 1, RFC 7208) for this transaction: resolves and checks the sender
+    /// domain's SPF record against the connecting `peer_ip`, falling back to the `helo` domain per
+    /// RFC 7208 §2.4 when `mail_from` is the null reverse-path or lacks a domain. Returns the
+    /// honest "never evaluated" outcome ([`SpfOutcome::unevaluated`]) when no [`SpfResolver`] is
+    /// configured, or `peer_ip` does not even parse as an IP — never a fabricated verdict.
+    pub fn evaluate_spf(&self, peer_ip: &str, mail_from: &str, helo: Option<&str>) -> SpfOutcome {
+        let resolver = match &self.spf_resolver {
+            Some(r) => r.as_ref(),
+            None => return SpfOutcome::unevaluated(),
+        };
+        let ip: std::net::IpAddr = match peer_ip.trim().parse() {
+            Ok(ip) => ip,
+            Err(_) => return SpfOutcome::unevaluated(),
+        };
+        spf::evaluate(resolver, ip, mail_from, helo)
+    }
+
+    /// Apply the SPF policy (spec item 1) at `MAIL FROM` time. See [`SpfPolicy`] for what each
+    /// result does under [`SpfPolicy::Enforce`]; [`SpfPolicy::Annotate`] never rejects.
+    fn spf_gate(&self, outcome: &SpfOutcome) -> Result<(), SmtpReply> {
+        if self.spf_policy != SpfPolicy::Enforce {
+            return Ok(());
+        }
+        match outcome.result {
+            SpfResult::Fail => Err(SmtpReply::new(
+                550,
+                "5.7.23 SPF hard fail (RFC 7208): sender IP not authorized for this domain",
+            )),
+            SpfResult::TempError => Err(SmtpReply::new(
+                451,
+                "4.4.3 SPF temporary DNS error evaluating sender policy, please retry",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Evaluate DMARC (spec item 2, RFC 7489) for an already-received message, combining the DKIM
+    /// verdict [`Self::verify_inbound_dkim`] computes with `spf` and domain alignment against the
+    /// `_dmarc` policy published for the message's `RFC5322.From` domain. Exposed publicly
+    /// (mirroring [`Self::verify_inbound_dkim`]) so a caller can inspect the raw verdict regardless
+    /// of [`DmarcHandling`] policy.
+    pub fn evaluate_dmarc(&self, data: &[u8], spf: Option<&SpfOutcome>, mail_from: &str) -> DmarcVerdict {
+        let dkim_verdict = self.verify_inbound_dkim(data);
+        self.dmarc_verdict_with_dkim(data, spf, &dkim_verdict, mail_from)
+    }
+
+    /// As [`Self::evaluate_dmarc`], but takes an already-computed DKIM verdict so the hot
+    /// (`accept_message_with_spf`) path never resolves the DKIM key twice.
+    fn dmarc_verdict_with_dkim(
+        &self,
+        data: &[u8],
+        spf: Option<&SpfOutcome>,
+        dkim_verdict: &DkimVerdict,
+        mail_from: &str,
+    ) -> DmarcVerdict {
+        let resolver = match &self.dmarc_resolver {
+            Some(r) => r.as_ref(),
+            None => return DmarcVerdict::NoPolicy,
+        };
+        let header_domain = match dmarc::header_from_domain(data) {
+            Some(d) => d,
+            // No parseable `From:` header/domain at all — nothing to align against. Malformed
+            // legacy mail is `dkim_gate`/recipient-resolution's problem, not fabricated here.
+            None => return DmarcVerdict::PermError,
+        };
+        let envelope_domain = domain_of(mail_from).unwrap_or("").to_string();
+        dmarc::evaluate(resolver, &header_domain, &envelope_domain, spf.map(|o| o.result), dkim_verdict)
+    }
+
+    /// Apply the DMARC policy (spec item 2) as a pre-delivery gate. Only `p=reject`/`sp=reject`
+    /// failures become an SMTP-level `550` under [`DmarcHandling::Enforce`] — see its docs on why
+    /// `quarantine` is not enacted here.
+    fn dmarc_gate(
+        &self,
+        data: &[u8],
+        spf: Option<&SpfOutcome>,
+        dkim_verdict: &DkimVerdict,
+        mail_from: &str,
+    ) -> Result<(), SmtpReply> {
+        if self.dmarc_policy != DmarcHandling::Enforce {
+            return Ok(());
+        }
+        match self.dmarc_verdict_with_dkim(data, spf, dkim_verdict, mail_from) {
+            DmarcVerdict::Fail { disposition: DmarcDisposition::Reject } => Err(SmtpReply::new(
+                550,
+                "5.7.1 message failed DMARC (RFC 7489): policy=reject and SPF/DKIM not aligned",
+            )),
+            // Pass, NoPolicy, PermError, or a Fail whose effective disposition is none/quarantine —
+            // none of these are an SMTP-level bounce here (see DmarcHandling::Enforce docs).
             _ => Ok(()),
         }
     }
@@ -475,7 +635,10 @@ impl InboundGateway {
     }
 
     /// The full `smtp-inbound` decision for one recipient (§19.7.1 steps 3–6): wrap, attest,
-    /// deliver, and return the SMTP reply — `250` only on a durable ack, else `451`.
+    /// deliver, and return the SMTP reply — `250` only on a durable ack, else `451`. A thin
+    /// convenience over [`Self::accept_message_with_spf`] for callers with no SPF outcome to feed
+    /// (no live `MAIL FROM` step, e.g. a caller driving the gateway directly) — DMARC then treats
+    /// SPF as not contributing a pass, never as a forged one.
     pub fn accept_message(
         &self,
         mail_from: &str,
@@ -483,9 +646,31 @@ impl InboundGateway {
         data: &[u8],
         now: TimestampMs,
     ) -> SmtpReply {
+        self.accept_message_with_spf(mail_from, rcpt_to, data, now, None)
+    }
+
+    /// As [`Self::accept_message`], but also takes the SPF outcome already evaluated for this
+    /// transaction (spec item 1: [`MxSession`] computes it at `MAIL FROM`, since SPF needs the
+    /// connecting peer IP, which this method alone does not receive). The outcome feeds DMARC
+    /// alignment (spec item 2, §7.2 step 2) alongside the existing DKIM gate.
+    pub fn accept_message_with_spf(
+        &self,
+        mail_from: &str,
+        rcpt_to: &str,
+        data: &[u8],
+        now: TimestampMs,
+        spf: Option<&SpfOutcome>,
+    ) -> SmtpReply {
         // Pre-delivery DKIM gate (§7.2 step 2): under an enforce policy, a present-but-invalid
-        // signature is refused here, before the body is ever wrapped into a MOTE.
-        if let Err(reply) = self.dkim_gate(data) {
+        // signature is refused here, before the body is ever wrapped into a MOTE. Computed once and
+        // reused by the DMARC gate below (avoids a second DKIM-key resolution).
+        let dkim_verdict = self.verify_inbound_dkim(data);
+        if let Err(reply) = self.dkim_gate(&dkim_verdict) {
+            return reply;
+        }
+        // DMARC (spec item 2, RFC 7489): combines the DKIM verdict above with `spf` and header-from
+        // alignment. Fail-closed only on an effective `reject` policy under Enforce (see docs).
+        if let Err(reply) = self.dmarc_gate(data, spf, &dkim_verdict, mail_from) {
             return reply;
         }
         let (env, attestation) = match self.wrap_and_attest(mail_from, rcpt_to, data, now) {
@@ -578,9 +763,16 @@ pub struct MxSession<'g> {
     peer_ip: String,
     now: TimestampMs,
     phase: Phase,
+    /// The `HELO`/`EHLO` argument, if any. Persists across `RSET`/transactions (RFC 5321 §4.1.1.1:
+    /// `RSET` resets the mail transaction, not the session's identification) — used as the SPF
+    /// fallback domain (spec item 1, RFC 7208 §2.4) when `MAIL FROM` is the null reverse-path.
+    helo: Option<String>,
     mail_from: Option<String>,
     rcpt_to: Option<String>,
     data: Vec<u8>,
+    /// The SPF outcome evaluated at `MAIL FROM` (spec item 1) for the current transaction, carried
+    /// through to the DMARC gate at the end of `DATA`.
+    spf_outcome: Option<SpfOutcome>,
 }
 
 impl<'g> MxSession<'g> {
@@ -590,9 +782,11 @@ impl<'g> MxSession<'g> {
             peer_ip: peer_ip.into(),
             now,
             phase: Phase::Command,
+            helo: None,
             mail_from: None,
             rcpt_to: None,
             data: Vec::new(),
+            spf_outcome: None,
         }
     }
 
@@ -605,6 +799,7 @@ impl<'g> MxSession<'g> {
         self.mail_from = None;
         self.rcpt_to = None;
         self.data.clear();
+        self.spf_outcome = None;
     }
 
     /// Feed one command line (no CRLF), or — during `DATA` — one data line. A lone `.` ends DATA.
@@ -617,7 +812,12 @@ impl<'g> MxSession<'g> {
             None => (line.trim().to_ascii_uppercase(), ""),
         };
         match verb.as_str() {
-            "HELO" | "EHLO" => SmtpReply::new(250, "envoir-gateway at your service"),
+            "HELO" | "EHLO" => {
+                // Captured for the SPF null-reverse-path fallback (spec item 1, RFC 7208 §2.4).
+                let arg = rest.trim();
+                self.helo = if arg.is_empty() { None } else { Some(arg.to_string()) };
+                SmtpReply::new(250, "envoir-gateway at your service")
+            }
             "MAIL" => self.cmd_mail(rest),
             "RCPT" => self.cmd_rcpt(rest),
             "DATA" => self.cmd_data(),
@@ -638,12 +838,19 @@ impl<'g> MxSession<'g> {
             None => return SmtpReply::new(501, "5.5.4 syntax: MAIL FROM:<address>"),
         };
         match self.gw.abuse_check(&self.peer_ip, &addr) {
-            AbuseDecision::Accept => {
-                self.mail_from = Some(addr);
-                SmtpReply::new(250, "2.1.0 sender ok")
-            }
-            AbuseDecision::Reject { code, reason } => SmtpReply::new(code, reason),
+            AbuseDecision::Accept => {}
+            AbuseDecision::Reject { code, reason } => return SmtpReply::new(code, reason),
         }
+        // SPF (spec item 1, RFC 7208): evaluated here, before DATA, since it needs the connecting
+        // peer IP, which only this MX session (not `InboundGateway::accept_message` alone) has. The
+        // outcome is stashed for the DMARC alignment gate at the end of DATA.
+        let spf_outcome = self.gw.evaluate_spf(&self.peer_ip, &addr, self.helo.as_deref());
+        if let Err(reply) = self.gw.spf_gate(&spf_outcome) {
+            return reply;
+        }
+        self.mail_from = Some(addr);
+        self.spf_outcome = Some(spf_outcome);
+        SmtpReply::new(250, "2.1.0 sender ok")
     }
 
     fn cmd_rcpt(&mut self, rest: &str) -> SmtpReply {
@@ -676,9 +883,17 @@ impl<'g> MxSession<'g> {
             let mail_from = self.mail_from.clone().unwrap_or_default();
             let rcpt_to = self.rcpt_to.clone().unwrap_or_default();
             let data = std::mem::take(&mut self.data);
+            let spf_outcome = self.spf_outcome.clone();
             self.reset_transaction();
             // The whole silent-loss-avoidance decision happens here: 250 only on a durable ack.
-            return self.gw.accept_message(&mail_from, &rcpt_to, &data, self.now);
+            // Feeds the MAIL-FROM-time SPF outcome into the DKIM/DMARC gates (spec items 1-2).
+            return self.gw.accept_message_with_spf(
+                &mail_from,
+                &rcpt_to,
+                &data,
+                self.now,
+                spf_outcome.as_ref(),
+            );
         }
         // Undo SMTP dot-stuffing (RFC 5321 §4.5.2), then append the line with CRLF.
         let unstuffed = line.strip_prefix('.').unwrap_or(line);

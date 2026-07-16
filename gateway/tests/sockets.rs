@@ -232,6 +232,104 @@ fn reply_code_mapping_delivered_transient_permanent() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// 4. STARTTLS advertised in EHLO but the STARTTLS command itself is refused → aborted, never
+//    downgraded — even when TLS was not strictly required for this send (opportunistic).
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn starttls_advertised_but_the_command_itself_is_refused_is_aborted_not_downgraded() {
+    let saw_mail = Arc::new(AtomicBool::new(false));
+    let (addr, _srv) = spawn_mini_mx(MiniMxScript {
+        offer_starttls: true, // EHLO advertises STARTTLS...
+        final_code: 250,
+        saw_mail: saw_mail.clone(),
+    });
+    // ...but `spawn_mini_mx`'s STARTTLS handler always replies 502 (see its `"STARTTLS" =>` arm) —
+    // modelling a peer that advertises the capability and then transiently refuses to use it.
+
+    let transport = SmtpTcpTransport::new("gateway.test")
+        .with_fixed_addr(addr)
+        .with_timeouts(Duration::from_secs(10), Duration::from_secs(10));
+    // Opportunistic (require_tls = false): TLS is not mandated for this send, yet a peer that
+    // advertised STARTTLS and then refused the command must still abort, not silently fall back to
+    // an unencrypted MAIL/DATA on the same connection.
+    let result = transport.deliver("advertises-then-refuses.test", &sample_message("bob@x.test"), false);
+    assert_eq!(
+        result,
+        TransportResult::TlsUnavailable,
+        "STARTTLS advertised then refused → abort, even when TLS was only opportunistic"
+    );
+    assert!(!saw_mail.load(Ordering::SeqCst), "must never fall back to cleartext MAIL/DATA");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 5. STARTTLS command accepted (220) but the TLS handshake itself never completes (peer drops the
+//    connection instead of responding with a ClientHello/ServerHello) → aborted, never downgraded.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn starttls_handshake_failure_after_220_is_aborted_not_downgraded_even_when_opportunistic() {
+    let saw_mail = Arc::new(AtomicBool::new(false));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let saw_mail2 = saw_mail.clone();
+    let handle = thread::spawn(move || {
+        let (stream, _) = match listener.accept() {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut w = stream.try_clone().expect("clone");
+        let mut r = BufReader::new(stream);
+        let send = |w: &mut TcpStream, s: &str| {
+            let _ = w.write_all(s.as_bytes());
+            let _ = w.flush();
+        };
+        send(&mut w, "220 mini-mx ready\r\n");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if r.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let verb = line.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+            match verb.as_str() {
+                "EHLO" | "HELO" => send(&mut w, "250-mini-mx\r\n250 STARTTLS\r\n"),
+                "STARTTLS" => {
+                    // Accept the STARTTLS command itself (220)...
+                    send(&mut w, "220 2.0.0 ready to start TLS\r\n");
+                    // ...but never actually speak TLS: drop the connection instead of answering the
+                    // client's ClientHello. This models a hung/broken peer whose handshake fails
+                    // after having already committed to STARTTLS.
+                    let _ = w.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                "MAIL" => {
+                    saw_mail2.store(true, Ordering::SeqCst);
+                    send(&mut w, "250 2.1.0 sender ok\r\n");
+                }
+                _ => send(&mut w, "250 2.0.0 ok\r\n"),
+            }
+        }
+    });
+
+    let transport = SmtpTcpTransport::new("gateway.test")
+        .with_fixed_addr(addr)
+        .with_timeouts(Duration::from_secs(5), Duration::from_secs(5));
+    // require_tls = false (opportunistic): the spec's no-downgrade rule (§7.3) applies even here —
+    // once STARTTLS has been issued, a failed handshake MUST NOT fall back to cleartext on the same
+    // connection (RFC 3207 §4.1's "the client MUST NOT send any mail on that connection" stance).
+    let result = transport.deliver("handshake-fails.test", &sample_message("bob@x.test"), false);
+    assert_eq!(
+        result,
+        TransportResult::TlsUnavailable,
+        "a TLS handshake that never completes after STARTTLS aborts, never downgrades"
+    );
+    assert!(!saw_mail.load(Ordering::SeqCst), "must never have sent MAIL/DATA in cleartext after STARTTLS failed");
+    let _ = handle.join();
+}
+
 // --- a tiny in-test SMTP server -------------------------------------------------------------
 
 struct MiniMxScript {

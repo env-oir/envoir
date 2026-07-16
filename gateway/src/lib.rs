@@ -20,6 +20,12 @@
 //!   real **MTA-STS enforcement** ([`mta_sts`], RFC 8461: TXT signal + HTTPS policy fetch/parse,
 //!   `enforce` mode requires TLS to an `mx:`-pattern-matching host and aborts rather than downgrading
 //!   otherwise). DANE (TLSA) is a documented, unimplemented seam (see [`outbound::TlsPolicy`] docs).
+//! - **Legacy interoperability hardening**: real **SPF** ([`spf`], RFC 7208 `check_host()` —
+//!   mechanisms, `include`/`redirect` chaining, a DNS-lookup budget, macro use rejected as a
+//!   documented narrowing) evaluated at `MAIL FROM`, and real **DMARC** ([`dmarc`], RFC 7489 —
+//!   alignment combining the SPF result with the existing DKIM verdict, `_dmarc` two-level policy
+//!   discovery, `p=`/`sp=` disposition) evaluated once the message is in hand — both wired into
+//!   [`inbound::InboundGateway`]'s annotate/enforce policy seams (spec §7.2 step 2, §9).
 //!
 //! ## Statelessness (spec §7.4)
 //! The gateway holds no queue and no mailbox. Durability is punted to the edges: inbound → the
@@ -46,6 +52,7 @@
 pub mod attestation;
 pub mod b64;
 pub mod dkim;
+pub mod dmarc;
 pub mod dns;
 pub mod inbound;
 pub mod inbound_tcp;
@@ -55,16 +62,21 @@ pub mod net;
 pub mod outbound;
 pub mod outbound_tcp;
 pub mod provenance;
+pub mod spf;
 
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 pub use dkim::{
     parse_public_key_txt, signing_domain_selector, verify_with_resolver, DkimError, DkimKey,
-    DkimKeyResolver, DkimVerdict, StaticDkimKeys,
+    DkimKeyResolver, DkimVerdict, DnsDkimKeyResolver, StaticDkimKeys,
+};
+pub use dmarc::{
+    organizational_domain, DmarcDisposition, DmarcPolicy, DmarcRecord, DmarcTxtResolver,
+    DmarcVerdict, DnsDmarcResolver, InMemoryDmarcResolver,
 };
 pub use inbound::{
     AbuseDecision, AllowAllAbuse, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy,
-    InboundBridged, InboundError, InboundGateway, KeyDirectory, MeshDelivery, MxSession,
-    RecipientKey, SmtpReply, SystemClock,
+    DmarcHandling, InboundBridged, InboundError, InboundGateway, KeyDirectory, MeshDelivery,
+    MxSession, RecipientKey, SmtpReply, SpfPolicy, SystemClock,
 };
 pub use inbound_tcp::{
     load_certs, load_private_key, server_config, server_config_from_pem, MxListener,
@@ -84,3 +96,4 @@ pub use provenance::{
     ProvenanceError, ProvenanceRecord, StaticGatewayAuthz, Tier,
 };
 pub use outbound_tcp::SmtpTcpTransport;
+pub use spf::{DnsSpfResolver, InMemorySpfResolver, SpfOutcome, SpfResolver, SpfResult};
