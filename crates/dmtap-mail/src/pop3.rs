@@ -4,7 +4,7 @@
 //! RSET/NOOP/QUIT. Deletes are committed to the store on QUIT (the UPDATE state).
 
 use crate::auth::{self, Authenticator};
-use crate::store::{Flag, MailStore};
+use crate::store::MailStore;
 use crate::util::{hex, md5};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,11 +289,9 @@ impl<S: MailStore, A: Authenticator> Pop3Session<S, A> {
                 self.slots.iter().filter(|s| s.deleted).map(|s| s.uid).collect();
             if let Some(mb) = self.store.mailbox_mut("INBOX") {
                 for uid in &to_delete {
-                    if let Some(pos) = mb.messages.iter().position(|m| m.uid == *uid) {
-                        // Mark \Deleted then remove (POP3 delete == expunge).
-                        mb.messages[pos].set_flag(Flag::Deleted);
-                        mb.messages.remove(pos);
-                        mb.highest_modseq += 1;
+                    // POP3 delete == expunge; remove_at records the vanished UID (QRESYNC / JMAP).
+                    if let Some(pos) = mb.index_of_uid(*uid) {
+                        mb.remove_at(pos);
                     }
                 }
             }

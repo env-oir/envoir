@@ -198,14 +198,27 @@ fn close_paren(toks: &[Token]) -> Result<usize, ParseError> {
 
 // --- Evaluation ----------------------------------------------------------------------------
 
-/// Per-message context for [`eval`].
+/// Per-message context for [`eval`]. The MIME parse is obtained **lazily** through the message's
+/// memoized cache ([`Message::parsed_cached`]) — a flag-only SEARCH over a large mailbox never
+/// parses a single body, and header/body predicates parse each message at most once, ever.
 pub struct SearchCtx<'a> {
     pub seq: u32,
     pub max_seq: u32,
     pub uid: u32,
     pub max_uid: u32,
     pub msg: &'a Message,
-    pub parsed: &'a ParsedMessage,
+}
+
+impl<'a> SearchCtx<'a> {
+    /// Build a context for `msg` at sequence/uid coordinates.
+    pub fn new(seq: u32, max_seq: u32, uid: u32, max_uid: u32, msg: &'a Message) -> SearchCtx<'a> {
+        SearchCtx { seq, max_seq, uid, max_uid, msg }
+    }
+
+    /// The memoized MIME parse (only touched by predicates that need headers/body/structure).
+    fn parsed(&self) -> &ParsedMessage {
+        self.msg.parsed_cached()
+    }
 }
 
 /// Evaluate a search key against one message.
@@ -236,7 +249,7 @@ pub fn eval(key: &SearchKey, c: &SearchCtx) -> bool {
         Cc(v) => hdr_contains(c, "Cc", v),
         Bcc(v) => hdr_contains(c, "Bcc", v),
         Subject(v) => hdr_contains(c, "Subject", v),
-        Header(f, v) => c.parsed.header(f).map(|h| icontains(h, v)).unwrap_or(v.is_empty()),
+        Header(f, v) => c.parsed().header(f).map(|h| icontains(h, v)).unwrap_or(v.is_empty()),
         Body(v) => body_contains(c, v),
         Text(v) => icontains(&String::from_utf8_lossy(&c.msg.raw), v),
         Larger(n) => c.msg.size() > *n,
@@ -258,11 +271,11 @@ fn has(c: &SearchCtx, f: &Flag) -> bool {
 }
 
 fn hdr_contains(c: &SearchCtx, name: &str, needle: &str) -> bool {
-    c.parsed.header(name).map(|h| icontains(h, needle)).unwrap_or(false)
+    c.parsed().header(name).map(|h| icontains(h, needle)).unwrap_or(false)
 }
 
 fn body_contains(c: &SearchCtx, needle: &str) -> bool {
-    icontains(&String::from_utf8_lossy(&c.parsed.body), needle)
+    icontains(&String::from_utf8_lossy(&c.parsed().body), needle)
 }
 
 fn icontains(haystack: &str, needle: &str) -> bool {
@@ -301,7 +314,7 @@ fn cmp_sent_date(c: &SearchCtx, d: &str, f: impl Fn(&(i64, i64, i64), &(i64, i64
         None => return false,
     };
     // Use the message's Date: header day if present; else fall back to internal date.
-    let sent = c.parsed.header("Date").and_then(parse_rfc5322_day).unwrap_or(mime::ymd_from_ms(c.msg.internal_date));
+    let sent = c.parsed().header("Date").and_then(parse_rfc5322_day).unwrap_or(mime::ymd_from_ms(c.msg.internal_date));
     f(&sent, &target)
 }
 
@@ -347,15 +360,8 @@ mod tests {
     #[test]
     fn evaluates_against_message() {
         let raw = b"From: Alice <alice@example.com>\r\nSubject: Weekly report\r\n\r\nthe body text\r\n";
-        let msg = Message {
-            uid: 5,
-            flags: vec![Flag::Seen],
-            internal_date: 1_752_537_600_000,
-            modseq: 3,
-            raw: raw.to_vec(),
-        };
-        let parsed = msg.parsed();
-        let ctx = SearchCtx { seq: 1, max_seq: 1, uid: 5, max_uid: 5, msg: &msg, parsed: &parsed };
+        let msg = Message::new(5, vec![Flag::Seen], 1_752_537_600_000, 3, raw.to_vec());
+        let ctx = SearchCtx::new(1, 1, 5, 5, &msg);
         assert!(eval(&key("SEEN"), &ctx));
         assert!(!eval(&key("UNSEEN"), &ctx));
         assert!(eval(&key("FROM alice"), &ctx));

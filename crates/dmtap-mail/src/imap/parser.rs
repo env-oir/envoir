@@ -173,8 +173,8 @@ pub enum Command {
     Enable(Vec<String>),
     Login { user: String, pass: String },
     Authenticate { mechanism: String, initial: Option<String> },
-    Select { mailbox: String, qresync: bool, condstore: bool },
-    Examine { mailbox: String, qresync: bool, condstore: bool },
+    Select { mailbox: String, qresync: Option<QResyncParams>, condstore: bool },
+    Examine { mailbox: String, qresync: Option<QResyncParams>, condstore: bool },
     Create(String),
     Delete(String),
     Rename { from: String, to: String },
@@ -193,10 +193,21 @@ pub enum Command {
     Namespace,
     Id(Option<Vec<(String, String)>>),
     Search { charset: Option<String>, key: SearchKey, uid: bool, ret: Vec<String> },
-    Fetch { set: SequenceSet, items: Vec<FetchItem>, uid: bool, changedsince: Option<u64> },
+    Fetch { set: SequenceSet, items: Vec<FetchItem>, uid: bool, changedsince: Option<u64>, vanished: bool },
     Store(StoreCommand),
     Copy { set: SequenceSet, mailbox: String, uid: bool },
     Move { set: SequenceSet, mailbox: String, uid: bool },
+}
+
+/// QRESYNC SELECT/EXAMINE parameters (RFC 7162 §3.2.5): the client's last-seen `UIDVALIDITY` and
+/// `HIGHESTMODSEQ`, plus optionally the set of UIDs it still knows about (so the server can scope
+/// the VANISHED (EARLIER) report). The optional `(seq-set uid-set)` known-sequence-match is parsed
+/// and ignored (a UID-based resync is a strict superset of what it optimizes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QResyncParams {
+    pub uid_validity: u32,
+    pub modseq: u64,
+    pub known_uids: Option<SequenceSet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,7 +309,7 @@ fn parse_body(name: &str, args: &[Token]) -> Result<Command, ParseError> {
         }
         "SELECT" | "EXAMINE" => {
             let mailbox = atom_at(args, 0)?;
-            let (qresync, condstore) = parse_select_params(&args[1.min(args.len())..]);
+            let (qresync, condstore) = parse_select_params(&args[1.min(args.len())..])?;
             if name == "SELECT" {
                 Command::Select { mailbox, qresync, condstore }
             } else {
@@ -325,20 +336,44 @@ fn parse_body(name: &str, args: &[Token]) -> Result<Command, ParseError> {
     })
 }
 
-fn parse_select_params(args: &[Token]) -> (bool, bool) {
-    // `(CONDSTORE)` or `(QRESYNC (…))` after the mailbox name.
-    let mut qresync = false;
+fn parse_select_params(args: &[Token]) -> Result<(Option<QResyncParams>, bool), ParseError> {
+    // The optional `(CONDSTORE)` / `(QRESYNC (uidvalidity modseq [known-uids [(seqs uids)]]))`
+    // parameter list after the mailbox name (RFC 7162 §3.1 / §3.2.5).
+    let mut qresync = None;
     let mut condstore = false;
-    for t in args {
-        if let Some(s) = t.as_str() {
-            match s.to_ascii_uppercase().as_str() {
-                "CONDSTORE" => condstore = true,
-                "QRESYNC" => qresync = true,
-                _ => {}
+    if !matches!(args.first(), Some(Token::LParen)) {
+        return Ok((None, false));
+    }
+    let (inner, _next) = read_paren_tokens(args, 0)?;
+    let mut i = 0;
+    while i < inner.len() {
+        match inner[i].as_str().map(|s| s.to_ascii_uppercase()).as_deref() {
+            Some("CONDSTORE") => {
+                condstore = true;
+                i += 1;
             }
+            Some("QRESYNC") => {
+                // QRESYNC is followed by a parenthesised argument list.
+                let (q, ni) = read_paren_tokens(&inner, i + 1)?;
+                let uid_validity =
+                    q.first().and_then(Token::as_str).and_then(|s| s.parse().ok()).ok_or(
+                        ParseError::Syntax("QRESYNC needs UIDVALIDITY"),
+                    )?;
+                let modseq = q
+                    .get(1)
+                    .and_then(Token::as_str)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or(ParseError::Syntax("QRESYNC needs modseq"))?;
+                // The third element (if an atom, not the trailing `(seq uid)` match list) is the
+                // set of UIDs the client still knows.
+                let known_uids = q.get(2).and_then(Token::as_str).and_then(SequenceSet::parse);
+                qresync = Some(QResyncParams { uid_validity, modseq, known_uids });
+                i = ni;
+            }
+            _ => i += 1,
         }
     }
-    (qresync, condstore)
+    Ok((qresync, condstore))
 }
 
 fn parse_list(args: &[Token]) -> Result<Command, ParseError> {
@@ -436,18 +471,21 @@ fn parse_search(args: &[Token], uid: bool) -> Result<Command, ParseError> {
 fn parse_fetch(args: &[Token], uid: bool) -> Result<Command, ParseError> {
     let set = SequenceSet::parse(atom_at(args, 0)?.as_str()).ok_or(ParseError::Syntax("bad sequence set"))?;
     let (items, next) = parse_fetch_items(args, 1)?;
-    // Optional `(CHANGEDSINCE n)` modifier (RFC 7162 QRESYNC).
+    // Optional `(CHANGEDSINCE n [VANISHED])` modifier list (RFC 7162 §3.1.5 / §3.2.5).
     let mut changedsince = None;
+    let mut vanished = false;
     if matches!(args.get(next), Some(Token::LParen)) {
         let (mods, _n) = read_paren_atoms(args, next)?;
         let mut it = mods.iter();
         while let Some(m) = it.next() {
             if m.eq_ignore_ascii_case("CHANGEDSINCE") {
                 changedsince = it.next().and_then(|v| v.parse().ok());
+            } else if m.eq_ignore_ascii_case("VANISHED") {
+                vanished = true;
             }
         }
     }
-    Ok(Command::Fetch { set, items, uid, changedsince })
+    Ok(Command::Fetch { set, items, uid, changedsince, vanished })
 }
 
 fn parse_fetch_items(args: &[Token], start: usize) -> Result<(Vec<FetchItem>, usize), ParseError> {
@@ -736,8 +774,20 @@ mod tests {
     fn parses_select_condstore() {
         assert_eq!(
             cmd("a SELECT INBOX (CONDSTORE)"),
-            Command::Select { mailbox: "INBOX".into(), qresync: false, condstore: true }
+            Command::Select { mailbox: "INBOX".into(), qresync: None, condstore: true }
         );
+    }
+
+    #[test]
+    fn parses_select_qresync() {
+        match cmd("a SELECT INBOX (QRESYNC (67890007 90060115 1:29))") {
+            Command::Select { qresync: Some(q), .. } => {
+                assert_eq!(q.uid_validity, 67890007);
+                assert_eq!(q.modseq, 90060115);
+                assert!(q.known_uids.is_some());
+            }
+            other => panic!("expected QRESYNC select, got {other:?}"),
+        }
     }
 
     #[test]

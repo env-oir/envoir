@@ -16,8 +16,17 @@ use crate::pop3::Pop3Session;
 use crate::smtp::SmtpSession;
 use crate::store::MailStore;
 
+/// Hard cap on a single IMAP literal (matches the SMTP/JMAP 50 MiB message ceiling, rounded up).
+/// A hostile `{9999999999}` literal must never be pre-allocated — we reject the command instead of
+/// letting the client drive the server to OOM.
+pub const MAX_LITERAL: usize = 64 * 1024 * 1024;
+
+/// Hard cap on a single command line before a literal (defends against an unbounded line flood).
+const MAX_LINE: usize = 1024 * 1024;
+
 /// Read one complete IMAP command (assembling synchronizing/non-sync literals) from `reader`,
-/// prompting on `writer`. Returns `Ok(None)` at clean EOF.
+/// prompting on `writer`. Returns `Ok(None)` at clean EOF. Oversized literals/lines are refused
+/// with a `BAD` and surfaced as an error so the caller drops the connection (fail closed).
 pub fn read_imap_command<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -29,8 +38,18 @@ pub fn read_imap_command<R: BufRead, W: Write>(
         if n == 0 {
             return Ok(if buf.is_empty() { None } else { Some(buf) });
         }
+        if line.len() > MAX_LINE {
+            let _ = writer.write_all(b"* BAD command line too long\r\n");
+            let _ = writer.flush();
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "command line too long"));
+        }
         buf.extend_from_slice(&line);
         match trailing_literal(&line) {
+            Some((size, _sync)) if size > MAX_LITERAL => {
+                let _ = writer.write_all(b"* BAD literal too large\r\n");
+                let _ = writer.flush();
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "literal exceeds MAX_LITERAL"));
+            }
             Some((size, sync)) => {
                 if sync {
                     writer.write_all(b"+ Ready for literal data\r\n")?;
@@ -46,9 +65,35 @@ pub fn read_imap_command<R: BufRead, W: Write>(
     }
 }
 
+/// Read up to (and including) the next `\n`, but **stop once `MAX_LINE` bytes have accrued** even
+/// if no newline has arrived — so a client that streams forever without a line terminator cannot
+/// drive the server to OOM (the caller then rejects the over-long line). Returns bytes read.
 fn read_until_lf<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> io::Result<usize> {
-    let n = reader.read_until(b'\n', out)?;
-    Ok(n)
+    let mut total = 0;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break; // EOF
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            out.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            total += pos + 1;
+            break;
+        }
+        let n = available.len();
+        out.extend_from_slice(available);
+        reader.consume(n);
+        total += n;
+        if out.len() > MAX_LINE {
+            break; // bounded — the caller sees an over-long line and refuses the command
+        }
+    }
+    Ok(total)
 }
 
 /// If the (CRLF-terminated) line ends with a literal introducer `{n}` or `{n+}`, return
@@ -87,19 +132,14 @@ where
             let mut writer = stream;
             let _ = writer.write_all(&session.greeting());
             let _ = writer.flush();
-            loop {
-                match read_imap_command(&mut reader, &mut writer) {
-                    Ok(Some(cmd)) => {
-                        let resp = session.process(&cmd);
-                        if writer.write_all(&resp).is_err() {
-                            break;
-                        }
-                        let _ = writer.flush();
-                        if session.state() == crate::imap::State::Logout {
-                            break;
-                        }
-                    }
-                    _ => break,
+            while let Ok(Some(cmd)) = read_imap_command(&mut reader, &mut writer) {
+                let resp = session.process(&cmd);
+                if writer.write_all(&resp).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+                if session.state() == crate::imap::State::Logout {
+                    break;
                 }
             }
         });
@@ -221,5 +261,16 @@ mod tests {
         assert_eq!(trailing_literal(b"a APPEND INBOX {11}\r\n"), Some((11, true)));
         assert_eq!(trailing_literal(b"a APPEND INBOX {11+}\r\n"), Some((11, false)));
         assert_eq!(trailing_literal(b"a NOOP\r\n"), None);
+    }
+
+    #[test]
+    fn oversized_literal_is_refused_not_allocated() {
+        // A hostile `{huge}` literal must be rejected (fail closed), never pre-allocated → no OOM.
+        let cmd = format!("a APPEND INBOX {{{}}}\r\n", MAX_LITERAL + 1);
+        let mut r = Cursor::new(cmd.into_bytes());
+        let mut w = Vec::new();
+        let err = read_imap_command(&mut r, &mut w).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(w.windows(4).any(|c| c == b"BAD "), "must warn BAD: {:?}", String::from_utf8_lossy(&w));
     }
 }

@@ -69,9 +69,9 @@ and speaks the legacy protocol; the mesh/relay never decrypts; there is no centr
 | ID | 2971 | ✅ |
 | LITERAL+ / synchronizing literals | 7888 | ✅ (`net` reader) |
 | CONDSTORE (HIGHESTMODSEQ, MODSEQ, CHANGEDSINCE) | 7162 | ✅ |
-| **QRESYNC full resync** (VANISHED, `(UIDVALIDITY … known-uids)`) | 7162 | ⚠️ **partial** — ENABLE + CHANGEDSINCE work; VANISHED/known-set resync **deferred** |
-| **CHARSET conversion in SEARCH** | 9051 | ⚠️ parsed but only ASCII/UTF-8 substring matching |
-| **Nested multipart part paths deeper than the MIME tree offsets** | 9051 | ✅ top-down walk; exotic message/rfc822 envelope-in-bodystructure **deferred** |
+| **QRESYNC full resync** (VANISHED (EARLIER) on `SELECT (QRESYNC …)`, `(UIDVALIDITY modseq known-uids)`, VANISHED on EXPUNGE/MOVE, `FETCH … (CHANGEDSINCE n VANISHED)`) | 7162 | ✅ |
+| **CHARSET in SEARCH** — US-ASCII / UTF-8 accepted; others rejected `[BADCHARSET (US-ASCII UTF-8)]` | 9051 | ✅ |
+| **Nested multipart part paths** (`BODY[n.m…]`, `.MIME`, partial windows) | 9051 | ✅ top-down walk; exotic `message/rfc822` envelope-in-BODYSTRUCTURE **deferred** (niche; needs recursive envelope embedding) |
 | **Real TLS** (STARTTLS crypto) | 9051 | ⛔ **deferred** — transport concern; state machine acks, node terminates TLS¹ |
 
 ### SMTP submission (RFC 6409)
@@ -85,7 +85,7 @@ and speaks the legacy protocol; the mesh/relay never decrypts; there is no centr
 | SMTPUTF8 | 6531 | ✅ advertised |
 | PIPELINING | 2920 | ✅ advertised |
 | SIZE (advertised + enforced against MAIL SIZE=) | 1870 | ✅ |
-| DSN (RET/NOTIFY/ENVID params) | 3461 | ⚠️ advertised + accepted; **no delivery-status generation** (submission-only) |
+| DSN (RET/NOTIFY/ENVID params + RFC 3464 report generation) | 3461 / 3464 | ✅ params captured on the `Submission`; `DsnReport::failure_for` / `.render()` emit a `multipart/report; report-type=delivery-status` honoring RET (full/hdrs), ENVID, and per-recipient NOTIFY |
 | ENHANCEDSTATUSCODES | 2034 | ✅ |
 | Submit → **MOTE** (`build_mote_draft`) or gateway hand-off | spec §8.2 | ✅ (draft built; mesh send is the node's job) |
 
@@ -109,14 +109,13 @@ and speaks the legacy protocol; the mesh/relay never decrypts; there is no centr
 | Request/Response envelope (`using`, `methodCalls`, `methodResponses`, `sessionState`) | 8620 | ✅ |
 | Mailbox/get, Mailbox/query | 8621 | ✅ |
 | Email/get (envelope fields, keywords, bodyValues, preview), Email/query (inMailbox filter) | 8621 | ✅ |
-| Email/set (keyword update — full + patch form — and destroy) | 8621 | ✅ |
-| Thread/get | 8621 | ✅ (reference: single-message threads) |
+| Email/set (create/update/destroy) — **create composes** RFC 5322 from `from`/`to`/`cc`/`subject`/`bodyValues`, keyword update (full + patch), destroy | 8621 | ✅ |
+| Thread/get, Thread/changes | 8621 | ✅ (reference: single-message threads) |
 | EmailSubmission/set (create → accepted; send is the node's MOTE path) | 8621 | ✅ |
 | Blob upload / download (blobId = content address, ties to MOTE id) | 8620 §6 | ✅ (functions) |
-| Mailbox/changes, Email/changes | 8620 §5.2 | ⚠️ **stub** — reports `cannotCalculateChanges` (no durable change log yet); clients fall back to full query+get |
-| Email/set **create** (compose a new Email object) | 8621 | ⛔ **deferred** (update/destroy done; MIME-compose-from-JMAP not yet) |
-| Push: StateChange / EventSource / WebSocket | 8620 §7 | ⚠️ **types provided** (`StateChange`); HTTP push transport **deferred** |
-| back-references (`#` result refs), method-level `createdIds` chaining | 8620 §3.7 | ⛔ **deferred** |
+| Mailbox/changes, Email/changes, Thread/changes | 8620 §5.2 | ✅ real delta from the per-mailbox modseq + create-modseq + vanished-log change tracking (opaque state token); `cannotCalculateChanges` only on an unparseable token |
+| back-references (`#` result refs, JSON-pointer `path` incl. `*`) | 8620 §3.7 | ✅ (e.g. `Email/query` → `Email/get` in one request) |
+| Push: StateChange / EventSource / WebSocket | 8620 §7 | ⚠️ **types provided** (`StateChange`); HTTP push transport **deferred** (transport concern, like TLS) |
 
 ### Autodiscovery
 
@@ -132,13 +131,32 @@ hands the plaintext stream to these state machines, which advertise/ack STARTTLS
 cleartext auth behind it (LOGINDISABLED / `538` / `STLS`). Wiring a TLS library is a transport
 concern for the node binary.
 
+## Efficiency properties (hot paths)
+
+The IMAP FETCH/SEARCH/STORE paths are built to stay proportional to the *answer*, not the mailbox:
+
+- **Parse once, ever.** Each `Message` memoizes its MIME parse (`parsed_cached`, a `OnceCell`);
+  ENVELOPE/BODYSTRUCTURE/SEARCH re-derivations across many requests never re-parse. A
+  `FETCH (FLAGS UID)` or a flag-only SEARCH parses **no** bodies at all (lazy — the parse is only
+  touched by items/keys that need it).
+- **`O(log n)` UID lookup.** Messages are held UID-sorted; `index_of_uid` is a binary search and
+  `resolve_targets` walks only the matched window, so a targeted `UID FETCH 5` over a 10k-message
+  mailbox touches ~`log n` messages instead of scanning all `n` (regression-guarded by a timing
+  test — see `tests/imap_session.rs::large_mailbox_targeted_fetch_is_sublinear`). `max_uid` is `O(1)`.
+- **No needless copies.** `BODY[]` / `BODY[HEADER]` / `BODY[TEXT]` **borrow** the raw bytes
+  (`Cow`), so a partial fetch `BODY[]<0.512>` on a 10 MB message copies only the 512-byte window,
+  not the whole message. `BODY[HEADER.FIELDS (…)]` parses just the header block, not the MIME tree.
+- **VANISHED is compact.** Expunged-UID lists collapse contiguous runs to `lo:hi`.
+- **Incremental-friendly store.** The `MailStore` trait exposes references (not clones) and the
+  JMAP change-log is derived from modseqs + a small vanished log, so a real indexed/encrypted
+  backend can implement it without a second journal.
+
 ## Explicitly deferred (never silently dropped)
 
-- IMAP **QRESYNC** VANISHED / known-UID resynchronization (CONDSTORE + CHANGEDSINCE are done).
-- IMAP **SEARCH CHARSET** transcoding beyond ASCII/UTF-8 substring; server-side threading (THREAD).
-- JMAP **/changes** durable change log, **Email/set create** (compose), **push transport**, and
-  request **back-references**.
-- SMTP **DSN status generation** (submission accepts DSN params but does not emit reports).
+- IMAP exotic `message/rfc822` **envelope-in-BODYSTRUCTURE** (top-down part walk + `.MIME` are
+  done); server-side **THREAD**. (QRESYNC VANISHED, SEARCH CHARSET are now **done**.)
+- JMAP **push transport** (StateChange types exist; HTTP EventSource/WebSocket wiring is a
+  transport concern like TLS). (`/changes`, Email/set create, back-references are now **done**.)
 - Real **TLS/crypto** (STARTTLS handshake) — see note ¹.
 - **CalDAV/CardDAV** (spec §8.4) — a separate surface, not in this crate.
 

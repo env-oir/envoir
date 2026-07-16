@@ -232,22 +232,37 @@ pub fn part_segments(raw: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
-/// Split a raw message into (header-block-bytes, body-bytes). Public for section fetches.
-pub fn header_and_body(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    // Find the separator index (mirrors split_headers but returns owned slices incl. the blank).
+/// The byte offset where the body begins: `raw[..body_offset]` is the header block (through the
+/// blank-line terminator) and `raw[body_offset..]` is the body. Returns `raw.len()` if there is no
+/// blank line. This is the borrow-friendly core of [`header_and_body`] — the IMAP `BODY[]`/
+/// `BODY[HEADER]`/`BODY[TEXT]` fetches slice on it without copying the whole message.
+pub fn body_offset(raw: &[u8]) -> usize {
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == b'\n' {
             if i + 1 < raw.len() && raw[i + 1] == b'\n' {
-                return (raw[..=i + 1].to_vec(), raw[i + 2..].to_vec());
+                return i + 2;
             }
             if i + 2 < raw.len() && raw[i + 1] == b'\r' && raw[i + 2] == b'\n' {
-                return (raw[..=i + 2].to_vec(), raw[i + 3..].to_vec());
+                return i + 3;
             }
         }
         i += 1;
     }
-    (raw.to_vec(), Vec::new())
+    raw.len()
+}
+
+/// Split a raw message into (header-block-bytes, body-bytes). Public for section fetches.
+pub fn header_and_body(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let s = body_offset(raw);
+    (raw[..s].to_vec(), raw[s..].to_vec())
+}
+
+/// Parse just the header block (no MIME-structure walk) — cheap for `BODY[HEADER.FIELDS (...)]`,
+/// which needs header lines but not the multipart tree.
+pub fn headers_only(raw: &[u8]) -> Vec<(String, String)> {
+    let s = body_offset(raw);
+    parse_header_block(&raw[..s])
 }
 
 fn count_lines(body: &[u8]) -> usize {

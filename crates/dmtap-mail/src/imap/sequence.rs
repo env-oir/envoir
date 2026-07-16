@@ -69,6 +69,24 @@ impl SequenceSet {
         }
         (1..=count).filter(|&n| self.contains(n, count)).collect()
     }
+
+    /// The normalized `(lo, hi)` ranges (`lo <= hi`) with `*` resolved to `max`. This lets a caller
+    /// walk only the matched span — e.g. a targeted `UID FETCH 5` yields `[(5, 5)]` and can be
+    /// answered with an `O(log n)` binary search instead of scanning the whole mailbox.
+    pub fn ranges_resolved(&self, max: u32) -> Vec<(u32, u32)> {
+        self.ranges
+            .iter()
+            .map(|r| {
+                let a = r.lo.resolve(max);
+                let b = r.hi.resolve(max);
+                if a <= b {
+                    (a, b)
+                } else {
+                    (b, a)
+                }
+            })
+            .collect()
+    }
 }
 
 fn parse_point(s: &str) -> Option<Point> {
@@ -109,5 +127,13 @@ mod tests {
         assert!(SequenceSet::parse("abc").is_none());
         assert!(SequenceSet::parse("0").is_none());
         assert!(SequenceSet::parse("1:").is_none());
+        assert!(SequenceSet::parse("1:2:3").is_none());
+        assert!(SequenceSet::parse(",").is_none());
+    }
+
+    #[test]
+    fn ranges_resolved_normalizes_and_resolves_star() {
+        let set = SequenceSet::parse("5:3,10,*").unwrap();
+        assert_eq!(set.ranges_resolved(100), vec![(3, 5), (10, 10), (100, 100)]);
     }
 }

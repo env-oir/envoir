@@ -3,6 +3,8 @@
 //!
 //! Everything here is pure string/byte production so it round-trips in unit tests.
 
+use std::borrow::Cow;
+
 use crate::mime::{self, BodyPart, ParsedMessage};
 
 use super::parser::Section;
@@ -123,25 +125,36 @@ fn param_list(params: &[(String, String)]) -> String {
     out
 }
 
-/// Extract the bytes for a FETCH `BODY[section]` request from the raw message.
-pub fn extract_section(raw: &[u8], section: &Section) -> Vec<u8> {
+/// Extract the bytes for a FETCH `BODY[section]` request from the raw message. `[]`, `[HEADER]`
+/// and `[TEXT]` **borrow** the raw bytes (no copy — the partial-fetch path then slices only the
+/// requested window); field-filtered and part sections must build new bytes.
+pub fn extract_section<'a>(raw: &'a [u8], section: &Section) -> Cow<'a, [u8]> {
     match section {
-        Section::Full => raw.to_vec(),
-        Section::Header => mime::header_and_body(raw).0,
-        Section::Text => mime::header_and_body(raw).1,
-        Section::HeaderFields(fields) => selected_headers(raw, fields, true),
-        Section::HeaderFieldsNot(fields) => selected_headers(raw, fields, false),
-        Section::Part(path) => extract_part(raw, path).map(|seg| mime::header_and_body(&seg).1).unwrap_or_default(),
-        Section::PartMime(path) => extract_part(raw, path).map(|seg| mime::header_and_body(&seg).0).unwrap_or_default(),
+        Section::Full => Cow::Borrowed(raw),
+        Section::Header => Cow::Borrowed(&raw[..mime::body_offset(raw)]),
+        Section::Text => Cow::Borrowed(&raw[mime::body_offset(raw)..]),
+        Section::HeaderFields(fields) => Cow::Owned(selected_headers(raw, fields, true)),
+        Section::HeaderFieldsNot(fields) => Cow::Owned(selected_headers(raw, fields, false)),
+        Section::Part(path) => Cow::Owned(
+            extract_part(raw, path)
+                .map(|seg| seg[mime::body_offset(&seg)..].to_vec())
+                .unwrap_or_default(),
+        ),
+        Section::PartMime(path) => Cow::Owned(
+            extract_part(raw, path)
+                .map(|seg| seg[..mime::body_offset(&seg)].to_vec())
+                .unwrap_or_default(),
+        ),
     }
 }
 
-/// Header lines matching (or not matching) `fields`, followed by the terminating CRLF.
+/// Header lines matching (or not matching) `fields`, followed by the terminating CRLF. Parses only
+/// the header block (not the MIME tree) — the common Apple/Thunderbird "headers preview" fetch.
 fn selected_headers(raw: &[u8], fields: &[String], include: bool) -> Vec<u8> {
-    let parsed = ParsedMessage::parse(raw);
+    let headers = mime::headers_only(raw);
     let wanted: Vec<String> = fields.iter().map(|f| f.to_ascii_lowercase()).collect();
     let mut out = String::new();
-    for (name, value) in &parsed.headers {
+    for (name, value) in &headers {
         let is_wanted = wanted.contains(&name.to_ascii_lowercase());
         if is_wanted == include {
             out.push_str(&format!("{name}: {value}\r\n"));
@@ -230,8 +243,11 @@ mod tests {
     #[test]
     fn section_extraction() {
         let raw = b"From: a@b\r\nSubject: S\r\n\r\nthe body\r\n";
-        assert_eq!(extract_section(raw, &Section::Text), b"the body\r\n");
-        let hf = extract_section(raw, &Section::HeaderFields(vec!["Subject".into()]));
+        assert_eq!(extract_section(raw, &Section::Text).as_ref(), b"the body\r\n");
+        // [] and [HEADER]/[TEXT] must borrow the raw bytes (no allocation) so partial fetches slice.
+        assert!(matches!(extract_section(raw, &Section::Full), Cow::Borrowed(_)));
+        assert!(matches!(extract_section(raw, &Section::Text), Cow::Borrowed(_)));
+        let hf = extract_section(raw, &Section::HeaderFields(vec!["Subject".into()])).into_owned();
         let s = String::from_utf8(hf).unwrap();
         assert!(s.contains("Subject: S"));
         assert!(!s.contains("From:"));
@@ -243,6 +259,6 @@ mod tests {
                     --B\r\nContent-Type: text/plain\r\n\r\nfirst part\r\n\
                     --B\r\nContent-Type: text/html\r\n\r\n<p>second</p>\r\n--B--\r\n";
         let part1 = extract_section(raw, &Section::Part(vec![1]));
-        assert_eq!(String::from_utf8_lossy(&part1).trim(), "first part");
+        assert_eq!(String::from_utf8_lossy(part1.as_ref()).trim(), "first part");
     }
 }

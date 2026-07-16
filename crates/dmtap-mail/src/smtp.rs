@@ -15,12 +15,37 @@ use crate::mime::ParsedMessage;
 /// The maximum message size advertised via the SIZE extension (RFC 1870). 50 MiB.
 pub const MAX_SIZE: usize = 50 * 1024 * 1024;
 
-/// An accepted submission (envelope + RFC 5322 bytes).
+/// What the sender asked to have returned in a DSN (RFC 3461 `RET`): the full original message,
+/// or its headers only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ret {
+    Full,
+    Headers,
+}
+
+impl Ret {
+    fn parse(v: &str) -> Option<Ret> {
+        match v.to_ascii_uppercase().as_str() {
+            "FULL" => Some(Ret::Full),
+            "HDRS" => Some(Ret::Headers),
+            _ => None,
+        }
+    }
+}
+
+/// An accepted submission (envelope + RFC 5322 bytes), including the DSN parameters (RFC 3461) the
+/// client attached so the node's delivery path can emit delivery-status notifications.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Submission {
     pub mail_from: String,
     pub rcpt_to: Vec<String>,
     pub data: Vec<u8>,
+    /// `ENVID=` — echoed back as `Original-Envelope-Id` in any DSN (RFC 3461 §4.4).
+    pub envid: Option<String>,
+    /// `RET=` — whether a DSN should carry the full message or just headers (RFC 3461 §4.3).
+    pub ret: Option<Ret>,
+    /// Per-recipient `NOTIFY=` values (aligned with `rcpt_to`), e.g. `SUCCESS,FAILURE` / `NEVER`.
+    pub dsn_notify: Vec<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +64,9 @@ pub struct SmtpSession<A: Authenticator> {
     authed: Option<Vec<u8>>,
     mail_from: Option<String>,
     rcpt_to: Vec<String>,
+    dsn_notify: Vec<Option<String>>,
+    envid: Option<String>,
+    ret: Option<Ret>,
     data_buf: Vec<u8>,
     pending_auth: Option<SmtpPendingAuth>,
     submissions: Vec<Submission>,
@@ -60,6 +88,9 @@ impl<A: Authenticator> SmtpSession<A> {
             authed: None,
             mail_from: None,
             rcpt_to: Vec::new(),
+            dsn_notify: Vec::new(),
+            envid: None,
+            ret: None,
             data_buf: Vec::new(),
             pending_auth: None,
             submissions: Vec::new(),
@@ -207,8 +238,12 @@ impl<A: Authenticator> SmtpSession<A> {
                 return "552 5.3.4 Message size exceeds fixed limit\r\n".into();
             }
         }
+        // Capture the DSN envelope parameters (RFC 3461): RET= and ENVID=.
+        self.ret = param_value(rest, "RET").and_then(|v| Ret::parse(&v));
+        self.envid = param_value(rest, "ENVID");
         self.mail_from = Some(addr);
         self.rcpt_to.clear();
+        self.dsn_notify.clear();
         "250 2.1.0 Sender OK\r\n".into()
     }
 
@@ -221,6 +256,7 @@ impl<A: Authenticator> SmtpSession<A> {
             None => return "501 5.5.4 Syntax: RCPT TO:<address>\r\n".into(),
         };
         self.rcpt_to.push(addr);
+        self.dsn_notify.push(param_value(rest, "NOTIFY"));
         "250 2.1.5 Recipient OK\r\n".into()
     }
 
@@ -242,6 +278,9 @@ impl<A: Authenticator> SmtpSession<A> {
                 mail_from: self.mail_from.take().unwrap_or_default(),
                 rcpt_to: std::mem::take(&mut self.rcpt_to),
                 data,
+                envid: self.envid.take(),
+                ret: self.ret.take(),
+                dsn_notify: std::mem::take(&mut self.dsn_notify),
             };
             self.submissions.push(sub);
             return "250 2.0.0 OK: queued as MOTE\r\n".into();
@@ -256,6 +295,9 @@ impl<A: Authenticator> SmtpSession<A> {
     fn reset_txn(&mut self) {
         self.mail_from = None;
         self.rcpt_to.clear();
+        self.dsn_notify.clear();
+        self.envid = None;
+        self.ret = None;
         self.data_buf.clear();
     }
 }
@@ -298,6 +340,210 @@ pub fn build_mote_draft(data: &[u8], ts: TimestampMs) -> MoteDraft {
         cc: Vec::new(),
     };
     draft
+}
+
+// --- DSN (Delivery Status Notification) generation (RFC 3461 / RFC 3464) --------------------
+
+/// The per-recipient delivery action reported in a DSN (RFC 3464 §2.3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsnAction {
+    Failed,
+    Delayed,
+    Delivered,
+    Relayed,
+    Expanded,
+}
+
+impl DsnAction {
+    fn wire(self) -> &'static str {
+        match self {
+            DsnAction::Failed => "failed",
+            DsnAction::Delayed => "delayed",
+            DsnAction::Delivered => "delivered",
+            DsnAction::Relayed => "relayed",
+            DsnAction::Expanded => "expanded",
+        }
+    }
+    fn human(self) -> &'static str {
+        match self {
+            DsnAction::Failed => "Delivery to the following recipient failed permanently:",
+            DsnAction::Delayed => "Delivery to the following recipient has been delayed:",
+            DsnAction::Delivered => "Your message was successfully delivered to:",
+            DsnAction::Relayed => "Your message was relayed to:",
+            DsnAction::Expanded => "Your message was expanded to:",
+        }
+    }
+}
+
+/// One recipient's status in a DSN report (RFC 3464 §2.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsnRecipient {
+    pub address: String,
+    pub action: DsnAction,
+    /// The RFC 3463 enhanced status code, e.g. `5.1.1` (no such user).
+    pub status: String,
+    /// An optional SMTP diagnostic (`Diagnostic-Code: smtp; 550 …`).
+    pub diagnostic: Option<String>,
+}
+
+/// A delivery-status report to be rendered into an RFC 3464 `multipart/report` message.
+#[derive(Debug, Clone)]
+pub struct DsnReport {
+    /// Who the DSN is addressed to — the original `MAIL FROM` (the return path).
+    pub notify_to: String,
+    /// This node's reporting MTA name (`Reporting-MTA: dns; <name>`).
+    pub reporting_mta: String,
+    /// Echoed `ENVID` (`Original-Envelope-Id`), if the submission supplied one.
+    pub original_envelope_id: Option<String>,
+    pub recipients: Vec<DsnRecipient>,
+    /// The submitted message (for the returned `message/rfc822` or `text/rfc822-headers` part).
+    pub original_message: Vec<u8>,
+    /// Whether to attach the full message or just its headers (from `RET=`).
+    pub ret: Ret,
+    pub arrival: TimestampMs,
+}
+
+impl DsnReport {
+    /// A permanent-failure DSN for every recipient of `sub` that asked to be notified on failure
+    /// (RFC 3461: `NOTIFY=NEVER`/`SUCCESS`-only recipients are skipped). Returns `None` when no
+    /// recipient wants a failure DSN. `status`/`diagnostic` describe the failure.
+    pub fn failure_for(
+        sub: &Submission,
+        reporting_mta: impl Into<String>,
+        status: &str,
+        diagnostic: Option<&str>,
+        now: TimestampMs,
+    ) -> Option<DsnReport> {
+        let recipients: Vec<DsnRecipient> = sub
+            .rcpt_to
+            .iter()
+            .zip(sub.dsn_notify.iter().chain(std::iter::repeat(&None)))
+            .filter(|(_, notify)| wants_failure_dsn(notify.as_deref()))
+            .map(|(addr, _)| DsnRecipient {
+                address: addr.clone(),
+                action: DsnAction::Failed,
+                status: status.to_string(),
+                diagnostic: diagnostic.map(str::to_string),
+            })
+            .collect();
+        if recipients.is_empty() {
+            return None;
+        }
+        Some(DsnReport {
+            notify_to: sub.mail_from.clone(),
+            reporting_mta: reporting_mta.into(),
+            original_envelope_id: sub.envid.clone(),
+            recipients,
+            original_message: sub.data.clone(),
+            ret: sub.ret.unwrap_or(Ret::Headers),
+            arrival: now,
+        })
+    }
+
+    /// Render the report as an RFC 3464 `multipart/report; report-type=delivery-status` message,
+    /// ready to be filed into the sender's INBOX by the node.
+    pub fn render(&self) -> Vec<u8> {
+        // Deterministic boundary from the content (stable across renders → reproducible tests).
+        let boundary = format!("=_dsn_{}", crate::util::hex(&stable_tag(&self.original_message)));
+        let date = crate::mime::format_rfc5322_date(self.arrival);
+        let overall = if self.recipients.iter().all(|r| r.action == DsnAction::Delivered) {
+            "Delivered"
+        } else if self.recipients.iter().any(|r| r.action == DsnAction::Failed) {
+            "Failure"
+        } else {
+            "Delayed"
+        };
+
+        let mut m = String::new();
+        m.push_str(&format!("From: Mail Delivery System <postmaster@{}>\r\n", self.reporting_mta));
+        m.push_str(&format!("To: <{}>\r\n", self.notify_to));
+        m.push_str(&format!("Subject: Delivery Status Notification ({overall})\r\n"));
+        m.push_str(&format!("Date: {date}\r\n"));
+        m.push_str("MIME-Version: 1.0\r\n");
+        m.push_str("Auto-Submitted: auto-replied\r\n");
+        m.push_str(&format!(
+            "Content-Type: multipart/report; report-type=delivery-status;\r\n\tboundary=\"{boundary}\"\r\n\r\n"
+        ));
+
+        // Part 1 — human-readable notification (RFC 3464 §2.1).
+        m.push_str(&format!("--{boundary}\r\n"));
+        m.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
+        m.push_str("This is an automatically generated Delivery Status Notification.\r\n\r\n");
+        for r in &self.recipients {
+            m.push_str(r.action.human());
+            m.push_str(&format!("\r\n  {} (status {})\r\n", r.address, r.status));
+            if let Some(d) = &r.diagnostic {
+                m.push_str(&format!("  {d}\r\n"));
+            }
+        }
+        m.push_str("\r\n");
+
+        // Part 2 — machine-readable delivery-status (RFC 3464 §2.1 / §2.3).
+        m.push_str(&format!("--{boundary}\r\n"));
+        m.push_str("Content-Type: message/delivery-status\r\n\r\n");
+        m.push_str(&format!("Reporting-MTA: dns; {}\r\n", self.reporting_mta));
+        if let Some(envid) = &self.original_envelope_id {
+            m.push_str(&format!("Original-Envelope-Id: {envid}\r\n"));
+        }
+        m.push_str(&format!("Arrival-Date: {date}\r\n"));
+        for r in &self.recipients {
+            m.push_str("\r\n");
+            m.push_str(&format!("Original-Recipient: rfc822;{}\r\n", r.address));
+            m.push_str(&format!("Final-Recipient: rfc822;{}\r\n", r.address));
+            m.push_str(&format!("Action: {}\r\n", r.action.wire()));
+            m.push_str(&format!("Status: {}\r\n", r.status));
+            if let Some(d) = &r.diagnostic {
+                m.push_str(&format!("Diagnostic-Code: smtp; {d}\r\n"));
+            }
+        }
+        m.push_str("\r\n");
+
+        // Part 3 — the returned content (RFC 3461 RET): full message or just headers.
+        m.push_str(&format!("--{boundary}\r\n"));
+        let mut bytes = m.into_bytes();
+        match self.ret {
+            Ret::Full => {
+                bytes.extend_from_slice(b"Content-Type: message/rfc822\r\n\r\n");
+                bytes.extend_from_slice(&self.original_message);
+            }
+            Ret::Headers => {
+                bytes.extend_from_slice(b"Content-Type: text/rfc822-headers\r\n\r\n");
+                let (headers, _) = crate::mime::header_and_body(&self.original_message);
+                bytes.extend_from_slice(&headers);
+            }
+        }
+        if !bytes.ends_with(b"\r\n") {
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        bytes
+    }
+}
+
+/// Whether a recipient's `NOTIFY=` value asks for a failure DSN. Absent = default (notify on
+/// failure); `NEVER` suppresses; otherwise honor an explicit `FAILURE` (RFC 3461 §4.1).
+fn wants_failure_dsn(notify: Option<&str>) -> bool {
+    match notify {
+        None => true,
+        Some(v) => {
+            let up = v.to_ascii_uppercase();
+            if up.split(',').any(|t| t.trim() == "NEVER") {
+                false
+            } else {
+                up.split(',').any(|t| t.trim() == "FAILURE")
+            }
+        }
+    }
+}
+
+/// A short deterministic tag over some bytes, for a stable MIME boundary (BLAKE3-256, first 8 B).
+fn stable_tag(b: &[u8]) -> [u8; 8] {
+    let cid = dmtap_core::ContentId::of(b);
+    let digest = cid.digest();
+    let mut out = [0u8; 8];
+    let n = digest.len().min(8);
+    out[..n].copy_from_slice(&digest[..n]);
+    out
 }
 
 #[cfg(test)]
@@ -355,5 +601,59 @@ mod tests {
         let draft = build_mote_draft(b"Subject: Test\r\n\r\nbody", 42);
         assert_eq!(draft.headers.subject.as_deref(), Some("Test"));
         assert_eq!(draft.body, b"body");
+    }
+
+    /// Drive a full submission that declares DSN parameters, then generate the failure DSN.
+    fn submitted_with_dsn(ret: &str, notify: &str) -> Submission {
+        let mut s = authed_session();
+        s.feed_line("EHLO c");
+        let cred = base64_encode(b"\0alice\0pw");
+        s.feed_line(&format!("AUTH PLAIN {cred}"));
+        s.feed_line(&format!("MAIL FROM:<alice@dmtap.local> RET={ret} ENVID=abc123"));
+        s.feed_line(&format!("RCPT TO:<bob@example.net> NOTIFY={notify}"));
+        s.feed_line("DATA");
+        s.feed_line("Subject: Hi");
+        s.feed_line("From: alice@dmtap.local");
+        s.feed_line("");
+        s.feed_line("Hello Bob");
+        s.feed_line(".");
+        s.take_submissions().pop().unwrap()
+    }
+
+    #[test]
+    fn captures_dsn_params() {
+        let sub = submitted_with_dsn("FULL", "FAILURE");
+        assert_eq!(sub.ret, Some(Ret::Full));
+        assert_eq!(sub.envid.as_deref(), Some("abc123"));
+        assert_eq!(sub.dsn_notify, vec![Some("FAILURE".to_string())]);
+    }
+
+    #[test]
+    fn generates_failure_dsn_report() {
+        let sub = submitted_with_dsn("HDRS", "FAILURE");
+        let report =
+            DsnReport::failure_for(&sub, "mail.dmtap.local", "5.1.1", Some("550 no such user"), 0)
+                .expect("a failure DSN should be produced");
+        let bytes = report.render();
+        let text = String::from_utf8_lossy(&bytes);
+        // Structure: RFC 3464 multipart/report with a machine-readable delivery-status part.
+        assert!(text.contains("Content-Type: multipart/report; report-type=delivery-status"), "{text}");
+        assert!(text.contains("Content-Type: message/delivery-status"), "{text}");
+        assert!(text.contains("Reporting-MTA: dns; mail.dmtap.local"), "{text}");
+        assert!(text.contains("Original-Envelope-Id: abc123"), "{text}");
+        assert!(text.contains("Final-Recipient: rfc822;bob@example.net"), "{text}");
+        assert!(text.contains("Action: failed"), "{text}");
+        assert!(text.contains("Status: 5.1.1"), "{text}");
+        assert!(text.contains("Diagnostic-Code: smtp; 550 no such user"), "{text}");
+        // RET=HDRS returns only the original headers, as text/rfc822-headers.
+        assert!(text.contains("Content-Type: text/rfc822-headers"), "{text}");
+        assert!(text.contains("Subject: Hi"), "{text}");
+        assert!(!text.contains("Hello Bob"), "RET=HDRS must not echo the body: {text}");
+    }
+
+    #[test]
+    fn notify_never_suppresses_dsn() {
+        let sub = submitted_with_dsn("FULL", "NEVER");
+        assert!(DsnReport::failure_for(&sub, "mta", "5.0.0", None, 0).is_none());
     }
 }

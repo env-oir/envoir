@@ -8,12 +8,14 @@
 //! in-memory [`MemoryStore`] is the reference backing used by the servers and the tests; a real
 //! node would back the same trait with its encrypted-at-rest store + device-cluster CRDT (§8.3).
 
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
 use dmtap_core::mote::Payload;
 use dmtap_core::TimestampMs;
 
 use crate::mime;
+use crate::util::base64_decode;
 
 /// A message unique identifier within a mailbox (IMAP UID, RFC 9051 §2.3.1.1).
 pub type Uid = u32;
@@ -105,16 +107,39 @@ impl SpecialUse {
 
 /// A stored message: RFC 5322 bytes plus IMAP metadata. Built either by rendering a MOTE
 /// payload ([`MemoryStore::deliver_mote`]) or by a client APPEND / SMTP submission.
+///
+/// The MIME parse is **memoized** in `parsed_cache`: the raw bytes never change after a message
+/// is stored, so ENVELOPE / BODYSTRUCTURE / SEARCH re-derivations across many FETCH/SEARCH
+/// requests parse the message at most once (the IMAP hot path — see [`Message::parsed_cached`]).
 #[derive(Debug, Clone)]
 pub struct Message {
     pub uid: Uid,
     pub flags: Vec<Flag>,
     pub internal_date: TimestampMs,
     pub modseq: ModSeq,
+    /// The modseq at which this message was **created** (appended). Distinguishes JMAP
+    /// `created` from `updated` in `/changes` (RFC 8620 §5.2) without a separate log.
+    pub created_modseq: ModSeq,
     pub raw: Vec<u8>,
+    /// Lazily-populated MIME parse (see the type doc). `OnceCell` keeps `Message: Send` (it is
+    /// `!Sync`, which is fine — a session owns its store on one thread).
+    parsed_cache: OnceCell<mime::ParsedMessage>,
 }
 
 impl Message {
+    /// Construct a stored message with an explicit create-modseq (used by [`Mailbox::append`]).
+    pub fn new(uid: Uid, flags: Vec<Flag>, internal_date: TimestampMs, modseq: ModSeq, raw: Vec<u8>) -> Message {
+        Message {
+            uid,
+            flags,
+            internal_date,
+            modseq,
+            created_modseq: modseq,
+            raw,
+            parsed_cache: OnceCell::new(),
+        }
+    }
+
     /// RFC822.SIZE — octet count of the raw message.
     pub fn size(&self) -> usize {
         self.raw.len()
@@ -134,13 +159,25 @@ impl Message {
         self.flags.retain(|x| x != f);
     }
 
-    /// Parse the message into headers + MIME structure (for ENVELOPE / BODYSTRUCTURE / SEARCH).
+    /// Parse the message into headers + MIME structure (fresh, uncached).
     pub fn parsed(&self) -> mime::ParsedMessage {
         mime::ParsedMessage::parse(&self.raw)
+    }
+
+    /// The memoized MIME parse (parses once, then returns the cached structure). This is what the
+    /// IMAP FETCH/SEARCH hot paths use so a 10k-message mailbox is never re-parsed per request.
+    pub fn parsed_cached(&self) -> &mime::ParsedMessage {
+        self.parsed_cache.get_or_init(|| mime::ParsedMessage::parse(&self.raw))
     }
 }
 
 /// A mailbox (folder) — an ordered list of messages with IMAP bookkeeping.
+///
+/// Messages are held in **ascending UID order** (UIDs are monotonic and expunge preserves order),
+/// so UID→index lookups are `O(log n)` binary searches, not linear scans ([`Mailbox::index_of_uid`]).
+/// `expunged` is the QRESYNC vanished-UID log: each expunge records `(uid, modseq)` so a client
+/// that reconnects after being offline can fast-resync (RFC 7162 §3.2.5.2 VANISHED (EARLIER)) and
+/// JMAP `/changes` can report `destroyed` (RFC 8620 §5.2) — both without keeping the message body.
 #[derive(Debug, Clone)]
 pub struct Mailbox {
     pub name: String,
@@ -150,6 +187,8 @@ pub struct Mailbox {
     pub highest_modseq: ModSeq,
     pub subscribed: bool,
     pub messages: Vec<Message>,
+    /// `(expunged-uid, modseq-at-expunge)`, ascending by modseq. The vanished log (RFC 7162).
+    pub expunged: Vec<(Uid, ModSeq)>,
 }
 
 impl Mailbox {
@@ -162,6 +201,7 @@ impl Mailbox {
             highest_modseq: 1,
             subscribed: true,
             messages: Vec::new(),
+            expunged: Vec::new(),
         }
     }
 
@@ -177,6 +217,11 @@ impl Mailbox {
         self.messages.iter().filter(|m| !m.has_flag(&Flag::Seen)).count()
     }
 
+    /// The highest UID in use (`*` in a UID sequence-set). `O(1)` — messages are UID-sorted.
+    pub fn max_uid(&self) -> Uid {
+        self.messages.last().map(|m| m.uid).unwrap_or(0)
+    }
+
     /// Sequence number (1-based) of the first unseen message, per SELECT's `[UNSEEN n]`.
     pub fn first_unseen_seq(&self) -> Option<usize> {
         self.messages.iter().position(|m| !m.has_flag(&Flag::Seen)).map(|i| i + 1)
@@ -187,17 +232,43 @@ impl Mailbox {
         let uid = self.uid_next;
         self.uid_next += 1;
         self.highest_modseq += 1;
-        self.messages.push(Message { uid, flags, internal_date, modseq: self.highest_modseq, raw });
+        self.messages.push(Message::new(uid, flags, internal_date, self.highest_modseq, raw));
         uid
     }
 
-    /// UID → sequence number (1-based).
+    /// Index of a UID via binary search (`O(log n)`; messages are UID-sorted).
+    pub fn index_of_uid(&self, uid: Uid) -> Option<usize> {
+        self.messages.binary_search_by(|m| m.uid.cmp(&uid)).ok()
+    }
+
+    /// UID → sequence number (1-based). `O(log n)`.
     pub fn seq_of_uid(&self, uid: Uid) -> Option<usize> {
-        self.messages.iter().position(|m| m.uid == uid).map(|i| i + 1)
+        self.index_of_uid(uid).map(|i| i + 1)
     }
 
     pub fn by_uid(&self, uid: Uid) -> Option<&Message> {
-        self.messages.iter().find(|m| m.uid == uid)
+        self.index_of_uid(uid).map(|i| &self.messages[i])
+    }
+
+    /// Remove the message at `index`, bumping modseq and recording the vanished UID in the
+    /// expunge log (QRESYNC / JMAP change tracking). Returns the removed UID.
+    pub fn remove_at(&mut self, index: usize) -> Option<Uid> {
+        if index >= self.messages.len() {
+            return None;
+        }
+        let uid = self.messages[index].uid;
+        self.highest_modseq += 1;
+        self.expunged.push((uid, self.highest_modseq));
+        self.messages.remove(index);
+        Some(uid)
+    }
+
+    /// UIDs expunged since `modseq` (for QRESYNC VANISHED (EARLIER) resync), ascending.
+    pub fn vanished_since(&self, modseq: ModSeq) -> Vec<Uid> {
+        let mut v: Vec<Uid> =
+            self.expunged.iter().filter(|(_, ms)| *ms > modseq).map(|(u, _)| *u).collect();
+        v.sort_unstable();
+        v
     }
 }
 
@@ -211,8 +282,33 @@ pub enum StoreError {
     InboxImmutable,
 }
 
+/// A JMAP object type for `/changes` (RFC 8620 §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JmapObj {
+    Email,
+    Mailbox,
+    Thread,
+}
+
+/// The result of a JMAP `/changes` call: object ids that were created / updated / destroyed since
+/// the client's `sinceState`, plus the resulting `newState` (RFC 8620 §5.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JmapChanges {
+    pub old_state: String,
+    pub new_state: String,
+    pub created: Vec<String>,
+    pub updated: Vec<String>,
+    pub destroyed: Vec<String>,
+    pub has_more: bool,
+}
+
 /// The MailStore projection: the set of operations every protocol view needs. A real node backs
 /// this with its encrypted store; [`MemoryStore`] is the reference/testing backing.
+///
+/// The JMAP change-log methods ([`MailStore::jmap_state`] / [`MailStore::jmap_changes`]) are
+/// **default-implemented** purely from per-mailbox modseqs and the per-message create-modseq +
+/// [`Mailbox::expunged`] log, so *every* backend gets a real, durable `/changes` — no separate
+/// change journal, and no `cannotCalculateChanges` fallback.
 pub trait MailStore {
     fn mailbox_names(&self) -> Vec<String>;
     fn mailbox(&self, name: &str) -> Option<&Mailbox>;
@@ -220,6 +316,110 @@ pub trait MailStore {
     fn create(&mut self, name: &str) -> Result<(), StoreError>;
     fn delete(&mut self, name: &str) -> Result<(), StoreError>;
     fn rename(&mut self, from: &str, to: &str) -> Result<(), StoreError>;
+
+    /// The opaque JMAP state token (RFC 8620 §1.3): an encoding of every mailbox's
+    /// `highest_modseq`, from which [`jmap_changes`](MailStore::jmap_changes) computes a delta.
+    fn jmap_state(&self) -> String {
+        let map: BTreeMap<String, ModSeq> = self
+            .mailbox_names()
+            .iter()
+            .filter_map(|n| self.mailbox(n).map(|mb| (n.clone(), mb.highest_modseq)))
+            .collect();
+        encode_state_map(&map)
+    }
+
+    /// Compute a JMAP `/changes` delta for `obj` since the `since` state token. Compares the
+    /// caller's per-mailbox modseqs against the live store: a message with `modseq > old` is a
+    /// change (`created` if `created_modseq > old`, else `updated`); every `expunged` entry with
+    /// `modseq > old` is `destroyed`. Returns `None` only if the token is unparseable (the JMAP
+    /// layer then reports `cannotCalculateChanges`).
+    fn jmap_changes(&self, obj: JmapObj, since: &str) -> Option<JmapChanges> {
+        let old = decode_state_map(since)?;
+        let new_state = self.jmap_state();
+        let mut created = Vec::new();
+        let mut updated = Vec::new();
+        let mut destroyed = Vec::new();
+
+        match obj {
+            JmapObj::Email | JmapObj::Thread => {
+                for name in self.mailbox_names() {
+                    let mb = match self.mailbox(&name) {
+                        Some(mb) => mb,
+                        None => continue,
+                    };
+                    let old_ms = old.get(&name).copied().unwrap_or(0);
+                    for m in &mb.messages {
+                        if m.modseq > old_ms {
+                            let id = format!("{name}|{}", m.uid);
+                            if m.created_modseq > old_ms {
+                                created.push(id);
+                            } else {
+                                updated.push(id);
+                            }
+                        }
+                    }
+                    for (uid, ms) in &mb.expunged {
+                        if *ms > old_ms {
+                            destroyed.push(format!("{name}|{uid}"));
+                        }
+                    }
+                }
+            }
+            JmapObj::Mailbox => {
+                let current: BTreeMap<String, ModSeq> = self
+                    .mailbox_names()
+                    .iter()
+                    .filter_map(|n| self.mailbox(n).map(|mb| (n.clone(), mb.highest_modseq)))
+                    .collect();
+                for (name, ms) in &current {
+                    match old.get(name) {
+                        None => created.push(name.clone()),
+                        Some(old_ms) if ms != old_ms => updated.push(name.clone()),
+                        _ => {}
+                    }
+                }
+                for name in old.keys() {
+                    if !current.contains_key(name) {
+                        destroyed.push(name.clone());
+                    }
+                }
+            }
+        }
+        Some(JmapChanges { old_state: since.to_string(), new_state, created, updated, destroyed, has_more: false })
+    }
+}
+
+/// Encode a `{mailbox → modseq}` map as an opaque, order-independent state token. Length-prefixed
+/// binary (so mailbox names may contain any byte) then base64 — safe to hand a client verbatim.
+fn encode_state_map(map: &BTreeMap<String, ModSeq>) -> String {
+    let mut buf = Vec::with_capacity(map.len() * 16);
+    for (name, ms) in map {
+        buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&ms.to_be_bytes());
+    }
+    crate::util::base64_encode(&buf)
+}
+
+/// Inverse of [`encode_state_map`]. Returns `None` on any malformed token (fail closed).
+fn decode_state_map(token: &str) -> Option<BTreeMap<String, ModSeq>> {
+    // The genesis token "0" (or empty) means "before any state" — an empty map.
+    if token.is_empty() || token == "0" {
+        return Some(BTreeMap::new());
+    }
+    let bytes = base64_decode(token)?;
+    let mut map = BTreeMap::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let nlen = u32::from_be_bytes(bytes.get(i..i + 4)?.try_into().ok()?) as usize;
+        i += 4;
+        let name = String::from_utf8(bytes.get(i..i + nlen)?.to_vec()).ok()?;
+        i += nlen;
+        let ms = u64::from_be_bytes(bytes.get(i..i + 8)?.try_into().ok()?);
+        i += 8;
+        map.insert(name, ms);
+    }
+    Some(map)
 }
 
 /// In-memory reference MailStore. Deterministic UIDVALIDITY, INBOX + the five SPECIAL-USE
@@ -381,5 +581,65 @@ mod tests {
         }
         // System flags are case-insensitive.
         assert_eq!(Flag::parse("\\SEEN"), Flag::Seen);
+    }
+
+    #[test]
+    fn index_of_uid_is_binary_search() {
+        let mut s = MemoryStore::empty();
+        for i in 0..1000u32 {
+            s.deliver_raw("INBOX", vec![(i % 256) as u8], vec![], 0);
+        }
+        let mb = s.mailbox("INBOX").unwrap();
+        assert_eq!(mb.index_of_uid(1), Some(0));
+        assert_eq!(mb.index_of_uid(500), Some(499));
+        assert_eq!(mb.index_of_uid(1000), Some(999));
+        assert_eq!(mb.index_of_uid(1001), None);
+        assert_eq!(mb.max_uid(), 1000);
+    }
+
+    #[test]
+    fn remove_at_records_vanished() {
+        let mut s = MemoryStore::empty();
+        for _ in 0..4 {
+            s.deliver_raw("INBOX", b"x".to_vec(), vec![], 0);
+        }
+        let mb = s.mailbox_mut("INBOX").unwrap();
+        let base = mb.highest_modseq;
+        // Remove uid 2 (index 1) then uid 3 (now index 1) — vanished log grows, modseq climbs.
+        mb.remove_at(1);
+        mb.remove_at(1);
+        assert_eq!(mb.exists(), 2);
+        let vanished = mb.vanished_since(base);
+        assert_eq!(vanished, vec![2, 3]);
+        // A later baseline sees nothing.
+        assert!(mb.vanished_since(mb.highest_modseq).is_empty());
+    }
+
+    #[test]
+    fn jmap_state_token_round_trips() {
+        let s = MemoryStore::new();
+        let token = s.jmap_state();
+        let map = decode_state_map(&token).unwrap();
+        assert!(map.contains_key("INBOX"));
+        // Genesis + empty tokens decode to "before any state".
+        assert!(decode_state_map("0").unwrap().is_empty());
+        assert!(decode_state_map("").unwrap().is_empty());
+        // Garbage fails closed.
+        assert!(decode_state_map("@@not base64@@").is_none());
+    }
+
+    #[test]
+    fn jmap_changes_delta_from_modseq() {
+        let mut s = MemoryStore::empty();
+        s.deliver_raw("INBOX", b"one".to_vec(), vec![], 0);
+        let state0 = s.jmap_state();
+        s.deliver_raw("INBOX", b"two".to_vec(), vec![], 0);
+        let ch = s.jmap_changes(JmapObj::Email, &state0).unwrap();
+        assert_eq!(ch.created, vec!["INBOX|2"]);
+        assert!(ch.updated.is_empty());
+        assert!(ch.destroyed.is_empty());
+        // Mailbox-level changes see INBOX as updated (its modseq advanced).
+        let mch = s.jmap_changes(JmapObj::Mailbox, &state0).unwrap();
+        assert_eq!(mch.updated, vec!["INBOX"]);
     }
 }

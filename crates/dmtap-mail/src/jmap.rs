@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::mime::ParsedMessage;
-use crate::store::{Flag, MailStore};
+use crate::store::{Flag, JmapObj, MailStore};
 
 /// A JMAP method invocation `[name, arguments, callId]` (RFC 8620 §3.2).
 pub type Invocation = (String, Value, String);
@@ -97,12 +97,20 @@ impl StateChange {
     }
 }
 
-/// Process a JMAP request against a store, dispatching each method call (RFC 8620 §3.3).
+/// Process a JMAP request against a store, dispatching each method call (RFC 8620 §3.3), with
+/// back-reference (`#`) resolution (§3.7) so a client can chain e.g. `Email/query` → `Email/get`.
 pub fn process<S: MailStore>(store: &mut S, account_id: &str, req: &Request) -> Response {
-    let mut responses = Vec::new();
+    let mut responses: Vec<Invocation> = Vec::new();
     for (name, args, call_id) in &req.method_calls {
-        let result = dispatch(store, account_id, name, args);
-        match result {
+        // Resolve any `#name`/ResultReference arguments against the responses so far (§3.7).
+        let resolved = match resolve_references(args, &responses) {
+            Ok(a) => a,
+            Err(e) => {
+                responses.push(("error".to_string(), e, call_id.clone()));
+                continue;
+            }
+        };
+        match dispatch(store, account_id, name, &resolved) {
             Ok((rname, rargs)) => responses.push((rname, rargs, call_id.clone())),
             Err(err) => responses.push(("error".to_string(), err, call_id.clone())),
         }
@@ -119,25 +127,99 @@ fn dispatch<S: MailStore>(
     match name {
         "Mailbox/get" => Ok(("Mailbox/get".into(), mailbox_get(store, account, args))),
         "Mailbox/query" => Ok(("Mailbox/query".into(), mailbox_query(store, account))),
-        "Mailbox/changes" => Ok(("Mailbox/changes".into(), changes_stub(store, account, "Mailbox"))),
+        "Mailbox/changes" => Ok(("Mailbox/changes".into(), changes(store, account, JmapObj::Mailbox, args))),
         "Email/get" => Ok(("Email/get".into(), email_get(store, account, args))),
         "Email/query" => Ok(("Email/query".into(), email_query(store, account, args))),
-        "Email/changes" => Ok(("Email/changes".into(), changes_stub(store, account, "Email"))),
+        "Email/changes" => Ok(("Email/changes".into(), changes(store, account, JmapObj::Email, args))),
         "Email/set" => Ok(("Email/set".into(), email_set(store, account, args))),
         "Thread/get" => Ok(("Thread/get".into(), thread_get(store, account, args))),
+        "Thread/changes" => Ok(("Thread/changes".into(), changes(store, account, JmapObj::Thread, args))),
         "EmailSubmission/set" => Ok(("EmailSubmission/set".into(), submission_set(account, args))),
         _ => Err(json!({ "type": "unknownMethod", "description": name })),
     }
 }
 
+/// The opaque JMAP state token (an encoding of every mailbox's modseq — see
+/// [`MailStore::jmap_state`]); every `state`/`queryState`/`newState` field uses it so a client can
+/// feed it straight back into a `/changes` call.
 fn state_string<S: MailStore>(store: &S) -> String {
-    let sum: u64 = store
-        .mailbox_names()
-        .iter()
-        .filter_map(|n| store.mailbox(n))
-        .map(|mb| mb.highest_modseq)
-        .sum();
-    sum.to_string()
+    store.jmap_state()
+}
+
+// --- back-references (RFC 8620 §3.7) -------------------------------------------------------
+
+/// Resolve `#`/ResultReference argument values against prior method responses. A top-level
+/// argument whose value is `{ "resultOf": callId, "name": method, "path": jsonPointer }` is
+/// replaced by evaluating the pointer over that earlier response's arguments.
+fn resolve_references(args: &Value, prior: &[Invocation]) -> Result<Value, Value> {
+    let obj = match args.as_object() {
+        Some(o) => o,
+        None => return Ok(args.clone()),
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in obj {
+        // The wire spelling of a back-reference argument is `#<realArgName>`.
+        if let Some(real) = k.strip_prefix('#') {
+            let rr = v.as_object().ok_or_else(|| ref_error("ResultReference not an object"))?;
+            let result_of = rr.get("resultOf").and_then(Value::as_str);
+            let mname = rr.get("name").and_then(Value::as_str);
+            let path = rr.get("path").and_then(Value::as_str);
+            let (result_of, mname, path) = match (result_of, mname, path) {
+                (Some(a), Some(b), Some(c)) => (a, b, c),
+                _ => return Err(ref_error("ResultReference missing resultOf/name/path")),
+            };
+            let source = prior
+                .iter()
+                .find(|(n, _, cid)| n == mname && cid == result_of)
+                .ok_or_else(|| ref_error("ResultReference target not found"))?;
+            let resolved = eval_pointer(&source.1, path).ok_or_else(|| ref_error("bad ResultReference path"))?;
+            out.insert(real.to_string(), resolved);
+        } else {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn ref_error(desc: &str) -> Value {
+    json!({ "type": "invalidResultReference", "description": desc })
+}
+
+/// Evaluate a JMAP JSON pointer (RFC 8620 §3.7 / RFC 6901) with the `*` array-map extension:
+/// `/list/*/id` maps over `list` collecting each element's `id`.
+fn eval_pointer(value: &Value, path: &str) -> Option<Value> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() {
+        return Some(value.clone());
+    }
+    let (token, rest) = match path.split_once('/') {
+        Some((t, r)) => (t, r),
+        None => (path, ""),
+    };
+    if token == "*" {
+        let arr = value.as_array()?;
+        let mut out = Vec::new();
+        for item in arr {
+            match eval_pointer(item, rest) {
+                // A `*` that maps to arrays flattens them (§3.7).
+                Some(Value::Array(inner)) => out.extend(inner),
+                Some(v) => out.push(v),
+                None => {}
+            }
+        }
+        Some(Value::Array(out))
+    } else {
+        let next = match value {
+            Value::Object(m) => m.get(token)?,
+            Value::Array(a) => a.get(token.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+        if rest.is_empty() {
+            Some(next.clone())
+        } else {
+            eval_pointer(next, rest)
+        }
+    }
 }
 
 // --- Mailbox --------------------------------------------------------------------------------
@@ -183,7 +265,7 @@ fn mailbox_query<S: MailStore>(store: &S, account: &str) -> Value {
     json!({
         "accountId": account,
         "queryState": state_string(store),
-        "canCalculateChanges": false,
+        "canCalculateChanges": true,
         "position": 0,
         "total": ids.len(),
         "ids": ids
@@ -241,7 +323,7 @@ fn email_query<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
     json!({
         "accountId": account,
         "queryState": state_string(store),
-        "canCalculateChanges": false,
+        "canCalculateChanges": true,
         "position": 0,
         "total": ids.len(),
         "ids": ids
@@ -339,10 +421,35 @@ fn preview(p: &ParsedMessage) -> String {
 }
 
 fn email_set<S: MailStore>(store: &mut S, account: &str, args: &Value) -> Value {
+    let mut created = serde_json::Map::new();
+    let mut not_created = serde_json::Map::new();
     let mut updated = serde_json::Map::new();
     let mut not_updated = serde_json::Map::new();
     let mut destroyed = Vec::new();
     let mut not_destroyed = serde_json::Map::new();
+
+    // create: compose a brand-new Email object into a MOTE-backed message (RFC 8621 §4.6).
+    if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
+        for (cid, obj) in create {
+            match compose_email(store, obj) {
+                Ok((mailbox, uid, size)) => {
+                    let id = email_id(&mailbox, uid);
+                    created.insert(
+                        cid.clone(),
+                        json!({
+                            "id": id,
+                            "blobId": id,
+                            "threadId": format!("T{uid}"),
+                            "size": size
+                        }),
+                    );
+                }
+                Err(e) => {
+                    not_created.insert(cid.clone(), e);
+                }
+            }
+        }
+    }
 
     // update: change keywords (flags) on existing emails.
     if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
@@ -369,9 +476,9 @@ fn email_set<S: MailStore>(store: &mut S, account: &str, args: &Value) -> Value 
             match parse_email_id(id) {
                 Some((mb, uid)) => {
                     if let Some(m) = store.mailbox_mut(&mb) {
-                        if let Some(pos) = m.messages.iter().position(|x| x.uid == uid) {
-                            m.messages.remove(pos);
-                            m.highest_modseq += 1;
+                        if let Some(pos) = m.index_of_uid(uid) {
+                            // remove_at records the vanished UID so /changes can report `destroyed`.
+                            m.remove_at(pos);
                             destroyed.push(Value::String(id.to_string()));
                             continue;
                         }
@@ -389,13 +496,100 @@ fn email_set<S: MailStore>(store: &mut S, account: &str, args: &Value) -> Value 
         "accountId": account,
         "oldState": "0",
         "newState": state_string(store),
-        "created": {},
+        "created": Value::Object(created),
         "updated": Value::Object(updated),
         "destroyed": destroyed,
-        "notCreated": {},
+        "notCreated": Value::Object(not_created),
         "notUpdated": Value::Object(not_updated),
         "notDestroyed": Value::Object(not_destroyed)
     })
+}
+
+/// Compose a JMAP `Email` create object (RFC 8621 §4.6) into RFC 5322 bytes and file it into the
+/// store. Returns `(mailbox, uid, size)` or a JMAP SetError. This is the JMAP→MIME compose path:
+/// `from`/`to`/`cc`/`subject` become headers, `bodyValues`+`textBody` become the body, `keywords`
+/// become flags. A real node would additionally build a native MOTE draft for outbound send.
+fn compose_email<S: MailStore>(store: &mut S, obj: &Value) -> Result<(String, u32, usize), Value> {
+    // Destination mailbox: the first (true) entry of mailboxIds, defaulting to Drafts→INBOX.
+    let mailbox = obj
+        .get("mailboxIds")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.iter().find(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.clone()))
+        .filter(|m| store.mailbox(m).is_some())
+        .or_else(|| store.mailbox("Drafts").map(|_| "Drafts".to_string()))
+        .unwrap_or_else(|| "INBOX".to_string());
+    if store.mailbox(&mailbox).is_none() {
+        return Err(json!({ "type": "notFound", "description": "mailboxIds references no such mailbox" }));
+    }
+
+    let mut headers = String::new();
+    let addr_header = |key: &str, label: &str, out: &mut String| {
+        if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
+            let rendered: Vec<String> = list
+                .iter()
+                .filter_map(|a| {
+                    let email = a.get("email").and_then(Value::as_str)?;
+                    Some(match a.get("name").and_then(Value::as_str) {
+                        Some(n) if !n.is_empty() => format!("{n} <{email}>"),
+                        _ => email.to_string(),
+                    })
+                })
+                .collect();
+            if !rendered.is_empty() {
+                out.push_str(&format!("{label}: {}\r\n", rendered.join(", ")));
+            }
+        }
+    };
+    addr_header("from", "From", &mut headers);
+    addr_header("to", "To", &mut headers);
+    addr_header("cc", "Cc", &mut headers);
+    if let Some(subject) = obj.get("subject").and_then(Value::as_str) {
+        headers.push_str(&format!("Subject: {}\r\n", sanitize_header(subject)));
+    }
+    headers.push_str(&format!("Date: {}\r\n", crate::mime::format_rfc5322_date(0)));
+    headers.push_str("MIME-Version: 1.0\r\n");
+    headers.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+
+    // Body: the text part referenced by textBody[0].partId, else the first bodyValue.
+    let body_values = obj.get("bodyValues").and_then(|v| v.as_object());
+    let part_id = obj
+        .get("textBody")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|p| p.get("partId"))
+        .and_then(Value::as_str);
+    let body = body_values
+        .and_then(|bv| {
+            part_id
+                .and_then(|pid| bv.get(pid))
+                .or_else(|| bv.values().next())
+                .and_then(|v| v.get("value"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_string();
+
+    let mut raw = headers.into_bytes();
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(body.as_bytes());
+    let size = raw.len();
+
+    let flags: Vec<Flag> = obj
+        .get("keywords")
+        .and_then(|v| v.as_object())
+        .map(|kw| kw.keys().map(|k| flag_of_keyword(k)).collect())
+        .unwrap_or_default();
+
+    let uid = store
+        .mailbox_mut(&mailbox)
+        .map(|mb| mb.append(raw, flags, 0))
+        .ok_or_else(|| json!({ "type": "serverFail" }))?;
+    Ok((mailbox, uid, size))
+}
+
+/// Strip CR/LF from a header value so a composed Email can't inject extra headers (RFC 5322 §2.2).
+fn sanitize_header(v: &str) -> String {
+    v.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
 fn apply_email_update<S: MailStore>(store: &mut S, mb: &str, uid: u32, patch: &Value) -> bool {
@@ -489,18 +683,26 @@ fn submission_set(account: &str, args: &Value) -> Value {
     })
 }
 
-fn changes_stub<S: MailStore>(store: &S, account: &str, _type: &str) -> Value {
-    // /changes requires a durable change log; the reference reports "no calculable changes" so a
-    // client falls back to a full /query + /get (RFC 8620 §5.2 cannotCalculateChanges).
-    json!({
-        "accountId": account,
-        "oldState": "0",
-        "newState": state_string(store),
-        "hasMoreChanges": false,
-        "created": [],
-        "updated": [],
-        "destroyed": []
-    })
+/// `Foo/changes` (RFC 8620 §5.2): a real delta computed from the store's modseq change-log
+/// ([`MailStore::jmap_changes`]). `sinceState` is required; an unparseable token yields the
+/// `cannotCalculateChanges` error so the client falls back to a full `/query`+`/get`.
+fn changes<S: MailStore>(store: &S, account: &str, obj: JmapObj, args: &Value) -> Value {
+    let since = args.get("sinceState").and_then(Value::as_str).unwrap_or("0");
+    match store.jmap_changes(obj, since) {
+        Some(c) => json!({
+            "accountId": account,
+            "oldState": c.old_state,
+            "newState": c.new_state,
+            "hasMoreChanges": c.has_more,
+            "created": c.created,
+            "updated": c.updated,
+            "destroyed": c.destroyed
+        }),
+        None => json!({
+            "type": "cannotCalculateChanges",
+            "description": "sinceState is not a recognizable state token"
+        }),
+    }
 }
 
 // --- Blob up/download ----------------------------------------------------------------------
@@ -600,5 +802,119 @@ mod tests {
         let up = blob_upload("acct1", b"hello", "text/plain");
         assert_eq!(up["size"], json!(5));
         assert!(up["blobId"].as_str().unwrap().len() >= 32);
+    }
+
+    #[test]
+    fn changes_reports_created_updated_destroyed() {
+        let mut s = store_with_mail(); // INBOX has uid 1
+        let state0 = s.jmap_state();
+
+        // Create a new email → appears in `created` since state0.
+        call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "create": { "c1": {
+                "mailboxIds": { "INBOX": true },
+                "subject": "Fresh",
+                "from": [{ "name": "Me", "email": "me@dmtap.local" }],
+                "bodyValues": { "b": { "value": "hello there" } },
+                "textBody": [{ "partId": "b", "type": "text/plain" }]
+            } } }),
+        );
+        let ch = call(&mut s, "Email/changes", json!({ "accountId": "acct1", "sinceState": state0 }));
+        let created: Vec<&str> = ch["created"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(created, vec!["INBOX|2"], "new email must be in created: {ch}");
+        assert!(ch["updated"].as_array().unwrap().is_empty());
+
+        // Update a keyword → appears in `updated`.
+        let state1 = s.jmap_state();
+        call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "update": { "INBOX|1": { "keywords/$seen": true } } }),
+        );
+        let ch = call(&mut s, "Email/changes", json!({ "accountId": "acct1", "sinceState": state1 }));
+        assert_eq!(ch["updated"][0], json!("INBOX|1"), "updated: {ch}");
+        assert!(ch["created"].as_array().unwrap().is_empty());
+
+        // Destroy → appears in `destroyed` (from the vanished log).
+        let state2 = s.jmap_state();
+        call(&mut s, "Email/set", json!({ "accountId": "acct1", "destroy": ["INBOX|1"] }));
+        let ch = call(&mut s, "Email/changes", json!({ "accountId": "acct1", "sinceState": state2 }));
+        assert_eq!(ch["destroyed"][0], json!("INBOX|1"), "destroyed: {ch}");
+    }
+
+    #[test]
+    fn changes_unparseable_state_reports_cannot_calculate() {
+        let mut s = store_with_mail();
+        let ch = call(&mut s, "Email/changes", json!({ "accountId": "acct1", "sinceState": "!!!not-base64!!!" }));
+        assert_eq!(ch["type"], json!("cannotCalculateChanges"), "{ch}");
+    }
+
+    #[test]
+    fn email_set_create_composes_a_message() {
+        let mut s = store_with_mail();
+        let r = call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "create": { "draft1": {
+                "mailboxIds": { "INBOX": true },
+                "keywords": { "$draft": true },
+                "subject": "Compose test",
+                "from": [{ "name": "Alice", "email": "alice@dmtap.local" }],
+                "to": [{ "email": "bob@example.net" }],
+                "bodyValues": { "1": { "value": "the composed body" } },
+                "textBody": [{ "partId": "1", "type": "text/plain" }]
+            } } }),
+        );
+        let id = r["created"]["draft1"]["id"].as_str().unwrap();
+        assert_eq!(id, "INBOX|2");
+        let (mb, uid) = parse_email_id(id).unwrap();
+        let msg = s.mailbox(&mb).unwrap().by_uid(uid).unwrap();
+        assert!(msg.has_flag(&Flag::Draft));
+        let text = String::from_utf8_lossy(&msg.raw);
+        assert!(text.contains("Subject: Compose test"), "{text}");
+        assert!(text.contains("From: Alice <alice@dmtap.local>"), "{text}");
+        assert!(text.contains("To: bob@example.net"), "{text}");
+        assert!(text.contains("the composed body"), "{text}");
+    }
+
+    #[test]
+    fn create_rejects_header_injection() {
+        let mut s = store_with_mail();
+        let r = call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "create": { "x": {
+                "mailboxIds": { "INBOX": true },
+                "subject": "evil\r\nBcc: victim@example.com",
+                "bodyValues": { "1": { "value": "b" } },
+                "textBody": [{ "partId": "1", "type": "text/plain" }]
+            } } }),
+        );
+        let id = r["created"]["x"]["id"].as_str().unwrap();
+        let (mb, uid) = parse_email_id(id).unwrap();
+        let raw = String::from_utf8_lossy(&s.mailbox(&mb).unwrap().by_uid(uid).unwrap().raw).to_string();
+        // The CRLF-injected "Bcc" must be flattened into the Subject, not a real header line.
+        assert!(!raw.contains("\r\nBcc:"), "header injection leaked: {raw}");
+    }
+
+    #[test]
+    fn back_reference_chains_query_into_get() {
+        let mut s = store_with_mail();
+        let req = Request {
+            using: vec![CAP_MAIL.into()],
+            method_calls: vec![
+                ("Email/query".into(), json!({ "accountId": "acct1", "filter": { "inMailbox": "INBOX" } }), "q".into()),
+                (
+                    "Email/get".into(),
+                    json!({ "accountId": "acct1", "#ids": { "resultOf": "q", "name": "Email/query", "path": "/ids" } }),
+                    "g".into(),
+                ),
+            ],
+        };
+        let resp = process(&mut s, "acct1", &req);
+        let get = &resp.method_responses[1].1;
+        assert_eq!(get["list"][0]["subject"], json!("Hello"), "back-ref get: {get}");
     }
 }
