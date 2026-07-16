@@ -218,6 +218,21 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .pres.away { background: var(--warn); }
 
 /* ============================================================================================
+   BRAND MARK — the leaning e/at glyph (brand/README.md). A tiny signature moment: on its very
+   first paint (onboarding) the stroke draws itself on, like a pen completing the mark; everywhere
+   else it's static. Fully inert under reduced-motion (the global rule above zeroes durations).
+   ============================================================================================ */
+.brand-mark { display: block; }
+.brand-mark .bm-tile { transition: filter .2s; }
+@media (prefers-reduced-motion: no-preference) {
+  .brand-mark.draw .bm-tile { animation: bmTileIn .5s var(--ease-out) both; }
+  .brand-mark.draw .bm-arc { stroke-dasharray: 640; stroke-dashoffset: 640; animation: bmDraw 1.05s var(--ease-out) .2s forwards; }
+  .brand-mark.draw .bm-bar { stroke-dasharray: 90; stroke-dashoffset: 90; animation: bmDraw .28s var(--ease-out) 1.15s forwards; }
+}
+@keyframes bmTileIn { from { opacity: 0; transform: scale(.86); } }
+@keyframes bmDraw { to { stroke-dashoffset: 0; } }
+
+/* ============================================================================================
    ONBOARDING
    ============================================================================================ */
 .overlay { position: fixed; inset: 0; z-index: 400; display: grid; place-items: center; padding: 24px; overflow: auto;
@@ -270,7 +285,8 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
    ============================================================================================ */
 .app { display: grid; grid-template-columns: 78px 1fr; height: 100vh; }
 .rail { background: var(--bg-1); border-right: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; padding: 14px 0 12px; gap: 2px; }
-.rail-brand { margin-bottom: 14px; filter: drop-shadow(0 4px 10px color-mix(in srgb, var(--accent-2) 40%, transparent)); }
+.rail-brand { margin-bottom: 14px; filter: drop-shadow(0 4px 10px color-mix(in srgb, var(--accent-2) 40%, transparent)); transition: transform .22s var(--ease-spring), filter .22s; }
+.rail-brand:hover { transform: rotate(-6deg) scale(1.08); filter: drop-shadow(0 6px 16px color-mix(in srgb, var(--accent-2) 55%, transparent)); }
 .rail-nav { display: flex; flex-direction: column; gap: 2px; width: 100%; align-items: center; }
 .rail-btn { position: relative; width: 62px; padding: 9px 0 7px; border-radius: 12px; color: var(--text-faint); display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 10px; font-weight: 640; transition: color .14s, background .14s; }
 .rail-btn .ic { width: 22px; height: 22px; }
@@ -441,6 +457,22 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .path-node.gateway .path-node-ic { background: color-mix(in srgb, var(--legacy) 22%, transparent); color: var(--legacy); }
 .path-arrow { display: flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-faint); }
 .path-arrow .ic { width: 15px; height: 15px; }
+/* The connectors are tinted to the tone of the hop they represent (violet=private mesh,
+   indigo=fast/direct, amber=gateway) — the graph reads as one continuous, colored current
+   rather than a row of gray chevrons, and a message's route is legible at a glance. */
+.path-arrow.priv { color: var(--priv); }
+.path-arrow.fast { color: var(--fast); }
+.path-arrow.gw   { color: var(--legacy); }
+/* Reveal + "current flowing" pulse: plays once on open (staggered by DOM order via --i), then
+   the connectors keep a slow, quiet pulse toward the recipient — never in the base (closed)
+   state, so it costs nothing until someone actually opens the path. */
+@media (prefers-reduced-motion: no-preference) {
+  .path-detail.show .path-graph > * { animation: pgIn .34s var(--ease-out) both; animation-delay: calc(var(--i, 0) * 55ms); }
+  .path-detail.show .path-arrow .ic { animation: pgIn .34s var(--ease-out) both, pgFlow 1.7s ease-in-out .5s infinite;
+    animation-delay: calc(var(--i, 0) * 55ms), calc(500ms + var(--i, 0) * 220ms); }
+}
+@keyframes pgIn { from { opacity: 0; transform: translateY(5px); } }
+@keyframes pgFlow { 0%, 100% { opacity: .6; transform: translateX(0); } 50% { opacity: 1; transform: translateX(2.5px); } }
 
 .gw-attest { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r); padding: 9px 12px; margin-bottom: 6px; }
 .gw-attest-row { display: flex; gap: 8px; font-size: 11.5px; padding: 2.5px 0; }
