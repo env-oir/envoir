@@ -1,0 +1,17 @@
+[package]
+name = "downgrade-tests"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Downgrade & negative test suite proving DMTAP's §10.7 fail-closed invariants, driven entirely through dmtap-core's public API"
+repository = "https://example.invalid/envoir"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+# Read-only: this crate exercises dmtap-core's public API and never modifies it (spec §10.4: the
+# reference is not normative, but *this* crate's job is to lock the reference's own fail-closed
+# behavior so a regression there is caught immediately).
+dmtap-core = { path = "../dmtap-core" }
