@@ -7,6 +7,7 @@ import { FOLDERS, LABELS, person } from '../seed.js';
 import { el, esc, icon, avatar, timeAgo, fmtLong, trustPill, emptyState, verifiedGlyph, showInspector, litHop, toast, renderBody, commandMenu } from '../ui.js';
 import { buildMote, KIND } from '../mote.js';
 import { planDelivery, animatePath } from '../mesh-sim.js';
+import { pathBadge, pathSummary, pathToggleButton, pathGraphHtml, threadProvenance } from '../provenance.js';
 import { bus } from '../bus.js';
 import { openCompose } from '../compose.js';
 
@@ -107,12 +108,13 @@ function drawList(root) {
     const last = t.msgs[t.msgs.length - 1];
     const p = person(t.msgs[0].from === 'you' ? (t.msgs[0].to?.[0] || 'you') : t.msgs[0].from);
     const names = [...new Set(t.msgs.map(m => m.from === 'you' ? 'You' : person(m.from).name.split(' ')[0]))].join(', ');
-    const row = el(`<div class="trow ${state.ui.selThread === t.id ? 'sel' : ''} ${t.read ? '' : 'unread'} ${t.legacy ? 'legacy' : ''}" data-id="${t.id}" role="button" tabindex="0" aria-label="${esc(t.subject)} — from ${esc(names)}${t.read ? '' : ', unread'}" style="animation-delay:${Math.min(i * 20, 300)}ms">
+    const prov = threadProvenance(t);
+    const row = el(`<div class="trow ${state.ui.selThread === t.id ? 'sel' : ''} ${t.read ? '' : 'unread'} ${t.legacy ? 'legacy' : ''}" data-id="${t.id}" role="button" tabindex="0" aria-label="${esc(t.subject)} — from ${esc(names)}${t.read ? '' : ', unread'}${prov ? ', ' + esc(pathSummary(prov)) : ''}" style="animation-delay:${Math.min(i * 20, 300)}ms">
       <button class="tcheck ${sel.has(t.id) ? 'on' : ''}" data-check="${t.id}" aria-label="Select">${sel.has(t.id) ? icon('check') : ''}</button>
       ${avatar(p, dense ? 28 : 36, { ring: true })}
       <div class="tmain">
         <div class="trow-top">
-          <span class="tfrom">${esc(names)}${t.verified ? verifiedGlyph() : ''}${t.msgs.length > 1 ? `<i class="tcount">${t.msgs.length}</i>` : ''}</span>
+          <span class="tfrom">${esc(names)}${t.verified ? verifiedGlyph() : ''}${t.msgs.length > 1 ? `<i class="tcount">${t.msgs.length}</i>` : ''}${pathBadge(prov)}</span>
           <span class="ttime">${t.scheduledAt ? icon('clock') : ''}${timeAgo(lastTime(t))}</span>
         </div>
         <div class="tsubj">${esc(t.subject)}</div>
@@ -216,15 +218,18 @@ function drawRead(root) {
         </div>
         <div class="msg-side">
           <span class="msg-time">${fmtLong(m.time)}</span>
+          ${pathToggleButton(m.provenance, m.id)}
           <button class="icon-btn sm" data-insp="${i}" title="Why is this private?">${icon('info')}</button>
         </div>
       </div>
       ${legacyMsg ? `<div class="legacy-note">${icon('shield')} Arrived from the legacy world via the gateway — authenticated (DKIM) but not end-to-end encrypted before the gateway (spec §7.2).</div>` : ''}
       <div class="msg-body">${renderBody(m)}</div>
       ${(m.attach || []).length ? `<div class="msg-attach">${m.attach.map(a => `<span class="att">${icon('files')} ${esc(a.name)} · ${fmt(a.size)}</span>`).join('')}</div>` : ''}
+      ${pathGraphHtml(m.provenance, m.from === 'you' ? null : p, m.id)}
     </article>`);
     card.querySelector('[data-insp]').onclick = () => inspectMessage(t, m);
-    if (!last) card.querySelector('.msg-head').onclick = (e) => { if (e.target.closest('[data-insp]')) return; card.classList.toggle('open'); };
+    card.querySelector('[data-pathbtn]')?.addEventListener('click', (e) => { e.stopPropagation(); togglePathDetail(card, m.id); });
+    if (!last) card.querySelector('.msg-head').onclick = (e) => { if (e.target.closest('[data-insp]') || e.target.closest('[data-pathbtn]')) return; card.classList.toggle('open'); };
     scroll.appendChild(card);
   });
 
@@ -329,6 +334,16 @@ function popover(anchor, items) {
 }
 
 function fmt(n) { const u = ['B', 'KB', 'MB', 'GB']; let i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; }
+
+// Expand/collapse the per-message transport-path graph (spec §7.8/§8.6). DOM-only ephemeral UI
+// state — like the command menu, it doesn't live in `state`.
+function togglePathDetail(card, key) {
+  const btn = card.querySelector(`[data-pathbtn="${CSS.escape(String(key))}"]`);
+  const panel = card.querySelector(`#path-${CSS.escape(String(key))}`);
+  if (!panel) return;
+  const open = panel.classList.toggle('show');
+  btn?.setAttribute('aria-expanded', String(open));
+}
 
 // --- Keyboard action surface (called by shell) ---
 export const mailKeys = {

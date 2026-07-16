@@ -406,6 +406,51 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .att .ic { width: 14px; height: 14px; color: var(--accent); }
 .read-foot { display: flex; gap: 10px; padding: 14px 24px; border-top: 1px solid var(--line); flex-shrink: 0; }
 
+/* ---- Transport-path provenance (spec §7.8/§8.6) — sender → tier(hops) → gateway? → you ------
+   Pure-mesh vs. gateway-touched must read as unmistakably different at a glance: violet/indigo
+   (shield/bolt, the private/fast tiers already used elsewhere) for pure-mesh, amber (bridge,
+   the same --legacy tone used for legacy-origin threads) for gateway-touched. */
+.path-badge { display: inline-flex; width: 14px; height: 14px; flex-shrink: 0; }
+.path-badge .ic { width: 13px; height: 13px; }
+.path-badge.priv { color: var(--priv); }
+.path-badge.fast { color: var(--fast); }
+.path-badge.gw   { color: var(--legacy); }
+.path-btn.priv { color: var(--priv); }
+.path-btn.fast { color: var(--fast); }
+.path-btn.gw   { color: var(--legacy); }
+.path-btn.priv:hover { background: color-mix(in srgb, var(--priv) 16%, transparent); color: var(--priv); }
+.path-btn.fast:hover { background: color-mix(in srgb, var(--fast) 16%, transparent); color: var(--fast); }
+.path-btn.gw:hover   { background: color-mix(in srgb, var(--legacy) 16%, transparent); color: var(--legacy); }
+.path-btn[aria-expanded="true"] { background: var(--bg-3); }
+
+.path-detail { max-height: 0; overflow: hidden; opacity: 0; border-top: 1px solid transparent; transition: max-height .28s var(--ease), opacity .2s, padding .2s; }
+.path-detail.show { max-height: 640px; opacity: 1; padding: 14px 18px 16px; border-top: 1px solid var(--line); background: var(--bg-2); }
+
+.path-graph { display: flex; align-items: stretch; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.path-node { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 5px; padding: 8px 10px; border-radius: var(--r); background: var(--bg-1); border: 1px solid var(--line); min-width: 92px; }
+.path-node-ic { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--bg-3); color: var(--text-dim); flex-shrink: 0; }
+.path-node-ic .ic { width: 15px; height: 15px; }
+.path-node-txt { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.path-node-txt b { font-size: 11.5px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.path-node-txt span { font-size: 10px; color: var(--text-faint); word-break: break-word; }
+.path-node.tier.priv .path-node-ic { background: color-mix(in srgb, var(--priv) 22%, transparent); color: var(--priv); }
+.path-node.tier.fast .path-node-ic { background: color-mix(in srgb, var(--fast) 22%, transparent); color: var(--fast); }
+.path-node.gateway .path-node-ic { background: color-mix(in srgb, var(--legacy) 22%, transparent); color: var(--legacy); }
+.path-arrow { display: flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-faint); }
+.path-arrow .ic { width: 15px; height: 15px; }
+
+.gw-attest { background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r); padding: 9px 12px; margin-bottom: 6px; }
+.gw-attest-row { display: flex; gap: 8px; font-size: 11.5px; padding: 2.5px 0; }
+.gw-attest-row .k { color: var(--text-faint); min-width: 96px; flex-shrink: 0; }
+.gw-attest-row .v { color: var(--text-dim); word-break: break-all; }
+
+.path-note { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 1.55; padding: 10px 12px; border-radius: var(--r); }
+.path-note + .path-note { margin-top: 8px; }
+.path-note .ic { width: 15px; height: 15px; flex-shrink: 0; margin-top: 1px; }
+.path-note.good { color: color-mix(in srgb, var(--good) 85%, var(--text)); background: color-mix(in srgb, var(--good) 10%, transparent); }
+.path-note.warn { color: color-mix(in srgb, var(--legacy) 92%, var(--text)); background: color-mix(in srgb, var(--legacy) 10%, transparent); }
+.path-note.dim  { color: var(--text-dim); background: var(--bg-1); border: 1px dashed var(--line-2); }
+
 /* popover */
 .popover { position: fixed; z-index: 300; background: var(--elev); border: 1px solid var(--line-2); border-radius: 11px; box-shadow: var(--sh-2); padding: 5px; min-width: 190px; animation: pop .14s; }
 .popover button { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 11px; border-radius: 7px; font-size: 13px; color: var(--text-dim); }
@@ -1314,6 +1359,11 @@ mark.hl.cur { background: var(--warn); color: #241a02; box-shadow: 0 0 0 2px col
   .msg-head { flex-wrap: wrap; row-gap: 4px; }
   .msg-who { flex-basis: calc(100% - 52px); }
   .msg-side { width: 100%; justify-content: flex-end; }
+  /* transport-path graph: stack vertically instead of wrapping node/arrow rows sideways */
+  .path-graph { flex-direction: column; align-items: stretch; }
+  .path-node { flex-direction: row; text-align: left; min-width: 0; }
+  .path-arrow { transform: rotate(90deg); padding: 1px 0; }
+  .gw-attest-row .k { min-width: 78px; }
   .msg-name { flex-wrap: wrap; }
   .read-foot { padding: 12px 14px; }
   .chat-head { padding: 10px 14px; }

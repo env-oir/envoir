@@ -84,6 +84,10 @@ const P = {
   density: '<path d="M4 5h16M4 9h16M4 13h16M4 17h16"/>',
   pdf: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 13h1.2a1.3 1.3 0 010 2.6H9zm0 0v4"/>',
   image: '<rect x="3" y="4" width="18" height="16" rx="2.4"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M4 18l5-5 3.5 3.5L16 12l4 4"/>',
+  // Legacy-gateway bridge glyph (spec §7.8/§8.6 transport-path provenance) — deliberately distinct
+  // from shield (pure-mesh) and bolt (fast/direct): an arch + deck reads as "crossed a boundary".
+  bridge: '<path d="M3 17c2.2-6.4 5-9.6 9-9.6s6.8 3.2 9 9.6"/><path d="M2 17h20"/><path d="M6.5 13.5V17M12 11.5V17M17.5 13.5V17"/>',
+  chevRight: '<path d="M9 5l7 7-7 7"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;

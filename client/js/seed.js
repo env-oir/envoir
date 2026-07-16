@@ -49,6 +49,7 @@ export function seedMail() {
       tier: 'private', verified: true, legacy: false,
       msgs: [
         { id: 't1m1', from: 'ada', to: ['you@envoir.org'], time: now - 2 * HOUR, tier: 'private',
+          provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: now - 2 * HOUR, gateways: [] },
           body: "You're on the sovereign network now.\n\nHere's the one idea that changes everything: your KEY is your identity. The address you@envoir.org is just a memorable pointer to it — like a phone number pointing at a person. No provider holds the key, so no provider can read your mail, and you can move your whole life to another provider (or your own domain) without losing a single message or contact.\n\nThe blue ✓ next to my name means you compared my safety number out-of-band, so you KNOW this is really me and not a look-alike. That's the anti-spoofing win: phishing stops working when identity is a key, not a display name.\n\nTry replying — open the ⓘ inspector on any message to see the three encrypted layers of the MOTE it becomes.\n\n— Ada" },
       ],
     },
@@ -58,8 +59,10 @@ export function seedMail() {
       tier: 'private', verified: true, legacy: false,
       msgs: [
         { id: 't2m1', from: 'theo', to: ['you@envoir.org', 'ada@envoir.org'], time: now - 5 * HOUR, tier: 'private',
+          provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: now - 5 * HOUR, gateways: [] },
           body: "I benchmarked the padding buckets on the three relays. 4 KiB / 16 KiB / 64 KiB covers 98.6% of traffic without leaking length. Anything bigger falls back to the file path (content-addressed chunks).\n\nNumbers attached." , attach: [{ name: 'bucket-bench.csv', size: 48213 }] },
         { id: 't2m2', from: 'ada', to: ['you@envoir.org', 'theo@envoir.org'], time: now - 4 * HOUR, tier: 'private',
+          provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: now - 4 * HOUR, gateways: [] },
           body: "Nice. Let's lock 4/16/64 for v2. Can you write it up for §6.3?" },
         { id: 't2m3', from: 'you', to: ['ada@envoir.org', 'theo@envoir.org'], time: now - 3 * HOUR, tier: 'private',
           body: "+1 from me. I'll take the spec paragraph if Theo takes the reference impl.", me: true },
@@ -68,9 +71,10 @@ export function seedMail() {
     {
       id: 't3', subject: 'Design review — new mail three-pane',
       labels: ['design'], folder: 'inbox', read: true, starred: true, snoozeUntil: null,
-      tier: 'private', verified: true, legacy: false,
+      tier: 'fast', verified: true, legacy: false,
       msgs: [
-        { id: 't3m1', from: 'mira', to: ['you@envoir.org'], time: now - 26 * HOUR, tier: 'private',
+        { id: 't3m1', from: 'mira', to: ['you@envoir.org'], time: now - 26 * HOUR, tier: 'fast',
+          provenance: { tier: 'fast', profile: null, origin: 'pure-mesh', minHops: 1, observedAt: now - 26 * HOUR, gateways: [] },
           body: "Pushed the new three-pane comps. Key moves:\n\n• The verified ✓ is now a first-class glyph next to the sender, not buried in a menu.\n• Legacy-origin messages get a dotted amber rail so you always know what wasn't E2E before the gateway.\n• The MOTE inspector is a 'why this is private' drawer, not a debug panel.\n\nLook when you can — this is the flagship, it has to feel inevitable.", attach: [{ name: 'three-pane-v3.fig', size: 2_100_400 }] },
       ],
     },
@@ -80,6 +84,8 @@ export function seedMail() {
       tier: 'legacy', verified: false, legacy: true,
       msgs: [
         { id: 't4m1', from: 'carol', to: ['you@envoir.org'], time: now - 30 * HOUR, tier: 'legacy',
+          provenance: { tier: 'fast', profile: null, origin: 'gateway-touched', minHops: null, observedAt: now - 30 * HOUR,
+            gateways: [{ domain: 'envoir.org', selector: 'gw1', recvAt: now - 30 * HOUR - 40 * 1000, legacyFrom: 'carol@gmail.com', seq: 0 }] },
           body: "hey! are you free thursday around 1? there's a new place near the office.\n\n(this came in from the old world via the gateway — authenticated by DKIM but not end-to-end encrypted before the gateway, so Envoir marks it legacy-origin. once you're both on the network it upgrades automatically.)" },
       ],
     },
@@ -89,6 +95,7 @@ export function seedMail() {
       tier: 'private', verified: true, legacy: false,
       msgs: [
         { id: 't5m1', from: 'grace', to: ['you@envoir.org'], time: now - 2 * DAY, tier: 'private',
+          provenance: { tier: 'private', profile: 'high', origin: 'pure-mesh', minHops: 5, observedAt: now - 2 * DAY, gateways: [] },
           body: "Flight lands 14:20 Friday, I'll come straight over.\n\nWhen we meet let's read safety numbers so this thread goes from TOFU-pinned to verified. Mine starts otter-heron-wolf — bring yours." },
       ],
     },
@@ -98,6 +105,7 @@ export function seedMail() {
       tier: 'private', verified: true, legacy: false,
       msgs: [
         { id: 't6m1', from: 'ada', to: ['you+billing@envoir.org'], time: now - 3 * DAY, tier: 'private',
+          provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: now - 3 * DAY, gateways: [] },
           body: "Receipt for the Sovereign plan. Note this was sent to you+billing@envoir.org — plus-addressing routes to the same key, so you can filter billing without a second account.\n\nAmount: your storage + relay bandwidth. Privacy is never the paid part.", plusTag: 'billing' },
       ],
     },
@@ -107,15 +115,17 @@ export function seedMail() {
       tier: 'private', verified: false, legacy: false,
       msgs: [
         { id: 't7m1', from: 'linus', to: ['you@envoir.org'], time: now - 4 * DAY, tier: 'private',
+          provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: now - 4 * DAY, gateways: [] },
           body: "Applied v3. One nit inline — the return value on the mixnet path isn't checked. Otherwise good. This whole thread is metadata-private; an observer can't even tell we correspond." },
       ],
     },
     {
       id: 't8', subject: 'Field report — relay uptime JHB',
       labels: [], folder: 'inbox', read: true, starred: false, snoozeUntil: now + 2 * DAY,
-      tier: 'private', verified: true, legacy: false,
+      tier: 'fast', verified: true, legacy: false,
       msgs: [
-        { id: 't8m1', from: 'omar', to: ['you@envoir.org'], time: now - 6 * HOUR, tier: 'private',
+        { id: 't8m1', from: 'omar', to: ['you@envoir.org'], time: now - 6 * HOUR, tier: 'fast',
+          provenance: { tier: 'fast', profile: null, origin: 'pure-mesh', minHops: 1, observedAt: now - 6 * HOUR, gateways: [] },
           body: "Snoozing this to you for Monday: the Johannesburg relay held 99.98% this week. Egress cost is the story — worth a call. I set this to resurface Monday morning." },
       ],
     },
