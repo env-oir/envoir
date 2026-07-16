@@ -16,6 +16,15 @@ use crate::DeniableError;
 /// exhaust memory (§16.9 rate-limit posture).
 const MAX_SKIP: u32 = 1000;
 
+/// Global upper bound on the *total* number of out-of-order message keys retained across the whole
+/// session (every receiving chain), independent of the per-chain [`MAX_SKIP`] budget. Without it a
+/// long-lived session — or a peer that repeatedly forces near-`MAX_SKIP` gaps across successive
+/// DH-ratchet steps — accumulates skipped keys without bound. Set to `2 * MAX_SKIP`: ample headroom
+/// for legitimate out-of-order delivery spanning a couple of chains, while capping worst-case
+/// retention at ~64 KiB of key material. Exceeding it is rejected ([`DeniableError::TooManySkipped`])
+/// rather than allocated.
+const MAX_SKIPPED_KEYS: usize = 2 * MAX_SKIP as usize;
+
 /// The per-message ratchet header (the cleartext `dh`/`pn`/`n` of a [`dmtap_core::deniable::DeniableMessage`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
@@ -106,7 +115,27 @@ impl DoubleRatchet {
     /// Decrypt one message. Handles out-of-order delivery (skipped keys) and DH-ratchet steps.
     /// A wrong key / tampered ciphertext / tampered header fails the AEAD tag.
     pub fn decrypt(&mut self, ad: &[u8], header: Header, ct: &[u8]) -> Result<Vec<u8>, DeniableError> {
-        // A message key we previously skipped (arrived late) — one-shot, removed on use.
+        // Deniable messages carry no signature, so the cleartext header (`dh`/`pn`/`n`) is entirely
+        // attacker-controllable until the AEAD tag proves the message genuine. Every state mutation
+        // the decrypt path performs — evicting a skipped key, advancing/stashing the receiving chain
+        // (`skip`), and the DH-ratchet root/keypair roll (`dh_ratchet`) — is therefore staged on a
+        // working COPY and committed to `self` ONLY after `aead_open` verifies. On any failure the
+        // staged copy is dropped and `self` is byte-for-byte unchanged, so a single forged packet can
+        // neither corrupt the root key (permanent session DoS) nor persist skipped keys (unbounded
+        // memory). The success path derives exactly the same keys and leaves exactly the same state as
+        // before.
+        let mut staged = self.clone();
+        let pt = staged.decrypt_staged(ad, header, ct)?;
+        *self = staged; // commit — reached only when the tag verified
+        Ok(pt)
+    }
+
+    /// The mutating decrypt body. It is only ever run against a staged clone produced by
+    /// [`DoubleRatchet::decrypt`]; the caller discards the clone (and thus every mutation made here)
+    /// unless this returns `Ok`, which happens only after the AEAD tag verifies.
+    fn decrypt_staged(&mut self, ad: &[u8], header: Header, ct: &[u8]) -> Result<Vec<u8>, DeniableError> {
+        // A message key we previously skipped (arrived late) — one-shot, removed on use. The removal
+        // is on the staged copy, so a bad tag here does not consume the genuine stashed key either.
         if let Some(mk) = self.skipped.remove(&(header.dh, header.n)) {
             return aead_open(&mk, &full_ad(ad, &header), ct);
         }
@@ -137,6 +166,11 @@ impl DoubleRatchet {
             return Err(DeniableError::DecryptFailed);
         }
         while self.nr < until {
+            // Global cap across all chains — the per-call `MAX_SKIP` gate above bounds one skip, but
+            // not cumulative retention; refuse rather than allocate unboundedly.
+            if self.skipped.len() >= MAX_SKIPPED_KEYS {
+                return Err(DeniableError::TooManySkipped);
+            }
             let ck = self.ckr.expect("checked above");
             let (next, mk) = kdf_ck(&ck);
             self.ckr = Some(next);
@@ -180,6 +214,13 @@ impl DoubleRatchet {
         let header = Header { dh: dhr, pn: self.pn, n: self.nr };
         let ct = aead_seal(&mk, &full_ad(ad, &header), plaintext);
         Some((header, ct))
+    }
+
+    /// Test-only: the number of out-of-order message keys currently retained (bounded by
+    /// [`MAX_SKIPPED_KEYS`]).
+    #[cfg(test)]
+    pub(crate) fn skipped_len(&self) -> usize {
+        self.skipped.len()
     }
 }
 

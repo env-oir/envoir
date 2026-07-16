@@ -162,6 +162,117 @@ fn repudiation_receiver_can_forge_a_sender_message() {
 }
 
 #[test]
+fn forged_message_cannot_corrupt_ratchet_state() {
+    // Exploit (a) — permanent session DoS. A single unauthenticated packet with a novel `dh` forces
+    // a DH-ratchet (recomputing the root key from the attacker's fake ratchet key) and chain skips
+    // BEFORE the AEAD tag is checked. Pre-fix those mutations persisted through the failed tag, so
+    // the peer's next genuine message ratcheted from the corrupted root and never decrypted again.
+    // Post-fix `decrypt` is transactional: a rejected forgery leaves the ratchet byte-for-byte
+    // unchanged. (This assertion FAILS against the old code and PASSES after the fix.)
+    let (alice, mut bob) = setup(2);
+    let (mut a, init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "m0")).unwrap();
+    let (mut b, m0) = bob.accept(&init).unwrap();
+    assert_eq!(m0.body, b"m0");
+
+    // A valid-looking but forged packet: a novel ratchet key (any 32 bytes is a valid X25519
+    // public), a large in-chain index, and garbage ciphertext whose tag cannot verify.
+    let forged = DeniableMessage { dh: vec![0x42u8; 32], pn: 0, n: 900, ct: vec![0u8; 48] };
+    assert!(b.decrypt(&forged).is_err(), "the forged tag must be rejected");
+    assert_eq!(b.skipped_len(), 0, "a rejected forgery retains no skipped keys");
+
+    // The peer's next GENUINE message still decrypts — proof the ratchet state never advanced.
+    let m1 = a.encrypt(&payload(&alice.ik_public(), "m1"));
+    assert_eq!(
+        b.decrypt(&m1).unwrap().body,
+        b"m1",
+        "genuine peer traffic still decrypts after a rejected forgery"
+    );
+}
+
+#[test]
+fn repeated_forgeries_retain_no_skipped_keys() {
+    // Exploit (b) — unbounded memory. Each novel-`dh` forgery pre-fix stashed up to ~2*MAX_SKIP
+    // message keys that persisted across the failed tag; repeated injection exhausted memory.
+    // Post-fix a rejected forgery commits nothing, so retained skipped-key memory never grows.
+    let (alice, mut bob) = setup(2);
+    let (_a, init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "m0")).unwrap();
+    let (mut b, _m0) = bob.accept(&init).unwrap();
+
+    for i in 0..100u8 {
+        // A distinct novel ratchet key each time (would each force a fresh dh-ratchet + big skip).
+        let forged = DeniableMessage { dh: vec![i; 32], pn: 0, n: 900, ct: vec![0u8; 48] };
+        assert!(b.decrypt(&forged).is_err(), "every forgery is rejected");
+    }
+    assert_eq!(
+        b.skipped_len(),
+        0,
+        "no rejected forgery leaves skipped keys behind — retained memory stays bounded"
+    );
+}
+
+#[test]
+fn global_skipped_key_cap_rejects_unbounded_accumulation() {
+    // The per-chain MAX_SKIP budget alone does not bound TOTAL retained keys: legitimate large gaps
+    // across successive deliveries accumulate. The global cap (2*MAX_SKIP = 2000) rejects the excess
+    // deterministically with TooManySkipped rather than allocating without bound.
+    let (alice, mut bob) = setup(2);
+    let (mut a, init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "m0")).unwrap();
+    let (mut b, _m0) = bob.accept(&init).unwrap();
+
+    // One long in-order sending chain from Alice (no replies ⇒ no DH ratchet on her side). msgs[k]
+    // carries in-chain index n = k + 1 (n = 0 was the init message Bob already consumed).
+    let mut msgs = Vec::with_capacity(2100);
+    for _ in 0..2100u32 {
+        msgs.push(a.encrypt(&payload(&alice.ik_public(), "x")));
+    }
+
+    // Deliver n=1000 then n=2000: each individual gap is < MAX_SKIP so the per-call gate passes, but
+    // together they stash 1998 keys — just under the global cap.
+    assert!(b.decrypt(&msgs[999]).is_ok(), "n=1000 within per-call skip budget");
+    assert!(b.decrypt(&msgs[1999]).is_ok(), "n=2000 within per-call skip budget");
+    let before = b.skipped_len();
+    assert_eq!(before, 1998, "two large-but-legit gaps stash 999 + 999 keys");
+
+    // A further legitimate gap tips retained keys over the global cap ⇒ rejected, state unchanged.
+    let over = b.decrypt(&msgs[2099]); // n = 2100, per-call gap 99 (< MAX_SKIP)
+    assert!(
+        matches!(over, Err(DeniableError::TooManySkipped)),
+        "the global skipped-key cap rejects rather than allocating unboundedly"
+    );
+    assert_eq!(b.skipped_len(), before, "the rejected over-cap delivery changed nothing");
+}
+
+#[test]
+fn normal_in_order_and_out_of_order_still_decrypt_after_fix() {
+    // Regression: the transactional decrypt must preserve exact success-path behaviour — in-order
+    // delivery, legitimately-skipped out-of-order delivery (stash then consume), and the DH ratchet.
+    let (alice, mut bob) = setup(2);
+    let (mut a, init) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "m0")).unwrap();
+    let (mut b, m0) = bob.accept(&init).unwrap();
+    assert_eq!(m0.body, b"m0");
+
+    // In order.
+    let m1 = a.encrypt(&payload(&alice.ik_public(), "m1"));
+    let m2 = a.encrypt(&payload(&alice.ik_public(), "m2"));
+    assert_eq!(b.decrypt(&m1).unwrap().body, b"m1");
+
+    // Out of order: deliver m4 before m3 (m3's key is stashed, then consumed on arrival).
+    let m3 = a.encrypt(&payload(&alice.ik_public(), "m3"));
+    let m4 = a.encrypt(&payload(&alice.ik_public(), "m4"));
+    assert_eq!(b.decrypt(&m2).unwrap().body, b"m2");
+    assert_eq!(b.decrypt(&m4).unwrap().body, b"m4");
+    assert_eq!(b.skipped_len(), 1, "exactly m3's key is stashed");
+    assert_eq!(b.decrypt(&m3).unwrap().body, b"m3");
+    assert_eq!(b.skipped_len(), 0, "the stash is consumed on delivery");
+
+    // The DH ratchet still turns: Bob replies, Alice decrypts, and Alice's next message ratchets.
+    let r0 = b.encrypt(&payload(&bob.bundle().ik, "r0"));
+    assert_eq!(a.decrypt(&r0).unwrap().body, b"r0");
+    let m5 = a.encrypt(&payload(&alice.ik_public(), "m5"));
+    assert_eq!(b.decrypt(&m5).unwrap().body, b"m5");
+}
+
+#[test]
 fn payload_rejects_smuggled_signature() {
     // A DeniablePayload MUST NOT carry a signature (ERR_DENIABLE_SIGNATURE_PRESENT). The session
     // decrypt path decodes via DeniablePayload::from_det_cbor, which fails closed on any extra key.
