@@ -163,6 +163,40 @@ export function emptyState(iconName, title, sub) {
   return `<div class="empty"><div class="empty-glow">${icon(iconName)}</div><b>${esc(title)}</b><span>${esc(sub)}</span></div>`;
 }
 
+// ---- Rich-text body rendering (spec §17#8 rich text/HTML) ----------------------------------
+// Messages may carry HTML bodies (composed in the rich editor). We render our own composed HTML
+// through a strict allow-list sanitizer — no remote content is ever fetched (no <img src>, no
+// scripts, no event handlers), which also closes the tracking-pixel/read-confirmation leak the
+// parity audit (§17#8) calls out. Plaintext bodies keep their pre-wrap rendering.
+const ALLOWED_TAGS = new Set(['B','STRONG','I','EM','U','A','UL','OL','LI','BR','P','DIV','SPAN','BLOCKQUOTE','CODE','PRE','H1','H2','H3']);
+export function sanitizeHtml(html) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = String(html || '');
+  const walk = (node) => {
+    [...node.childNodes].forEach(child => {
+      if (child.nodeType === 1) {
+        if (!ALLOWED_TAGS.has(child.tagName)) { // unwrap disallowed element, keep text
+          const text = document.createTextNode(child.textContent || '');
+          child.replaceWith(text); return;
+        }
+        [...child.attributes].forEach(attr => {
+          const n = attr.name.toLowerCase();
+          const okHref = child.tagName === 'A' && n === 'href' && /^(https?:|mailto:)/i.test(attr.value);
+          if (!okHref) child.removeAttribute(attr.name);
+        });
+        if (child.tagName === 'A') { child.setAttribute('target', '_blank'); child.setAttribute('rel', 'noopener noreferrer nofollow'); }
+        walk(child);
+      }
+    });
+  };
+  walk(tmp);
+  return tmp.innerHTML;
+}
+export function renderBody(m) {
+  if (m && m.html) return `<div class="msg-rich">${sanitizeHtml(m.body)}</div>`;
+  return esc(m ? m.body : '');
+}
+
 // ---- MOTE inspector (three-layer visualization, spec §2.1) --------------------------------
 export function showInspector(mote, plan) {
   const insp = document.getElementById('inspector');

@@ -2,9 +2,9 @@
 // Folders + labels rail · conversation-threaded list with multi-select + bulk actions ·
 // reading pane with per-message verified badges, legacy-origin marking, and the MOTE inspector.
 
-import { state, threadsIn, thread, unreadCount, lastTime } from '../store.js';
+import { state, threadsIn, thread, unreadCount, lastTime, parseSearch, matchThread, searchIsGlobal, blockSender, allowSender, threadSender, uid } from '../store.js';
 import { FOLDERS, LABELS, person } from '../seed.js';
-import { el, esc, icon, avatar, timeAgo, fmtLong, trustPill, emptyState, verifiedGlyph, showInspector, litHop } from '../ui.js';
+import { el, esc, icon, avatar, timeAgo, fmtLong, trustPill, emptyState, verifiedGlyph, showInspector, litHop, toast, renderBody } from '../ui.js';
 import { buildMote, KIND } from '../mote.js';
 import { planDelivery, animatePath } from '../mesh-sim.js';
 import { bus } from '../bus.js';
@@ -56,15 +56,16 @@ function drawLabels(root) {
   });
 }
 
-function matchesSearch(t) {
-  const q = state.ui.search.trim().toLowerCase();
-  if (!q) return true;
-  const hay = (t.subject + ' ' + t.msgs.map(m => (person(m.from).name || '') + ' ' + m.body).join(' ')).toLowerCase();
-  return hay.includes(q);
-}
-
 export function currentList() {
-  return threadsIn(state.ui.mailFolder, state.ui.mailLabel).filter(matchesSearch);
+  const q = state.ui.search.trim();
+  const parsed = parseSearch(q);
+  // Operator-driven searches (label:/in:) go global across the mailbox; otherwise search stays
+  // scoped to the folder/label the sidebar has selected — predictable, Gmail-ish behavior.
+  if (q && searchIsGlobal(parsed)) {
+    return state.mail.filter(t => t.folder !== 'trash' && matchThread(t, parsed)).sort((a, b) => lastTime(b) - lastTime(a));
+  }
+  const base = threadsIn(state.ui.mailFolder, state.ui.mailLabel);
+  return q ? base.filter(t => matchThread(t, parsed)) : base;
 }
 
 let _listKey = null;
@@ -88,14 +89,14 @@ function drawList(root) {
         <button class="icon-btn" data-bulk="spam" title="Spam">${icon('shield')}</button>
         <button class="icon-btn" data-bulk="trash" title="Delete (#)">${icon('trash')}</button>
         <button class="icon-btn" data-bulk="clear" title="Clear">${icon('x')}</button>
-      </div>` : `<h2>${esc(title)}</h2><span class="list-count">${list.length}</span>`}
+      </div>` : `<h2>${esc(state.ui.search ? 'Search' : title)}</h2><span class="list-count">${list.length}</span>${searchChips()}`}
     </div>
     <div class="thread-list ${fresh ? '' : 'static'}" id="threads"></div>`;
 
   if (sel.size) wrap.querySelectorAll('[data-bulk]').forEach(b => b.onclick = () => bulk(b.dataset.bulk));
 
   const tl = wrap.querySelector('#threads');
-  if (!list.length) { tl.innerHTML = emptyState('inbox', 'Nothing here', state.ui.search ? 'No messages match your search.' : 'You are all caught up.'); return; }
+  if (!list.length) { tl.innerHTML = emptyState('inbox', 'Nothing here', state.ui.search ? 'No messages match. Try operators: from: to: subject: label: in: is:unread has:attachment' : 'You are all caught up.'); return; }
 
   list.forEach((t, i) => {
     const last = t.msgs[t.msgs.length - 1];
@@ -124,6 +125,24 @@ function drawList(root) {
   });
   // Keep the selected conversation visible when moving through the list with j/k.
   tl.querySelector('.trow.sel')?.scrollIntoView({ block: 'nearest' });
+}
+
+// Show which search operators were recognized — makes on-device operator search discoverable.
+function searchChips() {
+  const q = state.ui.search.trim(); if (!q) return '';
+  const p = parseSearch(q);
+  const chips = [];
+  if (p.from) chips.push('from:' + p.from);
+  if (p.to) chips.push('to:' + p.to);
+  if (p.subject) chips.push('subject:' + p.subject);
+  if (p.label) chips.push('label:' + p.label);
+  if (p.in) chips.push('in:' + p.in);
+  if (p.flags.unread) chips.push('is:unread');
+  if (p.flags.read) chips.push('is:read');
+  if (p.flags.starred) chips.push('is:starred');
+  if (p.flags.attachment) chips.push('has:attachment');
+  if (!chips.length) return '';
+  return `<div class="search-ops">${chips.map(c => `<i class="op-chip mono">${esc(c)}</i>`).join('')}</div>`;
 }
 
 function toggleSel(id) { const s = state.ui.selected; s.has(id) ? s.delete(id) : s.add(id); bus.rerender(); }
@@ -158,17 +177,24 @@ function drawRead(root) {
         </div>
       </div>
       <div class="read-actions">
-        <button class="icon-btn" id="a-archive" title="Archive (e)">${icon('archive')}</button>
+        ${t.folder === 'spam'
+          ? `<button class="icon-btn" id="a-notspam" title="Not spam — move to inbox">${icon('check')}</button>`
+          : `<button class="icon-btn" id="a-archive" title="Archive (e)">${icon('archive')}</button>`}
         <button class="icon-btn" id="a-snooze" title="Snooze">${icon('snooze')}</button>
         <button class="icon-btn" id="a-label" title="Label">${icon('label')}</button>
         <button class="icon-btn" id="a-star" title="Star" >${icon('star')}</button>
+        <button class="icon-btn" id="a-unread" title="Mark unread (u)">${icon('mail')}</button>
+        <button class="icon-btn" id="a-more" title="More actions">${icon('more')}</button>
         <button class="icon-btn" id="a-trash" title="Delete (#)">${icon('trash')}</button>
       </div>
     </header>
     <div class="read-scroll" id="read-scroll"></div>
     <footer class="read-foot">
-      <button class="btn primary" id="a-reply">${icon('reply')} Reply</button>
-      <button class="btn" id="a-forward">${icon('forward')} Forward</button>
+      ${t.folder === 'drafts'
+        ? `<button class="btn primary" id="a-edit">${icon('edit')} ${t.scheduledAt ? 'Edit scheduled' : 'Continue editing'}</button>
+           <button class="btn danger" id="a-discard">${icon('trash')} Discard draft</button>`
+        : `<button class="btn primary" id="a-reply">${icon('reply')} Reply</button>
+           <button class="btn" id="a-forward">${icon('forward')} Forward</button>`}
     </footer>`;
 
   const scroll = wrap.querySelector('#read-scroll');
@@ -189,7 +215,7 @@ function drawRead(root) {
         </div>
       </div>
       ${legacyMsg ? `<div class="legacy-note">${icon('shield')} Arrived from the legacy world via the gateway — authenticated (DKIM) but not end-to-end encrypted before the gateway (spec §7.2).</div>` : ''}
-      <div class="msg-body">${esc(m.body)}</div>
+      <div class="msg-body">${renderBody(m)}</div>
       ${(m.attach || []).length ? `<div class="msg-attach">${m.attach.map(a => `<span class="att">${icon('files')} ${esc(a.name)} · ${fmt(a.size)}</span>`).join('')}</div>` : ''}
     </article>`);
     card.querySelector('[data-insp]').onclick = () => inspectMessage(t, m);
@@ -199,13 +225,40 @@ function drawRead(root) {
 
   const A = wrap;
   A.querySelector('#m-back').onclick = () => { state.ui.mobileDetail = false; bus.rerender(); };
-  A.querySelector('#a-archive').onclick = () => { t.folder = 'archive'; nextAfterAction(); };
-  A.querySelector('#a-trash').onclick = () => { t.folder = 'trash'; nextAfterAction(); };
+  A.querySelector('#a-archive')?.addEventListener('click', () => moveWithUndo(t, 'archive', 'Archived'));
+  A.querySelector('#a-notspam')?.addEventListener('click', () => { allowSender(threadSender(t)); moveWithUndo(t, 'inbox', 'Moved to Inbox · sender allow-listed'); });
+  A.querySelector('#a-trash').onclick = () => moveWithUndo(t, 'trash', 'Deleted');
   A.querySelector('#a-star').onclick = () => { t.starred = !t.starred; bus.rerender(); };
+  A.querySelector('#a-unread').onclick = () => { t.read = false; nextAfterAction(); };
   A.querySelector('#a-snooze').onclick = () => snoozeMenu(A.querySelector('#a-snooze'), t);
   A.querySelector('#a-label').onclick = () => labelMenu(A.querySelector('#a-label'), t);
-  A.querySelector('#a-reply').onclick = () => replyTo(t);
-  A.querySelector('#a-forward').onclick = () => openCompose({ subject: 'Fwd: ' + t.subject, body: '\n\n---\n' + t.msgs[t.msgs.length - 1].body });
+  A.querySelector('#a-more').onclick = () => moreMenu(A.querySelector('#a-more'), t);
+  A.querySelector('#a-reply')?.addEventListener('click', () => replyTo(t));
+  A.querySelector('#a-forward')?.addEventListener('click', () => openCompose({ subject: 'Fwd: ' + t.subject, body: (t.msgs[t.msgs.length - 1].html ? '<br><br>--- Forwarded ---<br>' : '\n\n--- Forwarded ---\n') + t.msgs[t.msgs.length - 1].body, html: !!t.msgs[t.msgs.length - 1].html }));
+  A.querySelector('#a-edit')?.addEventListener('click', () => {
+    const m = t.msgs[0];
+    openCompose({ threadId: t.id, to: (m.to || []).join(', '), subject: t.subject === '(no subject)' ? '' : t.subject, body: m.body, html: !!m.html, tier: t.tier, attach: m.attach || [], scheduleAt: t.scheduledAt || null });
+  });
+  A.querySelector('#a-discard')?.addEventListener('click', () => { state.mail = state.mail.filter(x => x.id !== t.id); toast(`${icon('trash')} Draft discarded`); nextAfterAction(); });
+}
+
+// Destructive/move actions get a Gmail-style Undo toast (spec §17#19 archive, §17#20 spam).
+function moveWithUndo(t, dest, label) {
+  const prev = t.folder;
+  t.folder = dest;
+  nextAfterAction();
+  toast(`${icon(dest === 'archive' ? 'archive' : dest === 'spam' ? 'shield' : dest === 'trash' ? 'trash' : 'inbox')} ${label}`, {
+    ms: 5000, action: 'Undo', onAction: () => { t.folder = prev; state.ui.selThread = t.id; bus.rerender(); bus.refreshChrome(); },
+  });
+}
+
+function moreMenu(anchor, t) {
+  const items = [];
+  if (t.folder !== 'spam') items.push({ label: 'Report spam', run: () => moveWithUndo(t, 'spam', 'Reported as spam') });
+  items.push({ label: 'Block sender', run: () => { blockSender(threadSender(t)); moveWithUndo(t, 'spam', 'Sender blocked'); } });
+  if (t.folder !== 'inbox') items.push({ label: 'Move to Inbox', run: () => moveWithUndo(t, 'inbox', 'Moved to Inbox') });
+  items.push({ label: t.read ? 'Mark unread' : 'Mark read', run: () => { t.read = !t.read; bus.rerender(); bus.refreshChrome(); } });
+  popover(anchor, items);
 }
 
 async function inspectMessage(t, m) {
