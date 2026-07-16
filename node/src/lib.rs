@@ -27,10 +27,12 @@ pub use dmtap_mail as clients;
 // identity + store + outbound retry queue (§20.1) + inbound validation (§20.2) + transport (§4),
 // culminating in two in-process nodes exchanging a real end-to-end-encrypted MOTE (§2, §19.3).
 pub mod inbound;
+pub mod journal;
 pub mod node;
 pub mod outbound;
 pub mod transport;
 
+pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, NullJournal, Snapshot};
 pub use node::{Node, SendError};
 
 // Node-only planned modules (see README): the rest of the client side that *is* the mesh.

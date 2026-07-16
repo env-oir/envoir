@@ -7,9 +7,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "node",      # the whole client side; it IS the mesh
-    "gateway",   # optional legacy SMTP bridge
-    "crates/*",  # shared libraries incl. dmtap-seam (the operator seam)
+    "node",        # the whole client side; it IS the mesh
+    "gateway",     # optional legacy SMTP bridge
+    "integration", # cross-component end-to-end tests (test-only crate)
+    "crates/*",    # shared libraries incl. dmtap-seam (the operator seam)
 ]
 
 [workspace.metadata.dmtap]

@@ -22,7 +22,12 @@
 //!   identity is proven only by `Payload.sig` after decryption (§2.7 step 8).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// A unit handed to the transport: either a sealed MOTE envelope or a delivery acknowledgement.
 ///
@@ -36,6 +41,10 @@ pub enum Frame {
     /// An `ack(id)` (§19.3.2): the content address being acknowledged.
     Ack(Vec<u8>),
 }
+
+/// An inbound frame paired with its sender's return path (`from`), as yielded by
+/// [`Transport::drain`]. Named to keep the transport queue/type signatures legible.
+pub type InboundFrame = (Vec<u8>, Frame);
 
 /// Why a [`Transport::send`] attempt failed. Distinct from delivery failure — this is the
 /// transport rung reporting it could not hand the frame off, which drives the sender-retry
@@ -145,6 +154,221 @@ impl Transport for InMemoryTransport {
     }
 }
 
+// --- TCP/loopback implementation -----------------------------------------------------------
+//
+// A concrete [`Transport`] over real sockets (std `TcpStream`/`TcpListener`), so two nodes in
+// **separate OS processes** can exchange a MOTE over `127.0.0.1` (or any TCP address). It keeps the
+// same trait shape as [`InMemoryTransport`]; the in-memory one stays for fast, deterministic tests.
+//
+// ## Wire format (length-prefixed frames)
+// Each send opens a connection, writes exactly one framed message, and closes it. A message is:
+//
+// ```text
+//   u32be from_len ‖ from_bytes ‖ u8 tag ‖ u32be payload_len ‖ payload_bytes
+// ```
+//
+// `from` is the sender's logical DMTAP address (its identity bytes) so the receiver has a return
+// path for the `ack` (§19.3.2) — exactly the role [`Frame`]'s `from` plays for the in-memory
+// fabric. `tag` is `0` for a MOTE, `1` for an ack. Both lengths are bounded by [`MAX_FRAME`] so a
+// malformed/hostile peer cannot make the reader allocate unboundedly.
+//
+// ## Simplifications vs. a production mesh transport (documented, not hidden)
+// - **Addressing** is a static peer book (`add_peer`: DMTAP address → `SocketAddr`), a stand-in for
+//   the real mesh's signed `LocationRecord` discovery (§4.2). A real transport also pools
+//   connections rather than dialing per send; connect-per-send is simplest and correct for a
+//   reference/loopback transport.
+// - **No TLS.** A real reachability-ladder leg terminates TLS (§8.2/§4.3); this raw loopback
+//   transport carries the already-end-to-end-sealed MOTE in the clear over the socket. The MOTE
+//   payload is HPKE-sealed regardless, so the socket sees only ciphertext either way.
+
+/// Frame tag for a MOTE envelope on the TCP wire.
+const TCP_TAG_MOTE: u8 = 0;
+/// Frame tag for an ack on the TCP wire.
+const TCP_TAG_ACK: u8 = 1;
+/// Upper bound on any single length-prefixed field (16 MiB) — guards the reader's allocation.
+const MAX_FRAME: u32 = 16 * 1024 * 1024;
+/// How long a `send` waits to establish a connection before reporting the peer unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Read timeout on an accepted connection, so a stalled peer cannot wedge the accept loop.
+const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn invalid(msg: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+fn read_u32(stream: &mut TcpStream) -> std::io::Result<u32> {
+    let mut b = [0u8; 4];
+    stream.read_exact(&mut b)?;
+    Ok(u32::from_be_bytes(b))
+}
+
+/// Write one framed `(from, frame)` message. Flushes so the whole message is on the wire before the
+/// connection is dropped by the caller.
+fn write_tcp_frame(stream: &mut TcpStream, from: &[u8], frame: &Frame) -> std::io::Result<()> {
+    let (tag, payload): (u8, &[u8]) = match frame {
+        Frame::Mote(b) => (TCP_TAG_MOTE, b),
+        Frame::Ack(b) => (TCP_TAG_ACK, b),
+    };
+    stream.write_all(&(from.len() as u32).to_be_bytes())?;
+    stream.write_all(from)?;
+    stream.write_all(&[tag])?;
+    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()
+}
+
+/// Read one framed `(from, frame)` message, failing closed on an over-long field or unknown tag.
+fn read_tcp_frame(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, Frame)> {
+    let from_len = read_u32(stream)?;
+    if from_len > MAX_FRAME {
+        return Err(invalid("from field too large"));
+    }
+    let mut from = vec![0u8; from_len as usize];
+    stream.read_exact(&mut from)?;
+
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag)?;
+
+    let payload_len = read_u32(stream)?;
+    if payload_len > MAX_FRAME {
+        return Err(invalid("payload field too large"));
+    }
+    let mut payload = vec![0u8; payload_len as usize];
+    stream.read_exact(&mut payload)?;
+
+    let frame = match tag[0] {
+        TCP_TAG_MOTE => Frame::Mote(payload),
+        TCP_TAG_ACK => Frame::Ack(payload),
+        _ => return Err(invalid("unknown frame tag")),
+    };
+    Ok((from, frame))
+}
+
+/// The accept loop run on a background thread: pull framed messages off inbound connections into the
+/// shared inbox until `shutdown` is set. Uses a non-blocking listener polled on a short interval so
+/// the thread exits promptly on drop (no dangling accept).
+fn tcp_accept_loop(
+    listener: TcpListener,
+    inbox: Arc<Mutex<VecDeque<InboundFrame>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((mut stream, _peer)) => {
+                // The accepted stream may inherit the listener's non-blocking flag on some
+                // platforms — force blocking + a read timeout so `read_exact` behaves.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                // A connection carries one message (connect-per-send); read until EOF/timeout.
+                // On a clean EOF, timeout, or malformed frame we are simply done with this conn.
+                while let Ok(msg) = read_tcp_frame(&mut stream) {
+                    inbox.lock().unwrap().push_back(msg);
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => return, // listener broke; stop the thread.
+        }
+    }
+}
+
+/// A [`Transport`] over real TCP sockets. Its listener runs on a background thread that fills an
+/// inbox drained by [`drain`](Transport::drain); [`send`](Transport::send) dials the peer's
+/// registered socket and writes one framed message. Drops cleanly (signals + joins the listener).
+pub struct TcpTransport {
+    /// This node's logical DMTAP address (identity bytes) — the `from` return path it stamps on
+    /// every frame and the address peers look up in their own peer book.
+    local_addr: Vec<u8>,
+    /// Where this node's listener is bound (tell peers to `add_peer(local_addr, this)`).
+    socket_addr: SocketAddr,
+    /// Peer book: logical DMTAP address → TCP socket to dial. A stand-in for §4.2 mesh discovery.
+    peers: Arc<Mutex<HashMap<Vec<u8>, SocketAddr>>>,
+    /// Frames received by the listener thread, awaiting [`drain`](Transport::drain).
+    inbox: Arc<Mutex<VecDeque<InboundFrame>>>,
+    /// Set on drop to stop the accept loop.
+    shutdown: Arc<AtomicBool>,
+    /// The listener thread handle, joined on drop.
+    listener: Option<JoinHandle<()>>,
+}
+
+impl TcpTransport {
+    /// Bind a listener at `bind_to` (e.g. `"127.0.0.1:0"` for an ephemeral port) and start serving.
+    /// `local_addr` is this node's logical DMTAP address (typically its identity public bytes).
+    pub fn bind(local_addr: impl Into<Vec<u8>>, bind_to: &str) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(bind_to)?;
+        let socket_addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+
+        let inbox: Arc<Mutex<VecDeque<InboundFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let inbox = inbox.clone();
+            let shutdown = shutdown.clone();
+            std::thread::spawn(move || tcp_accept_loop(listener, inbox, shutdown))
+        };
+
+        Ok(TcpTransport {
+            local_addr: local_addr.into(),
+            socket_addr,
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            inbox,
+            shutdown,
+            listener: Some(handle),
+        })
+    }
+
+    /// The socket this node's listener is bound to — hand it to peers so they can reach this node.
+    pub fn local_socket_addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+
+    /// Register how to reach a peer: its logical DMTAP `addr` maps to a TCP `socket` to dial
+    /// (a stand-in for signed `LocationRecord` discovery, §4.2).
+    pub fn add_peer(&self, addr: impl Into<Vec<u8>>, socket: SocketAddr) {
+        self.peers.lock().unwrap().insert(addr.into(), socket);
+    }
+}
+
+impl Drop for TcpTransport {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.listener.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Transport for TcpTransport {
+    fn local_addr(&self) -> Vec<u8> {
+        self.local_addr.clone()
+    }
+
+    fn send(&self, to: &[u8], frame: Frame) -> Result<(), TransportError> {
+        // Resolve the peer's socket from the book; an unknown peer is unreachable (§20.1).
+        let socket = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(to)
+            .copied()
+            .ok_or(TransportError::Unreachable)?;
+        // Dial + write one framed message; any I/O failure is `Unreachable` (drives sender retry).
+        let mut stream = TcpStream::connect_timeout(&socket, CONNECT_TIMEOUT)
+            .map_err(|_| TransportError::Unreachable)?;
+        write_tcp_frame(&mut stream, &self.local_addr, &frame)
+            .map_err(|_| TransportError::Unreachable)?;
+        Ok(())
+    }
+
+    fn drain(&self) -> Vec<(Vec<u8>, Frame)> {
+        self.inbox.lock().unwrap().drain(..).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +401,79 @@ mod tests {
         assert_eq!(a.send(b"bob", Frame::Ack(vec![9])), Err(TransportError::Unreachable));
         net.set_down(b"bob", false);
         assert!(a.send(b"bob", Frame::Ack(vec![9])).is_ok());
+    }
+
+    // --- TCP/loopback transport ------------------------------------------------------------
+
+    /// Spin-wait up to ~2 s for `pred` to hold, draining nothing itself — used to bridge the async
+    /// gap between a `send` returning and the listener thread enqueuing the frame.
+    fn wait_until(mut pred: impl FnMut() -> bool) -> bool {
+        for _ in 0..1000 {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        pred()
+    }
+
+    #[test]
+    fn tcp_frames_route_over_loopback_with_return_path() {
+        let a = TcpTransport::bind(b"alice".to_vec(), "127.0.0.1:0").unwrap();
+        let b = TcpTransport::bind(b"bob".to_vec(), "127.0.0.1:0").unwrap();
+        // Each learns how to dial the other.
+        a.add_peer(b"bob".to_vec(), b.local_socket_addr());
+        b.add_peer(b"alice".to_vec(), a.local_socket_addr());
+
+        a.send(b"bob", Frame::Mote(vec![1, 2, 3])).unwrap();
+
+        // The frame arrives at Bob, tagged with Alice's return path.
+        let mut got = Vec::new();
+        assert!(
+            wait_until(|| {
+                got = b.drain();
+                !got.is_empty()
+            }),
+            "frame should arrive over the socket"
+        );
+        assert_eq!(got, vec![(b"alice".to_vec(), Frame::Mote(vec![1, 2, 3]))]);
+        // Alice received nothing.
+        assert!(a.drain().is_empty());
+    }
+
+    #[test]
+    fn tcp_ack_travels_back_over_a_fresh_connection() {
+        let a = TcpTransport::bind(b"alice".to_vec(), "127.0.0.1:0").unwrap();
+        let b = TcpTransport::bind(b"bob".to_vec(), "127.0.0.1:0").unwrap();
+        a.add_peer(b"bob".to_vec(), b.local_socket_addr());
+        b.add_peer(b"alice".to_vec(), a.local_socket_addr());
+
+        // Bob acks back to Alice's return path.
+        b.send(b"alice", Frame::Ack(vec![0xaa, 0xbb])).unwrap();
+        let mut got = Vec::new();
+        assert!(wait_until(|| {
+            got = a.drain();
+            !got.is_empty()
+        }));
+        assert_eq!(got, vec![(b"bob".to_vec(), Frame::Ack(vec![0xaa, 0xbb]))]);
+    }
+
+    #[test]
+    fn tcp_unknown_peer_is_unreachable() {
+        let a = TcpTransport::bind(b"alice".to_vec(), "127.0.0.1:0").unwrap();
+        // Never registered → no route.
+        assert_eq!(a.send(b"ghost", Frame::Ack(vec![1])), Err(TransportError::Unreachable));
+    }
+
+    #[test]
+    fn tcp_dead_socket_is_unreachable() {
+        let a = TcpTransport::bind(b"alice".to_vec(), "127.0.0.1:0").unwrap();
+        // Bind a peer, capture its socket, then drop it so nothing is listening there.
+        let dead_socket = {
+            let b = TcpTransport::bind(b"bob".to_vec(), "127.0.0.1:0").unwrap();
+            b.local_socket_addr()
+        };
+        a.add_peer(b"bob".to_vec(), dead_socket);
+        assert_eq!(a.send(b"bob", Frame::Mote(vec![1])), Err(TransportError::Unreachable));
     }
 }

@@ -24,9 +24,15 @@ dmtap-core = { path = "../crates/dmtap-core" }
 # blocking TCP listeners the `run` command wires up (a real node terminates TLS first, §8.2).
 dmtap-mail = { path = "../crates/dmtap-mail", features = ["net"] }
 
+# --- Durable outbound-queue journal (spec §19.3.3, §0.5, §4.7) ---
+# The sender-side retry queue is the sole durability mechanism and MUST survive restart. The
+# file-backed journal serializes a node snapshot as JSON; the sealed Envelope inside each queued
+# entry is stored as its canonical §18 CBOR bytes (so it round-trips exactly via det_cbor).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 # --- Serialization (spec §README, deterministic CBOR RFC 8949 §4.2, bytewise key order) ---
 # ciborium = "0.2"          # CBOR; verify it emits/validates deterministic (core) form
-# serde = { version = "1", features = ["derive"] }
 
 # --- Hashing / content addressing (spec §2; BLAKE3-256, with hash-agility prefix) ---
 # blake3 = "1"

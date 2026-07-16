@@ -43,6 +43,32 @@ impl OutState {
     pub fn is_terminal(self) -> bool {
         matches!(self, OutState::Acked | OutState::Expired)
     }
+
+    /// Stable discriminant for on-disk persistence (§19.3.3 durability). The mapping is fixed
+    /// forever — appending new states is fine, renumbering an existing one corrupts old journals.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            OutState::Queued => 0,
+            OutState::Sealed => 1,
+            OutState::InFlight => 2,
+            OutState::Retry => 3,
+            OutState::Acked => 4,
+            OutState::Expired => 5,
+        }
+    }
+
+    /// Inverse of [`as_u8`](Self::as_u8); `None` for an unknown discriminant (a corrupt journal).
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0 => OutState::Queued,
+            1 => OutState::Sealed,
+            2 => OutState::InFlight,
+            3 => OutState::Retry,
+            4 => OutState::Acked,
+            5 => OutState::Expired,
+            _ => return None,
+        })
+    }
 }
 
 /// The events that drive the §20.1 machine (see its "Events" list). `Blocked`/`SealOk` cover the

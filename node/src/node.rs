@@ -33,6 +33,7 @@ use dmtap_core::{ContentId, TimestampMs};
 use dmtap_mail::store::{MailStore, Mailbox, MemoryStore};
 
 use crate::inbound::{DropReason, InboundOutcome};
+use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
 
@@ -91,6 +92,10 @@ pub struct Node<T: Transport> {
     transport: T,
     /// Injected clock (ms). Explicit so deadline/backoff behavior is deterministic in tests.
     now: TimestampMs,
+    /// Durable store for the outbound retry queue + dedup set (§19.3.3). Every mutation of that
+    /// state is checkpointed here so a restarted node resumes its pending sends; the default
+    /// [`NullJournal`] persists nothing (ephemeral node).
+    journal: Box<dyn Journal>,
 }
 
 impl<T: Transport> Node<T> {
@@ -100,7 +105,9 @@ impl<T: Transport> Node<T> {
         Node::with_identity(IdentityKey::generate(), SealKeypair::generate(), transport)
     }
 
-    /// Build a node from explicit keys (for reproducible tests / persisted identities).
+    /// Build a node from explicit keys (for reproducible tests / persisted identities). Uses a
+    /// [`NullJournal`] — the outbound queue is **not** durable; use [`with_journal`](Self::with_journal)
+    /// for a node that must resume its pending sends across restart (§19.3.3).
     pub fn with_identity(ik: IdentityKey, seal: SealKeypair, transport: T) -> Self {
         Node {
             ik,
@@ -112,7 +119,45 @@ impl<T: Transport> Node<T> {
             directory: HashMap::new(),
             transport,
             now: 1_700_000_000_000,
+            journal: Box::new(NullJournal),
         }
+    }
+
+    /// Build a node backed by a durable [`Journal`], **resuming** any previously-persisted outbound
+    /// retry queue and dedup set (spec §19.3.3: the queue MUST survive restart). Rebuild the node
+    /// with the same identity + the same journal after a restart and its pending sends come back;
+    /// call [`retry_pending`](Self::retry_pending) to re-dispatch them.
+    ///
+    /// The identity keys and the delivered-mail store are **not** restored from the journal (that
+    /// state lives elsewhere, see [`crate::journal`]); the caller supplies the identity, and only
+    /// the in-flight delivery state is recovered here.
+    pub fn with_journal(
+        ik: IdentityKey,
+        seal: SealKeypair,
+        transport: T,
+        journal: Box<dyn Journal>,
+    ) -> Result<Self, JournalError> {
+        let snapshot = journal.load()?;
+        let mut node = Node {
+            ik,
+            seal,
+            store: MemoryStore::new(),
+            seen: HashMap::new(),
+            outbound: HashMap::new(),
+            contacts: HashSet::new(),
+            directory: HashMap::new(),
+            transport,
+            now: 1_700_000_000_000,
+            journal,
+        };
+        for pe in snapshot.outbound {
+            let entry = pe.into_entry()?;
+            node.outbound.insert(entry.id.as_bytes().to_vec(), entry);
+        }
+        for (id, from) in snapshot.seen {
+            node.seen.insert(id, from);
+        }
+        Ok(node)
     }
 
     // --- identity / directory ---------------------------------------------------------------
@@ -150,6 +195,36 @@ impl<T: Transport> Node<T> {
     /// The mail-store projection (IMAP/JMAP view of delivered MOTEs).
     pub fn store(&self) -> &MemoryStore {
         &self.store
+    }
+
+    /// Mutable access to the mail-store projection — lets a JMAP handler
+    /// ([`dmtap_mail::jmap::process`]) or IMAP session run directly against the node's live store.
+    pub fn store_mut(&mut self) -> &mut MemoryStore {
+        &mut self.store
+    }
+
+    // --- durability (§19.3.3) ----------------------------------------------------------------
+
+    /// The current durable state (outbound queue + dedup set) as a serializable [`Snapshot`].
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            outbound: self.outbound.values().map(PersistedEntry::from_entry).collect(),
+            seen: self.seen.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Persist the current delivery state to the journal (§19.3.3). Called after every mutation of
+    /// the outbound queue / dedup set. Best-effort: a journal write failure is swallowed here (there
+    /// is no useful in-line recovery mid-operation), matching a durable-queue node that logs and
+    /// continues; [`flush`](Self::flush) exposes the same write with its error for explicit checks.
+    fn checkpoint(&self) {
+        let _ = self.journal.save(&self.snapshot());
+    }
+
+    /// Force a durable checkpoint, surfacing any journal error (for callers that want to confirm
+    /// the queue is committed — e.g. before reporting a send accepted).
+    pub fn flush(&self) -> Result<(), JournalError> {
+        self.journal.save(&self.snapshot())
     }
 
     /// The INBOX mailbox (delivered, accepted MOTEs).
@@ -212,6 +287,7 @@ impl<T: Transport> Node<T> {
         entry.sealed = Some(env);
         self.dispatch(&mut entry); // SEALED → IN_FLIGHT (or → RETRY if unreachable)
         self.outbound.insert(id.as_bytes().to_vec(), entry);
+        self.checkpoint(); // §19.3.3: the queued MOTE is now durable before we return.
         Ok(id)
     }
 
@@ -257,6 +333,7 @@ impl<T: Transport> Node<T> {
             }
             self.outbound.insert(key.clone(), entry);
         }
+        self.checkpoint(); // attempts/state advanced — persist the new queue state.
         redispatched
     }
 
@@ -269,6 +346,9 @@ impl<T: Transport> Node<T> {
                 entry.apply(OutEvent::DeadlineExceeded).expect("→EXPIRED");
                 expired.push(entry.id.clone());
             }
+        }
+        if !expired.is_empty() {
+            self.checkpoint(); // some entries reached the EXPIRED terminal — persist it.
         }
         expired
     }
@@ -301,6 +381,7 @@ impl<T: Transport> Node<T> {
                 OutState::Sealed | OutState::Queued => return,
             };
             let _ = entry.apply(ev);
+            self.checkpoint(); // ACKED/late-ack state change — persist it.
         }
     }
 
@@ -364,6 +445,7 @@ impl<T: Transport> Node<T> {
             .deliver_mote(&payload, "INBOX", self.now)
             .expect("INBOX always exists");
         self.seen.insert(id.as_bytes().to_vec(), from.to_vec());
+        self.checkpoint(); // dedup set grew — persist so a post-restart redelivery is still re-acked.
         self.send_ack(from, id);
         InboundOutcome::Stored { id: id.clone(), uid }
     }
