@@ -1,0 +1,127 @@
+(* ============================================================================
+   DMTAP-Auth  --  native login ceremony  (spec: dmtap/13-identity-auth.md 13.3)
+   ----------------------------------------------------------------------------
+   Ceremony modelled (the 6 steps of section 13.3):
+     1-2. RP resolves name -> pinned identity key IK_U.
+     3.   RP issues Challenge { rp_origin, nonce, issued_at, exp, aud }.
+     4.   The TRUSTED CLIENT verifies/binds the rp_origin, generates a FRESH
+          per-RP session keypair, and computes  cnf = H(session_pubkey)
+          BEFORE signing (RFC 7800 confirmation key).
+     5.   IK_U signs the DOMAIN-SEPARATED preimage
+            "DMTAP-v0/auth-assertion" || 0x00 || H(rp_origin||nonce||iat||exp||aud||cnf).
+     6.   RP verifies sig vs pinned IK_U, rp_origin == its OWN origin, nonce
+          fresh, not expired, and binds the session ONLY to cnf (PoP, 13.4).
+
+   Properties proven:
+     (U) assertion UNFORGEABILITY  -- only the IK_U holder yields a valid
+         assertion for a given (origin, nonce, cnf);
+     (R) REPLAY resistance         -- a nonce is single-use (injectivity);
+     (O) ORIGIN binding            -- an assertion accepted at origin O was
+         signed FOR O; cross-origin replay (phishing) is impossible;
+     (K) session KEY-BINDING / DPoP-- a captured assertion WITHOUT the session
+         private key is useless: the session-protected resource stays secret.
+
+   (U),(R),(O) are captured together by one INJECTIVE agreement that carries
+   (origin, nonce, cnf).  (K) is a secrecy query.
+
+   Tool: ProVerif.   Run:  proverif dmtap_auth.pv
+   ============================================================================ *)
+
+(* ---------- Ed25519 identity key IK_U -------------------------------------- *)
+type sigpriv.
+type sigpub.
+fun  sigpk(sigpriv): sigpub.
+fun  sign(bitstring, sigpriv): bitstring.
+reduc forall m: bitstring, k: sigpriv; checksign(sign(m,k), sigpk(k)) = m.
+
+(* ---------- Session keypair (key-bound session, spec 13.4). Modelled as an
+   encryption keypair so "bound to cnf" = only the sk_sess holder can use it. - *)
+type skpriv.
+type skpub.
+fun  skpk(skpriv): skpub.
+fun  penc(bitstring, skpub): bitstring.
+reduc forall m: bitstring, k: skpriv; pdec(penc(m, skpk(k)), k) = m.
+
+fun  H(bitstring): bitstring.               (* hash: cnf, challenge digest     *)
+const DS_AUTH: bitstring.                    (* "DMTAP-v0/auth-assertion" tag   *)
+
+free c: channel.                             (* public network                  *)
+
+(* Two HONEST relying-party origins, to exercise origin-binding (O). A phisher
+   is just the Dolev-Yao attacker relaying between them / from its own origin. *)
+free O_BANK: bitstring.
+free O_SHOP: bitstring.
+
+(* The session-protected resource, for the key-binding secrecy test (K).      *)
+free secretResource: bitstring [private].
+
+(* ---------- Events -------------------------------------------------------- *)
+event UserSigned(sigpub, bitstring, bitstring, bitstring). (* IK_U, origin, nonce, cnf *)
+event RPAccepts (sigpub, bitstring, bitstring, bitstring). (* IK_U, self-origin, nonce, cnf *)
+
+(* ===================== QUERIES ========================================== *)
+
+(* (U)+(R)+(O)  INJECTIVE agreement on (origin, nonce, cnf):
+     - RP accepts only assertions actually signed by IK_U          => (U);
+     - the SAME origin appears on both sides                        => (O)
+       (an assertion accepted at origin o was signed FOR o, so a
+        cross-origin/phishing replay cannot be accepted);
+     - injectivity: each acceptance maps to a DISTINCT signing, so a
+       replayed assertion is never accepted twice                   => (R). *)
+query u: sigpub, o: bitstring, n: bitstring, cnf: bitstring;
+  inj-event(RPAccepts(u,o,n,cnf)) ==> inj-event(UserSigned(u,o,n,cnf)).
+
+(* (K)  KEY-BINDING / DPoP: even though every assertion is public (the attacker,
+     and per spec 13.6 the bridge, sees it), the session-bound resource stays
+     secret -- a bearer who lacks the session private key cannot use it. *)
+query attacker(secretResource).
+
+(* ===================== ROLES ============================================ *)
+
+(* Trusted client + user, for the origin O the client has VERIFIED.
+   The `=O` input pattern is the load-bearing origin binding (13.3.1): the
+   client will only sign a challenge whose rp_origin matches the origin it
+   actually observed / the login intent it originated.  An unsolicited
+   relayed challenge for a different origin has no matching client and is
+   never signed (this also closes the remote-node relay hole, H1). *)
+let userClient(IKU: sigpriv, O: bitstring) =
+  in(c, (=O, nonce: bitstring, iat: bitstring, exp: bitstring, aud: bitstring));
+  new sk_sess: skpriv;                        (* fresh per-RP, per-device      *)
+  let spub = skpk(sk_sess) in
+  let cnf  = H(spub) in                        (* cnf bound BEFORE signing      *)
+  let pre  = (DS_AUTH, H((O, nonce, iat, exp, aud, cnf))) in
+  event UserSigned(sigpk(IKU), O, nonce, cnf);
+  out(c, (O, nonce, iat, exp, aud, cnf, spub, sign(pre, IKU)));
+  (* the legitimate holder can decrypt whatever the RP binds to this session *)
+  in(c, ct: bitstring);
+  let r = pdec(ct, sk_sess) in 0.
+
+(* Relying party, for its OWN origin Oself.  A fresh per-challenge nonce plus a
+   single following input means each challenge is answered at most once, and an
+   assertion must echo the exact (origin,nonce,iat,exp) issued here -> replay
+   to another RP instance mismatches the nonce and is rejected. *)
+let rp(IKUpub: sigpub, Oself: bitstring) =
+  new nonce: bitstring;  new iat: bitstring;  new exp: bitstring;
+  out(c, (Oself, nonce, iat, exp, Oself));                   (* Challenge (aud=Oself) *)
+  in(c, (=Oself, =nonce, =iat, =exp, aud2: bitstring, cnf: bitstring,
+         spub: skpub, sig: bitstring));
+  if aud2 = Oself then                                        (* aud binds to RP  *)
+  let pre = (DS_AUTH, H((Oself, nonce, iat, exp, Oself, cnf))) in
+  if checksign(sig, IKUpub) = pre then                       (* sig vs pinned IK *)
+  if H(spub) = cnf then                                       (* cnf == H(spub)   *)
+    event RPAccepts(IKUpub, Oself, nonce, cnf);
+    (* bind the session ONLY to cnf: release the resource encrypted to the
+       session key, so a party without sk_sess (a stolen-assertion bearer)
+       cannot obtain it. *)
+    out(c, penc(secretResource, spub)).
+
+(* ===================== MAIN ============================================= *)
+process
+  new IKU: sigpriv;                            (* the user's pinned identity key *)
+  out(c, sigpk(IKU));                          (* public (resolved via KT/DID)   *)
+  (
+      ( ! userClient(IKU, O_BANK) )
+    | ( ! userClient(IKU, O_SHOP) )
+    | ( ! rp(sigpk(IKU), O_BANK) )
+    | ( ! rp(sigpk(IKU), O_SHOP) )
+  )

@@ -1,0 +1,149 @@
+(* ============================================================================
+   DMTAP  --  Deniable 1:1 mode  (spec: dmtap/05-messaging.md, section 5.2.1)
+   ----------------------------------------------------------------------------
+   Ceremony modelled:
+     X3DH (suite 0x01) session setup + first Double-Ratchet message, with:
+       - a DEDICATED long-term X25519 "deniable-identity DH key" `idk`
+         (the Ed25519 IK only CERTIFIES idk via idk_sig, never does DH);
+       - a signed prekey `spk` and a one-time prekey `opk`;
+       - AD = IK_A || IK_B  (oriented initiator||responder), spec 18.3.9;
+       - authentication of every message by a SHARED-KEY MAC (AEAD tag),
+         NEVER a signature over content  ->  this is what makes it deniable.
+
+   This file proves the REACHABILITY properties of the handshake:
+       (S)  secrecy of the first-message plaintext and the session key;
+       (A)  mutual authentication (injective agreement, via IK-certified idk);
+       (F)  weak forward secrecy (post-session long-term-key compromise).
+
+   DENIABILITY / repudiation is an INDISTINGUISHABILITY property, not a
+   reachability one, so it is proven in the companion biprocess
+   `deniable_1to1_deniability.pv` (observational equivalence).  It MUST be a
+   separate analysis: a forger who holds the responder's key material breaks
+   third-party-provable authentication *by design* (that IS the deniability),
+   so it cannot coexist with the authentication query in one attacker world.
+   See README.md.
+
+   Tool: ProVerif.   Run:  proverif deniable_1to1.pv
+   ============================================================================ *)
+
+(* ---------- Diffie-Hellman over X25519 (idk / spk / opk / ek) ------------- *)
+type dhpriv.
+type dhpub.
+fun  dhexp(dhpriv): dhpub.                 (* public point from a scalar        *)
+fun  dh(dhpriv, dhpub): bitstring.         (* raw DH shared value               *)
+equation forall x: dhpriv, y: dhpriv;
+  dh(x, dhexp(y)) = dh(y, dhexp(x)).       (* DH commutativity (the only eq.)   *)
+
+(* ---------- Ed25519 identity signing key IK (certifies public keys only) --- *)
+type sigpriv.
+type sigpub.
+fun  sigpk(sigpriv): sigpub.
+fun  sign(bitstring, sigpriv): bitstring.
+reduc forall m: bitstring, k: sigpriv; checksign(sign(m,k), sigpk(k)) = m.
+
+(* ---------- KDF + AEAD.  The AEAD tag is the shared-key MAC. -------------- *)
+fun  kdf(bitstring, bitstring, bitstring, bitstring): bitstring.
+fun  aead(bitstring, bitstring, bitstring): bitstring.   (* key, plaintext, AD *)
+reduc forall k: bitstring, m: bitstring, ad: bitstring;
+  adec(k, aead(k,m,ad), ad) = m.
+
+(* ---------- Domain-separation tags (spec 18.9.10) ------------------------ *)
+const TAG_IDK: bitstring.     (* "DMTAP-v0/deniable-idk"  -- certifies idk    *)
+const TAG_SPK: bitstring.     (* signed-prekey signature tag                  *)
+const CONFIRM: bitstring.     (* B->A key-confirmation payload                *)
+
+free c: channel.              (* public Dolev-Yao network                    *)
+
+(* The secret first-message plaintext, used for the secrecy test.           *)
+free msgAB: bitstring [private].
+
+(* ---------- Events ------------------------------------------------------- *)
+(* IK_A, IK_B, session key  -- carried so agreement is on the derived key.   *)
+event SendInit(sigpub, sigpub, bitstring).   (* A committed to a session      *)
+event RecvResp(sigpub, sigpub, bitstring).   (* B accepted A's first message  *)
+event ConfirmB(sigpub, sigpub, bitstring).   (* B committed to the reply      *)
+event AcceptA(sigpub, sigpub, bitstring).    (* A accepted B's confirmation   *)
+
+(* ===================== QUERIES ========================================== *)
+
+(* (S) Secrecy of the first-message plaintext.  Because a post-session
+       long-term-key leak also runs (phase 1 below), a PROVED result here is
+       in fact WEAK FORWARD SECRECY (property F): the message stays secret
+       even after IK/idk of both parties are handed to the attacker. *)
+query attacker(msgAB).
+
+(* (A) Mutual authentication as INJECTIVE agreement on the session key:
+       - B accepts A only if A really initiated that exact session key;
+       - A accepts B (on confirmation) only if B really confirmed it.
+       Injectivity => no replay of an accepted session (the one-time prekey
+       `opk` is what makes this hold; see the responder below). *)
+query a: sigpub, b: sigpub, k: bitstring;
+  inj-event(RecvResp(a,b,k)) ==> inj-event(SendInit(a,b,k)).
+query a: sigpub, b: sigpub, k: bitstring;
+  inj-event(AcceptA(a,b,k))  ==> inj-event(ConfirmB(a,b,k)).
+
+(* ===================== ROLES ============================================ *)
+
+(* Initiator A: has long-term idkA + IK_A; talks to B whose identity key
+   IK_B is pinned (KT, spec 3.5).  Verifies B's certified idk and signed
+   prekey before use; authenticates B via the returned key-confirmation. *)
+let initiatorA(idkA: dhpriv, IKA: sigpriv, idkcertA: bitstring, IKBpub: sigpub) =
+  (* pull B's advertised bundle from the network and verify it *)
+  in(c, (IDKB: dhpub, idkcertB: bitstring, SPKB: dhpub, spksigB: bitstring, OPKB: dhpub));
+  if checksign(idkcertB, IKBpub) = (TAG_IDK, IDKB) then       (* idk_b <- IK_B  *)
+  if checksign(spksigB,  IKBpub) = (TAG_SPK, SPKB) then       (* spk_b <- IK_B  *)
+  new ekA: dhpriv;
+  let EKA = dhexp(ekA) in
+  (* X3DH: DH1=idk_a.spk_b  DH2=ek_a.idk_b  DH3=ek_a.spk_b  DH4=ek_a.opk_b *)
+  let sk = kdf( dh(idkA, SPKB), dh(ekA, IDKB), dh(ekA, SPKB), dh(ekA, OPKB) ) in
+  let AD = (sigpk(IKA), IKBpub) in                            (* IK_A || IK_B  *)
+  event SendInit(sigpk(IKA), IKBpub, sk);
+  out(c, (dhexp(idkA), idkcertA, EKA, OPKB, aead(sk, msgAB, AD)));
+  (* key-confirmation reply authenticates B to A *)
+  in(c, ct2: bitstring);
+  let AD2 = (IKBpub, sigpk(IKA)) in
+  if adec(sk, ct2, AD2) = CONFIRM then
+    event AcceptA(sigpk(IKA), IKBpub, sk).
+
+(* Responder B: publishes a fresh one-time prekey per instance and only
+   accepts an init that consumed THAT opk -> single-use => replay-resistant.
+   Verifies A's IK-certified idk (pinned IK_A). *)
+let responderB(idkB: dhpriv, IKB: sigpriv, spkB: dhpriv, idkcertB: bitstring,
+               spksigB: bitstring, IKApub: sigpub) =
+  new opkB: dhpriv;                                            (* one-time key  *)
+  let OPKB = dhexp(opkB) in
+  out(c, (dhexp(idkB), idkcertB, dhexp(spkB), spksigB, OPKB)); (* the bundle    *)
+  in(c, (IDKA: dhpub, idkcertA: bitstring, EKA: dhpub, =OPKB, ct: bitstring));
+  if checksign(idkcertA, IKApub) = (TAG_IDK, IDKA) then        (* idk_a <- IK_A *)
+  (* B reconstructs the same key from the responder side of each DH *)
+  let sk = kdf( dh(spkB, IDKA), dh(idkB, EKA), dh(spkB, EKA), dh(opkB, EKA) ) in
+  let AD = (IKApub, sigpk(IKB)) in
+  let m = adec(sk, ct, AD) in                                  (* MAC check     *)
+  event RecvResp(IKApub, sigpk(IKB), sk);
+  (* send key-confirmation back to A *)
+  let AD2 = (sigpk(IKB), IKApub) in
+  event ConfirmB(IKApub, sigpk(IKB), sk);
+  out(c, aead(sk, CONFIRM, AD2)).
+
+(* ===================== MAIN ============================================= *)
+process
+  (* ----- long-term key setup ----- *)
+  new idkA: dhpriv;  new IKA: sigpriv;      (* A: deniable-idk + Ed25519 IK   *)
+  new idkB: dhpriv;  new IKB: sigpriv;      (* B: deniable-idk + Ed25519 IK   *)
+  new spkB: dhpriv;                         (* B: signed prekey (semi-static) *)
+  (* IK certifies idk (idk_sig) and signs spk (spk_sig) -- the ONLY signatures *)
+  let idkcertA = sign((TAG_IDK, dhexp(idkA)), IKA) in
+  let idkcertB = sign((TAG_IDK, dhexp(idkB)), IKB) in
+  let spksigB  = sign((TAG_SPK, dhexp(spkB)), IKB) in
+  (* publish all public identity material (attacker sees it too) *)
+  out(c, (sigpk(IKA), sigpk(IKB), dhexp(idkA), dhexp(idkB), dhexp(spkB),
+          idkcertA, idkcertB, spksigB));
+  (
+      ( ! initiatorA(idkA, IKA, idkcertA, sigpk(IKB)) )
+    | ( ! responderB(idkB, IKB, spkB, idkcertB, spksigB, sigpk(IKA)) )
+      (* ----- (F) weak forward secrecy: AFTER sessions run, hand the
+         attacker BOTH parties' long-term secrets.  The one-time prekey opk
+         and the ephemeral ek are deleted (never revealed), so a proved
+         secrecy of msgAB above is forward secrecy. ----- *)
+    | ( phase 1; out(c, (idkA, idkB, IKA, IKB)) )
+  )
