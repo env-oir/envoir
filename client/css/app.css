@@ -145,6 +145,9 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 /* ---------- pills & badges ---------- */
 .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 650; padding: 3px 9px; border-radius: 20px; white-space: nowrap; }
 .pill .ic { width: 13px; height: 13px; }
+button.pill { flex-shrink: 0; transition: filter .14s, transform .08s; }
+button.pill:hover { filter: brightness(1.16); }
+button.pill:active { transform: scale(.97); }
 .pill.sm { font-size: 10.5px; padding: 2px 7px; }
 .pill.priv   { background: color-mix(in srgb, var(--priv) 16%, transparent); color: color-mix(in srgb, var(--priv) 82%, var(--text)); }
 .pill.accent { background: color-mix(in srgb, var(--accent) 16%, transparent); color: color-mix(in srgb, var(--accent) 82%, var(--text)); }
@@ -1071,6 +1074,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .id-scroll { width: 100%; }
 .id-inner { max-width: 940px; margin: 0 auto; padding: 28px 28px 64px; }
 .teal { color: color-mix(in srgb, var(--teal) 88%, var(--text)); }
+.gw-attest-row .v.teal { color: color-mix(in srgb, var(--teal) 82%, var(--text-dim)); }
 
 .id-hero { position: relative; display: flex; align-items: center; gap: 24px; overflow: hidden;
   background: linear-gradient(135deg, color-mix(in srgb, var(--indigo) 18%, var(--bg-1)), color-mix(in srgb, var(--violet) 16%, var(--bg-1)));
@@ -1367,6 +1371,9 @@ mark.hl.cur { background: var(--warn); color: #241a02; box-shadow: 0 0 0 2px col
   .msg-name { flex-wrap: wrap; }
   .read-foot { padding: 12px 14px; }
   .chat-head { padding: 10px 14px; }
+  .proto-pill .pp-label { display: none; }
+  .proto-pill { padding: 7px; }
+  .chat-members { display: none; }
   .bubbles { padding: 16px 14px; }
   .brow { max-width: 86%; }
   .gr-detail { padding: 20px 16px 40px; }

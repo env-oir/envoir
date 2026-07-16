@@ -42,7 +42,11 @@ an address*; it is now correctly a verification affordance, never an address.)
   multi-select **bulk actions**, mark read/unread, per-message **verified badges**, clear
   **legacy-origin** marking, and the MOTE **3-layer inspector** as a "why this is private" drawer.
 - **Chat** — DMs + **channels (groups)**, reactions, threaded replies, opt-in typing/presence
-  (labeled metadata-sensitive) — the same MOTE substrate (`kind=chat`, fast tier).
+  (labeled metadata-sensitive) — the same MOTE substrate (`kind=chat`, fast tier). Every
+  conversation header carries an honest protocol badge: DMs are **deniable 1:1** (a pairwise
+  X3DH + Double Ratchet channel, MAC-authenticated, spec §5.2.1 — no signature ties a message to
+  you), channels are **MLS group · signed** (spec §5.3/§5.8 — scales to any group size, but the
+  per-message signature is non-repudiable); click the badge for the tradeoff explained in full.
 - **Calendar** — month / week / day views, create event, **recurring** events, peer-to-peer
   **invitations + RSVP** (a message, not a server query), reminders, free/busy.
 - **Contacts** — cards with org/title/phone/groups, gradient avatars, and **per-contact key
@@ -105,7 +109,7 @@ js/signin.js          "Sign in with Envoir" demo (real signature over an origin-
 js/ui.js              DOM helpers, icon set, avatars, MOTE inspector, safety visuals, toast, modal, shimmer
 
 js/views/mail.js      three-pane mail: folders/labels, threading, bulk actions, reading pane, inspector
-js/views/chat.js      DMs + channels, reactions, threads, typing/presence
+js/views/chat.js      DMs + channels, reactions, threads, typing/presence, deniable-vs-MLS badge
 js/views/calendar.js  month/week/day, recurring events, invitations + RSVP, reminders
 js/views/contacts.js  cards + per-contact safety-number verification, import/export
 js/views/files.js     content-addressed E2E files, shared-folder = group

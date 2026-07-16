@@ -106,6 +106,7 @@ function drawMain(root) {
         <div class="chat-head-name">${esc(convTitle(c))} ${isCh ? '' : (p.trust === 'verified' ? trustPill('verified') : trustPill('tofu'))}</div>
         <div class="chat-head-sub mono">${isCh ? esc(g.address) + ' · ' + g.members.length + ' members · ' + g.mode : (state.settings.presence ? (c.presence === 'online' ? '<span class="pres-inline online"></span> online' : c.presence) : 'presence off') }</div>
       </div>
+      <button class="pill ${isCh ? 'accent' : 'priv'} proto-pill" id="protopill" title="How this conversation is authenticated — click for details">${icon(isCh ? 'groups' : 'lock')} <span class="pp-label">${isCh ? 'MLS group · signed' : 'Deniable 1:1'}</span></button>
       <button class="icon-btn ${chatSearch.open ? 'on' : ''}" id="chatsearchbtn" title="Search this conversation" aria-label="Search this conversation" aria-pressed="${chatSearch.open}">${icon('search')}</button>
       ${members.length ? `<div class="chat-members">${members.slice(0, 4).map(m => avatar(m, 26, { ring: false })).join('')}${g.members.length > members.length ? `<span class="chat-more-m">+${g.members.length - members.length}</span>` : ''}</div>` : ''}
     </header>
@@ -136,6 +137,7 @@ function drawMain(root) {
       setTimeout(() => { c.typing = false; c.msgs.push({ from: c.with, me: false, t: Date.now(), body: pick(REPLIES), reactions: {} }); if (state.ui.selChat === c.id) bus.rerender(); }, 1400); }, 700);
   };
   wrap.querySelector('#chat-back').onclick = () => { state.ui.mobileDetail = false; bus.rerender(); };
+  wrap.querySelector('#protopill').onclick = () => protocolModal(c, isCh, g);
   wrap.querySelector('#cs').onclick = send;
   inp.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
   wrap.querySelector('#ciemoji').onclick = (e) => { e.stopPropagation(); emojiPanel(wrap.querySelector('#ciemoji'), (emo) => { inp.value += emo; inp.focus(); }); };
@@ -272,6 +274,33 @@ function drawThread(wrap, c, idx) {
 }
 
 function reactPicker(anchor, m) { emojiPanel(anchor, (e) => { m.reactions = m.reactions || {}; m.reactions[e] = (m.reactions[e] || 0) + 1; bus.rerender(); }); }
+
+// ---- Deniable 1:1 vs MLS group — which cryptographic mode this conversation uses ----------
+// Two DISTINCT pairwise substrates, never mixed (spec §5.2.1 vs §5.3/§5.8): a DM is a separate
+// Double-Ratchet channel authenticated by a shared-key MAC (deniable — either party could have
+// produced any message); a channel is an MLS group where every message carries the sender's
+// signature (efficient at group scale, but the signature is non-repudiable). The badge in the
+// chat header always tells you honestly which one you're in.
+function protocolModal(c, isCh, g) {
+  const card = openModal(`<div class="id-modal">
+    <div class="ev-detail-head"><h2>${icon(isCh ? 'groups' : 'lock')} ${isCh ? 'MLS group messaging' : 'Deniable 1:1 messaging'}</h2><button class="icon-btn" id="pmx">${icon('x')}</button></div>
+    ${isCh ? `
+    <p class="modal-note">${icon('info')} <b>${esc(g?.name || convTitle(c))}</b> is a group conversation: every member's client holds the shared MLS group state (spec §5.3, §5.8), and every message is <b>signed</b> by its sender's key. That signature is what lets a group scale efficiently with a provable, ordered history — but it also means a member could prove authorship to someone outside the group. Efficiency and group-scale forward secrecy, traded for deniability.</p>
+    <div class="gw-attest">
+      <div class="gw-attest-row"><span class="k">authentication</span><span class="v">Ed25519 signature per message</span></div>
+      <div class="gw-attest-row"><span class="k">deniability</span><span class="v">none — signatures are non-repudiable</span></div>
+      <div class="gw-attest-row"><span class="k">scales to</span><span class="v">any group size (tree-based key schedule)</span></div>
+    </div>` : `
+    <p class="modal-note">${icon('info')} This DM runs on a separate pairwise channel (spec §5.2.1) — X3DH key agreement into a Double Ratchet, the same design Signal popularized. Every message is authenticated only by a <b>shared-key MAC</b>, never a signature: either of you holds the key material to have produced any message, so neither can prove to a third party who sent what. Forward secrecy <i>and</i> deniability — traded for group scale; this mode is pairwise-only and is never used for groups.</p>
+    <div class="gw-attest">
+      <div class="gw-attest-row"><span class="k">authentication</span><span class="v">shared-key MAC (Double Ratchet)</span></div>
+      <div class="gw-attest-row"><span class="k">deniability</span><span class="v teal">offline-deniable — no signature ties a message to you</span></div>
+      <div class="gw-attest-row"><span class="k">scales to</span><span class="v">pairwise (1:1) only</span></div>
+    </div>`}
+    <div class="ev-detail-foot"><span class="sim-tag">${icon('shield')} real design, structural in this browser demo — the actual ratchet/MLS session runs in the Rust core (dmtap-deniable / dmtap-mls crates)</span></div>
+  </div>`, { wide: true });
+  card.querySelector('#pmx').onclick = closeModal;
+}
 
 // Pinned messages — reorderable (drag the grip, or the ↑/↓ controls). The top pin shows in the bar.
 function pinnedModal(c) {
