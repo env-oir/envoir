@@ -23,14 +23,24 @@
 //! legacy sender's SMTP retry (hence `451`, never `250`, without a durable ack); outbound → the
 //! user's node retry queue. Every network effect — mesh delivery, the outbound SMTP socket, and the
 //! DNS lookups for recipient keys, attestation keys, and DKIM delegation — is abstracted behind a
-//! trait, so the whole bridge is exercised in-process and a real deployment supplies thin socket
-//! impls.
+//! trait, so the whole bridge is exercised in-process.
+//!
+//! ## Real sockets
+//! The trait-abstracted network legs now have concrete socket impls: [`inbound_tcp::MxListener`] is
+//! a real `TcpListener` MX that runs the SMTP dialog (with STARTTLS termination via rustls) and
+//! feeds the assembled message into the verified [`inbound::MxSession`] pipeline; [`SmtpTcpTransport`]
+//! is a real SMTP client that opens a TCP connection to the destination MX, negotiates STARTTLS, and
+//! enforces the TLS-required-never-cleartext rule (§7.3). The in-process trait doubles remain for
+//! unit tests; the socket impls are the production leg.
 
 pub mod attestation;
 pub mod b64;
 pub mod dkim;
 pub mod inbound;
+pub mod inbound_tcp;
+pub mod net;
 pub mod outbound;
+pub mod outbound_tcp;
 
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 pub use dkim::{DkimError, DkimKey};
@@ -38,7 +48,11 @@ pub use inbound::{
     AbuseDecision, AllowAllAbuse, AntiAbuse, DeliveryOutcome, InboundError, InboundGateway,
     KeyDirectory, MeshDelivery, MxSession, RecipientKey, SmtpReply,
 };
+pub use inbound_tcp::{
+    load_certs, load_private_key, server_config, server_config_from_pem, MxListener,
+};
 pub use outbound::{
     AlwaysRequireTls, OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy,
     TlsRequirement, TransportResult,
 };
+pub use outbound_tcp::SmtpTcpTransport;

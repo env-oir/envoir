@@ -28,6 +28,17 @@ sha2 = "0.10"
 # --- Errors ---
 thiserror = "1"
 
+# --- Real SMTP-over-TLS sockets (the one dep worth taking, spec §7.3 STARTTLS) ---
+# rustls (ring provider) terminates/initiates STARTTLS; pemfile loads operator cert/key;
+# webpki-roots is the default trust anchor set for validating destination MX certs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+
+[dev-dependencies]
+# Self-signed cert generation for the in-process loopback TLS tests only (never at runtime).
+rcgen = "0.13"
+
 [lib]
 name = "envoir_gateway"
 path = "src/lib.rs"
