@@ -4,7 +4,7 @@
 
 import { state, uid } from '../store.js';
 import { person } from '../seed.js';
-import { el, esc, icon, avatar, toast, timeAgo, fmtBytes } from '../ui.js';
+import { el, esc, icon, avatar, toast, timeAgo, fmtBytes, emptyState } from '../ui.js';
 import { sha256, hex } from '../identity.js';
 import { bus } from '../bus.js';
 
@@ -12,7 +12,8 @@ export function render(root) {
   root.className = 'view files-view';
   const q = state.ui.search.trim().toLowerCase();
   const files = state.files.filter(f => !q || f.name.toLowerCase().includes(q));
-  const shared = state.files.filter(f => f.shared);
+  // Unique shared folders (by group), each a group over a set of manifests.
+  const sharedGroups = [...new Set(state.files.filter(f => f.shared).map(f => f.shared))];
 
   root.innerHTML = `
     <div class="files-inner">
@@ -20,11 +21,11 @@ export function render(root) {
         <div><h1>Files</h1><div class="files-sub">Content-addressed, end-to-end encrypted, any size — no protocol cap. A shared folder is a group.</div></div>
         <button class="btn primary" id="upload">${icon('plus')} Share a file</button>
       </header>
-      <div class="drop" id="drop"><div class="drop-inner">${icon('files')}<b>Drop a file to share</b><span>chunked, hashed (b3:), and sealed client-side — nothing leaves in the clear</span></div></div>
+      <div class="drop" id="drop" role="button" tabindex="0" aria-label="Share a file — opens the file picker"><div class="drop-inner">${icon('files')}<b>Drop a file to share</b><span>chunked, hashed (b3:), and sealed client-side — nothing leaves in the clear</span></div></div>
       <input type="file" id="finput" class="hidden">
 
-      ${shared.length ? `<div class="files-section-h">${icon('groups')} Shared folders (groups)</div>
-      <div class="folder-grid">${shared.map(f => { const g = state.groups.find(x => x.id === f.shared); return `<div class="folder-card"><div class="folder-ic">${icon('groups')}</div><div><b>${esc(g?.name || f.shared)}</b><span class="mono">${esc(g?.address || '')}</span></div><i class="folder-n">${state.files.filter(x => x.shared === f.shared).length} file(s)</i></div>`; }).filter((v, i, a) => a.indexOf(v) === i).join('')}</div>` : ''}
+      ${sharedGroups.length ? `<div class="files-section-h">${icon('groups')} Shared folders (groups)</div>
+      <div class="folder-grid">${sharedGroups.map(gid => { const g = state.groups.find(x => x.id === gid); return `<div class="folder-card"><div class="folder-ic">${icon('groups')}</div><div><b>${esc(g?.name || gid)}</b><span class="mono">${esc(g?.address || '')}</span></div><i class="folder-n">${state.files.filter(x => x.shared === gid).length} file(s)</i></div>`; }).join('')}</div>` : ''}
 
       <div class="files-section-h">All files <span class="list-count">${files.length}</span></div>
       <div class="file-grid" id="grid"></div>
@@ -33,6 +34,7 @@ export function render(root) {
   const grid = root.querySelector('#grid');
   const draw = () => {
     grid.innerHTML = '';
+    if (!files.length) { grid.innerHTML = emptyState('files', q ? 'No files match' : 'No files yet', q ? 'Try a different search.' : 'Drop a file above to share it — sealed and content-addressed.'); return; }
     files.forEach(f => {
       const p = person(f.from);
       const g = f.shared ? state.groups.find(x => x.id === f.shared) : null;
@@ -50,6 +52,7 @@ export function render(root) {
   const inp = root.querySelector('#finput'), drop = root.querySelector('#drop');
   root.querySelector('#upload').onclick = () => inp.click();
   drop.onclick = () => inp.click();
+  drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); inp.click(); } };
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files[0]) shareFile(e.dataTransfer.files[0]); };

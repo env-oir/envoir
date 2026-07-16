@@ -262,6 +262,8 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .empty-glow .ic { width: 34px; height: 34px; }
 .empty b { font-size: 15px; color: var(--text-dim); }
 .empty span { font-size: 13px; max-width: 320px; }
+/* An empty state dropped into a grid should span every column, not sit in one cell. */
+.file-grid .empty, .folder-grid .empty { grid-column: 1 / -1; min-height: 220px; }
 
 /* shimmer */
 .shimmer-wrap { padding: 12px; display: grid; gap: 14px; }
@@ -302,6 +304,8 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 @keyframes fade { from { opacity: 0; } }
 .thread-list { flex: 1; overflow-y: auto; }
 .trow { position: relative; display: flex; gap: 11px; padding: 12px 16px 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer; transition: background .1s; align-items: flex-start; animation: rowin .3s both; }
+/* In-place re-renders (star/read/archive) shouldn't replay the entrance stagger. */
+.thread-list.static .trow { animation: none; }
 @keyframes rowin { from { opacity: 0; transform: translateY(4px); } }
 .trow:hover { background: var(--bg-2); }
 .trow.sel { background: color-mix(in srgb, var(--accent) 9%, var(--bg-1)); }

@@ -18,12 +18,12 @@ import { render as renderGroups } from './views/groups.js';
 import { render as renderSettings } from './views/settings.js';
 
 const VIEWS = [
-  { id: 'mail', name: 'Mail', icon: 'mail', render: renderMail },
-  { id: 'chat', name: 'Chat', icon: 'chat', render: renderChat },
+  { id: 'mail', name: 'Mail', icon: 'mail', render: renderMail, search: 'Search mail' },
+  { id: 'chat', name: 'Chat', icon: 'chat', render: renderChat, search: 'Search conversations' },
   { id: 'calendar', name: 'Calendar', icon: 'calendar', render: renderCalendar },
-  { id: 'contacts', name: 'Contacts', icon: 'contacts', render: renderContacts },
-  { id: 'files', name: 'Files', icon: 'files', render: renderFiles },
-  { id: 'groups', name: 'Groups', icon: 'groups', render: renderGroups },
+  { id: 'contacts', name: 'Contacts', icon: 'contacts', render: renderContacts, search: 'Search contacts' },
+  { id: 'files', name: 'Files', icon: 'files', render: renderFiles, search: 'Search files' },
+  { id: 'groups', name: 'Groups', icon: 'groups', render: renderGroups, search: 'Search groups' },
   { id: 'settings', name: 'Settings', icon: 'settings', render: renderSettings },
 ];
 
@@ -62,9 +62,9 @@ export function mountShell() {
     </nav>
     <div class="workspace">
       <header class="topbar">
-        <div class="topbar-search" role="search">
+        <div class="topbar-search" id="topbar-search" role="search">
           ${icon('search')}
-          <input id="globalsearch" placeholder="Search this view…" aria-label="Search the current view" autocomplete="off" spellcheck="false">
+          <input id="globalsearch" placeholder="Search…" aria-label="Search the current view" autocomplete="off" spellcheck="false">
         </div>
         <button class="cmd-open" id="cmdk" aria-label="Open command palette"><kbd>⌘K</kbd> commands</button>
         <div class="topbar-right">
@@ -101,7 +101,10 @@ function setView(v) {
   state.ui.mobileDetail = false;   // land on the list pane when arriving at a view (mobile)
   hideInspector();                 // the MOTE inspector is mail-scoped; don't leak it across views
   const nav = document.getElementById('app');
-  const gs = nav.querySelector('#globalsearch'); if (gs) gs.value = '';
+  const def = VIEWS.find(x => x.id === v);
+  const gs = nav.querySelector('#globalsearch'); if (gs) { gs.value = ''; gs.placeholder = (def?.search || 'Search') + '…'; }
+  // Search only filters list-style views; on Calendar/Settings it would be a dead field, so hide it.
+  const searchBox = nav.querySelector('#topbar-search'); if (searchBox) searchBox.classList.toggle('hidden', !def?.search);
   nav.querySelectorAll('.rail-btn').forEach(b => {
     const on = b.dataset.view === v;
     b.classList.toggle('active', on);

@@ -25,14 +25,24 @@ export function render(root) {
 
 function convTitle(c) { return c.type === 'channel' ? (state.groups.find(g => g.id === c.group)?.name || c.group) : person(c.with).name; }
 
+function matchesSearch(c) {
+  const q = state.ui.search.trim().toLowerCase();
+  if (!q) return true;
+  const hay = (convTitle(c) + ' ' + c.msgs.map(m => m.body).join(' ')).toLowerCase();
+  return hay.includes(q);
+}
+
 function drawConvs(root) {
   const wrap = root.querySelector('#convs');
   wrap.innerHTML = '';
-  state.chats.forEach(c => {
+  const list = state.chats.filter(matchesSearch);
+  if (!list.length) { wrap.innerHTML = emptyState('search', 'No conversations', 'No chats match your search.'); return; }
+  list.forEach(c => {
     const last = c.msgs[c.msgs.length - 1];
     const isCh = c.type === 'channel';
     const p = isCh ? { name: convTitle(c), hue: 250, trust: 'verified' } : person(c.with);
-    const row = el(`<button class="conv ${state.ui.selChat === c.id ? 'sel' : ''}" data-id="${c.id}">
+    const sel = state.ui.selChat === c.id;
+    const row = el(`<button class="conv ${sel ? 'sel' : ''}" data-id="${c.id}"${sel ? ' aria-current="true"' : ''} aria-label="${esc(convTitle(c))}${c.unread ? `, ${c.unread} unread` : ''}">
       ${isCh ? `<span class="av chgroup" style="--h:250">${icon('groups')}</span>` : avatar(p, 40, { presence: state.settings.presence ? c.presence : null })}
       <div class="conv-main">
         <div class="conv-top"><span class="conv-name">${esc(convTitle(c))}</span><span class="conv-time">${timeAgo(last.t)}</span></div>
@@ -40,7 +50,7 @@ function drawConvs(root) {
       </div>
       ${c.unread ? `<i class="conv-unread">${c.unread}</i>` : ''}
     </button>`);
-    row.onclick = () => { state.ui.selChat = c.id; c.unread = 0; state.ui.mobileDetail = true; bus.rerender(); };
+    row.onclick = () => { state.ui.selChat = c.id; c.unread = 0; state.ui.mobileDetail = true; bus.rerender(); bus.refreshChrome(); };
     wrap.appendChild(row);
   });
 }

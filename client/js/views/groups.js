@@ -25,8 +25,12 @@ export function render(root) {
     <section class="gr-detail" id="grdetail"></section>`;
 
   const rows = root.querySelector('#grrows');
-  state.groups.forEach(gr => {
-    const row = el(`<button class="gr-row ${state.ui.selGroup === gr.id ? 'sel' : ''}" data-id="${gr.id}">
+  const q = state.ui.search.trim().toLowerCase();
+  const list = state.groups.filter(gr => !q || (gr.name + ' ' + gr.address + ' ' + (gr.handle || '')).toLowerCase().includes(q));
+  if (!list.length) rows.innerHTML = emptyState('search', 'No groups', 'No groups match your search.');
+  list.forEach(gr => {
+    const sel = state.ui.selGroup === gr.id;
+    const row = el(`<button class="gr-row ${sel ? 'sel' : ''}" data-id="${gr.id}"${sel ? ' aria-current="true"' : ''}>
       <span class="av chgroup" style="--h:250;width:40px;height:40px">${icon(gr.mode === 'broadcast' ? 'bell' : 'groups')}</span>
       <div class="gr-row-main"><span class="gr-name">${esc(gr.name)}</span><span class="gr-addr mono">${esc(gr.address)}</span></div>
       <i class="pill ${gr.mode === 'broadcast' ? 'warn' : 'accent'} sm">${gr.mode}</i>
@@ -75,9 +79,9 @@ function drawDetail(root, g) {
     ${canManage ? `<div class="gr-sect-head"><h3>Group settings</h3></div>
     <div class="gr-settings">
       <div class="gr-set-row"><div><b>Posting model</b><small>broadcast = distribution list; channel = shared conversation</small></div>
-        <div class="seg" id="gmode"><button data-m="channel" class="${g.mode === 'channel' ? 'on' : ''}">Channel</button><button data-m="broadcast" class="${g.mode === 'broadcast' ? 'on' : ''}">Broadcast</button></div></div>
+        <div class="seg" id="gmode" role="group" aria-label="Posting model"><button data-m="channel" aria-pressed="${g.mode === 'channel'}" class="${g.mode === 'channel' ? 'on' : ''}">Channel</button><button data-m="broadcast" aria-pressed="${g.mode === 'broadcast'}" class="${g.mode === 'broadcast' ? 'on' : ''}">Broadcast</button></div></div>
       <div class="gr-set-row"><div><b>Membership visibility</b><small>whether members can see each other</small></div>
-        <div class="seg" id="gvis"><button data-v="1" class="${g.membershipVisible ? 'on' : ''}">Visible</button><button data-v="0" class="${!g.membershipVisible ? 'on' : ''}">Hidden</button></div></div>
+        <div class="seg" id="gvis" role="group" aria-label="Membership visibility"><button data-v="1" aria-pressed="${g.membershipVisible}" class="${g.membershipVisible ? 'on' : ''}">Visible</button><button data-v="0" aria-pressed="${!g.membershipVisible}" class="${!g.membershipVisible ? 'on' : ''}">Hidden</button></div></div>
       <div class="gr-set-row"><div><b>Join policy</b><small>who may join the address</small></div>
         <select id="gjoin"><option ${g.joinPolicy === 'closed' ? 'selected' : ''}>closed</option><option ${g.joinPolicy === 'request' ? 'selected' : ''}>request</option><option ${g.joinPolicy === 'open' ? 'selected' : ''}>open</option><option ${g.joinPolicy === 'vouch' ? 'selected' : ''}>vouch</option></select></div>
     </div>` : ''}`;

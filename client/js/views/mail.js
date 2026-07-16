@@ -67,11 +67,16 @@ export function currentList() {
   return threadsIn(state.ui.mailFolder, state.ui.mailLabel).filter(matchesSearch);
 }
 
+let _listKey = null;
 function drawList(root) {
   const wrap = root.querySelector('#mail-list');
   const list = currentList();
   const sel = state.ui.selected;
   const title = state.ui.mailLabel ? (LABELS.find(l => l.id === state.ui.mailLabel)?.name + ' label') : (FOLDERS.find(f => f.id === state.ui.mailFolder)?.name);
+  // Only play the row entrance stagger when the *set* of rows changes (folder/label/search),
+  // not on in-place mutations like star/read/archive — otherwise the whole list re-flickers.
+  const key = state.ui.mailFolder + '|' + state.ui.mailLabel + '|' + state.ui.search;
+  const fresh = key !== _listKey; _listKey = key;
 
   wrap.innerHTML = `
     <div class="list-head">
@@ -85,7 +90,7 @@ function drawList(root) {
         <button class="icon-btn" data-bulk="clear" title="Clear">${icon('x')}</button>
       </div>` : `<h2>${esc(title)}</h2><span class="list-count">${list.length}</span>`}
     </div>
-    <div class="thread-list" id="threads"></div>`;
+    <div class="thread-list ${fresh ? '' : 'static'}" id="threads"></div>`;
 
   if (sel.size) wrap.querySelectorAll('[data-bulk]').forEach(b => b.onclick = () => bulk(b.dataset.bulk));
 
@@ -117,6 +122,8 @@ function drawList(root) {
     row.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
     tl.appendChild(row);
   });
+  // Keep the selected conversation visible when moving through the list with j/k.
+  tl.querySelector('.trow.sel')?.scrollIntoView({ block: 'nearest' });
 }
 
 function toggleSel(id) { const s = state.ui.selected; s.has(id) ? s.delete(id) : s.add(id); bus.rerender(); }

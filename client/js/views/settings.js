@@ -76,7 +76,7 @@ export function render(root) {
     <section class="set-card">
       <h2>${icon('shield')} Privacy &amp; network</h2>
       <div class="set-row between"><div><b>Default privacy tier</b><small>private = mixnet (metadata-private); fast = direct (lower latency)</small></div>
-        <div class="seg" id="tierseg"><button data-t="private" class="${s.tierDefault === 'private' ? 'on' : ''}">${icon('shield')} Private</button><button data-t="fast" class="${s.tierDefault === 'fast' ? 'on' : ''}">Fast</button></div></div>
+        <div class="seg" id="tierseg" role="group" aria-label="Default privacy tier"><button data-t="private" aria-pressed="${s.tierDefault === 'private'}" class="${s.tierDefault === 'private' ? 'on' : ''}">${icon('shield')} Private</button><button data-t="fast" aria-pressed="${s.tierDefault === 'fast'}" class="${s.tierDefault === 'fast' ? 'on' : ''}">Fast</button></div></div>
       <div class="set-row between"><div><b>Presence &amp; typing</b><small>metadata-sensitive — reveals when you're online</small></div>
         <label class="switch"><input type="checkbox" id="presence" ${s.presence ? 'checked' : ''}><i></i></label></div>
       <div class="set-row between"><div><b>Legacy gateway</b><small>bridge to/from the Gmail world (fades as the network grows)</small></div>
@@ -86,7 +86,7 @@ export function render(root) {
     <section class="set-card">
       <h2>${icon('sun')} Appearance</h2>
       <div class="set-row between"><div><b>Theme</b><small>dark is primary</small></div>
-        <div class="seg" id="themeseg"><button data-th="dark" class="${s.theme === 'dark' ? 'on' : ''}">${icon('moon')} Dark</button><button data-th="light" class="${s.theme === 'light' ? 'on' : ''}">${icon('sun')} Light</button></div></div>
+        <div class="seg" id="themeseg" role="group" aria-label="Theme"><button data-th="dark" aria-pressed="${s.theme === 'dark'}" class="${s.theme === 'dark' ? 'on' : ''}">${icon('moon')} Dark</button><button data-th="light" aria-pressed="${s.theme === 'light'}" class="${s.theme === 'light' ? 'on' : ''}">${icon('sun')} Light</button></div></div>
     </section>
 
     <section class="set-card">

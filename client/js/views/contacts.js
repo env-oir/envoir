@@ -5,7 +5,7 @@
 
 import { state } from '../store.js';
 import { PEOPLE, person } from '../seed.js';
-import { el, esc, icon, avatar, trustPill, toast, emptyState, safetyWords, safetyGrid, safetyNumeric } from '../ui.js';
+import { el, esc, icon, avatar, trustPill, toast, emptyState, safetyWords, safetyGrid, safetyNumeric, shimmerRows } from '../ui.js';
 import { deriveSafetyFromString } from '../safety.js';
 import { bus } from '../bus.js';
 
@@ -30,7 +30,8 @@ export function render(root) {
   const list = PEOPLE.filter(p => !q || (p.name + ' ' + p.address).toLowerCase().includes(q));
   if (!list.length) rows.innerHTML = emptyState('contacts', 'No contacts', 'Try a different search.');
   list.forEach(p => {
-    const row = el(`<button class="ct-row ${selId === p.id ? 'sel' : ''}" data-id="${p.id}">
+    const sel = selId === p.id;
+    const row = el(`<button class="ct-row ${sel ? 'sel' : ''}" data-id="${p.id}"${sel ? ' aria-current="true"' : ''}>
       ${avatar(p, 38, { ring: true, badge: true })}
       <div class="ct-row-main"><span class="ct-name">${esc(p.name)}</span><span class="ct-addr mono">${esc(p.address)}</span></div>
       ${p.trust === 'verified' ? `<span class="vglyph sm">${icon('verified')}</span>` : ''}
@@ -49,7 +50,17 @@ async function drawDetail(root) {
   const p = person(selId);
   if (!p) { wrap.innerHTML = emptyState('contacts', 'Select a contact', 'Verify keys by comparing safety numbers.'); return; }
   const groups = state.groups.filter(g => g.members.some(m => m.address === p.address));
+  // The safety number is derived async; show the identity chrome immediately so switching
+  // contacts never leaves the previous card on screen while the digest computes.
+  if (wrap.dataset.for !== p.id) {
+    wrap.dataset.for = p.id;
+    wrap.innerHTML = `<div class="ct-card"><div class="ct-card-hero" style="--h:${p.hue}">
+      ${avatar(p, 84, { ring: true, badge: true })}<h1>${esc(p.name)}</h1>
+      <div class="ct-card-sub">${esc([p.title, p.org].filter(Boolean).join(' · ')) || 'Contact'}</div></div>
+      <div class="ct-card-body">${shimmerRows(3)}</div></div>`;
+  }
   const safety = await deriveSafetyFromString(p.address + p.name);
+  if (selId !== p.id) return; // selection changed while awaiting — abandon this stale render
 
   wrap.innerHTML = `
     <div class="ct-card">
