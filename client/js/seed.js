@@ -145,8 +145,9 @@ export function seedChats() {
       { from: 'you', me: true, t: now - 38 * MIN, body: 'perfect, the violet→blue accent is exactly it' },
     ]},
     { id: 'ch-core', type: 'channel', group: 'team', presence: null, typing: false, unread: 3, msgs: [
+      { from: 'theo', me: false, t: now - 26 * HOUR, body: 'Reminder: v2 framing freeze is Friday. Buckets are locked at 4/16/64 KiB.', pinned: true, reactions: { '📌': 1 } },
       { from: 'theo', me: false, t: now - 2 * HOUR, body: 'relays are green across EU + JHB 🌍' },
-      { from: 'ada', me: false, t: now - 100 * MIN, body: 'shipping the v2 framing today. @nadia can you take the gateway interop note?', reactions: { '👀': 3 } },
+      { from: 'ada', me: false, t: now - 100 * MIN, body: 'shipping the v2 framing today. @you + @nadia can you take the gateway interop note?', reactions: { '👀': 3 } },
       { from: 'nadia', me: false, t: now - 96 * MIN, body: 'on it', thread: [
         { from: 'ada', me: false, t: now - 94 * MIN, body: 'thanks — link the DKIM delegation bit' },
         { from: 'nadia', me: false, t: now - 90 * MIN, body: 'will do 👍' },
@@ -227,6 +228,28 @@ export function seedGroups() {
         { address: 'ada@envoir.org', role: 'admin' },
         { address: '(2,481 subscribers)', role: 'member', hidden: true },
       ] },
+  ];
+}
+
+// ---- Devices: the identity's device cluster (spec §8.5) -----------------------------------
+// One keypair identity spans many devices. Each device holds a device-subkey signed by the
+// root key; data syncs as MOTEs across the cluster. Revoking a device rotates it out of the
+// MLS-style device group without touching the root identity.
+export function seedDevices() {
+  return [
+    { id: 'd1', name: 'MacBook Pro 16"', type: 'laptop', platform: 'macOS 15', current: true,  added: now - 210 * DAY, lastActive: now - 2 * MIN, location: 'Cape Town, ZA', subkey: 'dk:7f3a…e21c' },
+    { id: 'd2', name: 'iPhone 15 Pro',    type: 'phone',  platform: 'iOS 18',   current: false, added: now - 180 * DAY, lastActive: now - 3 * HOUR, location: 'Cape Town, ZA', subkey: 'dk:11b8…9a04' },
+    { id: 'd3', name: 'iPad Air',         type: 'tablet', platform: 'iPadOS 18', current: false, added: now - 96 * DAY, lastActive: now - 4 * DAY, location: 'Cape Town, ZA', subkey: 'dk:c0d2…4471' },
+    { id: 'd4', name: 'Envoir node (home relay)', type: 'server', platform: 'Debian 12', current: false, added: now - 240 * DAY, lastActive: now - 40 * MIN, location: 'self-hosted', subkey: 'dk:a930…be5f' },
+  ];
+}
+
+// ---- Sessions: apps you've signed into with Envoir (DMTAP-Auth, spec §13) ------------------
+export function seedSessions() {
+  return [
+    { id: 'ss1', app: 'Envoir Docs',      origin: 'https://docs.envoir.org',   scope: 'profile · files',   granted: now - 12 * DAY, lastUsed: now - 5 * HOUR, avatar: 262 },
+    { id: 'ss2', app: 'Mesh Dashboard',   origin: 'https://mesh.dmtap.dev',    scope: 'profile',           granted: now - 40 * DAY, lastUsed: now - 2 * DAY, avatar: 190 },
+    { id: 'ss3', app: 'Fieldwork Tracker',origin: 'https://app.fieldwork.io',  scope: 'profile · calendar',granted: now - 3 * DAY, lastUsed: now - 20 * MIN, avatar: 46 },
   ];
 }
 

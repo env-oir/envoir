@@ -57,6 +57,26 @@ const P = {
   import: '<path d="M12 14V3M8 10l4 4 4-4"/><path d="M5 15v4h14v-4"/>',
   bell: '<path d="M6 9a6 6 0 1112 0c0 6 2 7 2 7H4s2-1 2-7z"/><path d="M10 20a2 2 0 004 0"/>',
   repeat: '<path d="M4 9a5 5 0 015-5h8l-2-2m2 2l-2 2"/><path d="M20 15a5 5 0 01-5 5H7l2 2m-2-2l2-2"/>',
+  laptop: '<rect x="4" y="5" width="16" height="11" rx="1.6"/><path d="M2 20h20M9.5 20l.5-2h4l.5 2"/>',
+  phone: '<rect x="7" y="3" width="10" height="18" rx="2.4"/><path d="M11 18h2"/>',
+  tablet: '<rect x="5" y="3" width="14" height="18" rx="2.2"/><path d="M11 18h2"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="1.8"/><rect x="3" y="13" width="18" height="7" rx="1.8"/><path d="M7 7.5h.01M7 16.5h.01"/>',
+  rotate: '<path d="M20 11a8 8 0 10-2.3 5.7"/><path d="M20 5v5h-5"/>',
+  link: '<path d="M9 15l6-6"/><path d="M11 6l1-1a4 4 0 016 6l-1 1"/><path d="M13 18l-1 1a4 4 0 01-6-6l1-1"/>',
+  signout: '<path d="M14 4h4a1 1 0 011 1v14a1 1 0 01-1 1h-4"/><path d="M10 12H3m0 0l3.5-3.5M3 12l3.5 3.5"/>',
+  globe: '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.4 2.5 14.6 0 17M12 3.5c-2.5 2.4-2.5 14.6 0 17"/>',
+  fingerprint: '<path d="M8 11a4 4 0 018 0v2"/><path d="M6 12a6 6 0 0112 0v1c0 1.5-.2 3-.6 4"/><path d="M12 12v3c0 1.2-.2 2.4-.6 3.5"/><path d="M9 14v1a7 7 0 01-1 3.5"/>',
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h8"/>',
+  pin: '<path d="M9 4h6l-1 6 3 3v2H7v-2l3-3z"/><path d="M12 15v5"/>',
+  smile: '<circle cx="12" cy="12" r="8.5"/><path d="M8.5 14a4 4 0 007 0"/><path d="M9 9.5h.01M15 9.5h.01"/>',
+  at: '<circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 006 0c0-5-4-9-10-9a10 10 0 100 20c2 0 4-.6 5.5-1.6"/>',
+  bolt: '<path d="M13 3L5 14h5l-1 7 8-11h-5z"/>',
+  grid: '<rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/>',
+  rows: '<rect x="4" y="5" width="16" height="4.5" rx="1.4"/><rect x="4" y="14.5" width="16" height="4.5" rx="1.4"/>',
+  download: '<path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 19h14"/>',
+  share: '<circle cx="6" cy="12" r="2.4"/><circle cx="17" cy="6" r="2.4"/><circle cx="17" cy="18" r="2.4"/><path d="M8.2 11l6.6-3.6M8.2 13l6.6 3.6"/>',
+  eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/>',
+  hash: '<path d="M9 4L7 20M17 4l-2 16M4 9h16M3 15h16"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
@@ -65,7 +85,7 @@ export function icon(name, cls = '') {
 // ---- Envoir brand mark (inline SVG, from brand/logo-mark.svg) -----------------------------
 export function brandMark(size = 28) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 128 128" fill="none" aria-label="Envoir">
-    <defs><linearGradient id="em-${size}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#5B9DFF"/><stop offset="1" stop-color="#7C5CFF"/></linearGradient></defs>
+    <defs><linearGradient id="em-${size}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#4C4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
     <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#em-${size})"/>
     <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke="#fff" stroke-width="5"/>
     <path d="M33 45 L64 68 L95 45" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>

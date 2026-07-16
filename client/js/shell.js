@@ -14,6 +14,7 @@ import { render as renderChat } from './views/chat.js';
 import { render as renderCalendar } from './views/calendar.js';
 import { render as renderContacts } from './views/contacts.js';
 import { render as renderFiles } from './views/files.js';
+import { render as renderIdentity } from './views/identity.js';
 import { render as renderGroups } from './views/groups.js';
 import { render as renderSettings } from './views/settings.js';
 
@@ -23,6 +24,7 @@ const VIEWS = [
   { id: 'calendar', name: 'Calendar', icon: 'calendar', render: renderCalendar },
   { id: 'contacts', name: 'Contacts', icon: 'contacts', render: renderContacts, search: 'Search contacts' },
   { id: 'files', name: 'Files', icon: 'files', render: renderFiles, search: 'Search files' },
+  { id: 'identity', name: 'Identity', icon: 'key', render: renderIdentity },
   { id: 'groups', name: 'Groups', icon: 'groups', render: renderGroups, search: 'Search groups' },
   { id: 'settings', name: 'Settings', icon: 'settings', render: renderSettings },
 ];
@@ -31,8 +33,8 @@ export const SHORTCUTS = [
   ['⌘K / Ctrl K', 'Command palette'],
   ['/', 'Search'],
   ['c', 'Compose'],
-  ['g then m/c/a/p/f/r', 'Go to Mail / Chat / cAlendar / People / Files / gRoups'],
-  ['1 – 7', 'Jump to view'],
+  ['g then m/c/a/p/f/i/r', 'Go to Mail / Chat / cAlendar / People / Files / Identity / gRoups'],
+  ['1 – 8', 'Jump to view'],
   ['j / k', 'Next / previous conversation'],
   ['Enter', 'Open conversation'],
   ['e', 'Archive'],
@@ -207,12 +209,13 @@ function installKeys() {
     // go-to prefix
     if (gPending) {
       gPending = false;
-      const map = { m: 'mail', c: 'chat', a: 'calendar', p: 'contacts', f: 'files', r: 'groups', s: 'settings' };
+      const map = { m: 'mail', c: 'chat', a: 'calendar', p: 'contacts', f: 'files', i: 'identity', r: 'groups', s: 'settings' };
       if (map[e.key]) { e.preventDefault(); setView(map[e.key]); return; }
     }
     if (e.key === 'g') { gPending = true; setTimeout(() => gPending = false, 900); return; }
 
-    if (e.key >= '1' && e.key <= '7') { setView(VIEWS[Number(e.key) - 1].id); return; }
+    const num = Number(e.key);
+    if (num >= 1 && num <= VIEWS.length) { setView(VIEWS[num - 1].id); return; }
     if (e.key === '/') { e.preventDefault(); openPalette(); return; }
     if (e.key === '?') { e.preventDefault(); openShortcuts(); return; }
     if (e.key === 'c') { e.preventDefault(); openCompose(); return; }
