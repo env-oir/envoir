@@ -56,6 +56,48 @@ fn serve_mail() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Demo: two in-process nodes exchange a real end-to-end-encrypted MOTE (spec §2, §19.3, §20).
+/// Alice seals a MOTE to Bob over the in-memory transport; Bob runs the §2.7 validation pipeline,
+/// decrypts, stores it (visible via the §8 mail projection), and acks; Alice's queue reaches ACKED.
+fn run_delivery_demo() {
+    use dmtap::node::Node;
+    use dmtap::transport::InMemoryNetwork;
+
+    let net = InMemoryNetwork::new();
+    let alice_ik = dmtap::identity::IdentityKey::generate();
+    let bob_ik = dmtap::identity::IdentityKey::generate();
+    let alice_t = net.endpoint(alice_ik.public());
+    let bob_t = net.endpoint(bob_ik.public());
+    let mut alice = Node::with_identity(alice_ik, dmtap::mote::SealKeypair::generate(), alice_t);
+    let mut bob = Node::with_identity(bob_ik, dmtap::mote::SealKeypair::generate(), bob_t);
+
+    // Mutual pinning: each learns the other's identity + sealing key (naming/KeyPackage stand-in).
+    let (a_ik, a_seal) = (alice.ik_public(), alice.seal_public());
+    let (b_ik, b_seal) = (bob.ik_public(), bob.seal_public());
+    alice.add_contact(&b_ik, b_seal);
+    bob.add_contact(&a_ik, a_seal);
+
+    println!("Envoir node delivery engine — in-process two-node demo (spec §2, §19.3, §20)\n");
+    let id = alice
+        .send_mail(&b_ik, "hello from Alice", b"the atomic unit of DMTAP is the MOTE")
+        .expect("send");
+    println!("A: sealed + dispatched MOTE {}", hex8(id.as_bytes()));
+    println!("A: outbound state = {:?}", alice.outbound_state(&id).unwrap());
+
+    for outcome in bob.poll() {
+        println!("B: {outcome:?}");
+    }
+    println!("B: INBOX now holds {} message(s) (IMAP/JMAP-visible)", bob.inbox().exists());
+
+    alice.poll(); // consume Bob's ack
+    println!("A: outbound state = {:?} (delivered)", alice.outbound_state(&id).unwrap());
+}
+
+/// First 8 bytes of a content id as hex, for compact logging.
+fn hex8(bytes: &[u8]) -> String {
+    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>() + "…"
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
@@ -71,13 +113,13 @@ fn main() {
             eprintln!("`init` not yet implemented — see spec §1 (identity lifecycle)");
         }
         "run" => {
-            // TODO: start libp2p mesh (Kad/Relay/DCUtR/AutoNAT/mDNS), mixnet client,
-            // MLS delivery service, client protocol servers (JMAP/IMAP), retry queue.
-            // NOTE: MLS handshakes go over an ORDERED channel, not the mixnet (spec §5.1).
-            // The client-access surface (spec §8) is implemented in `dmtap::clients`
-            // (the `dmtap-mail` crate); `serve-mail` runs its IMAP/POP/SMTP listeners.
-            eprintln!("`run` not yet implemented — see spec §4 (transport), §5 (messaging)");
-            eprintln!("try `envoir-node serve-mail` to run the §8 client servers (IMAP/POP/SMTP)");
+            // The real `run` starts the libp2p mesh (Kad/Relay/DCUtR/AutoNAT/mDNS), mixnet client,
+            // and MLS delivery service (spec §4/§5) — those transports are a separate frontier
+            // task, abstracted behind `dmtap::transport::Transport`. What IS implemented is the
+            // delivery engine (`dmtap::node`): identity + MOTE store + the §20.1 sender-retry queue
+            // and §20.2 inbound validation. This demo drives it over the in-process transport so
+            // the whole seal → validate → decrypt → ack path is observable end-to-end.
+            run_delivery_demo();
         }
         "serve-mail" => {
             if let Err(e) = serve_mail() {
