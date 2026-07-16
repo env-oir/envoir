@@ -2,11 +2,12 @@
 // filters, default privacy, appearance (theme), keyboard reference, sign-out, and the sign-in
 // demo. Settings persist to localStorage (a real client syncs them as MOTEs, spec §8.5).
 
-import { state, saveSettings } from '../store.js';
+import { state, saveSettings, applyFilters, uid, unblockSender, allowSender, blockSender } from '../store.js';
+import { LABELS } from '../seed.js';
 import { currentIdentity, displayAddress, displayName, logout, addAlias, removeAlias, makePrimary, fromB64u } from '../identity.js';
 import { verifySafety } from '../safety.js';
 import { claimHandle } from '../mesh-sim.js';
-import { el, esc, icon, toast, safetyWords, safetyGrid, safetyNumeric } from '../ui.js';
+import { el, esc, icon, toast, openModal, closeModal, safetyWords, safetyGrid, safetyNumeric } from '../ui.js';
 import { renderSignin } from '../signin.js';
 import { bus } from '../bus.js';
 import { SHORTCUTS } from '../shell.js';
@@ -69,8 +70,26 @@ export function render(root) {
 
     <section class="set-card">
       <h2>${icon('label')} Filters &amp; rules</h2>
+      <p class="set-hint">Rules run on your own always-on node (spec §17#3) — they apply even while this client is closed, but no third party ever sees your plaintext. Matching incoming mail is labelled, starred, archived, or filed as spam automatically.</p>
       <div class="filter-list" id="filters"></div>
-      <button class="btn" id="addfilter">${icon('plus')} New rule</button>
+      <div class="set-row"><button class="btn" id="addfilter">${icon('plus')} New rule</button><button class="btn ghost" id="runfilters">${icon('repeat')} Run rules on mailbox now</button></div>
+    </section>
+
+    <section class="set-card">
+      <h2>${icon('shield')} Spam · block &amp; allow lists</h2>
+      <p class="set-hint">Recipient-local policy (spec §9.2): blocked senders are filed straight to Spam; allowed senders always reach your inbox. In a real node this is enforced <b>before decryption</b> for cold senders — cost-to-reach replaces central content scanning (§17#20).</p>
+      <div class="bl-cols">
+        <div class="bl-col">
+          <div class="bl-h">${icon('trash')} Blocked <i class="list-count">${state.settings.blocked.length}</i></div>
+          <div class="bl-list" id="blocked"></div>
+          <div class="alias-add"><input id="newblock" placeholder="block name@domain"><button class="btn sm" id="addblock">Block</button></div>
+        </div>
+        <div class="bl-col">
+          <div class="bl-h">${icon('check')} Allowed <i class="list-count">${state.settings.allowed.length}</i></div>
+          <div class="bl-list" id="allowed"></div>
+          <div class="alias-add"><input id="newallow" placeholder="allow name@domain"><button class="btn sm" id="addallow">Allow</button></div>
+        </div>
+      </div>
     </section>
 
     <section class="set-card">
@@ -114,6 +133,7 @@ export function render(root) {
   drawAliases(root, id);
   drawSigs(root);
   drawFilters(root);
+  drawBlockLists(root);
 
   // Vacation
   root.querySelector('#vacon').onchange = (e) => { s.vacation.enabled = e.target.checked; root.querySelector('#vacbody').classList.toggle('hidden', !e.target.checked); saveSettings(); };
@@ -182,14 +202,72 @@ function drawSigs(root) {
   };
 }
 
+const ACTION_LABEL = { label: 'apply label', star: 'star it', archive: 'skip inbox (archive)', spam: 'mark as spam', read: 'mark read', 'legacy-flag': 'flag legacy-origin' };
+function actionText(f) { return f.action === 'label' ? 'label “' + esc(LABELS.find(l => l.id === f.label)?.name || f.label) + '”' : (ACTION_LABEL[f.action] || esc(f.action)); }
+
 function drawFilters(root) {
   const wrap = root.querySelector('#filters');
-  wrap.innerHTML = state.settings.filters.map(f => `<div class="filter-item">
-    <span class="mono">${f.from ? 'from:' + esc(f.from) : ''}${f.subject ? ' subject:' + esc(f.subject) : ''}</span>
+  if (!state.settings.filters.length) { wrap.innerHTML = `<div class="set-hint inline">No rules yet.</div>`; }
+  else wrap.innerHTML = state.settings.filters.map(f => `<div class="filter-item">
+    <span class="mono">${f.from ? 'from:' + esc(f.from) : ''}${f.subject ? (f.from ? ' ' : '') + 'subject:' + esc(f.subject) : ''}${!f.from && !f.subject ? '(empty)' : ''}</span>
     <span class="arrow-lil">→</span>
-    <span class="pill ${f.action === 'legacy-flag' ? 'legacy' : 'accent'} sm">${f.action === 'label' ? 'label ' + esc(f.label) : esc(f.action)}</span>
+    <span class="pill ${f.action === 'legacy-flag' ? 'legacy' : f.action === 'spam' ? 'warn' : 'accent'} sm">${actionText(f)}</span>
+    <div class="spacer"></div>
+    <button class="icon-btn sm" data-edit="${f.id}" title="Edit rule">${icon('edit')}</button>
+    <button class="icon-btn sm" data-del="${f.id}" title="Delete rule">${icon('trash')}</button>
     <label class="switch sm"><input type="checkbox" data-flt="${f.id}" ${f.enabled ? 'checked' : ''}><i></i></label>
   </div>`).join('');
   wrap.querySelectorAll('[data-flt]').forEach(c => c.onchange = () => { const f = state.settings.filters.find(x => x.id === c.dataset.flt); f.enabled = c.checked; saveSettings(); });
-  root.querySelector('#addfilter').onclick = () => toast('Simulated — a rule builder applies label/archive/forward actions to incoming MOTEs client-side.', { ms: 4200 });
+  wrap.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => ruleBuilder(root, state.settings.filters.find(x => x.id === b.dataset.edit)));
+  wrap.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { state.settings.filters = state.settings.filters.filter(x => x.id !== b.dataset.del); saveSettings(); bus.rerender(); });
+  root.querySelector('#addfilter').onclick = () => ruleBuilder(root, null);
+  root.querySelector('#runfilters').onclick = () => { const n = applyFilters(); saveSettings(); bus.rerender(); bus.refreshChrome(); toast(n ? `${icon('check')} Rules applied — ${n} conversation(s) updated` : 'No conversations matched your rules right now'); };
+}
+
+// A real client-side rule builder: condition (from / subject) → action. Persists to settings
+// and applies to the current mailbox immediately.
+function ruleBuilder(root, existing) {
+  const f = existing || { id: uid('flt'), from: '', subject: '', action: 'label', label: LABELS[0].id, enabled: true };
+  const card = openModal(`
+    <div class="ev-new">
+      <div class="ev-detail-head"><h2>${existing ? 'Edit rule' : 'New rule'}</h2><button class="icon-btn" id="rx">${icon('x')}</button></div>
+      <p class="modal-note">${icon('info')} If a message matches <b>all</b> the conditions you set, the action runs automatically. Leave a condition blank to ignore it. <span class="mono">from</span> accepts <span class="mono">*</span> wildcards (e.g. <span class="mono">*@envoir.org</span>).</p>
+      <div class="ev-new-row" style="grid-template-columns:1fr 1fr">
+        <label class="cfield"><span>From contains / matches</span><input id="rfrom" value="${esc(f.from)}" placeholder="*@envoir.org"></label>
+        <label class="cfield"><span>Subject contains</span><input id="rsubj" value="${esc(f.subject)}" placeholder="receipt"></label>
+      </div>
+      <div class="ev-new-row" style="grid-template-columns:1fr 1fr">
+        <label class="cfield"><span>Then</span><select id="raction">
+          ${['label', 'star', 'archive', 'spam', 'read'].map(a => `<option value="${a}" ${f.action === a ? 'selected' : ''}>${ACTION_LABEL[a]}</option>`).join('')}
+        </select></label>
+        <label class="cfield" id="rlabelwrap"><span>Label</span><select id="rlabel">${LABELS.map(l => `<option value="${l.id}" ${f.label === l.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
+      </div>
+      <div class="ev-detail-foot"><span class="sim-tag">${icon('shield')} runs on your node · client-side, no third party</span><div class="spacer"></div><button class="btn primary" id="rsave">${existing ? 'Save rule' : 'Create rule'}</button></div>
+    </div>`, { wide: true });
+  const syncLabel = () => card.querySelector('#rlabelwrap').style.display = card.querySelector('#raction').value === 'label' ? '' : 'none';
+  card.querySelector('#raction').onchange = syncLabel; syncLabel();
+  card.querySelector('#rx').onclick = closeModal;
+  card.querySelector('#rsave').onclick = () => {
+    f.from = card.querySelector('#rfrom').value.trim();
+    f.subject = card.querySelector('#rsubj').value.trim();
+    f.action = card.querySelector('#raction').value;
+    f.label = card.querySelector('#rlabel').value;
+    if (!f.from && !f.subject) { toast('Add at least one condition'); return; }
+    if (!existing) state.settings.filters.push(f);
+    saveSettings();
+    const n = applyFilters();
+    closeModal(); bus.rerender(); bus.refreshChrome();
+    toast(`${icon('check')} Rule saved${n ? ` · applied to ${n} conversation(s)` : ''}`);
+  };
+}
+
+function drawBlockLists(root) {
+  const rowHtml = (a, kind) => `<div class="bl-row"><span class="mono">${esc(a)}</span><button class="icon-btn sm" data-${kind}="${esc(a)}" title="Remove">${icon('x')}</button></div>`;
+  const bwrap = root.querySelector('#blocked'), awrap = root.querySelector('#allowed');
+  bwrap.innerHTML = state.settings.blocked.length ? state.settings.blocked.map(a => rowHtml(a, 'unblock')).join('') : `<div class="set-hint inline">Nothing blocked.</div>`;
+  awrap.innerHTML = state.settings.allowed.length ? state.settings.allowed.map(a => rowHtml(a, 'unallow')).join('') : `<div class="set-hint inline">No allow-listed senders.</div>`;
+  bwrap.querySelectorAll('[data-unblock]').forEach(b => b.onclick = () => { unblockSender(b.dataset.unblock); bus.rerender(); });
+  awrap.querySelectorAll('[data-unallow]').forEach(b => b.onclick = () => { state.settings.allowed = state.settings.allowed.filter(x => x !== b.dataset.unallow); saveSettings(); bus.rerender(); });
+  root.querySelector('#addblock').onclick = () => { const v = root.querySelector('#newblock').value.trim(); if (v) { blockSender(v); bus.rerender(); toast(`${icon('shield')} ${v} blocked`); } };
+  root.querySelector('#addallow').onclick = () => { const v = root.querySelector('#newallow').value.trim(); if (v) { allowSender(v); bus.rerender(); toast(`${icon('check')} ${v} allow-listed`); } };
 }

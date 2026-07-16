@@ -9,16 +9,22 @@ const now = Date.now();
 // ---- People (shared across mail, chat, calendar, contacts, groups) -----------------------
 // trust ∈ verified (safety number compared) | tofu (pinned on first contact) | unverified | legacy
 export const PEOPLE = [
-  { id: 'ada',    name: 'Ada Okonkwo',    address: 'ada@envoir.org',      hue: 210, trust: 'verified',   org: 'DMTAP Core',        title: 'Protocol lead',   phone: '+1 555 0182', note: 'Wrote the MOTE framing.' },
-  { id: 'grace',  name: 'Grace Vasquez',  address: 'grace@navy.mil',      hue: 262, trust: 'verified',   org: 'Naval Research',    title: 'Cryptographer',   phone: '+1 555 0143', note: 'Verified in person at RWC.' },
-  { id: 'linus',  name: 'Linus Bergström',address: 'linus@kernel.dev',    hue: 150, trust: 'tofu',       org: 'Kernel',            title: 'Maintainer',      phone: null,          note: 'Pinned on first contact.' },
-  { id: 'mira',   name: 'Mira Chen',       address: 'mira@studio.design',  hue: 330, trust: 'verified',   org: 'Studio Chen',       title: 'Design partner',  phone: '+1 555 0119', note: 'Brand + product design.' },
-  { id: 'theo',   name: 'Theo Marsh',      address: 'theo@envoir.org',     hue: 24,  trust: 'verified',   org: 'DMTAP Core',        title: 'Mesh & relays',   phone: '+1 555 0164', note: null },
-  { id: 'nadia',  name: 'Nadia Farouk',    address: 'nadia@envoir.org',    hue: 190, trust: 'tofu',       org: 'DMTAP Core',        title: 'Gateway & interop', phone: null,        note: 'Compare safety number next call.' },
-  { id: 'omar',   name: 'Omar Haddad',     address: 'omar@fieldwork.io',   hue: 46,  trust: 'verified',   org: 'Fieldwork',         title: 'Ops',             phone: '+44 20 7946', note: null },
-  { id: 'satoshi',name: 'satoshi',         address: '@satoshi',            hue: 120, trust: 'unverified', org: null,                title: 'Key-only identity', phone: null,        note: 'Handle only — no domain.' },
-  { id: 'carol',  name: 'Carol Reyes',     address: 'carol@gmail.com',     hue: 8,   trust: 'legacy',     org: null,                title: 'Old-world contact', phone: '+1 555 0177', note: 'Reaches you via the gateway.' },
+  { id: 'ada',    name: 'Ada Okonkwo',    address: 'ada@envoir.org',      hue: 210, trust: 'verified',   org: 'DMTAP Core',        title: 'Protocol lead',   phone: '+1 555 0182', note: 'Wrote the MOTE framing.', tags: ['Team', 'Core'] },
+  { id: 'grace',  name: 'Grace Vasquez',  address: 'grace@navy.mil',      hue: 262, trust: 'verified',   org: 'Naval Research',    title: 'Cryptographer',   phone: '+1 555 0143', note: 'Verified in person at RWC.', tags: ['Work'] },
+  { id: 'linus',  name: 'Linus Bergström',address: 'linus@kernel.dev',    hue: 150, trust: 'tofu',       org: 'Kernel',            title: 'Maintainer',      phone: null,          note: 'Pinned on first contact.', tags: ['Work'] },
+  { id: 'mira',   name: 'Mira Chen',       address: 'mira@studio.design',  hue: 330, trust: 'verified',   org: 'Studio Chen',       title: 'Design partner',  phone: '+1 555 0119', note: 'Brand + product design.', tags: ['Design'] },
+  { id: 'theo',   name: 'Theo Marsh',      address: 'theo@envoir.org',     hue: 24,  trust: 'verified',   org: 'DMTAP Core',        title: 'Mesh & relays',   phone: '+1 555 0164', note: null, tags: ['Team', 'Core'] },
+  { id: 'nadia',  name: 'Nadia Farouk',    address: 'nadia@envoir.org',    hue: 190, trust: 'tofu',       org: 'DMTAP Core',        title: 'Gateway & interop', phone: null,        note: 'Compare safety number next call.', tags: ['Team', 'Core'] },
+  { id: 'omar',   name: 'Omar Haddad',     address: 'omar@fieldwork.io',   hue: 46,  trust: 'verified',   org: 'Fieldwork',         title: 'Ops',             phone: '+44 20 7946', note: null, tags: ['Work'] },
+  { id: 'satoshi',name: 'satoshi',         address: '@satoshi',            hue: 120, trust: 'unverified', org: null,                title: 'Key-only identity', phone: null,        note: 'Handle only — no domain.', tags: [] },
+  { id: 'carol',  name: 'Carol Reyes',     address: 'carol@gmail.com',     hue: 8,   trust: 'legacy',     org: null,                title: 'Old-world contact', phone: '+1 555 0177', note: 'Reaches you via the gateway.', tags: ['Personal'] },
 ];
+
+// Add or update a contact (JSContact MOTE, spec §8.4). Mutating PEOPLE keeps person() resolving
+// the same reference everywhere. A real client syncs these as encrypted MOTEs across devices.
+export function addPerson(p) { PEOPLE.push(p); return p; }
+// All organizational tags in use (spec §17#31 local-tag contact groups — no address of their own).
+export function contactTags() { return [...new Set(PEOPLE.flatMap(p => p.tags || []))].sort(); }
 
 export const person = (idOrAddr) =>
   PEOPLE.find(p => p.id === idOrAddr || p.address === idOrAddr) ||

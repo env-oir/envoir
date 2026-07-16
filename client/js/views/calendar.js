@@ -161,11 +161,15 @@ function eventModal(e, presetDay) {
         <div class="ev-detail-foot">
           <span class="sim-tag">${icon('shield')} encrypted MOTE · kind=calendar · your node</span>
           <div class="spacer"></div>
+          ${e.organizer.startsWith('you@') ? `<button class="btn" id="evedit">${icon('edit')} Edit</button>` : ''}
           <button class="btn danger" id="evdel">Delete</button>
         </div>
       </div>
     </div>`, { wide: true });
   card.querySelector('#evx').onclick = closeModal;
+  // Replace the detail modal with the editor in place. Do NOT closeModal() first — its deferred
+  // innerHTML clear (180ms) would wipe the editor we open synchronously right after.
+  card.querySelector('#evedit')?.addEventListener('click', () => newEventModal(null, e));
   card.querySelector('#evdel').onclick = () => { state.events = state.events.filter(x => x.id !== e.id); closeModal(); bus.rerender(); toast('Event deleted'); };
   if (me) card.querySelectorAll('[data-r]').forEach(b => b.onclick = async () => {
     me.rsvp = b.dataset.r;
@@ -176,25 +180,33 @@ function eventModal(e, presetDay) {
   });
 }
 
-function newEventModal(presetDay) {
-  const base = presetDay || new Date(state.ui.calCursor);
+function newEventModal(presetDay, existing) {
+  const base = existing ? new Date(existing.start) : (presetDay || new Date(state.ui.calCursor));
   const dstr = `${base.getFullYear()}-${String(base.getMonth() + 1).padStart(2, '0')}-${String(base.getDate()).padStart(2, '0')}`;
+  const hm = (t) => { const d = new Date(t); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+  const startV = existing ? hm(existing.start) : '09:00';
+  const endV = existing ? hm(existing.end) : '10:00';
+  const repOpt = (v) => `<option ${existing && existing.recurrence === v ? 'selected' : ''}${v === '' ? ' value=""' : ''}>${v || 'Does not repeat'}</option>`;
+  const remV = existing ? String(existing.reminders?.[0] ?? '') : '10';
+  const guestsExisting = existing ? existing.attendees.filter(a => !a.address.startsWith('you@')).map(a => a.address).join(', ') : '';
   const card = openModal(`
     <div class="ev-new">
-      <div class="ev-detail-head"><h2>New event</h2><button class="icon-btn" id="evx">${icon('x')}</button></div>
-      <label class="cfield"><span>Title</span><input id="nt" placeholder="Coffee with Ada" autofocus></label>
+      <div class="ev-detail-head"><h2>${existing ? 'Edit event' : 'New event'}</h2><button class="icon-btn" id="evx">${icon('x')}</button></div>
+      <label class="cfield"><span>Title</span><input id="nt" placeholder="Coffee with Ada" value="${esc(existing ? existing.title : '')}" autofocus></label>
       <div class="ev-new-row">
         <label class="cfield"><span>Date</span><input id="nd" type="date" value="${dstr}"></label>
-        <label class="cfield"><span>Start</span><input id="ns" type="time" value="09:00"></label>
-        <label class="cfield"><span>End</span><input id="ne" type="time" value="10:00"></label>
+        <label class="cfield"><span>Start</span><input id="ns" type="time" value="${startV}"></label>
+        <label class="cfield"><span>End</span><input id="ne" type="time" value="${endV}"></label>
       </div>
       <div class="ev-new-row">
-        <label class="cfield"><span>Repeat</span><select id="nr"><option value="">Does not repeat</option><option>Weekly</option><option>Weekdays</option><option>Monthly</option></select></label>
-        <label class="cfield"><span>Reminder</span><select id="nrem"><option value="10">10 min before</option><option value="30">30 min before</option><option value="60">1 hour before</option><option value="">None</option></select></label>
+        <label class="cfield"><span>Repeat</span><select id="nr">${['', 'Weekly', 'Weekdays', 'Monthly'].map(repOpt).join('')}</select></label>
+        <label class="cfield"><span>Reminder</span><select id="nrem">
+          ${[['10', '10 min before'], ['30', '30 min before'], ['60', '1 hour before'], ['', 'None']].map(([v, l]) => `<option value="${v}" ${remV === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select></label>
       </div>
-      <label class="cfield"><span>Guests (invitations sent as MOTEs)</span><input id="ng" placeholder="ada@envoir.org, grace@navy.mil"></label>
-      <label class="cfield"><span>Location</span><input id="nl" placeholder="Optional"></label>
-      <div class="ev-detail-foot"><span class="sim-tag">${icon('shield')} sealed to guests · no central scheduler</span><div class="spacer"></div><button class="btn primary" id="evsave">Create</button></div>
+      <label class="cfield"><span>Guests (invitations sent as MOTEs)</span><input id="ng" value="${esc(guestsExisting)}" placeholder="ada@envoir.org, grace@navy.mil"></label>
+      <label class="cfield"><span>Location</span><input id="nl" value="${esc(existing ? (existing.location || '') : '')}" placeholder="Optional"></label>
+      <div class="ev-detail-foot"><span class="sim-tag">${icon('shield')} sealed to guests · no central scheduler</span><div class="spacer"></div><button class="btn primary" id="evsave">${existing ? 'Save changes' : 'Create'}</button></div>
     </div>`, { wide: true });
   card.querySelector('#evx').onclick = closeModal;
   card.querySelector('#evsave').onclick = async () => {
@@ -206,8 +218,21 @@ function newEventModal(presetDay) {
     const end = new Date(y, mo - 1, da, eh, em).getTime();
     const guests = card.querySelector('#ng').value.split(',').map(s => s.trim()).filter(Boolean);
     const rem = card.querySelector('#nrem').value;
-    const ev = { id: uid('e'), title, color: 210, start, end, recurrence: card.querySelector('#nr').value || null,
-      location: card.querySelector('#nl').value.trim() || null, reminders: rem ? [Number(rem)] : [],
+    const location = card.querySelector('#nl').value.trim() || null;
+    const recurrence = card.querySelector('#nr').value || null;
+    const reminders = rem ? [Number(rem)] : [];
+    if (existing) {
+      const oldGuests = new Set(existing.attendees.filter(a => !a.address.startsWith('you@')).map(a => a.address));
+      existing.title = title; existing.start = start; existing.end = end; existing.location = location;
+      existing.recurrence = recurrence; existing.reminders = reminders;
+      // preserve RSVPs for guests still invited; add pending for new ones
+      existing.attendees = existing.attendees.filter(a => a.address.startsWith('you@') || guests.includes(a.address));
+      guests.filter(g => !oldGuests.has(g)).forEach(g => existing.attendees.push({ address: g, rsvp: 'pending' }));
+      closeModal(); bus.rerender();
+      toast(`${icon('check')} Event updated — changes re-sealed to guests`);
+      return;
+    }
+    const ev = { id: uid('e'), title, color: 210, start, end, recurrence, location, reminders,
       organizer: 'you@envoir.org', description: null,
       attendees: [{ address: 'you@envoir.org', rsvp: 'yes' }, ...guests.map(g => ({ address: g, rsvp: 'pending' }))] };
     state.events.push(ev);
