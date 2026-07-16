@@ -41,6 +41,7 @@ type skpub.
 fun  skpk(skpriv): skpub.
 fun  penc(bitstring, skpub): bitstring.
 reduc forall m: bitstring, k: skpriv; pdec(penc(m, skpk(k)), k) = m.
+fun  pk2b(skpub): bitstring [typeConverter].  (* session pubkey as bytes        *)
 
 fun  H(bitstring): bitstring.               (* hash: cnf, challenge digest     *)
 const DS_AUTH: bitstring.                    (* "DMTAP-v0/auth-assertion" tag   *)
@@ -88,7 +89,7 @@ let userClient(IKU: sigpriv, O: bitstring) =
   in(c, (=O, nonce: bitstring, iat: bitstring, exp: bitstring, aud: bitstring));
   new sk_sess: skpriv;                        (* fresh per-RP, per-device      *)
   let spub = skpk(sk_sess) in
-  let cnf  = H(spub) in                        (* cnf bound BEFORE signing      *)
+  let cnf  = H(pk2b(spub)) in                        (* cnf bound BEFORE signing      *)
   let pre  = (DS_AUTH, H((O, nonce, iat, exp, aud, cnf))) in
   event UserSigned(sigpk(IKU), O, nonce, cnf);
   out(c, (O, nonce, iat, exp, aud, cnf, spub, sign(pre, IKU)));
@@ -108,7 +109,7 @@ let rp(IKUpub: sigpub, Oself: bitstring) =
   if aud2 = Oself then                                        (* aud binds to RP  *)
   let pre = (DS_AUTH, H((Oself, nonce, iat, exp, Oself, cnf))) in
   if checksign(sig, IKUpub) = pre then                       (* sig vs pinned IK *)
-  if H(spub) = cnf then                                       (* cnf == H(spub)   *)
+  if H(pk2b(spub)) = cnf then                                       (* cnf == H(pk2b(spub))   *)
     event RPAccepts(IKUpub, Oself, nonce, cnf);
     (* bind the session ONLY to cnf: release the resource encrypted to the
        session key, so a party without sk_sess (a stolen-assertion bearer)

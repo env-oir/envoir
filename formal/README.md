@@ -1,13 +1,13 @@
 # DMTAP formal (symbolic) models
 
-> **Verification status: NOT run in this environment** â ProVerif is not installed here, so these models are **structurally complete but locally unverified**. Run `./run.sh` (or in CI) to obtain actual results; no property below is *proved* until ProVerif reports it.
-
 Machine-checkable **symbolic (Dolev-Yao) models** of DMTAP's two
 security-critical ceremonies, in the [ProVerif](https://proverif.inria.fr/)
 process calculus. This is the same *class* of artifact used to audit TLS 1.3,
 MLS, and Signal: a mechanized proof (or refutation) of named security
 properties against an active network attacker, with perfect cryptography
 abstracted as an equational theory.
+
+**Status: all queries verified with ProVerif 2.05** (see [Results](#results)).
 
 Spec sources (read-only):
 
@@ -52,15 +52,25 @@ Every message is authenticated by the AEAD tag (the shared-key MAC), with
 
 - **(S) Secrecy** — `query attacker(msgAB)`. The first-message plaintext (and
   hence `SK`) is not derivable by the attacker.
-- **(A) Mutual authentication** — injective agreement on the derived session
-  key, in both directions:
-  `inj-event(RecvResp(a,b,k)) ==> inj-event(SendInit(a,b,k))` (B authenticates
-  A via A's IK-certified `idk`) and
-  `inj-event(AcceptA(a,b,k)) ==> inj-event(ConfirmB(a,b,k))` (A authenticates B
-  via a key-confirmation reply). **Injectivity** encodes replay-freeness; it
-  holds because the responder consumes a fresh **one-time prekey `opk`** per
-  session (the spec's §5.2.1 first-message replay defense — a last-resort-only
-  init would *not* be injective, exactly the documented caveat).
+- **(A) Mutual authentication** — injective agreement, in both directions:
+  `inj-event(RecvResp(a,b,n)) ==> inj-event(SendInit(a,b,n))` (B authenticates
+  A) and `inj-event(AcceptA(a,b,n)) ==> inj-event(ConfirmB(a,b,n))` (A
+  authenticates B via a key-confirmation reply). **Injectivity** encodes
+  replay-freeness; it holds because the responder consumes a fresh **one-time
+  prekey `opk`** per session (the spec's §5.2.1 first-message replay defense —
+  a last-resort-only init would *not* be injective, exactly the documented
+  caveat).
+
+  *Modelling note (authentication nonce).* The deniable handshake has no
+  content signature, so authentication comes entirely from the shared DH key
+  (only the two parties can compute it). ProVerif's DH-commutativity equation
+  does **not** terminate on a correspondence phrased directly over the derived
+  key term `SK`. The sound, standard workaround used here: each party places a
+  **fresh authentication nonce inside the shared-key AEAD payload** (`na`, `nb`)
+  and the events agree on that nonce. Since the nonce travels only under the
+  AEAD keyed by `SK`, agreement on it *is* agreement on a session only the two
+  key-holders could have produced — the mutual authentication we want — and the
+  query terminates. (See [Limitations](#limitations-of-the-symbolic-model-honest).)
 - **(F) Weak forward secrecy** — after the sessions run (`phase 1`), the
   attacker is handed **both parties' long-term secrets** (`idk_A, idk_B,
   IK_A, IK_B`); `ek` and `opk` are deleted, never revealed. A *proved* (S)
@@ -133,11 +143,47 @@ Reading the output: for a reachability `query`, ProVerif prints
 `RESULT ... is true` when the property holds (secrecy: secret; correspondence:
 authenticated). For the equivalence model, expect
 `RESULT Observational equivalence is true`. A `false` result comes with an
-attack derivation — for these files that would be a **finding** (see below).
+attack derivation.
 
 ## Results
 
-<!-- RESULTS-PLACEHOLDER -->
+Verified with **ProVerif 2.05** (installed via `opam`, run in the `ocaml/opam`
+Docker image; see `run.sh`). **Every query holds — no attack found.** Verbatim
+verification summaries:
+
+**`deniable_1to1.pv`** (secrecy, mutual authentication, weak forward secrecy):
+
+```
+Query not attacker_p1(msgAB[]) is true.
+Query inj-event(RecvResp(a,b,n)) ==> inj-event(SendInit(a,b,n)) is true.
+Query inj-event(AcceptA(a,b,n)) ==> inj-event(ConfirmB(a,b,n)) is true.
+```
+- `not attacker_p1(msgAB[]) is true` — the first message stays secret **even in
+  phase 1, after both parties' long-term keys are leaked** ⇒ secrecy **and**
+  weak forward secrecy.
+- both `inj-event ... ==> inj-event ...` — **injective** mutual authentication
+  (replay-resistant) in both directions.
+
+**`deniable_1to1_deniability.pv`** (deniability / repudiation):
+
+```
+RESULT Observational equivalence is true.
+```
+- A judge holding **both** parties' long-term secret keys and choosing the
+  message cannot distinguish a genuine transcript from a responder-forged one ⇒
+  **offline participation & message repudiation** proved.
+
+**`dmtap_auth.pv`** (unforgeability, replay, origin-binding, key-binding):
+
+```
+RESULT inj-event(RPAccepts(u,o,n,cnf_4)) ==> inj-event(UserSigned(u,o,n,cnf_4)) is true.
+RESULT not attacker(secretResource[]) is true.
+```
+- injective `RPAccepts ==> UserSigned` — **unforgeability + single-use nonce
+  (replay resistance) + origin binding** (assertion accepted at origin `o` was
+  signed for `o`; cross-origin phishing replay impossible).
+- `not attacker(secretResource[]) is true` — **key-binding / DPoP**: a captured
+  assertion without the session private key cannot unlock the session.
 
 ## Limitations of the symbolic model (honest)
 
@@ -149,18 +195,24 @@ attack derivation — for these files that would be a **finding** (see below).
 - **DH is abstracted** by a single commutativity equation
   (`dh(x,dhexp(y)) = dh(y,dhexp(x))`); it does not model small-subgroup /
   invalid-curve / identity-element behaviour of X25519.
+- **Authentication is proved via an in-AEAD authentication nonce**, not a
+  correspondence phrased directly over the derived key `SK`. This is a sound
+  encoding (the nonce is transported only under the shared-key AEAD, so
+  agreement on it implies both parties computed the same `SK`); it is used
+  because ProVerif's DH-equation handling does not terminate on the
+  direct-over-`SK` correspondence. This is a *tool* limitation, not a protocol
+  gap — the secrecy query does reason directly over `SK` and terminates.
 - **PQXDH (`suite = 0x02`, ML-KEM)** is not modelled — only the classical X3DH
   DH structure. The KEM leg would need its own encapsulation abstraction.
 - **Double Ratchet** is modelled only through its **first** message
-  (handshake + first AEAD). Per-message ratchet forward secrecy / PCS across
-  many messages is not exercised here.
-- **Deniability is offline only** (see scope note above); online deniability
-  and the endpoint-logging residual (§5.2.1(e)(1)) are out of symbolic scope.
+  (handshake + first AEAD + one key-confirmation). Per-message ratchet forward
+  secrecy / PCS across many messages is not exercised here.
+- **Deniability is offline only** (see scope above); online deniability and the
+  endpoint-logging residual (§5.2.1(e)(1)) are out of symbolic scope.
 - **DMTAP-Auth origin binding** models the trusted client's origin check as an
   exact `=origin` match. It does not model the §13.3.1 *companion-mode*
-  weakening against homograph/look-alike origins (that TOFU-pin nuance is a
-  UI/PKI property, not a protocol-message property), nor WebAuthn
-  `clientDataJSON` at the byte level.
+  weakening against homograph/look-alike origins (a UI/PKI TOFU property, not a
+  protocol-message property), nor WebAuthn `clientDataJSON` at the byte level.
 - These are **bounded well-formed models of the ceremonies as specified**, not
   of any particular implementation. An implementation can still be insecure
   while the protocol is sound.
