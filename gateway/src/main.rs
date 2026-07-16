@@ -9,12 +9,15 @@
 //! destination MX). The recipient directory (§3 resolve) and the mesh-delivery adapter (§4) are the
 //! operator-supplied seams — wired here to placeholders so the daemon shape is complete and runnable.
 
+use std::net::SocketAddr;
+
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::Envelope;
 
 use envoir_gateway::{
-    AllowAllAbuse, Attestation, AttestationKey, DeliveryOutcome, InboundGateway, KeyDirectory,
-    MeshDelivery, MxListener, OutboundGateway, RecipientKey, SmtpTcpTransport,
+    AllowAllAbuse, Attestation, AttestationKey, DeliveryOutcome, DnsMxResolver, DnsTxtResolver,
+    HttpsPolicyFetcher, InboundGateway, KeyDirectory, MeshDelivery, MtaStsTlsPolicy, MxListener,
+    OutboundGateway, RecipientKey, SmtpTcpTransport,
 };
 
 /// The operator-supplied §3 recipient directory seam. The reference build resolves nobody: a real
@@ -68,12 +71,26 @@ fn run() -> std::io::Result<()> {
         Box::new(AllowAllAbuse),
     );
 
-    // Outbound leg (§7.3): a real SMTP-over-STARTTLS transport, configured and ready. Outbound sends
-    // are driven by the node over the mesh (a MOTE marked for a legacy address); wiring that mesh
-    // ingress is the operator seam. We build the transport now so the daemon is fully configured.
+    // Outbound leg (§7.3): a real SMTP-over-STARTTLS transport, real MX resolution (RFC 5321 §5.1),
+    // and real MTA-STS policy discovery (RFC 8461), configured and ready. Outbound sends are driven
+    // by the node over the mesh (a MOTE marked for a legacy address); wiring that mesh ingress is the
+    // operator seam. We build the outbound gateway now so the daemon is fully configured.
+    let dns_server: SocketAddr = std::env::var("GATEWAY_DNS_SERVER")
+        .unwrap_or_else(|_| "1.1.1.1:53".to_string())
+        .parse()
+        .unwrap_or_else(|_| "1.1.1.1:53".parse().expect("valid fallback DNS server addr"));
     let transport = SmtpTcpTransport::new(domain.clone());
-    let _outbound = OutboundGateway::new(Vec::new(), Box::new(envoir_gateway::AlwaysRequireTls), Box::new(transport));
-    eprintln!("gateway: outbound SMTP transport configured (delegated-DKIM keys loaded on demand)");
+    let mx_resolver = DnsMxResolver::new(dns_server);
+    let tls_policy = MtaStsTlsPolicy::new(
+        Box::new(DnsTxtResolver::new(dns_server)),
+        Box::new(HttpsPolicyFetcher::new()),
+    );
+    let _outbound = OutboundGateway::new(Vec::new(), Box::new(tls_policy), Box::new(transport))
+        .with_mx_resolver(Box::new(mx_resolver));
+    eprintln!(
+        "gateway: outbound configured — SMTP-STARTTLS transport, MX resolution + MTA-STS via DNS {dns_server} \
+         (delegated-DKIM keys loaded on demand)"
+    );
 
     let listener = MxListener::bind(&listen, tls)?;
     let bound = listener.local_addr()?;
@@ -114,6 +131,8 @@ fn main() {
                  \x20 GATEWAY_DOMAIN     domain this gateway is MX for (default localhost)\n\
                  \x20 GATEWAY_TLS_CERT   PEM cert chain to enable STARTTLS (with GATEWAY_TLS_KEY)\n\
                  \x20 GATEWAY_TLS_KEY    PEM private key to enable STARTTLS\n\
+                 \x20 GATEWAY_DNS_SERVER DNS server (ip:port) for outbound MX + MTA-STS TXT lookups\n\
+                 \x20                    (default 1.1.1.1:53)\n\
                  \n\
                  Spec: ../dmtap/07-gateway.md — the DMTAP spec repo (normative). Stateless; needs a reputable IP."
             );
