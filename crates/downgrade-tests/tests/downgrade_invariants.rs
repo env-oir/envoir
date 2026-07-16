@@ -126,36 +126,42 @@ fn identity_declaring_only_unsupported_suite_is_rejected_not_downgraded() {
     assert_eq!(id.verify(None), Err(IdentityError::UnsupportedSuite(0x02)));
 }
 
-/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" at the MOTE envelope layer (§2.7 step 1): a
-/// well-formed, correctly-signed envelope whose `suite` is the reserved PQ id is rejected by
-/// `validate()` **before** any content-address/signature/decryption work, because the reference
-/// cannot actually validate that suite. Built entirely through the public `Envelope` struct
-/// (every field is `pub`) rather than `build_mote` (which only ever emits suite `Classical`).
+/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" at the MOTE envelope layer (§2.7 step 1). Now that
+/// the PQ suite (`0x02`) is a real, supported suite (`Suite::mote_supported`), every *representable*
+/// `Suite` is valid at the MOTE layer — so an *unsupported* suite is rejected even earlier and more
+/// strongly than before: an unknown suite byte can never decode into an `Envelope` at all, failing
+/// closed at the wire before `validate()` is ever reached (`Suite::from_u8` fails closed on any byte
+/// outside {0x01, 0x02}). This is the correct home for the "reject before any other check" invariant.
 #[test]
-fn mote_validate_rejects_unsupported_envelope_suite_before_any_other_check() {
+fn mote_decode_rejects_an_unsupported_suite_byte_before_any_other_check() {
+    let sender = IdentityKey::generate();
+    let eph = IdentityKey::generate();
     let recipient = IdentityKey::generate();
     let seal = SealKeypair::generate();
-    let to = DeliveryTag::Key(recipient.public());
-    let env = Envelope {
-        v: MOTE_VERSION,
-        suite: Suite::PqHybrid, // reserved, unsupported by the reference core
-        id: ContentId::of(b"anything"), // deliberately not a real content address either —
-        to,                              // suite rejection must fire first regardless
-        epoch: None,
-        ts: 1_700_000_000_000,
-        kind: Kind::Chat,
-        keypkg: None,
-        challenge: None,
-        ciphertext: b"not even real ciphertext".to_vec(),
-        sender_sig: None,
-        sender_eph: None,
+    let draft = MoteDraft::new(Kind::Chat, 1_700_000_000_000, b"hi".to_vec());
+    // A real, correctly-built, content-addressed envelope (suite Classical).
+    let env = build_mote(&Hpke, &sender, &eph, &recipient.public(), seal.public(), draft)
+        .expect("build_mote must succeed");
+
+    // Patch ONLY the suite field (integer key 2, §18.3.1) to an unknown byte 0x03 — everything else
+    // (content address, structure) stays valid, so any decode failure is attributable to the suite.
+    let mut m = match cbor::decode(&env.det_cbor()).unwrap() {
+        Cv::Map(m) => m,
+        _ => unreachable!(),
     };
-    let ctx = RecipientCtx {
-        our_ik: &recipient.public(),
-        seal_secret: seal.secret(),
-        sender_is_known: true,
-    };
-    assert_eq!(validate(&Hpke, &env, &ctx), Err(MoteError::UnsupportedSuite(0x02)));
+    for kv in m.iter_mut() {
+        if kv.0 == 2 {
+            kv.1 = Cv::U64(0x03);
+        }
+    }
+    let bogus = cbor::encode(&Cv::Map(m));
+
+    // Fail closed at the decoder — the unknown suite byte never becomes an Envelope, so no
+    // content-address / signature / decryption work is ever attempted.
+    assert!(
+        Envelope::from_det_cbor(&bogus).is_err(),
+        "an unknown suite byte (0x03) must fail closed at the decoder"
+    );
 }
 
 /// LOCKS §10.7.1 "Signed-object extension gating" (§10.2, §18.1.2): a decoder of a **signed**
