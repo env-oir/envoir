@@ -10,12 +10,11 @@
 //!
 //! ## The three terminal states (§19.3.1 "there is no fourth, undefined outcome")
 //! - **Stored + acked** — decrypted, authenticated, filed to the inbox.
-//! - **Deferred + acked** — a cold sender's MOTE held in the requests area (§2.7a). Per §19.3.1's
-//!   procedure and its worked example ("deferred MOTEs ARE acked — only invalid/forged ones are
-//!   not"), a deferred MOTE *is* acked; the sender should not keep retrying something the
-//!   recipient has durably held. (§20.2's table annotates DEFERRED "No ack"; where the two
-//!   normative sections conflict this engine follows §19.3.1's explicit three-outcome rule and
-//!   documents the divergence rather than hiding it.)
+//! - **Deferred + UNacked** — an under-proven cold sender's MOTE held in the requests area (§2.7a),
+//!   durably retained (30 days) but NOT acked: acking would confirm receipt to an unproven sender
+//!   and falsely signal *delivered* (the requests area is not the inbox), so the sender's own retry
+//!   simply EXPIREs. §19.3.1 step 9, §2.7a, and §20.2 now agree — the ack axis is binary: ack iff
+//!   delivered to the inbox.
 //! - **Dropped + unacked** — silent discard, only for cryptographically invalid/forged input.
 
 use dmtap_core::ContentId;
@@ -46,7 +45,10 @@ pub enum DropReason {
 pub enum InboundOutcome {
     /// Accepted, decrypted, filed to the inbox at IMAP `uid`; an `ack(id)` was sent. (§2.7 step 9)
     Stored { id: ContentId, uid: u32 },
-    /// A well-formed cold-sender MOTE held in the requests area; an `ack(id)` was sent. (§2.7a)
+    /// A well-formed but under-proven cold-sender MOTE held in the requests area — durably retained
+    /// (30 days, §16.5) but **NOT** acked: acking would confirm receipt to an unproven sender and
+    /// falsely signal *delivered*; the sender's own retry reaches EXPIRED (§2.7a, §19.3.1 step 9,
+    /// §20.2). The ack axis is binary — ack iff delivered to the inbox.
     Deferred { id: ContentId },
     /// `id` already held — acked immediately without reprocessing (dedup, §2.6).
     Duplicate { id: ContentId },
@@ -55,9 +57,10 @@ pub enum InboundOutcome {
 }
 
 impl InboundOutcome {
-    /// Whether this disposition sent an `ack` back to the sender. Dropped MOTEs never ack; every
-    /// other terminal state does (§19.3.1's three ack-eligible outcomes).
+    /// Whether this disposition sent an `ack` back to the sender. Ack is owed **only** for inbox
+    /// delivery (`Stored`) or a dedup of one already held (`Duplicate`); a `Deferred` cold MOTE and
+    /// a `Dropped` one are both unacked, differing only in retention (§19.3.1 step 9, §2.7a, §20.2).
     pub fn acked(&self) -> bool {
-        !matches!(self, InboundOutcome::Dropped(_))
+        matches!(self, InboundOutcome::Stored { .. } | InboundOutcome::Duplicate { .. })
     }
 }

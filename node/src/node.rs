@@ -336,11 +336,12 @@ impl<T: Transport> Node<T> {
         match outcome {
             Ok(Outcome::Accepted(payload)) => self.accept(from, &env.id, *payload),
             Ok(Outcome::Deferred) => {
-                // §2.7a: hold in the requests area, never the inbox. Deferred MOTEs ARE acked
-                // (§19.3.1) — record for dedup and ack so the sender stops retrying.
+                // §2.7a / §19.3.1 step 9 / §20.2: hold in the requests area (never the inbox) but
+                // do NOT ack — an unproven cold sender is not owed a receipt (acking would confirm
+                // existence and falsely signal *delivered*); the sender's own retry EXPIREs. We do
+                // NOT add the id to the ack-dedup `seen` set, precisely so a redelivery re-defers
+                // (and stays unacked) rather than hitting the dedup-ack fast path above.
                 self.store.deliver_mote(&placeholder_payload(from), REQUESTS_MAILBOX, env.ts);
-                self.seen.insert(env.id.as_bytes().to_vec(), from.to_vec());
-                self.send_ack(from, &env.id);
                 InboundOutcome::Deferred { id: env.id.clone() }
             }
             Err(e) => InboundOutcome::Dropped(drop_reason(e)),

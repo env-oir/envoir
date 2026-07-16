@@ -252,7 +252,7 @@ fn ack_is_idempotent_and_late_ack_does_not_resurrect() {
 // --- cold-sender paths (§2.7a) -------------------------------------------------------------
 
 #[test]
-fn cold_sender_without_challenge_is_deferred_but_acked() {
+fn cold_sender_without_challenge_is_deferred_and_unacked() {
     let net = InMemoryNetwork::new();
     let (mut alice, alice_ik, _alice_seal) = make_node(&net);
     let (mut bob, bob_ik, bob_seal) = make_node(&net);
@@ -263,12 +263,15 @@ fn cold_sender_without_challenge_is_deferred_but_acked() {
 
     let outcomes = bob.poll();
     assert_eq!(outcomes[0], InboundOutcome::Deferred { id: id.clone() });
+    assert!(!outcomes[0].acked(), "a deferred cold MOTE is NOT acked (§2.7a, §19.3.1 step 9, §20.2)");
     assert_eq!(bob.inbox().exists(), 0, "never the inbox (§2.7a)");
     assert_eq!(bob.requests().exists(), 1, "held in the requests area");
 
-    // Deferred MOTEs ARE acked (§19.3.1), so Alice's queue still reaches ACKED.
+    // Because Bob sent no ack, Alice's queue does NOT reach ACKED — it stays in flight and her own
+    // retry ultimately EXPIREs (the ack axis is binary: ack iff delivered to the inbox).
     alice.poll();
-    assert_eq!(alice.outbound_state(&id), Some(OutState::Acked));
+    assert_ne!(alice.outbound_state(&id), Some(OutState::Acked),
+        "no ack ⇒ sender never sees ACKED for a merely-deferred cold MOTE");
     // Silence the unused warning for alice_ik (kept for symmetry/readability).
     let _ = alice_ik;
 }
