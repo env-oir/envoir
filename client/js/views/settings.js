@@ -11,6 +11,11 @@ import { renderSignin } from '../signin.js';
 import { bus } from '../bus.js';
 import { SHORTCUTS } from '../shell.js';
 import { openEditProfile } from '../profileModal.js';
+import {
+  canInstall, promptInstall, isStandalone,
+  notifSupported, notificationPermission, requestNotificationPermission,
+  pushSupported, getPushSubscription, subscribePush, unsubscribePush, sendTestWakePing,
+} from '../pwa.js';
 
 export function render(root) {
   const id = currentIdentity();
@@ -108,6 +113,32 @@ export function render(root) {
     </section>
 
     <section class="set-card">
+      <h2>${icon('download')} App</h2>
+      <p class="set-hint">Envoir works as an installable app — its own window, an offline-ready app shell, and (with notifications on) the ability to wake in the background to sync.</p>
+      <div class="set-row between">
+        <div><b>Install app</b><small>${isStandalone() ? 'Already running as an installed app on this device' : 'Add Envoir to your home screen / apps'}</small></div>
+        <button class="btn ${canInstall() ? 'primary' : ''}" id="installapp" ${isStandalone() || !canInstall() ? 'disabled' : ''}>${icon('download')} Install</button>
+      </div>
+    </section>
+
+    <section class="set-card">
+      <h2>${icon('bell')} Notifications</h2>
+      <p class="set-hint">Pings are <b>content-free and sender-blind</b>: a push only ever means "your node has something new — open to sync." <b>Your own node originates it</b>, never a company reading your mail to decide when to notify you — the real message travels later, end-to-end, over the mesh. On iOS the OS push gateway sees timing only, never content.</p>
+      <div class="set-row between">
+        <div><b>Browser permission</b><small id="notifpermtxt">checking…</small></div>
+        <button class="btn sm" id="notifperm">Enable</button>
+      </div>
+      <div class="set-row between">
+        <div><b>Push subscription</b><small id="pushsubtxt">checking…</small></div>
+        <button class="btn sm" id="pushsub" disabled>Subscribe</button>
+      </div>
+      <div class="set-row between">
+        <div><b>Send test wake-ping</b><small>Local simulation of what your own node would send — posts straight to this browser's service worker and exercises the real push → sync → notification path, no server involved.</small></div>
+        <button class="btn ghost sm" id="testping">${icon('bell')} Send test wake-ping</button>
+      </div>
+    </section>
+
+    <section class="set-card">
       <h2>${icon('command')} Keyboard shortcuts</h2>
       <div class="kbd-grid">${SHORTCUTS.map(([k, d]) => `<div class="kbd-row"><kbd>${esc(k)}</kbd><span>${esc(d)}</span></div>`).join('')}</div>
     </section>
@@ -145,11 +176,68 @@ export function render(root) {
   // Appearance
   root.querySelectorAll('#themeseg [data-th]').forEach(b => b.onclick = () => { s.theme = b.dataset.th; document.documentElement.setAttribute('data-theme', s.theme); saveSettings(); bus.rerender(); bus.refreshChrome(); });
 
+  // App: install affordance
+  root.querySelector('#installapp').onclick = async () => {
+    const r = await promptInstall();
+    if (r.outcome === 'unavailable') toast('Your browser hasn’t offered an install prompt yet — try its menu → "Install Envoir" / "Add to Home Screen" instead.', { ms: 5000 });
+    else if (r.outcome === 'accepted') toast(`${icon('check')} Installing Envoir…`);
+    bus.rerender();
+  };
+
+  // Notifications: permission, push subscription, and the local test wake-ping
+  wireNotifications(root);
+
   // Danger
   root.querySelector('#showphrase').onclick = () => toast(id.phrase.join(' '), { ms: 6000 });
   root.querySelector('#signout').onclick = () => { if (confirm('Sign out and clear this identity from this browser?')) { logout(); location.reload(); } };
 
   renderSignin(root.querySelector('#signinbox'));
+}
+
+// ---- Notifications: browser permission + Web Push subscription + local test wake-ping -------
+function wireNotifications(root) {
+  const permBtn = root.querySelector('#notifperm');
+  const permTxt = root.querySelector('#notifpermtxt');
+  const subBtn = root.querySelector('#pushsub');
+  const subTxt = root.querySelector('#pushsubtxt');
+
+  const syncPerm = () => {
+    const p = notificationPermission();
+    if (!notifSupported) { permTxt.textContent = 'Not supported in this browser'; permBtn.disabled = true; return; }
+    permTxt.textContent = p === 'granted' ? 'Granted — this browser can show notifications' : p === 'denied' ? 'Denied — allow notifications for this site in your browser settings' : 'Not requested yet';
+    permBtn.textContent = p === 'granted' ? `${icon('check')} Enabled` : 'Enable';
+    permBtn.disabled = p === 'granted';
+  };
+  permBtn.onclick = async () => { await requestNotificationPermission(); syncPerm(); };
+  syncPerm();
+
+  const syncSub = async () => {
+    if (!pushSupported) { subTxt.textContent = 'Not supported in this browser'; subBtn.disabled = true; return; }
+    subBtn.disabled = false;
+    const sub = await getPushSubscription();
+    subTxt.textContent = sub ? 'Subscribed — this device can receive wake pings' : 'Not subscribed';
+    subBtn.textContent = sub ? 'Unsubscribe' : 'Subscribe';
+    subBtn.onclick = sub
+      ? async () => { await unsubscribePush(); toast('Unsubscribed from push'); syncSub(); }
+      : async () => {
+          try { await subscribePush(); toast(`${icon('check')} Subscribed — your node can now send a wake ping to this device`); }
+          catch (err) { toast('Could not subscribe: ' + (err?.message || err)); }
+          syncSub();
+        };
+  };
+  syncSub();
+
+  root.querySelector('#testping').onclick = async () => {
+    try {
+      if (notifSupported && notificationPermission() !== 'granted') {
+        const p = await requestNotificationPermission();
+        syncPerm();
+        if (p !== 'granted') { toast('Grant notification permission first to see the test ping appear'); return; }
+      }
+      await sendTestWakePing();
+      toast(`${icon('bell')} Test wake-ping sent to the service worker — a generic, content-free notification should appear now`, { ms: 4400 });
+    } catch (err) { toast('Test wake-ping failed: ' + (err?.message || err), { ms: 4400 }); }
+  };
 }
 
 function drawAliases(root, id) {
