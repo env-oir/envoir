@@ -56,6 +56,15 @@ impl AttestationKey {
         self.key.public()
     }
 
+    /// Sign an arbitrary preimage under this domain-anchored key with an explicit
+    /// domain-separation label. Used by the normative `GatewayAttestation` wire object
+    /// ([`crate::provenance`], §18.3.11 / §18.9.11) so its signature comes from the **same**
+    /// `_dmtap-gw` private key published in DNS — not the operator's arbitrary key. The DS label is
+    /// supplied by the caller so each object type keeps its own §18.1.6 separation tag.
+    pub(crate) fn sign_ds(&self, ds: &[u8], preimage: &[u8]) -> Vec<u8> {
+        self.key.sign_domain(ds, preimage)
+    }
+
     /// Sign an attestation binding this gateway to a specific inbound MOTE (§7.2a step 4). The
     /// signature covers the gateway id, domain/selector, receive time, the legacy SMTP envelope,
     /// and the MOTE's content address — so an attestation cannot be lifted onto a different MOTE.

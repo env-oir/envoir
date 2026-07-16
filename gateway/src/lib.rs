@@ -54,6 +54,7 @@ pub mod mx;
 pub mod net;
 pub mod outbound;
 pub mod outbound_tcp;
+pub mod provenance;
 
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 pub use dkim::{DkimError, DkimKey};
@@ -72,5 +73,10 @@ pub use mx::{DnsMxResolver, InMemoryMxResolver, MxHost, MxResolver};
 pub use outbound::{
     AlwaysRequireTls, OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy,
     TlsRequirement, TransportResult,
+};
+pub use provenance::{
+    chain_append, msg_digest, AuthzDecision, Bridge, BridgeDirection, BridgeError, CountingMeter,
+    GatewayAttestation, GatewayAuthz, GatewayMeter, MeterEvent, NullMeter, Origin, Profile,
+    ProvenanceError, ProvenanceRecord, StaticGatewayAuthz, Tier,
 };
 pub use outbound_tcp::SmtpTcpTransport;
