@@ -1,0 +1,105 @@
+(* ============================================================================
+   DMTAP  --  Deniable 1:1 mode: DENIABILITY / REPUDIATION
+   (spec: dmtap/05-messaging.md, section 5.2.1 (a),(e))
+   ----------------------------------------------------------------------------
+   This is the HEADLINE property, and it is an INDISTINGUISHABILITY property,
+   so it is a ProVerif observational-equivalence (biprocess) analysis, kept in
+   its own file (see README for why it cannot share the authentication query).
+
+   Statement proved (offline participation- & message-repudiation):
+
+     A judge who is GIVEN BOTH parties' long-term secret keys (idk_A, idk_B,
+     IK_A, IK_B) and who CHOOSES the message content still cannot tell apart:
+
+        LEFT   : a transcript the GENUINE initiator A produced
+                 (using A's real deniable-idk idk_A and a real ephemeral), from
+        RIGHT  : a transcript a FORGER fabricated using ONLY the responder's
+                 session prekeys (spk_B, opk_B) + A's PUBLIC idk/cert
+                 (NO secret of A, a forger-chosen ephemeral).
+
+     LEFT ~ RIGHT  =>  no transcript is a cryptographic proof that A authored
+     anything: either party (here, the responder) could have produced it.
+     This is exactly why X3DH is deniable -- the responder holds enough key
+     material to derive the shared secret and MAC any message "from" A.
+
+   Why it is meaningful (the negative control):
+     The ONLY long-term signatures in the mode certify PUBLIC keys
+     (idk_sig, spk_sig); NOTHING signs the message/ephemeral/transcript.
+     If a content signature sign(m, IK_A) were added, the RIGHT (forger)
+     branch could not reproduce it (no IK_A secret), the two worlds would
+     diverge, and ProVerif would report the equivalence FALSE -> not deniable.
+     So a PROVED equivalence certifies "no content signature binds authorship".
+
+   Honest scope (spec 5.2.1(e)): this is OFFLINE deniability with full
+   long-term-key compromise (the Vatandas-Gennaro-Ithurburn-Krawczyk, ACNS'20
+   offline result).  ONLINE/interactive deniability against a judge colluding
+   in real time is weaker and is NOT claimed here.
+
+   Tool: ProVerif.   Run:  proverif deniable_1to1_deniability.pv
+   Expected: "Observational equivalence is true".
+   ============================================================================ *)
+
+type dhpriv.
+type dhpub.
+fun  dhexp(dhpriv): dhpub.
+fun  dh(dhpriv, dhpub): bitstring.
+equation forall x: dhpriv, y: dhpriv;
+  dh(x, dhexp(y)) = dh(y, dhexp(x)).
+
+type sigpriv.
+type sigpub.
+fun  sigpk(sigpriv): sigpub.
+fun  sign(bitstring, sigpriv): bitstring.
+reduc forall m: bitstring, k: sigpriv; checksign(sign(m,k), sigpk(k)) = m.
+
+fun  kdf(bitstring, bitstring, bitstring, bitstring): bitstring.
+fun  aead(bitstring, bitstring, bitstring): bitstring.
+reduc forall k: bitstring, m: bitstring, ad: bitstring;
+  adec(k, aead(k,m,ad), ad) = m.
+
+const TAG_IDK: bitstring.
+
+free c: channel.
+
+(* The producer emits ONE transcript.  choice[L,R] selects the world.        *)
+let producer(idkA: dhpriv, IKA: sigpriv, idkcertA: bitstring,
+             idkB: dhpriv, spkB: dhpriv, opkB: dhpriv, IKB: sigpriv) =
+  in(c, m: bitstring);                       (* the JUDGE picks the content    *)
+  new ekL: dhpriv;                           (* LEFT : A's genuine ephemeral   *)
+  new ekR: dhpriv;                           (* RIGHT: forger's ephemeral      *)
+  let AD  = (sigpk(IKA), sigpk(IKB)) in       (* AD = IK_A || IK_B (public)     *)
+  let OPK = dhexp(opkB) in
+  (* LEFT: derived exactly as the genuine initiator A would (uses idk_A)      *)
+  let skL = kdf( dh(idkA, dhexp(spkB)),
+                 dh(ekL,  dhexp(idkB)),
+                 dh(ekL,  dhexp(spkB)),
+                 dh(ekL,  dhexp(opkB)) ) in
+  let ctL = aead(skL, m, AD) in
+  (* RIGHT: derived by the forger from the RESPONDER side (uses spk_B, opk_B,
+     and A's PUBLIC idk); no secret of A is used.  By DH commutativity this is
+     the same shared-secret construction, with a forger-chosen ephemeral.     *)
+  let skR = kdf( dh(spkB, dhexp(idkA)),
+                 dh(idkB, dhexp(ekR)),
+                 dh(spkB, dhexp(ekR)),
+                 dh(opkB, dhexp(ekR)) ) in
+  let ctR = aead(skR, m, AD) in
+  (* one output; the two worlds differ only in ephemeral + ciphertext.
+     The identity cert (public) and AD are identical in both worlds. *)
+  out(c, choice[ (dhexp(idkA), idkcertA, dhexp(ekL), OPK, ctL),
+                 (dhexp(idkA), idkcertA, dhexp(ekR), OPK, ctR) ]).
+
+process
+  new idkA: dhpriv;  new IKA: sigpriv;
+  new idkB: dhpriv;  new IKB: sigpriv;
+  new spkB: dhpriv;  new opkB: dhpriv;
+  let idkcertA = sign((TAG_IDK, dhexp(idkA)), IKA) in
+  let idkcertB = sign((TAG_IDK, dhexp(idkB)), IKB) in
+  (* publish ALL public identity material *)
+  out(c, (sigpk(IKA), sigpk(IKB), dhexp(idkA), dhexp(idkB), dhexp(spkB),
+          idkcertA, idkcertB));
+  (* STRONG offline judge: hand the attacker BOTH parties' LONG-TERM secrets.
+     (The per-session prekeys spk_B/opk_B stay with the responder/forger --
+     giving them to the judge would trivialise the game; long-term-key
+     compromise is the offline-deniability threat model.) *)
+  out(c, (idkA, idkB, IKA, IKB));
+  ( ! producer(idkA, IKA, idkcertA, idkB, spkB, opkB, IKB) )
