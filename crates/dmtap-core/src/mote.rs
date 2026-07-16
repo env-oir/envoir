@@ -33,7 +33,7 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use crate::cbor::{self, as_array, as_bytes, as_text, as_u32, as_u64, as_u8, CborError, Cv, Fields};
 use crate::id::ContentId;
 use crate::identity::{verify_domain, IdentityKey};
-use crate::suite::Suite;
+use crate::suite::{Suite, SuiteRatchet, SuiteRatchetError};
 use crate::TimestampMs;
 
 /// Current envelope format version (spec §2.2, `v`).
@@ -70,6 +70,32 @@ pub enum MoteError {
     BadKey,
     #[error("canonical CBOR decode failed: {0}")]
     BadEncoding(#[from] CborError),
+}
+
+/// Error type of [`validate_pinned`]: either a base [`validate`] failure ([`MoteError`]) or a
+/// per-contact suite **downgrade** rejection ([`SuiteRatchetError`], `ERR_SUITE_DOWNGRADE`, §21.3
+/// `0x020F`). Kept as a *separate, additive* type so [`validate`]'s public `Result<_, MoteError>`
+/// signature — and every downstream `match` on `MoteError` — is untouched (backward compatible).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ValidateError {
+    /// A base recipient-validation failure (steps 1–8, §2.7).
+    #[error(transparent)]
+    Mote(#[from] MoteError),
+    /// The object's asserted suite is below the sender-contact's established high-water-mark — a
+    /// suite downgrade (`ERR_SUITE_DOWNGRADE`, §21.3 `0x020F`).
+    #[error(transparent)]
+    Suite(#[from] SuiteRatchetError),
+}
+
+impl ValidateError {
+    /// The normative DMTAP wire error code (§21.3) when this failure carries one — currently the
+    /// suite downgrade (`0x020F`). Base [`MoteError`] structural failures have no assigned code.
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            ValidateError::Suite(e) => Some(e.code()),
+            ValidateError::Mote(_) => None,
+        }
+    }
 }
 
 // --- Message kinds (§2.3) ------------------------------------------------------------------
@@ -1055,7 +1081,11 @@ pub enum Outcome {
 ///
 /// Reference limits: issuer-trust evaluation of the `challenge` (ARC/PoW/postage grammar, §9)
 /// is not implemented — a *present* challenge is treated as meeting threshold; an *absent* one
-/// from a cold sender defers. Pinned-identity comparison at step 8 is left to the caller.
+/// from a cold sender defers.
+///
+/// This entry point does **not** enforce the per-contact suite high-water-mark (§2.7 step 8,
+/// §10.7.1): use [`validate_pinned`] with a [`SuiteRatchet`] to reject on-the-wire suite
+/// downgrades against an established contact. Suite *support* (step 1) is still enforced here.
 pub fn validate(
     sealer: &impl PayloadSeal,
     env: &Envelope,
@@ -1099,13 +1129,49 @@ pub fn validate(
     let pt = sealer.open(ctx.seal_secret, &aad, &env.ciphertext)?;
     let payload = Payload::from_det_cbor(&pt)?;
 
-    // 8. Verify Payload.sig under Payload.from (TOFU-pin / pinned-identity check is the caller's).
+    // 8. Verify Payload.sig under Payload.from — the authenticated sender identity.
     let ph = payload_hash(&payload);
     verify_domain(&payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig)
         .map_err(|_| MoteError::BadSignature)?;
 
-    // 9. (Caller applies expires/refs/kind semantics, stores, and acks.)
+    // 9. (Caller applies expires/refs/kind semantics + the step-8 suite pin — see
+    //     `validate_pinned` — then stores and acks.)
     Ok(Outcome::Accepted(Box::new(payload)))
+}
+
+/// [`validate`] **plus** the §2.7 step 8 / §10.7.1 **suite high-water-mark ratchet**: reject an
+/// inbound object whose asserted `Envelope.suite` is *below* the authenticated sender contact's
+/// established high-water-mark (a suite downgrade), and otherwise ratchet that mark **up**.
+///
+/// The ratchet is keyed on the sender's **authenticated identity** (`Payload.from`, verified at
+/// [`validate`] step 8) — never the unlinkable per-message `sender_eph`, which carries no pinning
+/// authority. The downgrade check therefore runs only *after* the object has fully passed
+/// [`validate`] (decrypted + identity-signature-verified), so it composes with every existing
+/// check with no regression. `Envelope.suite` is itself authenticated — it is bound into the
+/// payload AEAD ([`aad_bytes`]) — so a decrypting object genuinely uses the suite it asserts.
+///
+/// - **First contact** with a peer establishes the floor at its suite.
+/// - An **equal/higher** suite is accepted and ratchets the mark up ([`SuiteRatchet::accept`]).
+/// - A **lower** suite is rejected fail-closed with [`ValidateError::Suite`]
+///   ([`SuiteRatchetError::SuiteDowngrade`], §21.3 `0x020F`); the mark is left untouched (never
+///   ratchets down).
+///
+/// A `Deferred` outcome (cold sender, no challenge) carries no authenticated identity and does not
+/// touch the ratchet. Passing `None` for `ratchet` is exactly [`validate`] (no per-contact
+/// pinning). The ratchet is a caller-owned, deterministic store (no wall clock, §16.1); persist it
+/// across calls to retain a peer's high-water-mark.
+pub fn validate_pinned(
+    sealer: &impl PayloadSeal,
+    env: &Envelope,
+    ctx: &RecipientCtx,
+    ratchet: Option<&mut SuiteRatchet>,
+) -> Result<Outcome, ValidateError> {
+    let outcome = validate(sealer, env, ctx)?;
+    // Step 8 suite pin: only an accepted (authenticated) object has a `Payload.from` to key on.
+    if let (Outcome::Accepted(payload), Some(ratchet)) = (&outcome, ratchet) {
+        ratchet.accept(&payload.from, env.suite)?;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1234,6 +1300,122 @@ mod tests {
             sender_is_known: false,
         };
         assert!(matches!(validate(&Hpke, &env, &ctx).unwrap(), Outcome::Accepted(_)));
+    }
+
+    /// Build a MOTE from a *specific* sender identity (so a per-contact ratchet keyed on
+    /// `Payload.from == sender.public()` can be exercised across calls).
+    fn mote_from(sender: &IdentityKey, recipient_ik: &[u8], seal_pub: &[u8; 32]) -> Envelope {
+        let eph = IdentityKey::generate();
+        let draft = MoteDraft::new(Kind::Mail, 1, b"ratchet body".to_vec());
+        build_mote(&Hpke, sender, &eph, recipient_ik, seal_pub, draft).unwrap()
+    }
+
+    #[test]
+    fn ratchet_first_contact_sets_floor_and_accepts() {
+        let sender = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let env = mote_from(&sender, &recipient.public(), seal.public());
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        let mut ratchet = SuiteRatchet::new();
+        // First contact: unpinned peer is accepted and the floor is established at its suite.
+        assert!(matches!(
+            validate_pinned(&Hpke, &env, &ctx, Some(&mut ratchet)).unwrap(),
+            Outcome::Accepted(_)
+        ));
+        assert_eq!(ratchet.high_water_mark(&sender.public()), Some(Suite::Classical));
+    }
+
+    #[test]
+    fn ratchet_equal_suite_is_accepted_and_mark_holds() {
+        let sender = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        let mut ratchet = SuiteRatchet::new();
+        // Two objects from the SAME peer at the same (supported) suite: both accepted, and the
+        // mark stays put (accepting an equal suite ratchets to the same value, never down).
+        let a = mote_from(&sender, &recipient.public(), seal.public());
+        assert!(validate_pinned(&Hpke, &a, &ctx, Some(&mut ratchet)).is_ok());
+        assert_eq!(ratchet.high_water_mark(&sender.public()), Some(Suite::Classical));
+        let b = mote_from(&sender, &recipient.public(), seal.public());
+        assert!(validate_pinned(&Hpke, &b, &ctx, Some(&mut ratchet)).is_ok());
+        assert_eq!(ratchet.high_water_mark(&sender.public()), Some(Suite::Classical));
+    }
+
+    #[test]
+    fn ratchet_rejects_wire_downgrade_from_established_peer() {
+        let sender = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        // A genuine Classical (0x01) object — the only suite the reference core can seal/open.
+        let env = mote_from(&sender, &recipient.public(), seal.public());
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        // Simulate a prior PQ-suite (0x02) contact establishing a higher high-water-mark for this
+        // peer (build_mote can't emit an unsupported suite, so seed the floor directly — the
+        // point under test is that `validate_pinned` CONSULTS it, keyed on Payload.from).
+        let mut ratchet = SuiteRatchet::new();
+        ratchet.observe(&sender.public(), Suite::PqHybrid);
+        // The Classical object is now a downgrade against the established floor → 0x020F.
+        let err = validate_pinned(&Hpke, &env, &ctx, Some(&mut ratchet)).unwrap_err();
+        assert_eq!(err, ValidateError::Suite(SuiteRatchetError::SuiteDowngrade));
+        assert_eq!(err.code(), Some(0x020F));
+        // Rejected downgrade MUST NOT ratchet the mark down.
+        assert_eq!(ratchet.high_water_mark(&sender.public()), Some(Suite::PqHybrid));
+    }
+
+    #[test]
+    fn ratchet_none_reproduces_plain_validate() {
+        // With the same seeded-high floor, passing `None` (or calling `validate`) does NOT enforce
+        // the downgrade check — the ratchet is opt-in and additive; no regression to `validate`.
+        let sender = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let env = mote_from(&sender, &recipient.public(), seal.public());
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert!(matches!(validate(&Hpke, &env, &ctx).unwrap(), Outcome::Accepted(_)));
+        assert!(matches!(
+            validate_pinned(&Hpke, &env, &ctx, None).unwrap(),
+            Outcome::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn ratchet_does_not_disturb_earlier_failclosed_checks() {
+        // A tampered content address must still fail at step 2 (before decryption), and the
+        // ratchet must be left untouched — the downgrade gate never masks the cheaper checks.
+        let sender = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let mut env = mote_from(&sender, &recipient.public(), seal.public());
+        env.ciphertext[0] ^= 0xff;
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        let mut ratchet = SuiteRatchet::new();
+        assert_eq!(
+            validate_pinned(&Hpke, &env, &ctx, Some(&mut ratchet)),
+            Err(ValidateError::Mote(MoteError::BadContentAddress))
+        );
+        assert_eq!(ratchet.high_water_mark(&sender.public()), None);
     }
 
     #[test]
