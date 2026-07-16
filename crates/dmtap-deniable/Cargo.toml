@@ -1,0 +1,23 @@
+[package]
+name = "dmtap-deniable"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "DMTAP optional deniable 1:1 mode (spec §5.2.1) — X3DH handshake over a dedicated IK-certified X25519 idk, a Double Ratchet, and shared-key-MAC (AEAD-tag) authentication for cryptographic repudiation"
+repository = "https://example.invalid/envoir"
+
+[dependencies]
+# The wire objects (DeniablePrekeyBundle / DeniableInit / DeniableFrame / DeniableMessage /
+# DeniablePayload), identity signing, content addressing, canonical CBOR — all live in core.
+dmtap-core = { path = "../dmtap-core" }
+# X25519 for the dedicated deniable-identity DH key `idk`, prekeys, and the DH ratchet (RFC 7748).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# HKDF-SHA256 for the X3DH root, the root/chain KDFs, and per-message key derivation.
+hkdf = "0.12"
+sha2 = "0.10"
+# The shared-key MAC: ChaCha20-Poly1305 AEAD tag under a per-message key (RFC 8439 / 9180 AEAD).
+chacha20poly1305 = "0.10"
+# OS CSPRNG for ephemerals and ratchet keys.
+rand_core = { version = "0.6", features = ["getrandom"] }
+thiserror = "1"
