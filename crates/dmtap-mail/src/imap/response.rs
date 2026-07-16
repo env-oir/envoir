@@ -175,6 +175,62 @@ fn extract_part(raw: &[u8], path: &[u32]) -> Option<Vec<u8>> {
     Some(current)
 }
 
+/// Extract and **CTE-decode** a body part for a FETCH `BINARY[section]` request (RFC 3516). An
+/// empty path is the whole message body; a numeric path is that MIME part. The part's
+/// `Content-Transfer-Encoding` (base64 / quoted-printable) is decoded so the client receives the
+/// raw binary content; `7bit`/`8bit`/`binary` pass through unchanged.
+pub fn extract_binary(raw: &[u8], path: &[u32]) -> Vec<u8> {
+    let segment = if path.is_empty() {
+        raw.to_vec()
+    } else {
+        match extract_part(raw, path) {
+            Some(seg) => seg,
+            None => return Vec::new(),
+        }
+    };
+    let headers = mime::headers_only(&segment);
+    let cte = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Transfer-Encoding"))
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let body = &segment[mime::body_offset(&segment)..];
+    match cte.as_str() {
+        "base64" => crate::util::base64_decode(&String::from_utf8_lossy(body)).unwrap_or_default(),
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_vec(),
+    }
+}
+
+/// Decode a quoted-printable body (RFC 2045 §6.7): `=XX` hex escapes and `=`-soft line breaks.
+fn decode_quoted_printable(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] == b'=' {
+            // Soft line break: `=` at end of line.
+            if body.get(i + 1) == Some(&b'\r') && body.get(i + 2) == Some(&b'\n') {
+                i += 3;
+                continue;
+            }
+            if body.get(i + 1) == Some(&b'\n') {
+                i += 2;
+                continue;
+            }
+            let hi = body.get(i + 1).and_then(|c| (*c as char).to_digit(16));
+            let lo = body.get(i + 2).and_then(|c| (*c as char).to_digit(16));
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(body[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Render a [`Section`] back to its IMAP wire label (for the FETCH `BODY[label]` response).
 pub fn section_label(section: &Section) -> String {
     match section {

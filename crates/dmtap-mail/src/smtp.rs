@@ -60,6 +60,9 @@ pub struct SmtpSession<A: Authenticator> {
     auth: A,
     tls: bool,
     require_auth: bool,
+    /// The effective SIZE limit (RFC 1870), advertised in EHLO and enforced in MAIL/DATA. Defaults
+    /// to [`MAX_SIZE`]; a node may lower it per its storage plan.
+    max_size: usize,
     phase: Phase,
     authed: Option<Vec<u8>>,
     mail_from: Option<String>,
@@ -68,6 +71,9 @@ pub struct SmtpSession<A: Authenticator> {
     envid: Option<String>,
     ret: Option<Ret>,
     data_buf: Vec<u8>,
+    /// Set when the accumulated DATA exceeds [`MAX_SIZE`]; the final `.` then returns 552 (RFC 1870
+    /// §6.3) instead of accepting a message we advertised we would refuse.
+    data_oversized: bool,
     pending_auth: Option<SmtpPendingAuth>,
     submissions: Vec<Submission>,
 }
@@ -84,6 +90,7 @@ impl<A: Authenticator> SmtpSession<A> {
             auth,
             tls,
             require_auth: true,
+            max_size: MAX_SIZE,
             phase: Phase::Greeting,
             authed: None,
             mail_from: None,
@@ -92,9 +99,16 @@ impl<A: Authenticator> SmtpSession<A> {
             envid: None,
             ret: None,
             data_buf: Vec::new(),
+            data_oversized: false,
             pending_auth: None,
             submissions: Vec::new(),
         }
+    }
+
+    /// Override the advertised/enforced SIZE limit (RFC 1870).
+    pub fn set_max_size(&mut self, max: usize) -> &mut Self {
+        self.max_size = max;
+        self
     }
 
     /// The 220 service-ready banner.
@@ -153,7 +167,7 @@ impl<A: Authenticator> SmtpSession<A> {
             return format!("250 mail.dmtap.local greets {domain}\r\n");
         }
         let mut lines = vec![format!("250-mail.dmtap.local greets {domain}")];
-        lines.push(format!("250-SIZE {MAX_SIZE}"));
+        lines.push(format!("250-SIZE {}", self.max_size));
         lines.push("250-8BITMIME".into());
         lines.push("250-SMTPUTF8".into());
         lines.push("250-PIPELINING".into());
@@ -169,6 +183,9 @@ impl<A: Authenticator> SmtpSession<A> {
     }
 
     fn cmd_auth(&mut self, rest: &str) -> String {
+        if self.authed.is_some() {
+            return "503 5.5.1 Already authenticated\r\n".into();
+        }
         if !self.tls {
             return "538 5.7.11 Encryption required for requested authentication mechanism\r\n".into();
         }
@@ -234,7 +251,7 @@ impl<A: Authenticator> SmtpSession<A> {
         };
         // Honor a declared SIZE against our advertised limit (RFC 1870).
         if let Some(sz) = param_value(rest, "SIZE").and_then(|v| v.parse::<usize>().ok()) {
-            if sz > MAX_SIZE {
+            if sz > self.max_size {
                 return "552 5.3.4 Message size exceeds fixed limit\r\n".into();
             }
         }
@@ -266,6 +283,7 @@ impl<A: Authenticator> SmtpSession<A> {
         }
         self.phase = Phase::Data;
         self.data_buf.clear();
+        self.data_oversized = false;
         "354 End data with <CR><LF>.<CR><LF>\r\n".into()
     }
 
@@ -273,6 +291,13 @@ impl<A: Authenticator> SmtpSession<A> {
         if line == "." {
             // End of data.
             self.phase = Phase::Command;
+            // Enforce the advertised SIZE limit (RFC 1870): refuse an over-limit message rather
+            // than silently accepting it.
+            if self.data_oversized {
+                self.data_buf.clear();
+                self.reset_txn();
+                return "552 5.3.4 Message exceeds fixed maximum message size\r\n".into();
+            }
             let data = std::mem::take(&mut self.data_buf);
             let sub = Submission {
                 mail_from: self.mail_from.take().unwrap_or_default(),
@@ -287,8 +312,15 @@ impl<A: Authenticator> SmtpSession<A> {
         }
         // Dot-unstuffing (RFC 5321 §4.5.2).
         let content = line.strip_prefix('.').unwrap_or(line);
-        self.data_buf.extend_from_slice(content.as_bytes());
-        self.data_buf.extend_from_slice(b"\r\n");
+        // Track the total size but stop buffering once over the limit (bounded memory even for a
+        // hostile stream); the terminating `.` then returns 552.
+        if self.data_buf.len() <= self.max_size {
+            self.data_buf.extend_from_slice(content.as_bytes());
+            self.data_buf.extend_from_slice(b"\r\n");
+        }
+        if self.data_buf.len() > self.max_size {
+            self.data_oversized = true;
+        }
         String::new()
     }
 
@@ -649,6 +681,44 @@ mod tests {
         assert!(text.contains("Content-Type: text/rfc822-headers"), "{text}");
         assert!(text.contains("Subject: Hi"), "{text}");
         assert!(!text.contains("Hello Bob"), "RET=HDRS must not echo the body: {text}");
+    }
+
+    #[test]
+    fn auth_when_already_authenticated_is_rejected() {
+        let mut s = authed_session();
+        s.feed_line("EHLO c");
+        let cred = base64_encode(b"\0alice\0pw");
+        assert!(s.feed_line(&format!("AUTH PLAIN {cred}")).starts_with("235"));
+        // A second AUTH must be refused (RFC 4954 §4).
+        assert!(s.feed_line(&format!("AUTH PLAIN {cred}")).starts_with("503"), "second AUTH must 503");
+    }
+
+    #[test]
+    fn oversize_data_is_refused() {
+        let mut s = authed_session();
+        s.set_max_size(64);
+        s.feed_line("EHLO c");
+        let cred = base64_encode(b"\0alice\0pw");
+        s.feed_line(&format!("AUTH PLAIN {cred}"));
+        assert!(s.feed_line("EHLO c").contains("250-SIZE 64"), "advertises the lowered SIZE");
+        s.feed_line("MAIL FROM:<alice@dmtap.local>");
+        s.feed_line("RCPT TO:<bob@example.net>");
+        s.feed_line("DATA");
+        for _ in 0..20 {
+            s.feed_line("this line pushes the message over the 64-byte limit");
+        }
+        assert!(s.feed_line(".").starts_with("552"), "over-limit DATA must 552");
+        assert!(s.take_submissions().is_empty(), "no submission accepted when oversized");
+    }
+
+    #[test]
+    fn declared_size_over_limit_rejected_at_mail() {
+        let mut s = authed_session();
+        s.set_max_size(1000);
+        s.feed_line("EHLO c");
+        let cred = base64_encode(b"\0alice\0pw");
+        s.feed_line(&format!("AUTH PLAIN {cred}"));
+        assert!(s.feed_line("MAIL FROM:<a@b> SIZE=99999").starts_with("552"));
     }
 
     #[test]

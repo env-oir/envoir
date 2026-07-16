@@ -252,6 +252,144 @@ fn uid_fetch_edge_cases() {
 }
 
 #[test]
+fn sort_orders_by_criteria() {
+    // SORT (RFC 5256): three messages with distinct subjects/sizes → deterministic order.
+    let mut store = MemoryStore::new();
+    store.deliver_raw("INBOX", b"Subject: Banana\r\nDate: Wed, 03 Jul 2024 10:00:00 +0000\r\n\r\nx".to_vec(), vec![], 300);
+    store.deliver_raw("INBOX", b"Subject: Apple\r\nDate: Mon, 01 Jul 2024 10:00:00 +0000\r\n\r\nlonger body here".to_vec(), vec![], 100);
+    store.deliver_raw("INBOX", b"Subject: Cherry\r\nDate: Tue, 02 Jul 2024 10:00:00 +0000\r\n\r\nyy".to_vec(), vec![], 200);
+    let mut auth = StaticAuthenticator::new();
+    auth.issue("owner@dmtap.local", "app-password-xyz", IdentityKey::generate().public(), "d");
+    let mut session = Session::new(store, auth, true);
+    run(&mut session, "a1 LOGIN owner@dmtap.local app-password-xyz\r\n");
+    run(&mut session, "a2 SELECT INBOX\r\n");
+
+    // SORT by SUBJECT alphabetical: Apple(2) Banana(1) Cherry(3).
+    let subj = run(&mut session, "s1 SORT (SUBJECT) UTF-8 ALL\r\n");
+    assert!(subj.contains("* SORT 2 1 3"), "subject sort: {subj}");
+    // SORT by DATE ascending: 1 Jul(2), 2 Jul(3), 3 Jul(1).
+    let date = run(&mut session, "s2 SORT (DATE) UTF-8 ALL\r\n");
+    assert!(date.contains("* SORT 2 3 1"), "date sort: {date}");
+    // REVERSE SIZE: largest first → Apple(2, longest) ... .
+    let size = run(&mut session, "s3 SORT (REVERSE SIZE) UTF-8 ALL\r\n");
+    assert!(size.contains("* SORT 2"), "reverse size sort starts largest: {size}");
+    // UID SORT returns UIDs.
+    let usort = run(&mut session, "s4 UID SORT (SUBJECT) UTF-8 ALL\r\n");
+    assert!(usort.contains("* SORT 2 1 3"), "uid sort: {usort}");
+}
+
+#[test]
+fn thread_groups_by_references_and_subject() {
+    let mut store = MemoryStore::new();
+    // A root and a reply (via In-Reply-To) share a thread; a third is separate.
+    store.deliver_raw("INBOX", b"Subject: Plan\r\nMessage-ID: <root@x>\r\nDate: Mon, 01 Jul 2024 10:00:00 +0000\r\n\r\na".to_vec(), vec![], 100);
+    store.deliver_raw("INBOX", b"Subject: Re: Plan\r\nMessage-ID: <reply@x>\r\nIn-Reply-To: <root@x>\r\nDate: Tue, 02 Jul 2024 10:00:00 +0000\r\n\r\nb".to_vec(), vec![], 200);
+    store.deliver_raw("INBOX", b"Subject: Other\r\nMessage-ID: <other@x>\r\nDate: Wed, 03 Jul 2024 10:00:00 +0000\r\n\r\nc".to_vec(), vec![], 300);
+    let mut auth = StaticAuthenticator::new();
+    auth.issue("owner@dmtap.local", "app-password-xyz", IdentityKey::generate().public(), "d");
+    let mut session = Session::new(store, auth, true);
+    run(&mut session, "a1 LOGIN owner@dmtap.local app-password-xyz\r\n");
+    run(&mut session, "a2 SELECT INBOX\r\n");
+
+    let refs = run(&mut session, "t1 THREAD REFERENCES UTF-8 ALL\r\n");
+    assert!(refs.contains("* THREAD"), "thread response: {refs}");
+    assert!(refs.contains("(1 2)"), "root+reply must thread together: {refs}");
+    assert!(refs.contains("(3)"), "unrelated message is its own thread: {refs}");
+
+    // ORDEREDSUBJECT: "Plan" and "Re: Plan" share a base subject.
+    let os = run(&mut session, "t2 THREAD ORDEREDSUBJECT UTF-8 ALL\r\n");
+    assert!(os.contains("(1 2)"), "ordered-subject groups Re: with parent: {os}");
+}
+
+#[test]
+fn binary_fetch_decodes_cte() {
+    // BINARY[1] (RFC 3516) must CTE-decode a base64 part; BINARY.SIZE reports the decoded length.
+    let mut store = MemoryStore::new();
+    // base64("hello") = aGVsbG8=
+    let raw = b"Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+                --B\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n--B--\r\n";
+    store.deliver_raw("INBOX", raw.to_vec(), vec![], 0);
+    let mut auth = StaticAuthenticator::new();
+    auth.issue("owner@dmtap.local", "app-password-xyz", IdentityKey::generate().public(), "d");
+    let mut session = Session::new(store, auth, true);
+    run(&mut session, "a1 LOGIN owner@dmtap.local app-password-xyz\r\n");
+    run(&mut session, "a2 SELECT INBOX\r\n");
+
+    let bin = run(&mut session, "b1 FETCH 1 (BINARY.PEEK[1])\r\n");
+    assert!(bin.contains("BINARY[1] ~{5}"), "literal8 with decoded size: {bin}");
+    assert!(bin.contains("hello"), "decoded content: {bin}");
+    let size = run(&mut session, "b2 FETCH 1 (BINARY.SIZE[1])\r\n");
+    assert!(size.contains("BINARY.SIZE[1] 5"), "decoded size: {size}");
+}
+
+#[test]
+fn list_extended_and_status_and_special_use() {
+    let mut session = logged_in_selected(2);
+    // CREATE with SPECIAL-USE USE attribute (RFC 6154).
+    assert!(run(&mut session, "c1 CREATE Newsletters (USE (\\Archive))\r\n").contains("c1 OK"));
+    // A child mailbox → parent should report \HasChildren.
+    assert!(run(&mut session, "c2 CREATE Parent\r\n").contains("c2 OK"));
+    assert!(run(&mut session, "c3 CREATE Parent/Child\r\n").contains("c3 OK"));
+    let list = run(&mut session, "l1 LIST \"\" \"*\"\r\n");
+    assert!(list.contains("\\HasChildren) \"/\" \"Parent\""), "parent has children: {list}");
+    assert!(list.contains("\\HasNoChildren"), "leaf has no children: {list}");
+
+    // LIST RETURN (SUBSCRIBED) → \Subscribed attribute; LIST-STATUS piggybacks STATUS.
+    let ls = run(&mut session, "l2 LIST \"\" \"INBOX\" RETURN (STATUS (MESSAGES UNSEEN))\r\n");
+    assert!(ls.contains("* LIST"), "list line: {ls}");
+    assert!(ls.contains("* STATUS \"INBOX\" (MESSAGES 2"), "list-status piggyback: {ls}");
+
+    // Select-option SPECIAL-USE filters to special folders only.
+    let su = run(&mut session, "l3 LIST (SPECIAL-USE) \"\" \"*\"\r\n");
+    assert!(su.contains("Newsletters") && su.contains("Sent"), "special-use only: {su}");
+    assert!(!su.contains("\"Parent\""), "non-special mailbox excluded: {su}");
+
+    // STATUS DELETED item.
+    run(&mut session, "d1 STORE 1 +FLAGS (\\Deleted)\r\n");
+    let st = run(&mut session, "l4 STATUS INBOX (DELETED)\r\n");
+    assert!(st.contains("DELETED 1"), "status deleted: {st}");
+}
+
+#[test]
+fn searchres_save_and_dollar() {
+    let mut session = logged_in_selected(4);
+    // Mark 2 and 4 as seen, then SEARCH SEEN RETURN (SAVE).
+    run(&mut session, "x1 STORE 2,4 +FLAGS (\\Seen)\r\n");
+    let saved = run(&mut session, "x2 UID SEARCH RETURN (SAVE) SEEN\r\n");
+    assert!(saved.contains("x2 OK"), "save search: {saved}");
+    // `$` now refers to the saved UIDs {2,4}; UID FETCH $ returns exactly those.
+    let f = run(&mut session, "x3 UID FETCH $ (UID)\r\n");
+    assert!(f.contains("UID 2") && f.contains("UID 4"), "dollar fetch: {f}");
+    assert!(!f.contains("UID 1") && !f.contains("UID 3"), "only saved uids: {f}");
+    // COPY $ to Archive copies the saved set.
+    let cp = run(&mut session, "x4 UID COPY $ Archive\r\n");
+    assert!(cp.contains("[COPYUID"), "copy dollar: {cp}");
+    assert_eq!(session.store().mailbox("Archive").unwrap().exists(), 2);
+}
+
+#[test]
+fn catenate_append_builds_message() {
+    let mut session = logged_in_selected(1);
+    // CATENATE TEXT parts (RFC 4469) plus a URL referencing the existing UID 1's HEADER.
+    let cmd = "y1 APPEND Drafts CATENATE (TEXT {14}\r\nSubject: Hi\r\n\r\n TEXT {5}\r\nbody!)\r\n";
+    let resp = run(&mut session, cmd);
+    assert!(resp.contains("[APPENDUID"), "catenate append: {resp}");
+    let drafts = session.store().mailbox("Drafts").unwrap();
+    assert_eq!(drafts.exists(), 1);
+    let raw = String::from_utf8_lossy(&drafts.messages[0].raw);
+    assert!(raw.contains("Subject: Hi"), "catenated headers: {raw}");
+    assert!(raw.contains("body!"), "catenated body: {raw}");
+}
+
+#[test]
+fn esearch_count_and_all() {
+    let mut session = logged_in_selected(5);
+    let r = run(&mut session, "e1 SEARCH RETURN (COUNT) ALL\r\n");
+    assert!(r.contains("ESEARCH"), "esearch: {r}");
+    assert!(r.contains("COUNT 5"), "count: {r}");
+}
+
+#[test]
 fn large_mailbox_targeted_fetch_is_sublinear() {
     // Efficiency demonstration (a lightweight timing benchmark, no extra deps): a targeted UID
     // FETCH over a 10k-message mailbox must not scan linearly. We compare the cost of 200 targeted

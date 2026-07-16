@@ -30,13 +30,21 @@ struct Range {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceSet {
     ranges: Vec<Range>,
+    /// The SEARCHRES saved-result reference `$` (RFC 5182). When set, the concrete numbers come
+    /// from the session's last-saved SEARCH/SORT result, not from `ranges`; the session
+    /// materializes it via [`SequenceSet::from_uids`] before resolving targets.
+    saved: bool,
 }
 
 impl SequenceSet {
-    /// Parse a `sequence-set`. Returns `None` on any malformed token (fail closed).
+    /// Parse a `sequence-set`. Returns `None` on any malformed token (fail closed). The bare `$`
+    /// token (RFC 5182 SEARCHRES) parses to the saved-result reference.
     pub fn parse(s: &str) -> Option<SequenceSet> {
         if s.is_empty() {
             return None;
+        }
+        if s == "$" {
+            return Some(SequenceSet { ranges: Vec::new(), saved: true });
         }
         let mut ranges = Vec::new();
         for item in s.split(',') {
@@ -49,7 +57,21 @@ impl SequenceSet {
             };
             ranges.push(range);
         }
-        Some(SequenceSet { ranges })
+        Some(SequenceSet { ranges, saved: false })
+    }
+
+    /// Whether this set is the SEARCHRES saved-result reference `$` (RFC 5182).
+    pub fn is_saved(&self) -> bool {
+        self.saved
+    }
+
+    /// Build a concrete sequence set from an explicit list of numbers (used to materialize a `$`
+    /// reference from the session's saved UID/seq list).
+    pub fn from_uids(nums: &[u32]) -> SequenceSet {
+        SequenceSet {
+            ranges: nums.iter().map(|&n| Range { lo: Point::Num(n), hi: Point::Num(n) }).collect(),
+            saved: false,
+        }
     }
 
     /// Does `val` fall in the set, given `max` (the largest value in use, for `*`)?

@@ -223,12 +223,21 @@ impl<'a> SearchCtx<'a> {
 
 /// Evaluate a search key against one message.
 pub fn eval(key: &SearchKey, c: &SearchCtx) -> bool {
+    eval_saved(key, c, &[])
+}
+
+/// Evaluate a search key, resolving the SEARCHRES `$` reference (a bare `Seq`/`Uid` set that is the
+/// saved-result placeholder) against `saved_uids` (RFC 5182). `saved_uids` is empty for a plain
+/// SEARCH; the session passes the saved UID list so `SEARCH $ …` narrows to the saved set.
+pub fn eval_saved(key: &SearchKey, c: &SearchCtx, saved_uids: &[u32]) -> bool {
     use SearchKey::*;
     match key {
         All => true,
-        And(ks) => ks.iter().all(|k| eval(k, c)),
-        Or(a, b) => eval(a, c) || eval(b, c),
-        Not(k) => !eval(k, c),
+        And(ks) => ks.iter().all(|k| eval_saved(k, c, saved_uids)),
+        Or(a, b) => eval_saved(a, c, saved_uids) || eval_saved(b, c, saved_uids),
+        Not(k) => !eval_saved(k, c, saved_uids),
+        Uid(set) if set.is_saved() => saved_uids.contains(&c.uid),
+        Seq(set) if set.is_saved() => saved_uids.contains(&c.uid),
         Answered => has(c, &Flag::Answered),
         Unanswered => !has(c, &Flag::Answered),
         Deleted => has(c, &Flag::Deleted),

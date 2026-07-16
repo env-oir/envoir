@@ -209,6 +209,30 @@ pub fn microsoft_autodiscover(cfg: &HostConfig, email: &str) -> String {
     )
 }
 
+/// Microsoft Autodiscover **v2** JSON response (modern Outlook / mobile), served from
+/// `GET https://autodiscover.<domain>/autodiscover/autodiscover.json?Email=…&Protocol=…`. Unlike
+/// the POX endpoint this returns a single protocol's connection settings as JSON. `protocol` is the
+/// client's requested `Protocol` query value (`IMAP`, `POP3`, `SMTP`, or `AutodiscoverV1`).
+pub fn microsoft_autodiscover_v2(cfg: &HostConfig, protocol: &str) -> String {
+    let h = &cfg.host;
+    let (proto, port, ssl) = match protocol.to_ascii_uppercase().as_str() {
+        "POP3" => ("POP3", cfg.pop3s_port, true),
+        "SMTP" => ("SMTP", cfg.submission_port, true),
+        // Some clients first probe `AutodiscoverV1` to discover the POX endpoint URL.
+        "AUTODISCOVERV1" => {
+            return format!(
+                "{{\"Protocol\":\"AutodiscoverV1\",\"Url\":\"https://autodiscover.{}/autodiscover/autodiscover.xml\"}}",
+                cfg.domain
+            );
+        }
+        _ => ("IMAP", cfg.imaps_port, true),
+    };
+    format!(
+        "{{\"Protocol\":\"{proto}\",\"Server\":\"{h}\",\"Port\":{port},\"DomainRequired\":\"off\",\"SPA\":\"off\",\"SSL\":\"{}\",\"AuthPackage\":\"basic\"}}",
+        if ssl { "on" } else { "off" }
+    )
+}
+
 /// A stable pseudo-UUID (v4-shaped) derived from a seed via the core content hash. Not a real
 /// random UUID — deterministic so regenerating a profile yields the same identifier.
 fn pseudo_uuid(seed: &str) -> String {
@@ -271,6 +295,18 @@ mod tests {
         assert!(xml.contains("<Type>SMTP</Type>"));
         assert!(xml.contains("<Port>993</Port>"));
         assert!(xml.contains("<LoginName>bob@dmtap.local</LoginName>"));
+    }
+
+    #[test]
+    fn autodiscover_v2_json_per_protocol() {
+        let imap = microsoft_autodiscover_v2(&cfg(), "IMAP");
+        assert!(imap.contains("\"Protocol\":\"IMAP\""), "{imap}");
+        assert!(imap.contains("\"Port\":993"), "{imap}");
+        assert!(imap.contains("\"Server\":\"mail.dmtap.local\""));
+        let smtp = microsoft_autodiscover_v2(&cfg(), "smtp");
+        assert!(smtp.contains("\"Protocol\":\"SMTP\"") && smtp.contains("\"Port\":465"), "{smtp}");
+        let v1 = microsoft_autodiscover_v2(&cfg(), "AutodiscoverV1");
+        assert!(v1.contains("autodiscover.dmtap.local/autodiscover/autodiscover.xml"), "{v1}");
     }
 
     #[test]

@@ -175,7 +175,8 @@ pub enum Command {
     Authenticate { mechanism: String, initial: Option<String> },
     Select { mailbox: String, qresync: Option<QResyncParams>, condstore: bool },
     Examine { mailbox: String, qresync: Option<QResyncParams>, condstore: bool },
-    Create(String),
+    /// CREATE, optionally with a SPECIAL-USE `(USE (\Archive …))` attribute (RFC 6154 §3).
+    Create { name: String, use_attr: Option<String> },
     Delete(String),
     Rename { from: String, to: String },
     Subscribe(String),
@@ -183,7 +184,15 @@ pub enum Command {
     List { reference: String, pattern: String, return_opts: Vec<String>, select_opts: Vec<String> },
     Lsub { reference: String, pattern: String },
     Status { mailbox: String, items: Vec<String> },
-    Append { mailbox: String, flags: Vec<Flag>, date: Option<String>, message: Vec<u8> },
+    Append {
+        mailbox: String,
+        flags: Vec<Flag>,
+        date: Option<String>,
+        message: Vec<u8>,
+        /// CATENATE parts (RFC 4469), when the client built the message from `TEXT {n}` literals
+        /// and `URL "…"` references instead of a single literal. `None` = ordinary APPEND.
+        catenate: Option<Vec<CatPart>>,
+    },
     Check,
     Close,
     Unselect,
@@ -197,6 +206,39 @@ pub enum Command {
     Store(StoreCommand),
     Copy { set: SequenceSet, mailbox: String, uid: bool },
     Move { set: SequenceSet, mailbox: String, uid: bool },
+    /// SORT (RFC 5256): `SORT (criteria…) charset search-key`.
+    Sort { criteria: Vec<SortCriterion>, charset: Option<String>, key: SearchKey, uid: bool },
+    /// THREAD (RFC 5256): `THREAD algorithm charset search-key`.
+    Thread { algorithm: ThreadAlgorithm, charset: Option<String>, key: SearchKey, uid: bool },
+}
+
+/// A SORT ordering criterion (RFC 5256 §3), optionally reversed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortCriterion {
+    pub reverse: bool,
+    pub key: SortKey,
+}
+
+/// A SORT key (RFC 5256 §3): the sortable message attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Arrival,
+    Cc,
+    Date,
+    From,
+    Size,
+    Subject,
+    To,
+    /// `DISPLAYFROM` / `DISPLAYTO` (RFC 5957) — sort on the display name.
+    DisplayFrom,
+    DisplayTo,
+}
+
+/// A THREAD algorithm (RFC 5256 §3): ORDEREDSUBJECT or REFERENCES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadAlgorithm {
+    OrderedSubject,
+    References,
 }
 
 /// QRESYNC SELECT/EXAMINE parameters (RFC 7162 §3.2.5): the client's last-seen `UIDVALIDITY` and
@@ -227,6 +269,13 @@ pub enum StoreOp {
     Remove,
 }
 
+/// One CATENATE part (RFC 4469 §2): inline `TEXT` bytes or an IMAP `URL` reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatPart {
+    Text(Vec<u8>),
+    Url(String),
+}
+
 /// A FETCH data item (RFC 9051 §6.4.5, `fetch-att`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FetchItem {
@@ -244,6 +293,10 @@ pub enum FetchItem {
     ModSeq,
     /// `BODY[section]<partial>` / `BODY.PEEK[section]<partial>`.
     BodySection { peek: bool, section: Section, partial: Option<(u32, u32)> },
+    /// `BINARY[section]<partial>` / `BINARY.PEEK[…]` (RFC 3516): the CTE-decoded part content.
+    Binary { peek: bool, section: Vec<u32>, partial: Option<(u32, u32)> },
+    /// `BINARY.SIZE[section]` (RFC 3516): the decoded octet count.
+    BinarySize { section: Vec<u32> },
 }
 
 /// A body section specifier (RFC 9051 §6.4.5, `section`).
@@ -316,7 +369,7 @@ fn parse_body(name: &str, args: &[Token]) -> Result<Command, ParseError> {
                 Command::Examine { mailbox, qresync, condstore }
             }
         }
-        "CREATE" => Command::Create(atom_at(args, 0)?),
+        "CREATE" => parse_create(args)?,
         "DELETE" => Command::Delete(atom_at(args, 0)?),
         "RENAME" => Command::Rename { from: atom_at(args, 0)?, to: atom_at(args, 1)? },
         "SUBSCRIBE" => Command::Subscribe(atom_at(args, 0)?),
@@ -327,6 +380,8 @@ fn parse_body(name: &str, args: &[Token]) -> Result<Command, ParseError> {
         "APPEND" => parse_append(args)?,
         "ID" => parse_id(args)?,
         "SEARCH" => parse_search(args, false)?,
+        "SORT" => parse_sort(args, false)?,
+        "THREAD" => parse_thread(args, false)?,
         "FETCH" => parse_fetch(args, false)?,
         "STORE" => Command::Store(parse_store(args, false)?),
         "COPY" => parse_copy_move(args, false, false)?,
@@ -404,7 +459,7 @@ fn parse_status(args: &[Token]) -> Result<Command, ParseError> {
 }
 
 fn parse_append(args: &[Token]) -> Result<Command, ParseError> {
-    // APPEND mailbox [ (flags) ] [ "date-time" ] message-literal
+    // APPEND mailbox [ (flags) ] [ "date-time" ] ( message-literal | CATENATE (parts…) )
     let mailbox = atom_at(args, 0)?;
     let mut i = 1;
     let mut flags = Vec::new();
@@ -418,12 +473,107 @@ fn parse_append(args: &[Token]) -> Result<Command, ParseError> {
         date = Some(d.clone());
         i += 1;
     }
+    // CATENATE (RFC 4469): `CATENATE ( TEXT {n} | URL "…" )+`.
+    if matches!(args.get(i), Some(Token::Atom(a)) if a.eq_ignore_ascii_case("CATENATE")) {
+        let (inner, _n) = read_paren_tokens(args, i + 1)?;
+        let mut parts = Vec::new();
+        let mut j = 0;
+        while j < inner.len() {
+            let kw = inner[j].as_str().unwrap_or("").to_ascii_uppercase();
+            match kw.as_str() {
+                "TEXT" => {
+                    let bytes = inner
+                        .get(j + 1)
+                        .and_then(Token::as_bytes)
+                        .ok_or(ParseError::Syntax("CATENATE TEXT needs a literal"))?;
+                    parts.push(CatPart::Text(bytes));
+                    j += 2;
+                }
+                "URL" => {
+                    let url = inner
+                        .get(j + 1)
+                        .and_then(Token::as_str)
+                        .ok_or(ParseError::Syntax("CATENATE URL needs a string"))?;
+                    parts.push(CatPart::Url(url.to_string()));
+                    j += 2;
+                }
+                _ => return Err(ParseError::Syntax("bad CATENATE part")),
+            }
+        }
+        return Ok(Command::Append { mailbox, flags, date, message: Vec::new(), catenate: Some(parts) });
+    }
     let message = match args.get(i) {
         Some(Token::Literal(b)) => b.clone(),
         Some(t) => t.as_bytes().ok_or(ParseError::Syntax("APPEND needs a message"))?,
         None => return Err(ParseError::Syntax("APPEND needs a message")),
     };
-    Ok(Command::Append { mailbox, flags, date, message })
+    Ok(Command::Append { mailbox, flags, date, message, catenate: None })
+}
+
+fn parse_create(args: &[Token]) -> Result<Command, ParseError> {
+    let name = atom_at(args, 0)?;
+    // Optional `(USE (\Attr …))` SPECIAL-USE create parameter (RFC 6154 §3).
+    let mut use_attr = None;
+    if matches!(args.get(1), Some(Token::LParen)) {
+        let (inner, _n) = read_paren_tokens(args, 1)?;
+        let mut it = inner.iter();
+        while let Some(tok) = it.next() {
+            if tok.as_str().map(|s| s.eq_ignore_ascii_case("USE")).unwrap_or(false) {
+                if let Some(Token::LParen) = it.next() {
+                    // The next atom is the first \Use attribute.
+                    use_attr = it.next().and_then(Token::as_str).map(str::to_string);
+                }
+            }
+        }
+    }
+    Ok(Command::Create { name, use_attr })
+}
+
+fn parse_sort(args: &[Token], uid: bool) -> Result<Command, ParseError> {
+    // SORT (criteria) charset search-key
+    let (crit_atoms, next) = read_paren_atoms(args, 0)?;
+    let mut criteria = Vec::new();
+    let mut reverse = false;
+    for a in &crit_atoms {
+        if a.eq_ignore_ascii_case("REVERSE") {
+            reverse = true;
+            continue;
+        }
+        let key = match a.to_ascii_uppercase().as_str() {
+            "ARRIVAL" => SortKey::Arrival,
+            "CC" => SortKey::Cc,
+            "DATE" => SortKey::Date,
+            "FROM" => SortKey::From,
+            "SIZE" => SortKey::Size,
+            "SUBJECT" => SortKey::Subject,
+            "TO" => SortKey::To,
+            "DISPLAYFROM" => SortKey::DisplayFrom,
+            "DISPLAYTO" => SortKey::DisplayTo,
+            _ => return Err(ParseError::Syntax("unknown SORT key")),
+        };
+        criteria.push(SortCriterion { reverse, key });
+        reverse = false;
+    }
+    if criteria.is_empty() {
+        return Err(ParseError::Syntax("SORT needs at least one criterion"));
+    }
+    // charset (required by RFC 5256 grammar) then the search program.
+    let charset = args.get(next).and_then(Token::as_str).map(str::to_string);
+    let key = crate::search::parse_search_key(&args[(next + 1).min(args.len())..])?;
+    Ok(Command::Sort { criteria, charset, key, uid })
+}
+
+fn parse_thread(args: &[Token], uid: bool) -> Result<Command, ParseError> {
+    // THREAD algorithm charset search-key
+    let algo = atom_at(args, 0)?.to_ascii_uppercase();
+    let algorithm = match algo.as_str() {
+        "ORDEREDSUBJECT" => ThreadAlgorithm::OrderedSubject,
+        "REFERENCES" => ThreadAlgorithm::References,
+        _ => return Err(ParseError::Syntax("unknown THREAD algorithm")),
+    };
+    let charset = args.get(1).and_then(Token::as_str).map(str::to_string);
+    let key = crate::search::parse_search_key(&args[2.min(args.len())..])?;
+    Ok(Command::Thread { algorithm, charset, key, uid })
 }
 
 fn parse_id(args: &[Token]) -> Result<Command, ParseError> {
@@ -555,6 +705,32 @@ fn parse_one_fetch_att(toks: &[Token]) -> Result<(FetchItem, usize), ParseError>
     };
     if let Some(item) = simple {
         return Ok((item, 1));
+    }
+    // BINARY / BINARY.PEEK / BINARY.SIZE (RFC 3516): a numeric [section], optional <partial>.
+    if up == "BINARY" || up == "BINARY.PEEK" || up == "BINARY.SIZE" {
+        if !matches!(toks.get(1), Some(Token::LBracket)) {
+            return Err(ParseError::Syntax("BINARY needs a [section]"));
+        }
+        let end = matching_bracket(toks, 1)?;
+        // The section is a numeric part path (or empty for the whole message).
+        let section = match parse_section(&toks[2..end])? {
+            Section::Part(p) => p,
+            Section::Full => Vec::new(),
+            _ => return Err(ParseError::Syntax("BINARY section must be a part number")),
+        };
+        if up == "BINARY.SIZE" {
+            return Ok((FetchItem::BinarySize { section }, end + 1));
+        }
+        let peek = up == "BINARY.PEEK";
+        let mut consumed = end + 1;
+        let mut partial = None;
+        if let Some(Token::Atom(a)) = toks.get(consumed) {
+            if let Some(p) = parse_partial(a) {
+                partial = Some(p);
+                consumed += 1;
+            }
+        }
+        return Ok((FetchItem::Binary { peek, section, partial }, consumed));
     }
     // BODY / BODY.PEEK, optionally with a [section]<partial>.
     if up == "BODY" || up == "BODY.PEEK" {
@@ -691,6 +867,8 @@ fn parse_uid(args: &[Token]) -> Result<Command, ParseError> {
         "FETCH" => parse_fetch(rest, true)?,
         "STORE" => Command::Store(parse_store(rest, true)?),
         "SEARCH" => parse_search(rest, true)?,
+        "SORT" => parse_sort(rest, true)?,
+        "THREAD" => parse_thread(rest, true)?,
         "COPY" => parse_copy_move(rest, true, false)?,
         "MOVE" => parse_copy_move(rest, true, true)?,
         "EXPUNGE" => {

@@ -3,12 +3,17 @@
 //! the wire) and returns the response bytes. It is transport-agnostic and fully synchronous, so
 //! it is driven directly by unit/integration tests and by the optional `net` TCP server.
 
+use std::borrow::Cow;
+
 use crate::auth::{self, Authenticator, SaslMechanism};
 use crate::mime;
 use crate::search::{self, SearchCtx, SearchKey};
 use crate::store::{Flag, MailStore, Mailbox, Message};
 
-use super::parser::{self, Command, FetchItem, ParsedCommand, QResyncParams, StoreCommand, StoreOp};
+use super::parser::{
+    self, CatPart, Command, FetchItem, ParsedCommand, QResyncParams, Section, SortCriterion,
+    SortKey, StoreCommand, StoreOp, ThreadAlgorithm,
+};
 use super::response;
 use super::sequence::SequenceSet;
 use super::capability_line;
@@ -42,6 +47,9 @@ pub struct Session<S: MailStore, A: Authenticator> {
     qresync: bool,
     idle_tag: Option<String>,
     pending: Option<Pending>,
+    /// SEARCHRES saved result (RFC 5182): the UIDs from the last SEARCH/SORT that used
+    /// `RETURN (SAVE)`, referenced by `$` in a later command.
+    saved_search: Vec<u32>,
 }
 
 impl<S: MailStore, A: Authenticator> Session<S, A> {
@@ -58,6 +66,7 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             qresync: false,
             idle_tag: None,
             pending: None,
+            saved_search: Vec::new(),
         }
     }
 
@@ -148,10 +157,7 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             Command::Examine { mailbox, condstore, qresync } => {
                 self.cmd_select(&tag, &mailbox, true, condstore, qresync)
             }
-            Command::Create(name) => match self.store.create(&name) {
-                Ok(()) => ok(&tag, "CREATE completed"),
-                Err(e) => no(&tag, &format!("CREATE failed: {e}")),
-            },
+            Command::Create { name, use_attr } => self.cmd_create(&tag, &name, use_attr.as_deref()),
             Command::Delete(name) => match self.store.delete(&name) {
                 Ok(()) => ok(&tag, "DELETE completed"),
                 Err(e) => no(&tag, &format!("DELETE failed: {e}")),
@@ -162,11 +168,15 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             },
             Command::Subscribe(name) => self.set_subscribed(&tag, &name, true),
             Command::Unsubscribe(name) => self.set_subscribed(&tag, &name, false),
-            Command::List { reference, pattern, .. } => self.cmd_list(&tag, &reference, &pattern, false),
-            Command::Lsub { reference, pattern } => self.cmd_list(&tag, &reference, &pattern, true),
+            Command::List { reference, pattern, return_opts, select_opts } => {
+                self.cmd_list(&tag, &reference, &pattern, false, &return_opts, &select_opts)
+            }
+            Command::Lsub { reference, pattern } => {
+                self.cmd_list(&tag, &reference, &pattern, true, &[], &[])
+            }
             Command::Status { mailbox, items } => self.cmd_status(&tag, &mailbox, &items),
-            Command::Append { mailbox, flags, date, message } => {
-                self.cmd_append(&tag, &mailbox, flags, date, message)
+            Command::Append { mailbox, flags, date, message, catenate } => {
+                self.cmd_append(&tag, &mailbox, flags, date, message, catenate)
             }
             Command::Idle => {
                 self.idle_tag = Some(tag);
@@ -179,6 +189,12 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             Command::Expunge => self.cmd_expunge(&tag, None),
             Command::UidExpunge(set) => self.cmd_expunge(&tag, Some(set)),
             Command::Search { key, uid, ret, charset } => self.cmd_search(&tag, key, uid, ret, charset),
+            Command::Sort { criteria, charset, key, uid } => {
+                self.cmd_sort(&tag, &criteria, charset, key, uid)
+            }
+            Command::Thread { algorithm, charset, key, uid } => {
+                self.cmd_thread(&tag, algorithm, charset, key, uid)
+            }
             Command::Fetch { set, items, uid, changedsince, vanished } => {
                 self.cmd_fetch(&tag, set, items, uid, changedsince, vanished)
             }
@@ -408,7 +424,15 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         out
     }
 
-    fn cmd_list(&mut self, tag: &str, _reference: &str, pattern: &str, lsub: bool) -> Vec<u8> {
+    fn cmd_list(
+        &mut self,
+        tag: &str,
+        _reference: &str,
+        pattern: &str,
+        lsub: bool,
+        return_opts: &[String],
+        select_opts: &[String],
+    ) -> Vec<u8> {
         let verb = if lsub { "LSUB" } else { "LIST" };
         let mut out = Vec::new();
         // `LIST "" ""` is the hierarchy-delimiter probe (RFC 9051 §6.3.9).
@@ -417,52 +441,135 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             out.extend(ok(tag, &format!("{verb} completed")));
             return out;
         }
+        let up: Vec<String> = return_opts.iter().map(|s| s.to_ascii_uppercase()).collect();
+        let sel: Vec<String> = select_opts.iter().map(|s| s.to_ascii_uppercase()).collect();
+        let want_subscribed = up.iter().any(|s| s == "SUBSCRIBED");
+        let want_children = up.iter().any(|s| s == "CHILDREN");
+        // LIST-EXTENDED select-options (RFC 5258 §3): filter to SUBSCRIBED / SPECIAL-USE sets.
+        let only_subscribed = sel.iter().any(|s| s == "SUBSCRIBED");
+        let only_special = sel.iter().any(|s| s == "SPECIAL-USE");
+        // LIST-STATUS: RETURN (STATUS (items…)) piggybacks a STATUS reply per match (RFC 5819).
+        let status_items = self.list_status_items(&up);
+
         let names = self.store.mailbox_names();
-        for name in names {
-            if !wildcard_match(pattern, &name) {
+        let mut status_lines = Vec::new();
+        for name in &names {
+            if !wildcard_match(pattern, name) {
                 continue;
             }
-            let mb = self.store.mailbox(&name).unwrap();
-            if lsub && !mb.subscribed {
+            let mb = self.store.mailbox(name).unwrap();
+            if (lsub || only_subscribed) && !mb.subscribed {
                 continue;
             }
-            let mut attrs: Vec<String> = vec!["\\HasNoChildren".into()];
+            if only_special && mb.special_use.and_then(|s| s.attribute()).is_none() {
+                continue;
+            }
+            let mut attrs: Vec<String> = Vec::new();
+            // \HasChildren / \HasNoChildren (RFC 3348 CHILDREN): a child is any mailbox prefixed
+            // with "<name>/". Always reported for LIST; gated on CHILDREN for the wire is optional.
+            let _ = want_children;
+            if names.iter().any(|n| n.starts_with(&format!("{name}/"))) {
+                attrs.push("\\HasChildren".into());
+            } else {
+                attrs.push("\\HasNoChildren".into());
+            }
+            if (want_subscribed || lsub) && mb.subscribed {
+                attrs.push("\\Subscribed".into());
+            }
             if let Some(su) = mb.special_use.and_then(|s| s.attribute()) {
                 attrs.push(su.to_string());
             }
             out.extend(untagged(&format!(
                 "{verb} ({}) \"/\" {}",
                 attrs.join(" "),
-                response::imap_string(&name)
+                response::imap_string(name)
             )));
+            if let Some(items) = &status_items {
+                status_lines.push(self.status_reply_line(name, items));
+            }
+        }
+        for line in status_lines {
+            out.extend(line);
         }
         out.extend(ok(tag, &format!("{verb} completed")));
         out
     }
 
+    /// Extract the `RETURN (STATUS (…))` item list from LIST return-options (RFC 5819).
+    fn list_status_items(&self, return_opts_upper: &[String]) -> Option<Vec<String>> {
+        let pos = return_opts_upper.iter().position(|s| s == "STATUS")?;
+        // The token after STATUS is the parenthesised item list, already flattened to atoms by the
+        // parser's `read_paren_atoms`; everything after STATUS up to the next known opt are items.
+        let items: Vec<String> = return_opts_upper[pos + 1..]
+            .iter()
+            .take_while(|s| {
+                matches!(
+                    s.as_str(),
+                    "MESSAGES" | "RECENT" | "UIDNEXT" | "UIDVALIDITY" | "UNSEEN" | "DELETED"
+                        | "SIZE" | "HIGHESTMODSEQ"
+                )
+            })
+            .cloned()
+            .collect();
+        if items.is_empty() {
+            None
+        } else {
+            Some(items)
+        }
+    }
+
     fn cmd_status(&mut self, tag: &str, name: &str, items: &[String]) -> Vec<u8> {
+        if self.store.mailbox(name).is_none() {
+            return no(tag, "[NONEXISTENT] no such mailbox");
+        }
+        let mut out = self.status_reply_line(name, items);
+        out.extend(ok(tag, "STATUS completed"));
+        out
+    }
+
+    /// Build a single untagged `* STATUS <name> (…)` response line for the requested items
+    /// (shared by STATUS and LIST-STATUS, RFC 9051 §7.3.2 / RFC 5819). `DELETED` counts messages
+    /// flagged `\Deleted` awaiting expunge (RFC 9051 STATUS item).
+    fn status_reply_line(&self, name: &str, items: &[String]) -> Vec<u8> {
         let mb = match self.store.mailbox(name) {
             Some(mb) => mb,
-            None => return no(tag, "[NONEXISTENT] no such mailbox"),
+            None => return Vec::new(),
         };
         let mut parts = Vec::new();
         for item in items {
-            let v = match item.as_str() {
+            let v = match item.to_ascii_uppercase().as_str() {
                 "MESSAGES" => format!("MESSAGES {}", mb.exists()),
                 "RECENT" => format!("RECENT {}", mb.recent()),
                 "UIDNEXT" => format!("UIDNEXT {}", mb.uid_next),
                 "UIDVALIDITY" => format!("UIDVALIDITY {}", mb.uid_validity),
                 "UNSEEN" => format!("UNSEEN {}", mb.unseen()),
+                "DELETED" => format!(
+                    "DELETED {}",
+                    mb.messages.iter().filter(|m| m.has_flag(&Flag::Deleted)).count()
+                ),
                 "HIGHESTMODSEQ" => format!("HIGHESTMODSEQ {}", mb.highest_modseq),
                 "SIZE" => format!("SIZE {}", mb.messages.iter().map(|m| m.size()).sum::<usize>()),
                 _ => continue,
             };
             parts.push(v);
         }
-        let mut out =
-            untagged(&format!("STATUS {} ({})", response::imap_string(name), parts.join(" ")));
-        out.extend(ok(tag, "STATUS completed"));
-        out
+        untagged(&format!("STATUS {} ({})", response::imap_string(name), parts.join(" ")))
+    }
+
+    /// CREATE, honoring the SPECIAL-USE `(USE (\Attr))` parameter (RFC 6154 §3): the created
+    /// mailbox is tagged with the requested role so clients see the right folder icon.
+    fn cmd_create(&mut self, tag: &str, name: &str, use_attr: Option<&str>) -> Vec<u8> {
+        match self.store.create(name) {
+            Ok(()) => {
+                if let Some(su) = use_attr.and_then(special_use_from_attr) {
+                    if let Some(mb) = self.store.mailbox_mut(name) {
+                        mb.special_use = Some(su);
+                    }
+                }
+                ok(tag, "CREATE completed")
+            }
+            Err(e) => no(tag, &format!("CREATE failed: {e}")),
+        }
     }
 
     fn cmd_append(
@@ -472,8 +579,17 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         flags: Vec<Flag>,
         date: Option<String>,
         message: Vec<u8>,
+        catenate: Option<Vec<CatPart>>,
     ) -> Vec<u8> {
         let ts = date.as_deref().and_then(parse_internal_date).unwrap_or(0);
+        // Resolve CATENATE parts (RFC 4469) against the store before touching the destination.
+        let message = match catenate {
+            Some(parts) => match self.build_catenate(&parts) {
+                Ok(bytes) => bytes,
+                Err(msg) => return no(tag, msg),
+            },
+            None => message,
+        };
         let mb = match self.store.mailbox_mut(name) {
             Some(mb) => mb,
             None => return no(tag, "[TRYCREATE] no such mailbox"),
@@ -481,6 +597,48 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         let uidvalidity = mb.uid_validity;
         let uid = mb.append(message, flags, ts);
         ok(tag, &format!("[APPENDUID {uidvalidity} {uid}] APPEND completed"))
+    }
+
+    /// Assemble a CATENATE message (RFC 4469): concatenate inline `TEXT` parts with the bytes an
+    /// IMAP `URL` reference resolves to. URLs are resolved against *this* node's own store (the
+    /// common "resent/redirect" case, `imap://…/mailbox;UID=n[/;SECTION=…]`); a URL that names a
+    /// message we do not hold is rejected with `[BADURL]` rather than silently dropped.
+    fn build_catenate(&self, parts: &[CatPart]) -> Result<Vec<u8>, &'static str> {
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                CatPart::Text(bytes) => out.extend_from_slice(bytes),
+                CatPart::Url(url) => match self.resolve_imap_url(url) {
+                    Some(bytes) => out.extend_from_slice(&bytes),
+                    None => return Err("[BADURL] CATENATE URL not resolvable on this node"),
+                },
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve an IMAP URL (RFC 5092) of the form `…/<mailbox>;UID=<n>[/;SECTION=<sec>]` against the
+    /// local store, returning the referenced bytes (whole message, or a body section).
+    fn resolve_imap_url(&self, url: &str) -> Option<Vec<u8>> {
+        // Take the path after the authority (everything after the last "//host/…" or a bare path).
+        let path = url.rsplit_once('/').map(|(_, _)| url).unwrap_or(url);
+        let path = path.split_once("//").map(|(_, rest)| rest.splitn(2, '/').nth(1).unwrap_or(rest)).unwrap_or(path);
+        // mailbox;UID=n[/;SECTION=s]
+        let (mailbox_part, rest) = path.split_once(";UID=")?;
+        let mailbox = mailbox_part.trim_start_matches('/');
+        let (uid_str, section_str) = match rest.split_once("/;SECTION=") {
+            Some((u, s)) => (u, Some(s)),
+            None => (rest, None),
+        };
+        let uid: u32 = uid_str.trim_end_matches('/').parse().ok()?;
+        let msg = self.store.mailbox(mailbox)?.by_uid(uid)?;
+        match section_str {
+            None => Some(msg.raw.clone()),
+            Some(s) => {
+                let section = parse_url_section(s);
+                Some(response::extract_section(&msg.raw, &section).into_owned())
+            }
+        }
     }
 
     // --- selected-state ops ----------------------------------------------------------------
@@ -528,6 +686,7 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             return no(tag, "mailbox is read-only");
         }
         let qresync = self.qresync;
+        let uid_set = uid_set.map(|s| self.materialize(&s, true).into_owned());
         let mb = self.store.mailbox_mut(&name).unwrap();
         let max_uid = mb.max_uid();
         // Collect the sequence numbers to expunge (removed descending, so seq numbers stay valid).
@@ -579,49 +738,181 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             Some(n) => n,
             None => return bad(tag, "no mailbox selected"),
         };
+        let saved_uids = self.saved_search.clone();
         let mb = self.store.mailbox(&name).unwrap();
         let max_seq = mb.exists() as u32;
         let max_uid = mb.max_uid();
-        let mut hits: Vec<u32> = Vec::new();
+        // Matched (seq, uid) pairs — we keep both so SEARCHRES can SAVE UIDs regardless of mode.
+        let mut matched: Vec<(u32, u32)> = Vec::new();
         for (i, m) in mb.messages.iter().enumerate() {
             let seq = (i + 1) as u32;
             let ctx = SearchCtx::new(seq, max_seq, m.uid, max_uid, m);
-            if search::eval(&key, &ctx) {
-                hits.push(if uid { m.uid } else { seq });
+            if search::eval_saved(&key, &ctx, &saved_uids) {
+                matched.push((seq, m.uid));
             }
         }
+        let hits: Vec<u32> = matched.iter().map(|&(s, u)| if uid { u } else { s }).collect();
+
+        // SEARCHRES RETURN (SAVE) (RFC 5182): remember the matched UIDs for later `$` reference.
+        let up: Vec<String> = ret.iter().map(|r| r.to_ascii_uppercase()).collect();
+        if up.iter().any(|r| r == "SAVE") {
+            self.saved_search = matched.iter().map(|&(_, u)| u).collect();
+        }
+
         let mut out = Vec::new();
+        // A bare `RETURN (SAVE)` (no MIN/MAX/ALL/COUNT) produces no ESEARCH data (RFC 5182 §2.1).
+        let only_save = !up.is_empty() && up.iter().all(|r| r == "SAVE");
         if ret.is_empty() {
             // Classic SEARCH response.
             let list: Vec<String> = hits.iter().map(|n| n.to_string()).collect();
             out.extend(untagged(format!("SEARCH {}", list.join(" ")).trim_end()));
-        } else {
-            // ESEARCH (RFC 9051 §6.4.4 / RFC 4731).
-            let mut parts = format!("ESEARCH (TAG \"{tag}\")");
-            if uid {
-                parts.push_str(" UID");
-            }
-            if ret.iter().any(|r| r == "MIN") {
-                if let Some(m) = hits.iter().min() {
-                    parts.push_str(&format!(" MIN {m}"));
-                }
-            }
-            if ret.iter().any(|r| r == "MAX") {
-                if let Some(m) = hits.iter().max() {
-                    parts.push_str(&format!(" MAX {m}"));
-                }
-            }
-            if ret.iter().any(|r| r == "COUNT") {
-                parts.push_str(&format!(" COUNT {}", hits.len()));
-            }
-            if ret.iter().any(|r| r == "ALL") && !hits.is_empty() {
-                let list: Vec<String> = hits.iter().map(|n| n.to_string()).collect();
-                parts.push_str(&format!(" ALL {}", list.join(",")));
-            }
-            out.extend(untagged(&parts));
+        } else if !only_save {
+            out.extend(self.esearch_line(tag, uid, &up, &hits));
         }
         out.extend(ok(tag, "SEARCH completed"));
         out
+    }
+
+    /// Build an ESEARCH untagged line (RFC 9051 §6.4.4 / RFC 4731) for the requested return items.
+    fn esearch_line(&self, tag: &str, uid: bool, up: &[String], hits: &[u32]) -> Vec<u8> {
+        let mut parts = format!("ESEARCH (TAG \"{tag}\")");
+        if uid {
+            parts.push_str(" UID");
+        }
+        if up.iter().any(|r| r == "MIN") {
+            if let Some(m) = hits.iter().min() {
+                parts.push_str(&format!(" MIN {m}"));
+            }
+        }
+        if up.iter().any(|r| r == "MAX") {
+            if let Some(m) = hits.iter().max() {
+                parts.push_str(&format!(" MAX {m}"));
+            }
+        }
+        if up.iter().any(|r| r == "COUNT") {
+            parts.push_str(&format!(" COUNT {}", hits.len()));
+        }
+        // ALL (or, when only SAVE-less returns without MIN/MAX/COUNT were asked, default to ALL).
+        let wants_all = up.iter().any(|r| r == "ALL")
+            || !up.iter().any(|r| r == "MIN" || r == "MAX" || r == "COUNT");
+        if wants_all && !hits.is_empty() {
+            parts.push_str(&format!(" ALL {}", to_sequence_set_of(hits)));
+        }
+        untagged(&parts)
+    }
+
+    /// SORT (RFC 5256 §3): evaluate the SEARCH program, order the matches by the criteria, and emit
+    /// `* SORT <ids…>` (sequence numbers, or UIDs under UID SORT).
+    fn cmd_sort(
+        &mut self,
+        tag: &str,
+        criteria: &[SortCriterion],
+        charset: Option<String>,
+        key: SearchKey,
+        uid: bool,
+    ) -> Vec<u8> {
+        if let Some(bad) = self.check_charset(tag, &charset) {
+            return bad;
+        }
+        let name = match self.selected_name() {
+            Some(n) => n,
+            None => return bad(tag, "no mailbox selected"),
+        };
+        let saved = self.saved_search.clone();
+        let mb = self.store.mailbox(&name).unwrap();
+        let max_seq = mb.exists() as u32;
+        let max_uid = mb.max_uid();
+        let mut matched: Vec<usize> = Vec::new();
+        for (i, m) in mb.messages.iter().enumerate() {
+            let ctx = SearchCtx::new((i + 1) as u32, max_seq, m.uid, max_uid, m);
+            if search::eval_saved(&key, &ctx, &saved) {
+                matched.push(i);
+            }
+        }
+        matched.sort_by(|&a, &b| sort_compare(&mb.messages[a], &mb.messages[b], criteria));
+        let ids: Vec<String> = matched
+            .iter()
+            .map(|&i| if uid { mb.messages[i].uid } else { (i + 1) as u32 }.to_string())
+            .collect();
+        let mut out = untagged(format!("SORT {}", ids.join(" ")).trim_end());
+        out.extend(ok(tag, "SORT completed"));
+        out
+    }
+
+    /// THREAD (RFC 5256 §3): group the SEARCH matches into threads and emit `* THREAD (…)`.
+    fn cmd_thread(
+        &mut self,
+        tag: &str,
+        algorithm: ThreadAlgorithm,
+        charset: Option<String>,
+        key: SearchKey,
+        uid: bool,
+    ) -> Vec<u8> {
+        if let Some(bad) = self.check_charset(tag, &charset) {
+            return bad;
+        }
+        let name = match self.selected_name() {
+            Some(n) => n,
+            None => return bad(tag, "no mailbox selected"),
+        };
+        let saved = self.saved_search.clone();
+        let mb = self.store.mailbox(&name).unwrap();
+        let max_seq = mb.exists() as u32;
+        let max_uid = mb.max_uid();
+        let mut matched: Vec<usize> = Vec::new();
+        for (i, m) in mb.messages.iter().enumerate() {
+            let ctx = SearchCtx::new((i + 1) as u32, max_seq, m.uid, max_uid, m);
+            if search::eval_saved(&key, &ctx, &saved) {
+                matched.push(i);
+            }
+        }
+        let threads = build_threads(mb, &matched, algorithm);
+        let mut body = String::from("THREAD ");
+        for group in &threads {
+            body.push('(');
+            let ids: Vec<String> = group
+                .iter()
+                .map(|&i| if uid { mb.messages[i].uid } else { (i + 1) as u32 }.to_string())
+                .collect();
+            body.push_str(&ids.join(" "));
+            body.push(')');
+        }
+        let mut out = untagged(body.trim_end());
+        out.extend(ok(tag, "THREAD completed"));
+        out
+    }
+
+    /// Validate a SEARCH/SORT/THREAD CHARSET argument, returning a ready `NO [BADCHARSET]` reply if
+    /// it names a charset we cannot honor (RFC 9051 §6.4.4). `None` = acceptable.
+    fn check_charset(&self, tag: &str, charset: &Option<String>) -> Option<Vec<u8>> {
+        if let Some(cs) = charset {
+            let up = cs.to_ascii_uppercase();
+            if up != "UTF-8" && up != "US-ASCII" && up != "ASCII" {
+                return Some(no(tag, "[BADCHARSET (US-ASCII UTF-8)] unsupported charset"));
+            }
+        }
+        None
+    }
+
+    /// Materialize a sequence set, substituting the SEARCHRES saved result for `$` (RFC 5182). For
+    /// a UID command the saved UIDs are used directly; for a message-number command they are mapped
+    /// to current sequence numbers in the selected mailbox.
+    fn materialize<'a>(&self, set: &'a SequenceSet, uid_mode: bool) -> Cow<'a, SequenceSet> {
+        if !set.is_saved() {
+            return Cow::Borrowed(set);
+        }
+        if uid_mode {
+            return Cow::Owned(SequenceSet::from_uids(&self.saved_search));
+        }
+        let seqs: Vec<u32> = match self.selected.as_ref().and_then(|n| self.store.mailbox(n)) {
+            Some(mb) => self
+                .saved_search
+                .iter()
+                .filter_map(|&u| mb.seq_of_uid(u).map(|s| s as u32))
+                .collect(),
+            None => Vec::new(),
+        };
+        Cow::Owned(SequenceSet::from_uids(&seqs))
     }
 
     fn cmd_fetch(
@@ -637,6 +928,7 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             Some(n) => n,
             None => return bad(tag, "no mailbox selected"),
         };
+        let set = self.materialize(&set, uid_mode).into_owned();
         let read_only = self.read_only;
         let condstore = self.condstore || changedsince.is_some();
         let mb = self.store.mailbox_mut(&name).unwrap();
@@ -695,11 +987,12 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             return no(tag, "mailbox is read-only");
         }
         let condstore = self.condstore || sc.unchangedsince.is_some();
+        let set = self.materialize(&sc.set, sc.uid).into_owned();
         let mb = self.store.mailbox_mut(&name).unwrap();
 
         let mut out = Vec::new();
         let mut modified: Vec<u32> = Vec::new();
-        for i in resolve_targets(mb, &sc.set, sc.uid) {
+        for i in resolve_targets(mb, &set, sc.uid) {
             let seq = (i + 1) as u32;
             let uid = mb.messages[i].uid;
             // CONDSTORE UNCHANGEDSINCE guard (RFC 7162 §3.1).
@@ -815,8 +1108,9 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
     /// Snapshot (src_uid, cloned message) pairs for a COPY/MOVE, plus the source UIDVALIDITY.
     fn collect_for_copy(&self, set: &SequenceSet, uid_mode: bool) -> Option<(Vec<(u32, Message)>, u32)> {
         let name = self.selected.as_ref()?;
+        let set = self.materialize(set, uid_mode);
         let mb = self.store.mailbox(name)?;
-        let out = resolve_targets(mb, set, uid_mode)
+        let out = resolve_targets(mb, &set, uid_mode)
             .into_iter()
             .map(|i| (mb.messages[i].uid, mb.messages[i].clone()))
             .collect();
@@ -830,7 +1124,10 @@ fn fetch_marks_seen(items: &[FetchItem]) -> bool {
     items.iter().any(|i| {
         matches!(
             i,
-            FetchItem::Rfc822 | FetchItem::Rfc822Text | FetchItem::BodySection { peek: false, .. }
+            FetchItem::Rfc822
+                | FetchItem::Rfc822Text
+                | FetchItem::BodySection { peek: false, .. }
+                | FetchItem::Binary { peek: false, .. }
         )
     })
 }
@@ -913,6 +1210,24 @@ fn render_fetch_items(
                 };
                 literal_item(&mut out, &head, &data);
             }
+            FetchItem::Binary { section, partial, .. } => {
+                // RFC 3516: CTE-decoded content, emitted as a literal8 (`~{n}`) since it may hold
+                // NUL bytes. A `[NIL]` decode failure would use `BODY[…] NIL`; we always decode here.
+                let full = response::extract_binary(&msg.raw, section);
+                let (data, origin) = response::apply_partial(&full, *partial);
+                let label = join_nums(section);
+                let head = match origin {
+                    Some(o) => format!("BINARY[{label}]<{o}>"),
+                    None => format!("BINARY[{label}]"),
+                };
+                out.extend_from_slice(format!("{head} ~{{{}}}\r\n", data.len()).as_bytes());
+                out.extend_from_slice(&data);
+            }
+            FetchItem::BinarySize { section } => {
+                let full = response::extract_binary(&msg.raw, section);
+                let label = join_nums(section);
+                out.extend_from_slice(format!("BINARY.SIZE[{label}] {}", full.len()).as_bytes());
+            }
         }
     }
     // UID FETCH responses MUST include UID (RFC 9051 §6.4.8).
@@ -922,6 +1237,11 @@ fn render_fetch_items(
     }
     let _ = condstore;
     out
+}
+
+/// Join a numeric MIME part path into its dotted label (`[1.2]`), empty for the whole message.
+fn join_nums(nums: &[u32]) -> String {
+    nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(".")
 }
 
 fn literal_item(out: &mut Vec<u8>, label: &str, data: &[u8]) {
@@ -1017,6 +1337,221 @@ fn to_sequence_set(sorted_uids: &[u32]) -> String {
             out.push_str(&format!("{start}:{end}"));
         }
         i += 1;
+    }
+    out
+}
+
+/// Compact an unsorted id list into an IMAP sequence-set (sorts a copy first).
+fn to_sequence_set_of(ids: &[u32]) -> String {
+    let mut v = ids.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    to_sequence_set(&v)
+}
+
+/// Map a SPECIAL-USE `\Attr` (from `CREATE … (USE (\Archive))`) to a [`SpecialUse`] role.
+fn special_use_from_attr(attr: &str) -> Option<crate::store::SpecialUse> {
+    use crate::store::SpecialUse::*;
+    match attr.to_ascii_lowercase().as_str() {
+        "\\sent" => Some(Sent),
+        "\\drafts" => Some(Drafts),
+        "\\trash" => Some(Trash),
+        "\\junk" => Some(Junk),
+        "\\archive" => Some(Archive),
+        "\\all" => Some(All),
+        _ => None,
+    }
+}
+
+/// Parse the `SECTION=` fragment of an IMAP URL (RFC 5092) into a [`Section`] for CATENATE URL.
+fn parse_url_section(s: &str) -> Section {
+    let s = s.trim_end_matches('/');
+    if s.eq_ignore_ascii_case("HEADER") {
+        Section::Header
+    } else if s.eq_ignore_ascii_case("TEXT") {
+        Section::Text
+    } else if s.is_empty() {
+        Section::Full
+    } else {
+        let nums: Vec<u32> = s.split('.').filter_map(|p| p.parse().ok()).collect();
+        if nums.is_empty() {
+            Section::Full
+        } else {
+            Section::Part(nums)
+        }
+    }
+}
+
+/// Order two messages by a SORT criteria list (RFC 5256 §3), first criterion dominant.
+fn sort_compare(a: &Message, b: &Message, criteria: &[SortCriterion]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for c in criteria {
+        let ord = match c.key {
+            SortKey::Arrival => a.internal_date.cmp(&b.internal_date),
+            SortKey::Size => a.size().cmp(&b.size()),
+            SortKey::Date => sort_date(a).cmp(&sort_date(b)),
+            SortKey::Subject => base_subject(a).cmp(&base_subject(b)),
+            SortKey::From => addr_sort_key(a, "From", false).cmp(&addr_sort_key(b, "From", false)),
+            SortKey::To => addr_sort_key(a, "To", false).cmp(&addr_sort_key(b, "To", false)),
+            SortKey::Cc => addr_sort_key(a, "Cc", false).cmp(&addr_sort_key(b, "Cc", false)),
+            SortKey::DisplayFrom => {
+                addr_sort_key(a, "From", true).cmp(&addr_sort_key(b, "From", true))
+            }
+            SortKey::DisplayTo => addr_sort_key(a, "To", true).cmp(&addr_sort_key(b, "To", true)),
+        };
+        let ord = if c.reverse { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    // Ties break on sequence order — here, ascending UID (RFC 5256 §3, "otherwise by number").
+    a.uid.cmp(&b.uid)
+}
+
+/// The sort date of a message (RFC 5256): the `Date:` header, falling back to INTERNALDATE.
+fn sort_date(m: &Message) -> (i64, i64, i64) {
+    m.parsed_cached()
+        .header("Date")
+        .and_then(parse_date_ymd)
+        .unwrap_or_else(|| mime::ymd_from_ms(m.internal_date))
+}
+
+fn parse_date_ymd(date: &str) -> Option<(i64, i64, i64)> {
+    let cleaned = date.replace(',', " ");
+    let mut toks = cleaned.split_whitespace();
+    let mut first = toks.next()?;
+    let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    let month_of = |m: &str| months.iter().position(|x| x.eq_ignore_ascii_case(m)).map(|i| i as i64 + 1);
+    if month_of(first).is_none() && first.parse::<i64>().is_err() {
+        first = toks.next()?;
+    }
+    let day: i64 = first.parse().ok()?;
+    let mon = month_of(toks.next()?)?;
+    let year: i64 = toks.next()?.parse().ok()?;
+    Some((year, mon, day))
+}
+
+/// The RFC 5256 "base subject": the subject lowercased with leading `Re:`/`Fwd:` and surrounding
+/// whitespace stripped, so a reply threads/sorts next to its parent.
+fn base_subject(m: &Message) -> String {
+    let raw = m.parsed_cached().header("Subject").unwrap_or("").to_ascii_lowercase();
+    let mut s = raw.trim().to_string();
+    loop {
+        let t = s.trim_start();
+        let stripped = t
+            .strip_prefix("re:")
+            .or_else(|| t.strip_prefix("fwd:"))
+            .or_else(|| t.strip_prefix("fw:"));
+        match stripped {
+            Some(rest) => s = rest.trim_start().to_string(),
+            None => break,
+        }
+    }
+    s
+}
+
+/// A sort key for an address header (RFC 5256 §3): the mailbox local-part, or the display name for
+/// DISPLAYFROM/DISPLAYTO (RFC 5957), lowercased.
+fn addr_sort_key(m: &Message, header: &str, display: bool) -> String {
+    let addrs = m.parsed_cached().addresses(header);
+    match addrs.first() {
+        Some(a) if display => a
+            .name
+            .clone()
+            .or_else(|| a.mailbox.clone())
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        Some(a) => a.mailbox.clone().unwrap_or_default().to_ascii_lowercase(),
+        None => String::new(),
+    }
+}
+
+/// Group matched message indices into threads (RFC 5256 §3). ORDEREDSUBJECT groups by base
+/// subject; REFERENCES unions messages linked by Message-ID / In-Reply-To / References. Each thread
+/// is returned date-ordered, and threads are ordered by their earliest message's date.
+fn build_threads(mb: &Mailbox, matched: &[usize], algo: ThreadAlgorithm) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = match algo {
+        ThreadAlgorithm::OrderedSubject => {
+            let mut by_subject: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+            for &i in matched {
+                by_subject.entry(base_subject(&mb.messages[i])).or_default().push(i);
+            }
+            by_subject.into_values().collect()
+        }
+        ThreadAlgorithm::References => {
+            // Union-find over message-id links.
+            let mut id_to_pos: std::collections::HashMap<String, usize> = Default::default();
+            for (pos, &i) in matched.iter().enumerate() {
+                if let Some(mid) = msg_id(&mb.messages[i]) {
+                    id_to_pos.entry(mid).or_insert(pos);
+                }
+            }
+            let mut parent: Vec<usize> = (0..matched.len()).collect();
+            fn find(parent: &mut [usize], x: usize) -> usize {
+                let mut r = x;
+                while parent[r] != r {
+                    r = parent[r];
+                }
+                let mut c = x;
+                while parent[c] != r {
+                    let n = parent[c];
+                    parent[c] = r;
+                    c = n;
+                }
+                r
+            }
+            for (pos, &i) in matched.iter().enumerate() {
+                for reff in msg_refs(&mb.messages[i]) {
+                    if let Some(&other) = id_to_pos.get(&reff) {
+                        let (ra, rb) = (find(&mut parent, pos), find(&mut parent, other));
+                        if ra != rb {
+                            parent[ra] = rb;
+                        }
+                    }
+                }
+            }
+            let mut buckets: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+            for pos in 0..matched.len() {
+                let root = find(&mut parent, pos);
+                buckets.entry(root).or_default().push(matched[pos]);
+            }
+            buckets.into_values().collect()
+        }
+    };
+    // Order within each thread by sort date, and threads by their first message's date.
+    for g in &mut groups {
+        g.sort_by(|&a, &b| sort_date(&mb.messages[a]).cmp(&sort_date(&mb.messages[b])).then(a.cmp(&b)));
+    }
+    groups.sort_by(|a, b| {
+        let da = a.first().map(|&i| sort_date(&mb.messages[i]));
+        let db = b.first().map(|&i| sort_date(&mb.messages[i]));
+        da.cmp(&db)
+    });
+    groups
+}
+
+/// A message's own Message-ID (angle brackets stripped), for REFERENCES threading.
+fn msg_id(m: &Message) -> Option<String> {
+    m.parsed_cached()
+        .header("Message-ID")
+        .or_else(|| m.parsed_cached().header("Message-Id"))
+        .map(|s| s.trim().trim_matches(|c| c == '<' || c == '>').to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The message-ids a message references (In-Reply-To + References), for REFERENCES threading.
+fn msg_refs(m: &Message) -> Vec<String> {
+    let p = m.parsed_cached();
+    let mut out = Vec::new();
+    for h in ["In-Reply-To", "References"] {
+        if let Some(v) = p.header(h) {
+            for tok in v.split(|c: char| c == '<' || c == '>' || c.is_whitespace()) {
+                let t = tok.trim();
+                if !t.is_empty() && t.contains('@') {
+                    out.push(t.to_string());
+                }
+            }
+        }
     }
     out
 }

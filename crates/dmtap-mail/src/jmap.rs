@@ -125,16 +125,27 @@ fn dispatch<S: MailStore>(
     args: &Value,
 ) -> Result<(String, Value), Value> {
     match name {
+        // Core/echo (RFC 8620 §4): the request arguments are returned verbatim.
+        "Core/echo" => Ok(("Core/echo".into(), args.clone())),
         "Mailbox/get" => Ok(("Mailbox/get".into(), mailbox_get(store, account, args))),
         "Mailbox/query" => Ok(("Mailbox/query".into(), mailbox_query(store, account))),
         "Mailbox/changes" => Ok(("Mailbox/changes".into(), changes(store, account, JmapObj::Mailbox, args))),
+        "Mailbox/set" => Ok(("Mailbox/set".into(), mailbox_set(store, account, args))),
         "Email/get" => Ok(("Email/get".into(), email_get(store, account, args))),
         "Email/query" => Ok(("Email/query".into(), email_query(store, account, args))),
         "Email/changes" => Ok(("Email/changes".into(), changes(store, account, JmapObj::Email, args))),
+        "Email/queryChanges" => Ok(("Email/queryChanges".into(), email_query_changes(store, account, args))),
         "Email/set" => Ok(("Email/set".into(), email_set(store, account, args))),
         "Thread/get" => Ok(("Thread/get".into(), thread_get(store, account, args))),
         "Thread/changes" => Ok(("Thread/changes".into(), changes(store, account, JmapObj::Thread, args))),
+        "SearchSnippet/get" => Ok(("SearchSnippet/get".into(), search_snippet_get(store, account, args))),
+        "Identity/get" => Ok(("Identity/get".into(), identity_get(account, args))),
+        "Identity/changes" => Ok(("Identity/changes".into(), identity_changes(account, args))),
+        "Identity/set" => Ok(("Identity/set".into(), identity_set(account, args))),
         "EmailSubmission/set" => Ok(("EmailSubmission/set".into(), submission_set(account, args))),
+        "EmailSubmission/get" => Ok(("EmailSubmission/get".into(), submission_get(account, args))),
+        "PushSubscription/get" => Ok(("PushSubscription/get".into(), push_subscription_get(args))),
+        "PushSubscription/set" => Ok(("PushSubscription/set".into(), push_subscription_set(args))),
         _ => Err(json!({ "type": "unknownMethod", "description": name })),
     }
 }
@@ -683,6 +694,18 @@ fn submission_set(account: &str, args: &Value) -> Value {
     })
 }
 
+/// `EmailSubmission/get` (RFC 8621 §7 / spec §19.9): read the sender-retry state (§4.7) of a
+/// submission. This projection does not persist submission objects (the node's outbound state
+/// machine owns them), so requested ids are reported as `notFound` rather than fabricated.
+fn submission_get(account: &str, args: &Value) -> Value {
+    let not_found: Vec<Value> = args
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter(|v| v.is_string()).cloned().collect())
+        .unwrap_or_default();
+    json!({ "accountId": account, "state": "0", "list": [], "notFound": not_found })
+}
+
 /// `Foo/changes` (RFC 8620 §5.2): a real delta computed from the store's modseq change-log
 /// ([`MailStore::jmap_changes`]). `sinceState` is required; an unparseable token yields the
 /// `cannotCalculateChanges` error so the client falls back to a full `/query`+`/get`.
@@ -703,6 +726,291 @@ fn changes<S: MailStore>(store: &S, account: &str, obj: JmapObj, args: &Value) -
             "description": "sinceState is not a recognizable state token"
         }),
     }
+}
+
+// --- Mailbox/set (RFC 8621 §2.5) -----------------------------------------------------------
+
+/// `Mailbox/set`: create / update (rename, subscribe) / destroy mailboxes, mapping onto the
+/// [`MailStore`] mutators. Roles and `parentId` from the create object are honored where the store
+/// supports them (folder names are the ids in this projection).
+fn mailbox_set<S: MailStore>(store: &mut S, account: &str, args: &Value) -> Value {
+    let mut created = serde_json::Map::new();
+    let mut not_created = serde_json::Map::new();
+    let mut updated = serde_json::Map::new();
+    let mut not_updated = serde_json::Map::new();
+    let mut destroyed = Vec::new();
+    let mut not_destroyed = serde_json::Map::new();
+
+    if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
+        for (cid, obj) in create {
+            let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                not_created.insert(cid.clone(), json!({ "type": "invalidProperties", "properties": ["name"] }));
+                continue;
+            }
+            // A parentId prefixes the child name with the parent's path ("Parent/Child").
+            let full = match obj.get("parentId").and_then(Value::as_str) {
+                Some(p) if !p.is_empty() => format!("{p}/{name}"),
+                _ => name.to_string(),
+            };
+            match store.create(&full) {
+                Ok(()) => {
+                    created.insert(cid.clone(), json!({ "id": full, "totalEmails": 0, "unreadEmails": 0, "totalThreads": 0, "unreadThreads": 0, "isSubscribed": true }));
+                }
+                Err(e) => {
+                    not_created.insert(cid.clone(), json!({ "type": "invalidArguments", "description": e.to_string() }));
+                }
+            }
+        }
+    }
+
+    if let Some(update) = args.get("update").and_then(|v| v.as_object()) {
+        for (id, patch) in update {
+            let mut ok = true;
+            if let Some(newname) = patch.get("name").and_then(Value::as_str) {
+                ok = store.rename(id, newname).is_ok();
+            }
+            if ok {
+                if let Some(sub) = patch.get("isSubscribed").and_then(Value::as_bool) {
+                    // The renamed target may now carry the new name.
+                    let target = patch.get("name").and_then(Value::as_str).unwrap_or(id);
+                    if let Some(mb) = store.mailbox_mut(target) {
+                        mb.subscribed = sub;
+                    }
+                }
+                updated.insert(id.clone(), Value::Null);
+            } else {
+                not_updated.insert(id.clone(), json!({ "type": "notFound" }));
+            }
+        }
+    }
+
+    if let Some(list) = args.get("destroy").and_then(|v| v.as_array()) {
+        for id in list.iter().filter_map(Value::as_str) {
+            match store.delete(id) {
+                Ok(()) => destroyed.push(Value::String(id.to_string())),
+                Err(e) => {
+                    not_destroyed.insert(id.to_string(), json!({ "type": "notFound", "description": e.to_string() }));
+                }
+            }
+        }
+    }
+
+    json!({
+        "accountId": account,
+        "oldState": "0",
+        "newState": state_string(store),
+        "created": Value::Object(created),
+        "updated": Value::Object(updated),
+        "destroyed": destroyed,
+        "notCreated": Value::Object(not_created),
+        "notUpdated": Value::Object(not_updated),
+        "notDestroyed": Value::Object(not_destroyed)
+    })
+}
+
+// --- Email/queryChanges (RFC 8621 §4.5) ----------------------------------------------------
+
+/// `Email/queryChanges`: since we compute query results directly from the store, report the added
+/// items from the modseq delta and the removed items from the vanished log (RFC 8620 §5.6).
+fn email_query_changes<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let since = args.get("sinceQueryState").and_then(Value::as_str).unwrap_or("0");
+    match store.jmap_changes(JmapObj::Email, since) {
+        Some(c) => {
+            let added: Vec<Value> = c
+                .created
+                .iter()
+                .chain(c.updated.iter())
+                .enumerate()
+                .map(|(idx, id)| json!({ "id": id, "index": idx }))
+                .collect();
+            json!({
+                "accountId": account,
+                "oldQueryState": c.old_state,
+                "newQueryState": c.new_state,
+                "removed": c.destroyed,
+                "added": added
+            })
+        }
+        None => json!({ "type": "cannotCalculateChanges" }),
+    }
+}
+
+// --- SearchSnippet/get (RFC 8621 §5) -------------------------------------------------------
+
+/// `SearchSnippet/get`: return subject/preview snippets for the given emails, highlighting the
+/// filter's text terms with `<mark>…</mark>` (a reference highlighter over the plaintext body).
+fn search_snippet_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
+    let terms: Vec<String> = args
+        .get("filter")
+        .and_then(collect_filter_terms)
+        .unwrap_or_default();
+    let ids: Vec<String> = args
+        .get("emailIds")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let mut list = Vec::new();
+    for id in ids {
+        let msg = parse_email_id(&id).and_then(|(mb, uid)| store.mailbox(&mb).and_then(|m| m.by_uid(uid)));
+        let (subject, preview) = match msg {
+            Some(m) => {
+                let p = ParsedMessage::parse(&m.raw);
+                (
+                    highlight(p.header("Subject").unwrap_or(""), &terms),
+                    highlight(&preview(&p), &terms),
+                )
+            }
+            None => (Value::Null, Value::Null),
+        };
+        list.push(json!({ "emailId": id, "subject": subject, "preview": preview }));
+    }
+    json!({ "accountId": account, "list": list, "notFound": [] })
+}
+
+/// Collect the text terms from a JMAP Email filter (`text`/`subject`/`body`/`from`/`to`).
+fn collect_filter_terms(filter: &Value) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some(obj) = filter.as_object() {
+        for key in ["text", "subject", "body", "from", "to"] {
+            if let Some(v) = obj.get(key).and_then(Value::as_str) {
+                out.push(v.to_string());
+            }
+        }
+        // FilterOperator (AND/OR/NOT) with nested conditions.
+        if let Some(conds) = obj.get("conditions").and_then(|v| v.as_array()) {
+            for c in conds {
+                if let Some(mut inner) = collect_filter_terms(c) {
+                    out.append(&mut inner);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Highlight each term (case-insensitive) in `text` with `<mark>…</mark>`; `Null` when text empty.
+fn highlight(text: &str, terms: &[String]) -> Value {
+    if text.is_empty() {
+        return Value::Null;
+    }
+    let mut result = text.to_string();
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        let lower = result.to_lowercase();
+        let needle = term.to_lowercase();
+        if let Some(pos) = lower.find(&needle) {
+            let end = pos + needle.len();
+            result = format!("{}<mark>{}</mark>{}", &result[..pos], &result[pos..end], &result[end..]);
+        }
+    }
+    Value::String(result)
+}
+
+// --- Identity/* (RFC 8621 §6) --------------------------------------------------------------
+
+/// The default sending identity for an account — the address the node presents (spec §8.2). A real
+/// node lists every app-address/alias; the reference exposes one derived from the account id.
+fn default_identity(account: &str) -> Value {
+    json!({
+        "id": "I0",
+        "name": account,
+        "email": account,
+        "replyTo": Value::Null,
+        "bcc": Value::Null,
+        "textSignature": "",
+        "htmlSignature": "",
+        "mayDelete": false
+    })
+}
+
+fn identity_get(account: &str, args: &Value) -> Value {
+    let want = args.get("ids").and_then(|v| v.as_array());
+    let id = default_identity(account);
+    let list = match want {
+        Some(arr) if !arr.iter().any(|v| v.as_str() == Some("I0")) => vec![],
+        _ => vec![id],
+    };
+    json!({ "accountId": account, "state": "0", "list": list, "notFound": [] })
+}
+
+fn identity_changes(account: &str, args: &Value) -> Value {
+    let since = args.get("sinceState").and_then(Value::as_str).unwrap_or("0");
+    json!({
+        "accountId": account,
+        "oldState": since,
+        "newState": "0",
+        "hasMoreChanges": false,
+        "created": [],
+        "updated": [],
+        "destroyed": []
+    })
+}
+
+/// `Identity/set`: accept created identities (echoing a server-assigned id) and reject destroying
+/// the built-in default. Full persistence lives in the node's identity store (spec §8.2); this is
+/// the wire-correct reference projection.
+fn identity_set(account: &str, args: &Value) -> Value {
+    let mut created = serde_json::Map::new();
+    let mut not_destroyed = serde_json::Map::new();
+    if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
+        for (cid, obj) in create {
+            let email = obj.get("email").and_then(Value::as_str).unwrap_or(account);
+            created.insert(cid.clone(), json!({ "id": format!("I-{cid}"), "email": email, "mayDelete": true }));
+        }
+    }
+    if let Some(list) = args.get("destroy").and_then(|v| v.as_array()) {
+        for id in list.iter().filter_map(Value::as_str) {
+            if id == "I0" {
+                not_destroyed.insert(id.to_string(), json!({ "type": "forbidden", "description": "default identity" }));
+            }
+        }
+    }
+    json!({
+        "accountId": account,
+        "oldState": "0",
+        "newState": "0",
+        "created": Value::Object(created),
+        "updated": {},
+        "destroyed": [],
+        "notCreated": {},
+        "notUpdated": {},
+        "notDestroyed": Value::Object(not_destroyed)
+    })
+}
+
+// --- PushSubscription/* (RFC 8620 §7.2) ----------------------------------------------------
+
+/// `PushSubscription/get`: subscriptions are per-connection device state, not account data, so a
+/// fresh session lists none (RFC 8620 §7.2 — `accountId` is explicitly absent from the response).
+fn push_subscription_get(args: &Value) -> Value {
+    let _ = args;
+    json!({ "state": "0", "list": [], "notFound": [] })
+}
+
+/// `PushSubscription/set`: accept a created subscription, echoing a server id + a `verificationCode`
+/// the server would confirm out-of-band before delivering (RFC 8620 §7.2.2).
+fn push_subscription_set(args: &Value) -> Value {
+    let mut created = serde_json::Map::new();
+    if let Some(create) = args.get("create").and_then(|v| v.as_object()) {
+        for (cid, obj) in create {
+            let url = obj.get("url").and_then(Value::as_str).unwrap_or("");
+            let code = crate::util::hex(dmtap_core::ContentId::of(url.as_bytes()).digest());
+            created.insert(cid.clone(), json!({ "id": format!("P-{cid}"), "keys": Value::Null, "verificationCode": &code[..16] }));
+        }
+    }
+    json!({
+        "oldState": "0",
+        "newState": "0",
+        "created": Value::Object(created),
+        "updated": {},
+        "destroyed": [],
+        "notCreated": {},
+        "notUpdated": {},
+        "notDestroyed": {}
+    })
 }
 
 // --- Blob up/download ----------------------------------------------------------------------
@@ -897,6 +1205,81 @@ mod tests {
         let raw = String::from_utf8_lossy(&s.mailbox(&mb).unwrap().by_uid(uid).unwrap().raw).to_string();
         // The CRLF-injected "Bcc" must be flattened into the Subject, not a real header line.
         assert!(!raw.contains("\r\nBcc:"), "header injection leaked: {raw}");
+    }
+
+    #[test]
+    fn core_echo_returns_args_verbatim() {
+        let mut s = store_with_mail();
+        let r = call(&mut s, "Core/echo", json!({ "hello": [1, 2, 3], "x": "y" }));
+        assert_eq!(r, json!({ "hello": [1, 2, 3], "x": "y" }));
+    }
+
+    #[test]
+    fn mailbox_set_create_update_destroy() {
+        let mut s = store_with_mail();
+        // create
+        let r = call(&mut s, "Mailbox/set", json!({ "accountId": "acct1", "create": { "c1": { "name": "Work" } } }));
+        assert_eq!(r["created"]["c1"]["id"], json!("Work"));
+        assert!(s.mailbox("Work").is_some());
+        // update (rename)
+        let r = call(&mut s, "Mailbox/set", json!({ "accountId": "acct1", "update": { "Work": { "name": "Projects" } } }));
+        assert!(r["updated"].get("Work").is_some(), "{r}");
+        assert!(s.mailbox("Projects").is_some());
+        // destroy
+        let r = call(&mut s, "Mailbox/set", json!({ "accountId": "acct1", "destroy": ["Projects"] }));
+        assert_eq!(r["destroyed"][0], json!("Projects"));
+        assert!(s.mailbox("Projects").is_none());
+    }
+
+    #[test]
+    fn identity_get_and_set() {
+        let mut s = store_with_mail();
+        let g = call(&mut s, "Identity/get", json!({ "accountId": "acct1", "ids": null }));
+        assert_eq!(g["list"][0]["email"], json!("acct1"));
+        let st = call(&mut s, "Identity/set", json!({ "accountId": "acct1", "create": { "n": { "email": "alias@dmtap.local", "name": "Alias" } } }));
+        assert_eq!(st["created"]["n"]["email"], json!("alias@dmtap.local"));
+        // The default identity cannot be destroyed.
+        let d = call(&mut s, "Identity/set", json!({ "accountId": "acct1", "destroy": ["I0"] }));
+        assert!(d["notDestroyed"].get("I0").is_some(), "{d}");
+    }
+
+    #[test]
+    fn search_snippet_highlights_terms() {
+        let mut s = store_with_mail(); // subject "Hello", body "Hi Bob"
+        let id = email_id("INBOX", 1);
+        let r = call(
+            &mut s,
+            "SearchSnippet/get",
+            json!({ "accountId": "acct1", "filter": { "subject": "hello" }, "emailIds": [id] }),
+        );
+        let snippet = &r["list"][0];
+        assert_eq!(snippet["subject"], json!("<mark>Hello</mark>"), "{r}");
+    }
+
+    #[test]
+    fn push_subscription_set_echoes_verification() {
+        let mut s = store_with_mail();
+        let r = call(&mut s, "PushSubscription/set", json!({ "create": { "p": { "deviceClientId": "d1", "url": "https://push.example/x" } } }));
+        assert!(r["created"]["p"]["verificationCode"].is_string(), "{r}");
+        // get on a fresh session lists none, and omits accountId per RFC 8620.
+        let g = call(&mut s, "PushSubscription/get", json!({}));
+        assert!(g["list"].as_array().unwrap().is_empty());
+        assert!(g.get("accountId").is_none());
+    }
+
+    #[test]
+    fn email_submission_get_reports_not_found() {
+        let mut s = store_with_mail();
+        let r = call(&mut s, "EmailSubmission/get", json!({ "accountId": "acct1", "ids": ["sub-1"] }));
+        assert_eq!(r["notFound"][0], json!("sub-1"), "{r}");
+        assert!(r["list"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_method_errors() {
+        let mut s = store_with_mail();
+        let r = call(&mut s, "Bogus/frobnicate", json!({}));
+        assert_eq!(r["type"], json!("unknownMethod"));
     }
 
     #[test]
