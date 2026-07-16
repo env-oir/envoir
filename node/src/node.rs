@@ -42,24 +42,30 @@ use std::collections::{HashMap, HashSet};
 
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::{
-    build_mote, validate, Envelope, Headers, Hpke, Kind, MoteDraft, MoteError, Outcome, Payload,
-    RecipientCtx, SealKeypair,
+    build_mote, validate_pinned, Envelope, Headers, Hpke, Kind, MoteDraft, MoteError, Outcome,
+    Payload, RecipientCtx, SealKeypair, ValidateError,
 };
-use dmtap_core::{ContentId, TimestampMs};
+use dmtap_core::suite::SuiteRatchet;
+use dmtap_core::{ContentId, Suite, TimestampMs};
 use dmtap_mail::store::{MailStore, Mailbox, MemoryStore};
 use dmtap_mls::{Committer, Member, Session};
 
 use dmtap_core::deniable::{DeniableMessage, DeniablePayload};
 
 use crate::auth::{Challenge, Login, TrustedClient};
-use crate::deniable::{self, CertifiedBundle, CertifiedInit, DeniableRouteError, DeniableState, DEFAULT_OPKS};
+use crate::deniable::{
+    self, CertifiedBundle, CertifiedInit, DeniableAcceptLimits, DeniableAdmission,
+    DeniableRouteError, DeniableState, DEFAULT_OPKS,
+};
 use crate::group::{GroupAdd, GroupError, GroupMote};
 use crate::inbound::{DropReason, InboundOutcome};
 use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
+use crate::mixdir::{MixDirError, MixDirectoryTracker};
 use crate::naming::{self, AddressError, KeyPackageSource, Resolver};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
 use dmtap_auth::AuthError;
+use dmtap_core::mixnet::MixDirectory;
 
 /// The requests-area mailbox for deferred cold-sender MOTEs (§2.7a: never the inbox). Mapped onto
 /// the Junk SPECIAL-USE folder so existing IMAP/JMAP clients surface it distinctly from the inbox.
@@ -123,6 +129,17 @@ pub struct Node<T: Transport> {
     /// The deniable 1:1 subsystem (spec §5.2.1): a dedicated deniable identity, an optional
     /// responder half, and live pairwise ratchet sessions — distinct from the MLS group path.
     deniable: DeniableState,
+    /// The inbound deniable-init admission gate (audit #4): a per-source + global token bucket that
+    /// throttles unsolicited [`CertifiedInit`]s **before** an X3DH one-time prekey is consumed, so an
+    /// attacker cannot cheaply deplete the OPK pool and force the weak last-resort prekey (§5.2.1).
+    deniable_admission: DeniableAdmission,
+    /// Per-contact suite **high-water-mark ratchet** (§1.3, §2.7 step 8, §10.7.1): the highest
+    /// `Envelope.suite` accepted from each authenticated sender. [`receive_mote`](Node::receive_mote)
+    /// feeds it via [`validate_pinned`], so an on-the-wire suite downgrade is rejected *at the node*.
+    suite_ratchet: SuiteRatchet,
+    /// Per-authority mix-directory anti-rollback tracker (§4.4.2, §18.5.3): the monotonic
+    /// `(epoch, version)` high-water-mark that rejects a replayed/stale mix-fleet snapshot at the node.
+    mix_directory: MixDirectoryTracker,
     /// Inbound group **application** MOTEs pulled off the transport by [`Node::poll`], buffered for
     /// [`Node::poll_group_messages`] to decrypt — kept off the 1:1 outcome path so the 1:1
     /// pipeline is untouched. Each entry is the `(group_id, encoded GroupMote)` from a
@@ -158,6 +175,12 @@ impl<T: Transport> Node<T> {
             groups: HashMap::new(),
             pending_leaf: None,
             deniable: DeniableState::default(),
+            deniable_admission: DeniableAdmission::new(
+                DeniableAcceptLimits::default(),
+                1_700_000_000_000,
+            ),
+            suite_ratchet: SuiteRatchet::new(),
+            mix_directory: MixDirectoryTracker::new(),
             group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
@@ -191,6 +214,12 @@ impl<T: Transport> Node<T> {
             groups: HashMap::new(),
             pending_leaf: None,
             deniable: DeniableState::default(),
+            deniable_admission: DeniableAdmission::new(
+                DeniableAcceptLimits::default(),
+                1_700_000_000_000,
+            ),
+            suite_ratchet: SuiteRatchet::new(),
+            mix_directory: MixDirectoryTracker::new(),
             group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
@@ -504,8 +533,12 @@ impl<T: Transport> Node<T> {
         let sender_is_known = self.contacts.contains(from);
         let ctx = RecipientCtx { our_ik: &our_ik, seal_secret: &seal_secret, sender_is_known };
         // `ctx` borrows only these locals (not `self`), so the accept path below is free to take
-        // `&mut self`; NLL ends the borrow at this call.
-        let outcome = validate(&Hpke, &env, &ctx);
+        // `&mut self`; NLL ends the borrow at this call. The per-contact `suite_ratchet` enforces the
+        // §2.7 step 8 / §10.7.1 suite high-water-mark: an authenticated sender's `Envelope.suite` may
+        // never drop below the highest we have accepted from them (a downgrade), and each accept
+        // ratchets that mark up. The mutable ratchet borrow also ends at this call (the returned
+        // outcome holds no reference to it), so the `&mut self` accept path below is unaffected.
+        let outcome = validate_pinned(&Hpke, &env, &ctx, Some(&mut self.suite_ratchet));
 
         match outcome {
             Ok(Outcome::Accepted(payload)) => self.accept(from, &env.id, *payload),
@@ -518,7 +551,16 @@ impl<T: Transport> Node<T> {
                 self.store.deliver_mote(&placeholder_payload(from), REQUESTS_MAILBOX, env.ts);
                 InboundOutcome::Deferred { id: env.id.clone() }
             }
-            Err(e) => InboundOutcome::Dropped(drop_reason(e)),
+            Err(ValidateError::Suite(_)) => {
+                // §2.7 step 8 / §10.7.1 / §21.3 (0x020F): the object authenticated but asserts a suite
+                // *below* this contact's established high-water-mark — a downgrade. Disposition is
+                // DEFER_REQUESTS (§21.3): hold in the requests area, never the inbox, and do NOT ack
+                // (acking would signal *delivered*). `validate_pinned` guarantees the mark is NOT
+                // ratcheted down. Not added to `seen`, so a redelivery re-defers rather than fast-ack.
+                self.store.deliver_mote(&placeholder_payload(from), REQUESTS_MAILBOX, env.ts);
+                InboundOutcome::Deferred { id: env.id.clone() }
+            }
+            Err(ValidateError::Mote(e)) => InboundOutcome::Dropped(drop_reason(e)),
         }
     }
 
@@ -828,7 +870,33 @@ impl<T: Transport> Node<T> {
         certified: &CertifiedInit,
     ) -> Result<DeniablePayload, DeniableRouteError> {
         deniable::verify_deniable_binding(peer_root_ik, &certified.init.ik_a, &certified.cert)?;
+        // Audit #4 — OPK-depletion gate. The `idk_a_cert` chain verified above is *self-signable*
+        // (an attacker mints their own root IK + deniable IK), so cert-verification alone does not
+        // make an init trustworthy — it only proves who the deniable key claims to be. X3DH `accept`
+        // then consumes a one-time prekey *before* the ratchet MAC can authenticate the init, so an
+        // unsolicited flood would burn the OPK pool and force the weak last-resort prekey. Throttle
+        // (per-source + global token bucket) BEFORE touching a prekey; a genuine init retried after
+        // the bucket refills still succeeds. Keyed on the claimed root IK; the global bucket is what
+        // bounds a Sybil flood of throwaway identities.
+        if !self.deniable_admission.admit(peer_root_ik, self.now) {
+            return Err(DeniableRouteError::RateLimited);
+        }
         self.deniable.accept(&certified.init)
+    }
+
+    /// Reconfigure the inbound deniable-init admission gate (audit #4 OPK-depletion defense),
+    /// reseeding its token buckets full at the node's current clock. The defaults
+    /// ([`DeniableAcceptLimits::default`]) already keep an unsolicited burst below the published OPK
+    /// count; this is for callers/tests that want an explicit policy.
+    pub fn configure_deniable_accept_gate(&mut self, limits: DeniableAcceptLimits) {
+        self.deniable_admission.configure(limits, self.now);
+    }
+
+    /// The number of unspent one-time prekeys remaining in this node's published deniable bundle, or
+    /// `None` if none has been published. The admission gate exists to keep this above zero under an
+    /// unsolicited-init flood (so the weak last-resort prekey is never forced, §5.2.1).
+    pub fn deniable_opks_remaining(&self) -> Option<usize> {
+        self.deniable.opks_remaining()
     }
 
     /// Seal `payload` into a [`DeniableMessage`] on the live deniable session with `peer_ik`
@@ -868,6 +936,46 @@ impl<T: Transport> Node<T> {
         peer_ik: &[u8],
     ) -> Option<dmtap_deniable::DeniableSession> {
         self.deniable.session_snapshot(peer_ik)
+    }
+
+    // --- suite high-water-mark (spec §1.3, §2.7 step 8, §10.7.1) ----------------------------
+
+    /// This node's pinned suite **high-water-mark** for an authenticated contact (keyed by their
+    /// `Payload.from` identity key), or `None` if none has been accepted from them yet.
+    /// [`receive_mote`](Self::receive_mote) ratchets this up on every accepted MOTE and rejects any
+    /// later object below it as a downgrade (§2.7 step 8).
+    pub fn suite_high_water_mark(&self, contact: &[u8]) -> Option<Suite> {
+        self.suite_ratchet.high_water_mark(contact)
+    }
+
+    /// Pin (ratchet **up**) `contact`'s suite high-water-mark to `suite` from out-of-band knowledge —
+    /// e.g. a contact known to have migrated to a stronger suite, so a *first* on-the-wire MOTE that
+    /// silently offers a weaker one is already rejected as a downgrade. Never lowers an existing mark
+    /// ([`SuiteRatchet::observe`] semantics).
+    pub fn pin_suite_floor(&mut self, contact: &[u8], suite: Suite) {
+        self.suite_ratchet.observe(contact, suite);
+    }
+
+    // --- mix-directory anti-rollback (spec §4.4.2, §18.5.3) ---------------------------------
+
+    /// Ingest an inbound, wire-encoded [`MixDirectory`] (§18.5.3), **fail-closed**: verify the
+    /// authority signature and enforce the per-authority monotonic `(epoch, version)` high-water-mark,
+    /// rejecting a replayed/stale snapshot as a rollback ([`MixDirError`]). On success the mark
+    /// ratchets up and the fleet is retained (see [`mix_directory`](Self::mix_directory)). This is the
+    /// node-layer half of the crate's monotonic-`version` contract (§4.4.2): the rollback is rejected
+    /// *here*, using state held in the node, not merely rejectable in `dmtap_core`.
+    pub fn ingest_mix_directory(&mut self, bytes: &[u8]) -> Result<(), MixDirError> {
+        self.mix_directory.ingest(bytes)
+    }
+
+    /// The latest mix-directory this node has accepted from `authority`, if any (§4.4.2).
+    pub fn mix_directory(&self, authority: &[u8]) -> Option<&MixDirectory> {
+        self.mix_directory.latest(authority)
+    }
+
+    /// The pinned mix-directory high-water-mark `(epoch, version)` for `authority`, or `None`.
+    pub fn mix_directory_high_water_mark(&self, authority: &[u8]) -> Option<(u64, u64)> {
+        self.mix_directory.high_water_mark(authority)
     }
 }
 

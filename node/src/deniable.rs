@@ -42,6 +42,8 @@ use dmtap_core::deniable::{DeniableInit, DeniableMessage, DeniablePayload, Denia
 use dmtap_core::identity::{Cap, DeviceCert, IdentityKey};
 use dmtap_core::TimestampMs;
 
+pub use self::admission::{DeniableAdmission, DeniableAcceptLimits};
+
 pub use dmtap_deniable::{DeniableError, DeniableIdentity, DeniableResponder, DeniableSession};
 
 /// The `DeviceCert` label for the root-IK certification of a deniable identity key (§5.2.1, §1.2).
@@ -139,6 +141,13 @@ pub enum DeniableRouteError {
     /// certified a different deniable key than the one presented. Fail-closed (§5.2.1(a), §1.2): a
     /// deniable session is never established with an identity the peer cannot vouch for.
     UncertifiedIdentity,
+    /// The inbound deniable-init admission gate ([`DeniableAdmission`]) throttled this init before
+    /// any one-time prekey was consumed (audit #4 — OPK-depletion defense). A `DeniableInit`
+    /// authenticates only *after* X3DH consumes a prekey, so an unsolicited flood of self-signed
+    /// inits could otherwise burn the responder's OPK pool and force the weak last-resort path. The
+    /// node throttles accepts (per-source + global token buckets) *before* touching a prekey, so the
+    /// pool is preserved; the initiator's own retry re-offers once the bucket refills.
+    RateLimited,
 }
 
 impl From<DeniableError> for DeniableRouteError {
@@ -157,6 +166,10 @@ impl std::fmt::Display for DeniableRouteError {
             }
             DeniableRouteError::UncertifiedIdentity => f.write_str(
                 "peer's deniable identity key is not certified by its KT-resolved root identity",
+            ),
+            DeniableRouteError::RateLimited => f.write_str(
+                "inbound deniable init throttled by the accept admission gate (OPK-depletion \
+                 defense) — no one-time prekey was consumed",
             ),
         }
     }
@@ -262,6 +275,13 @@ impl DeniableState {
         self.identity.as_ref().map(|i| i.ik_public())
     }
 
+    /// The number of unspent one-time prekeys remaining in the published responder bundle, or `None`
+    /// if this node has not published one. The OPK-depletion defense ([`DeniableAdmission`]) exists
+    /// to keep this from being cheaply driven to zero (which forces the weak last-resort prekey).
+    pub fn opks_remaining(&self) -> Option<usize> {
+        self.responder.as_ref().map(|r| r.opks_remaining())
+    }
+
     /// Whether a live session exists for `peer_ik`.
     pub fn has_session(&self, peer_ik: &[u8]) -> bool {
         self.sessions.contains_key(peer_ik)
@@ -274,6 +294,247 @@ impl DeniableState {
     /// Returns `None` if no session exists for `peer_ik`.
     pub fn session_snapshot(&self, peer_ik: &[u8]) -> Option<DeniableSession> {
         self.sessions.get(peer_ik).map(|s| s.snapshot())
+    }
+}
+
+/// The inbound deniable-init **admission gate** (audit #4 — one-time-prekey depletion defense).
+///
+/// ## The attack
+/// X3DH `accept` consumes a one-time prekey (OPK) from the responder's published bundle *before* the
+/// first message can be authenticated — a `DeniableInit` is only authenticated by the ratchet MAC it
+/// establishes, and its `idk_a_cert` chain is **self-signable** (an attacker mints their own root IK
+/// + deniable IK and self-certifies a valid [`CertifiedInit`]). So a burst of unsolicited inits from
+/// throwaway identities can burn every OPK, forcing legitimate initiators onto the reused
+/// **last-resort** prekey (weaker replay properties, §5.2.1).
+///
+/// ## The gate
+/// A node-layer, wall-clock-free (driven by the node's injected clock) **token-bucket** rate limit
+/// applied *before* an OPK is consumed:
+/// - a **global** bucket bounds the total accept rate — this is the bucket that actually protects the
+///   shared OPK pool, because a Sybil attacker mints a fresh identity per init and so is invisible to
+///   any per-source accounting;
+/// - a **per-source** bucket (keyed on the claimed initiator root IK) stops a *single* identity from
+///   dominating the global budget, so an honest peer's legitimate retry is not starved by one noisy
+///   source.
+///
+/// Both buckets refill deterministically from the node clock; an init is admitted only when **both**
+/// have a token (consumed atomically). A throttled init returns
+/// [`DeniableRouteError::RateLimited`](super::DeniableRouteError::RateLimited) having consumed no
+/// prekey; the initiator's normal retry succeeds once the bucket refills. Legitimate low-rate flows
+/// (well under the burst capacity) are never affected.
+mod admission {
+    use super::TimestampMs;
+    use std::collections::HashMap;
+
+    /// A deterministic token bucket: `capacity` tokens, one refilled per `refill_ms`, clocked off an
+    /// externally supplied timestamp (no wall clock, §16.1) so behavior is reproducible in tests.
+    #[derive(Debug, Clone)]
+    struct TokenBucket {
+        capacity: u32,
+        refill_ms: u64,
+        tokens: u32,
+        /// The timestamp at which `tokens` was last accurate; advanced by whole refill intervals only
+        /// (the sub-interval remainder is preserved so tokens accrue smoothly).
+        last_ms: TimestampMs,
+    }
+
+    impl TokenBucket {
+        fn new(capacity: u32, refill_ms: u64, now: TimestampMs) -> Self {
+            TokenBucket { capacity, refill_ms, tokens: capacity, last_ms: now }
+        }
+
+        /// Credit whole refill-intervals elapsed since `last_ms` (saturating at `capacity`).
+        fn refill(&mut self, now: TimestampMs) {
+            if self.refill_ms == 0 || now <= self.last_ms {
+                return; // a zero interval = no refill; a non-advancing/backwards clock adds nothing.
+            }
+            let elapsed = now - self.last_ms;
+            let earned = elapsed / self.refill_ms;
+            if earned == 0 {
+                return;
+            }
+            let earned_u32 = u32::try_from(earned).unwrap_or(u32::MAX);
+            self.tokens = self.capacity.min(self.tokens.saturating_add(earned_u32));
+            // Advance only by the consumed whole intervals, keeping the sub-interval remainder.
+            self.last_ms += earned.saturating_mul(self.refill_ms);
+        }
+
+        /// Whether a token is available *after* refilling to `now` (no consumption).
+        fn available(&mut self, now: TimestampMs) -> bool {
+            self.refill(now);
+            self.tokens > 0
+        }
+    }
+
+    /// Tunable capacities for [`DeniableAdmission`]. Defaults keep an unsolicited burst well under the
+    /// default OPK pool while never throttling a legitimate low-rate initiator.
+    #[derive(Debug, Clone, Copy)]
+    pub struct DeniableAcceptLimits {
+        /// Global burst capacity — the max accepts admitted before any refill. Kept *below* the
+        /// published OPK count so no single burst can drain the pool to the last-resort prekey.
+        pub global_burst: u32,
+        /// Milliseconds to refill one global token.
+        pub global_refill_ms: u64,
+        /// Per-source (per claimed root IK) burst capacity.
+        pub source_burst: u32,
+        /// Milliseconds to refill one per-source token.
+        pub source_refill_ms: u64,
+    }
+
+    impl Default for DeniableAcceptLimits {
+        fn default() -> Self {
+            // global_burst (4) < DEFAULT_OPKS (8): a full unsolicited burst leaves OPKs to spare, so
+            // the last-resort prekey is never forced. One global token per 30 s ⇒ ~2 accepts/min
+            // sustained; a legitimate peer opens a session far under this.
+            DeniableAcceptLimits {
+                global_burst: 4,
+                global_refill_ms: 30_000,
+                source_burst: 2,
+                source_refill_ms: 60_000,
+            }
+        }
+    }
+
+    /// The node-held inbound-init admission gate. See the [module docs](self).
+    #[derive(Debug, Clone)]
+    pub struct DeniableAdmission {
+        limits: DeniableAcceptLimits,
+        global: TokenBucket,
+        /// Per claimed-root-IK buckets, created lazily. Pruned of fully-refilled (idle) entries once
+        /// the map grows past [`Self::PRUNE_AT`], so a Sybil flood cannot grow it without bound.
+        per_source: HashMap<Vec<u8>, TokenBucket>,
+    }
+
+    impl DeniableAdmission {
+        /// Prune idle (full-capacity) per-source buckets once the map exceeds this many entries.
+        const PRUNE_AT: usize = 1024;
+
+        /// A gate with the given limits, its buckets seeded full at `now`.
+        pub fn new(limits: DeniableAcceptLimits, now: TimestampMs) -> Self {
+            DeniableAdmission {
+                global: TokenBucket::new(limits.global_burst, limits.global_refill_ms, now),
+                per_source: HashMap::new(),
+                limits,
+            }
+        }
+
+        /// Reconfigure the limits, resetting the buckets full at `now` (the previous accounting is
+        /// discarded — intended for setup/tests, not per-init tuning).
+        pub fn configure(&mut self, limits: DeniableAcceptLimits, now: TimestampMs) {
+            *self = DeniableAdmission::new(limits, now);
+        }
+
+        /// Try to admit one inbound init from `source` (the claimed initiator root IK) at `now`.
+        /// Returns `true` (a global **and** a per-source token were consumed) iff the init may proceed
+        /// to consume an OPK; `false` throttles it with **no** token consumed on either bucket.
+        pub fn admit(&mut self, source: &[u8], now: TimestampMs) -> bool {
+            let source_burst = self.limits.source_burst;
+            let source_refill_ms = self.limits.source_refill_ms;
+            let global_ok = self.global.available(now);
+            let src = self
+                .per_source
+                .entry(source.to_vec())
+                .or_insert_with(|| TokenBucket::new(source_burst, source_refill_ms, now));
+            let source_ok = src.available(now);
+            let admitted = global_ok && source_ok;
+            if admitted {
+                // Consume atomically only when both were available (never strand one bucket's token).
+                self.global.tokens -= 1;
+                src.tokens -= 1;
+            }
+            if self.per_source.len() > Self::PRUNE_AT {
+                self.prune(now);
+            }
+            admitted
+        }
+
+        /// Drop per-source buckets that have refilled back to full — they carry no state a fresh
+        /// bucket would not reproduce, so this bounds memory under a distinct-source flood.
+        fn prune(&mut self, now: TimestampMs) {
+            let cap = self.limits.source_burst;
+            self.per_source.retain(|_, b| {
+                b.refill(now);
+                b.tokens < cap
+            });
+        }
+    }
+
+    impl Default for DeniableAdmission {
+        fn default() -> Self {
+            // Seeded at the node's default epoch clock; the node reseeds on construction anyway.
+            DeniableAdmission::new(DeniableAcceptLimits::default(), 1_700_000_000_000)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn global_bucket_throttles_a_burst_then_refills() {
+            let now = 1_000_000;
+            let mut gate = DeniableAdmission::new(
+                DeniableAcceptLimits {
+                    global_burst: 3,
+                    global_refill_ms: 10_000,
+                    source_burst: 100,
+                    source_refill_ms: 10_000,
+                },
+                now,
+            );
+            // Each init from a DISTINCT source (Sybil) — per-source never binds; global caps at 3.
+            let mut admitted = 0;
+            for i in 0..10u8 {
+                if gate.admit(&[i], now) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(admitted, 3, "global burst capacity bounds a distinct-source flood");
+            // No refill yet ⇒ still throttled.
+            assert!(!gate.admit(&[200], now));
+            // After one refill interval, exactly one more is admitted.
+            assert!(gate.admit(&[201], now + 10_000));
+            assert!(!gate.admit(&[202], now + 10_000));
+        }
+
+        #[test]
+        fn per_source_bucket_stops_one_identity_hogging() {
+            let now = 5;
+            let mut gate = DeniableAdmission::new(
+                DeniableAcceptLimits {
+                    global_burst: 100,
+                    global_refill_ms: 1,
+                    source_burst: 2,
+                    source_refill_ms: 1_000,
+                },
+                now,
+            );
+            let noisy = b"one-loud-identity".to_vec();
+            assert!(gate.admit(&noisy, now));
+            assert!(gate.admit(&noisy, now));
+            assert!(!gate.admit(&noisy, now), "a single source is capped by its per-source bucket");
+            // A different source is unaffected (global still has budget).
+            assert!(gate.admit(b"someone-else", now));
+        }
+
+        #[test]
+        fn a_rejected_init_consumes_no_token_on_either_bucket() {
+            let now = 0;
+            let mut gate = DeniableAdmission::new(
+                DeniableAcceptLimits {
+                    global_burst: 1,
+                    global_refill_ms: 1_000,
+                    source_burst: 5,
+                    source_refill_ms: 1_000,
+                },
+                now,
+            );
+            assert!(gate.admit(b"a", now)); // drains the only global token
+            assert!(!gate.admit(b"b", now)); // global empty ⇒ throttled
+                                             // `b`'s per-source token must NOT have been spent: once
+                                             // global refills, `b` still has its full per-source burst.
+            assert!(gate.admit(b"b", now + 1_000));
+        }
     }
 }
 

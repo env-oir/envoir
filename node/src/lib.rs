@@ -31,6 +31,7 @@ pub mod deniable;
 pub mod group;
 pub mod inbound;
 pub mod journal;
+pub mod mixdir;
 pub mod naming;
 pub mod node;
 pub mod outbound;
@@ -57,8 +58,15 @@ pub use dmtap_auth;
 
 // Real deniable 1:1 messaging (spec §5.2.1): X3DH + Double Ratchet, distinct from the MLS group
 // path, re-exported here as `dmtap::dmtap_deniable`.
-pub use deniable::{CertifiedBundle, CertifiedInit, DeniableRouteError, DeniableState};
+pub use deniable::{
+    CertifiedBundle, CertifiedInit, DeniableAcceptLimits, DeniableAdmission, DeniableRouteError,
+    DeniableState,
+};
 pub use dmtap_deniable;
+
+// Node-layer mix-directory anti-rollback (spec §4.4.2, §18.5.3): the per-authority monotonic
+// high-water-mark that rejects a replayed/stale mix-fleet snapshot at the node.
+pub use mixdir::{MixDirError, MixDirectoryTracker};
 
 // Node-only planned modules (see README): the rest of the client side that *is* the mesh.
 // pub mod privacy;     // §6 — sealed sender, cover traffic, padding, tiers
