@@ -1,0 +1,111 @@
+# Envoir self-host stack: the gateway (real, long-running SMTP bridge daemon) + the node
+# (reference client — identity/mesh/mail-projection scaffold; NOT yet a production mail server).
+# Read deploy/README.md before deploying this anywhere but a trusted LAN/loopback: several pieces
+# below are honestly-labelled demo/seam behavior, not hardened self-host infrastructure.
+#
+# Build context is `..` (the repo root) because both binaries live in one Cargo workspace and
+# their Dockerfiles need the sibling workspace members — see deploy/Dockerfile.node/.gateway.
+#
+# Usage:
+#   cp deploy/.env.example deploy/.env   # then edit
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up --build -d
+# or just run deploy/selfhost.sh from the repo root.
+
+services:
+  # -----------------------------------------------------------------------------------------
+  # gateway — the ONLY component here that is a genuine long-running network daemon today.
+  # `envoir-gateway run` binds a real inbound MX (SMTP) listener and serves forever
+  # (gateway/src/main.rs, gateway/src/inbound_tcp.rs::serve_forever). It is stateless by design
+  # (spec §7.4): no volume is needed for gateway state, only for an optional TLS cert/key pair.
+  #
+  # HONEST SEAMS (gateway/src/main.rs): the recipient directory and the mesh-delivery adapter
+  # are unconfigured operator seams in this reference build — every inbound RCPT is refused
+  # (SMTP 550) and nothing is ever durably ack'd (451), because `EmptyDirectory`/`UnreachableMesh`
+  # are wired in place of a real directory/mesh. That means this gateway, run as-is, does not yet
+  # actually deliver mail into a node — it proves the real inbound MX + outbound MX/MTA-STS/DKIM
+  # legs (spec §7.2/§7.3) end-to-end, wired and ready for those two seams to be plugged in.
+  # -----------------------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.gateway
+    image: envoir-gateway:local
+    environment:
+      # The domain this gateway is MX for (must match your public MX/DNS setup — operator-owned).
+      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN:-localhost}
+      # IMPORTANT: the binary's own default is 127.0.0.1:2525 (loopback-only). We override it to
+      # 0.0.0.0 here so the `ports:` mapping below actually reaches the process — verified: with
+      # GATEWAY_LISTEN=127.0.0.1:2525 the published port accepts the TCP connection but the
+      # gateway never sees it (same class of issue as the node's serve-mail, see below); with
+      # 0.0.0.0:2525 a real "220 envoir-gateway DMTAP MX ready" banner comes back through the
+      # published port.
+      - GATEWAY_LISTEN=0.0.0.0:2525
+      - GATEWAY_GW_SELECTOR=${GATEWAY_GW_SELECTOR:-gw1}
+      # DNS server used for outbound MX/TXT/MTA-STS lookups (a raw hand-rolled UDP client, not the
+      # system resolver — gateway/src/dns.rs). Point this at a resolver you trust.
+      - GATEWAY_DNS_SERVER=${GATEWAY_DNS_SERVER:-1.1.1.1:53}
+      # Unset (default) = no STARTTLS offered (dev-mode plaintext listener, gateway/src/main.rs).
+      # Set both in deploy/.env to enable STARTTLS with your own cert/key (mounted below).
+      #
+      # NOTE: these use the bare-name pass-through form, not `KEY: ${VAR:-}`, on purpose — the
+      # gateway checks `std::env::var(..).is_ok()`, so a variable that is *set but empty* (which
+      # `${VAR:-}` produces even when VAR is undefined) still counts as "configured" and the
+      # gateway then fails trying to open a PEM file at path "" (verified: `docker compose up`
+      # crash-loops with "No such file or directory" if you use the `${VAR:-}` form here). The
+      # bare form below only sets the variable in the container when it is actually set in
+      # deploy/.env or your shell.
+      - GATEWAY_TLS_CERT
+      - GATEWAY_TLS_KEY
+    ports:
+      - "${GATEWAY_PORT:-2525}:2525"
+    volumes:
+      # Operator-provided PEM cert chain + private key for STARTTLS (read-only). Leave the
+      # directory empty (and GATEWAY_TLS_CERT/KEY unset) to run a plaintext dev listener.
+      - ./certs:/certs:ro
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------------------------
+  # node — the reference DMTAP client (node/src/main.rs). Its default command, `serve-mail`, is
+  # an explicitly-labelled DEMO: an in-memory MOTE-store projection (wiped on every restart) with
+  # ONE fixed hardcoded credential (owner@dmtap.local / app-password), serving IMAP/POP3/SMTP-
+  # submission on localhost. It is useful to poke at the §8 client protocols; it is NOT a
+  # persistent, multi-user, or production mailbox.
+  #
+  # PORT-PUBLISHING CAVEAT (verified empirically with `docker build`/`docker run` against these
+  # exact images): `serve-mail` hard-codes its listeners to 127.0.0.1 *inside the process* — this
+  # is not configurable via flag or env var today (node/src/main.rs has no bind-address knob at
+  # all). A container's `ports:` mapping is implemented by (in this environment) NAT'ing to the
+  # loopback interface *inside the container's own network namespace*, which some Docker network
+  # backends honor and some don't — we observed the published port accept the TCP handshake but
+  # the app never receiving the bytes (immediate EOF, no IMAP greeting), i.e. it did NOT work
+  # here. Do not assume `ports:` below makes this reachable on your host; verify it yourself
+  # (see deploy/README.md "Testing the node demo servers"), and prefer one of:
+  #   - `docker compose exec node <tool>` / another container run with
+  #     `--network container:<the node container>` (always works — same netns),
+  #   - the commented `network_mode: "host"` block below (Linux hosts only).
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    image: envoir-node:local
+    ports:
+      - "1143:1143" # IMAP            — see the port-publishing caveat above
+      - "1110:1110" # POP3            — see the port-publishing caveat above
+      - "1587:1587" # SMTP submission — see the port-publishing caveat above
+    # Linux-only alternative to `ports:` above — shares the host's network namespace, so the
+    # process's 127.0.0.1:114x/1587 bindings become the HOST's own loopback (reachable at
+    # localhost on the Docker host itself, not from other machines). Comment out `ports:` above
+    # if you enable this (Compose rejects both on the same service). Not reliable on Docker
+    # Desktop for Mac/Windows depending on version — test before relying on it.
+    # network_mode: "host"
+    volumes:
+      # NOT wired to any CLI flag today (see deploy/README.md "Keys, journal, and what's actually
+      # persisted"): `envoir-node init` prints identity key material to stdout only, and the
+      # library-level durable journal (node/src/journal.rs::FileJournal) isn't yet exposed by any
+      # subcommand. This volume is reserved so you have somewhere durable to redirect/copy
+      # whatever you choose to persist by hand until that lands.
+      - node-data:/data
+    restart: unless-stopped
+
+volumes:
+  node-data:

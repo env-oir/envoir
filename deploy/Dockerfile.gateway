@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+#
+# Envoir gateway — the optional, stateless DMTAP <-> legacy SMTP bridge (spec §7).
+# This is the one component that is a genuine long-running network daemon today
+# (`envoir-gateway run` binds a real inbound MX listener and blocks serving forever) — see
+# deploy/README.md for what is and is not wired up (recipient directory + mesh delivery are
+# unconfigured operator seams; see gateway/src/main.rs).
+#
+# BUILD CONTEXT: the repo root (one level above this `deploy/` directory) — same reasoning as
+# Dockerfile.node (shared Cargo workspace). Build by hand from the repo root with:
+#
+#   docker build -f deploy/Dockerfile.gateway -t envoir-gateway .
+#
+# Verified against the real workspace: `cargo build --release -p envoir-gateway` builds the
+# `envoir-gateway` binary (gateway/src/main.rs) with no invented flags or features.
+#
+# Builder pin: see deploy/Dockerfile.node for why 1.90 (not the crates' declared rust-version
+# 1.75) — with no Cargo.lock committed upstream, cargo resolves a transitive dep
+# (`zeroize_derive`) that needs the edition2024 feature (stable since 1.85); 1.90-slim-bookworm
+# was verified end-to-end with `docker build`.
+
+FROM rust:1.90-slim-bookworm AS builder
+WORKDIR /src
+
+# See Dockerfile.node for why every one of these paths is required even though only the
+# gateway's own dependency subset (dmtap-core, dmtap-mail, plus its TLS/DKIM deps) gets compiled.
+COPY Cargo.toml ./Cargo.toml
+COPY node ./node
+COPY gateway ./gateway
+COPY crates ./crates
+COPY integration ./integration
+
+# No Cargo.lock is committed upstream — see deploy/README.md.
+RUN cargo build --release -p envoir-gateway
+
+# ---------------------------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+# envoir-gateway's real runtime dependencies, verified against gateway/src/*.rs:
+#   - TLS is rustls (ring provider) with the embedded `webpki-roots` trust store for outbound MX
+#     validation (gateway/src/outbound_tcp.rs, gateway/src/mta_sts.rs) — no system CA bundle used.
+#   - DNS (MX/TXT/MTA-STS) is a hand-rolled UDP client to an operator-configured resolver
+#     (gateway/src/dns.rs) — it does not read /etc/resolv.conf.
+# So, like the node image, nothing beyond glibc + libgcc is needed.
+RUN groupadd --system --gid 10001 envoir \
+    && useradd --system --uid 10001 --gid envoir --home-dir /data --shell /usr/sbin/nologin envoir \
+    && mkdir -p /data /certs \
+    && chown -R envoir:envoir /data /certs
+
+COPY --from=builder /src/target/release/envoir-gateway /usr/local/bin/envoir-gateway
+
+USER envoir
+WORKDIR /data
+
+# GATEWAY_LISTEN default is 127.0.0.1:2525 (gateway/src/main.rs) — unlike the node's serve-mail,
+# this IS operator-configurable; docker-compose.yml sets it to 0.0.0.0:2525 so the published port
+# actually works. 2525 (not 25) so no root/cap_net_bind_service is needed for this non-root user.
+EXPOSE 2525
+
+ENTRYPOINT ["/usr/local/bin/envoir-gateway"]
+CMD ["run"]
