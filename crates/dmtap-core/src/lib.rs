@@ -30,6 +30,14 @@
 //!   leaf-hash rule.
 //! - [`capability`] — delegated `CapabilityToken`/`Capability`/`CapabilityRevocation` (§18.7.3,
 //!   a UCAN v1.0 profile), signed per §18.9.14.
+//! - [`profile`] — the signed human display data `Profile` + `Avatar` (§18.4.12), signed per
+//!   §18.9.3 (DS-tag `DMTAP-v0/profile`); avatar content-address tamper-evidence.
+//! - [`push`] — the push wake-signaling objects `PushSubscription` (signed per §18.9.15) and the
+//!   content-free `WakePing` (§18.5.5/.6, §4.9).
+//! - [`policy`] — caller-policy predicates for the §2.6/§2.7 recipient pipeline (dedup, clock-skew,
+//!   expiry, pinned-identity re-pin), each mapped to its §21 code — additive to [`mote::validate`].
+//! - [`attestation`] — the advisory §1.2a device key-attestation evaluator (`0x0116`/`0x0118`),
+//!   never a §1.4 authority override.
 //! - [`sphinx`] — the fixed-length Sphinx byte layouts `SphinxCell`/`RoutingCommand`/`Surb`/
 //!   `SphinxFragmentHeader` (§18.5.4) — the one mixnet wire object that is NOT CBOR.
 //!
@@ -37,6 +45,7 @@
 //! Ed25519 signatures, HPKE `DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305`, BLAKE3-256 hashing.
 //! Suite `0x02` (PQ) is reserved and **fails closed** everywhere it is offered.
 
+pub mod attestation;
 pub mod capability;
 pub mod cbor;
 pub mod deniable;
@@ -47,6 +56,9 @@ pub mod kt;
 pub mod keyname;
 pub mod mixnet;
 pub mod mote;
+pub mod policy;
+pub mod profile;
+pub mod push;
 pub mod safety;
 pub mod sphinx;
 pub mod suite;
