@@ -29,4 +29,17 @@ safe; postage (spec §9) can fund outbound sending.
 
 ## Status
 
-Pre-alpha scaffold.
+Reference bridge implemented as a library (`envoir_gateway`), std-only and synchronous, with all
+network effects behind traits so the full flows run in-process:
+
+- **Inbound** (`inbound`): line-fed MX SMTP session with a pre-`DATA` anti-abuse gate, recipient-key
+  resolution, real MOTE sealing to the recipient (`dmtap-core` HPKE), a domain-anchored gateway
+  **attestation** (`attestation`, §7.2a), and the **ack-before-`250` / `451`-on-no-ack**
+  silent-loss-avoidance rule (§19.7.1).
+- **Outbound** (`outbound`): MOTE → RFC 5322, verifiable **delegated-selector DKIM** (`dkim`,
+  ed25519-sha256 / relaxed-relaxed, RFC 8463 / RFC 6376) with a hard refusal to sign undelegated
+  domains, plus **TLS enforcement** (MTA-STS/DANE policy hook) that refuses cleartext fallback.
+
+Abstract seams (`KeyDirectory`, `MeshDelivery`, `AntiAbuse`, `TlsPolicy`, `OutboundTransport`,
+`GwKeyResolver`) are the only things a production deployment fills in with real sockets/DNS. The
+`run` CLI subcommand is still a stub. Covered by `cargo test -p envoir-gateway`.

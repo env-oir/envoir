@@ -11,23 +11,26 @@ repository = "https://example.invalid/envoir"
 # (the legacy leg is unavoidably plaintext). It is OPTIONAL and fades as adoption grows.
 # See the DMTAP spec repo (../dmtap/07-gateway.md). Stateless: durability is punted to the edges.
 #
-# Intended dependencies are commented until implemented, so the scaffold builds std-only.
+# The reference bridge is std-only and synchronous: all network effects (mesh delivery, the
+# outbound SMTP socket, DNS lookups for keys/attestation/DKIM) are abstracted behind traits, so
+# the whole inbound/outbound flow is exercised in-process. Real sockets are a thin trait impl.
 
 [dependencies]
-# dmtap = { path = "../node" }        # shared MOTE / identity / mesh types
+# Shared DMTAP primitives — MOTE build/seal, Identity + Ed25519, canonical §18 CBOR (spec §1, §2).
+dmtap-core = { path = "../crates/dmtap-core" }
+# RFC 5322 parse/render + SMTP DATA→MoteDraft conversion (reused for the message translation).
+dmtap-mail = { path = "../crates/dmtap-mail" }
 
-# --- SMTP (inbound MX + outbound submission) ---
-# mail-parser = "0.9"                # RFC 5322 parsing
-# mail-send   = "0.4"                # SMTP client (outbound to legacy MX)
-# (an SMTP server for inbound; evaluate `samotop` or a minimal custom server)
+# --- DKIM delegated-selector signing (spec §7.3; RFC 8463 ed25519-sha256, RFC 6376 relaxed) ---
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
 
-# --- DKIM (delegated selector signing; spec §7.3) ---
-# (evaluate mail-auth for DKIM sign/verify + SPF/DMARC/ARC)
+# --- Errors ---
+thiserror = "1"
 
-# --- Spam gating before DATA (spec §9): RBL/DNSBL, SPF, DMARC, greylisting ---
-
-# --- Runtime ---
-# tokio = { version = "1", features = ["full"] }
+[lib]
+name = "envoir_gateway"
+path = "src/lib.rs"
 
 [[bin]]
 name = "envoir-gateway"

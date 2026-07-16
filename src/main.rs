@@ -9,7 +9,7 @@ fn main() {
 
     match cmd {
         "version" => {
-            println!("envoir-gateway {} (pre-alpha scaffold)", env!("CARGO_PKG_VERSION"));
+            println!("envoir-gateway {}", env!("CARGO_PKG_VERSION"));
         }
         "run" => {
             // TODO: start inbound MX (SMTP server) + outbound submission path.
