@@ -25,6 +25,11 @@ dmtap-mail = { path = "../crates/dmtap-mail" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 
+# --- CSPRNG for the DNS query transaction-id (off-path-spoof resistance, no DNSSEC here) ---
+# Already present transitively (via the crypto stack); taken as a direct, explicit dependency so
+# the DNS id is drawn from the OS CSPRNG rather than a predictable clock reading. Not a heavy dep.
+getrandom = "0.2"
+
 # --- Errors ---
 thiserror = "1"
 

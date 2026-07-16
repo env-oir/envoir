@@ -9,7 +9,7 @@
 //! thin socket impl that slots behind it; unit tests keep using the scripted transport.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,15 +81,40 @@ impl SmtpTcpTransport {
         self
     }
 
-    /// Resolve the socket to dial for `dest_domain` (test override wins, else `dest_domain:port`).
+    /// Resolve the socket to dial for `dest_domain` (test override wins, else `dest_domain:port`),
+    /// enforcing the SSRF guard: a domain that resolves **only** to a loopback / private / link-local
+    /// / unique-local / unspecified / broadcast address is refused rather than dialed.
+    ///
+    /// The gateway dials whatever a *destination's* MX name resolves to. Without a guard, a hostile
+    /// (or hijacked) MX record — or an attacker-chosen `To:` domain — could point the gateway's
+    /// socket at `127.0.0.1`, a private-range service, or the cloud metadata endpoint
+    /// `169.254.169.254`, turning the gateway into an SSRF pivot into the operator's own network.
+    /// This filters the *resolved IPs* (fail-closed) so only publicly-routable destinations are
+    /// reachable. The [`Self::with_fixed_addr`] override is the single, explicit, operator/test hook
+    /// that bypasses this (used only by the in-process loopback tests / an operator deliberately
+    /// pinning a smarthost) — it is never populated by name resolution.
     fn dial_addr(&self, dest_domain: &str) -> io::Result<SocketAddr> {
         if let Some(a) = self.fixed_addr {
-            return Ok(a);
+            return Ok(a); // explicit pin — intentionally exempt from the SSRF guard (see docs).
         }
-        (dest_domain, self.port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for destination"))
+        let mut resolved_any = false;
+        for addr in (dest_domain, self.port).to_socket_addrs()? {
+            resolved_any = true;
+            if !is_forbidden_dest_ip(addr.ip()) {
+                return Ok(addr);
+            }
+        }
+        if resolved_any {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to dial {dest_domain}: it resolves only to disallowed \
+                     (loopback/private/link-local/unique-local/unspecified/broadcast) addresses"
+                ),
+            ))
+        } else {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no address for destination"))
+        }
     }
 
     /// Run the full SMTP client transaction. A network/protocol error is reported as `Transient`
@@ -215,6 +240,46 @@ impl OutboundTransport for SmtpTcpTransport {
     }
 }
 
+/// The SSRF destination-IP deny-list (fail-closed). Returns `true` for an address the gateway MUST
+/// NOT dial when resolving a destination MX name:
+///
+/// - **loopback** — `127.0.0.0/8`, `::1`;
+/// - **RFC 1918 private** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`;
+/// - **link-local** — `169.254.0.0/16` (which includes the cloud metadata address
+///   `169.254.169.254`) and IPv6 `fe80::/10`;
+/// - **IPv6 unique-local (ULA)** — `fc00::/7`;
+/// - **unspecified / this-network** — `0.0.0.0`, `0.0.0.0/8`, `::`;
+/// - **broadcast** — `255.255.255.255`.
+///
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped and judged by their embedded IPv4 so
+/// a private target cannot be smuggled through the v6 form.
+pub(crate) fn is_forbidden_dest_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(mapped) => is_forbidden_v4(mapped),
+            None => is_forbidden_v6(v6),
+        },
+    }
+}
+
+fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()        // 127.0.0.0/8
+        || v4.is_private()   // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local()// 169.254.0.0/16 (incl. 169.254.169.254 metadata)
+        || v4.is_unspecified()// 0.0.0.0
+        || v4.is_broadcast() // 255.255.255.255
+        || v4.octets()[0] == 0 // 0.0.0.0/8 "this network" (RFC 1122)
+}
+
+fn is_forbidden_v6(v6: Ipv6Addr) -> bool {
+    let seg = v6.segments();
+    v6.is_loopback()                     // ::1
+        || v6.is_unspecified()           // ::
+        || (seg[0] & 0xffc0) == 0xfe80   // fe80::/10 link-local
+        || (seg[0] & 0xfe00) == 0xfc00   // fc00::/7 unique-local (ULA)
+}
+
 /// Map a destination reply code to a [`TransportResult`] (§19.7.2).
 fn classify(code: u16, text: String) -> TransportResult {
     match code {
@@ -331,5 +396,82 @@ impl Write for ClientStream {
             ClientStream::Plain(t) => t.flush(),
             ClientStream::Tls(s) => s.flush(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
+    }
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().unwrap())
+    }
+
+    #[test]
+    fn ssrf_guard_forbids_loopback_private_linklocal_and_metadata() {
+        // Loopback.
+        assert!(is_forbidden_dest_ip(v4("127.0.0.1")));
+        assert!(is_forbidden_dest_ip(v4("127.255.255.254")));
+        assert!(is_forbidden_dest_ip(v6("::1")));
+        // RFC 1918 private.
+        assert!(is_forbidden_dest_ip(v4("10.0.0.5")));
+        assert!(is_forbidden_dest_ip(v4("172.16.4.4")));
+        assert!(is_forbidden_dest_ip(v4("172.31.255.1")));
+        assert!(is_forbidden_dest_ip(v4("192.168.1.1")));
+        // Link-local, including the cloud metadata endpoint.
+        assert!(is_forbidden_dest_ip(v4("169.254.1.1")));
+        assert!(is_forbidden_dest_ip(v4("169.254.169.254")), "cloud metadata address is refused");
+        assert!(is_forbidden_dest_ip(v6("fe80::1")));
+        // IPv6 unique-local (fc00::/7 covers fc.. and fd..).
+        assert!(is_forbidden_dest_ip(v6("fc00::1")));
+        assert!(is_forbidden_dest_ip(v6("fd12:3456:789a::1")));
+        // Unspecified / this-network / broadcast.
+        assert!(is_forbidden_dest_ip(v4("0.0.0.0")));
+        assert!(is_forbidden_dest_ip(v4("0.1.2.3")));
+        assert!(is_forbidden_dest_ip(v4("255.255.255.255")));
+        assert!(is_forbidden_dest_ip(v6("::")));
+    }
+
+    #[test]
+    fn ssrf_guard_unwraps_v4_mapped_v6_and_judges_the_embedded_v4() {
+        // A private IPv4 target smuggled through the v4-mapped IPv6 form is still refused.
+        assert!(is_forbidden_dest_ip(v6("::ffff:127.0.0.1")));
+        assert!(is_forbidden_dest_ip(v6("::ffff:10.0.0.1")));
+        assert!(is_forbidden_dest_ip(v6("::ffff:169.254.169.254")));
+        // A public IPv4 mapped into v6 is still allowed.
+        assert!(!is_forbidden_dest_ip(v6("::ffff:93.184.216.34")));
+    }
+
+    #[test]
+    fn ssrf_guard_allows_ordinary_public_addresses() {
+        assert!(!is_forbidden_dest_ip(v4("93.184.216.34")));  // example.com
+        assert!(!is_forbidden_dest_ip(v4("142.250.72.36")));  // a Google MX-range addr
+        assert!(!is_forbidden_dest_ip(v4("8.8.8.8")));
+        assert!(!is_forbidden_dest_ip(v6("2606:2800:220:1:248:1893:25c8:1946")));
+        assert!(!is_forbidden_dest_ip(v6("2001:4860:4860::8888")));
+        // Boundary: 172.15.x and 172.32.x are NOT in 172.16/12.
+        assert!(!is_forbidden_dest_ip(v4("172.15.0.1")));
+        assert!(!is_forbidden_dest_ip(v4("172.32.0.1")));
+    }
+
+    #[test]
+    fn dial_addr_refuses_a_domain_resolving_only_to_loopback() {
+        // `localhost` resolves to loopback only → the guard fails closed with PermissionDenied.
+        let t = SmtpTcpTransport::new("gw.example.org");
+        match t.dial_addr("localhost") {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+            Ok(a) => panic!("expected loopback refusal, dialed {a}"),
+        }
+    }
+
+    #[test]
+    fn fixed_addr_override_bypasses_the_guard() {
+        // The explicit operator/test pin is the one sanctioned way to reach a loopback address.
+        let loop_addr: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let t = SmtpTcpTransport::new("gw.example.org").with_fixed_addr(loop_addr);
+        assert_eq!(t.dial_addr("anything.example").unwrap(), loop_addr);
     }
 }

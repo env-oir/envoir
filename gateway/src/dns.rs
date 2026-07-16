@@ -49,6 +49,17 @@ pub struct DnsMessage {
     pub answers: Vec<ResourceRecord>,
 }
 
+/// Draw a fresh, unpredictable 16-bit DNS transaction id from the OS CSPRNG (RFC 5452 §9.2). A
+/// CSPRNG-derived id — not a clock reading — is what makes an off-path answer-forgery attacker have
+/// to guess the id (there is no DNSSEC validation in this minimal client, so the id + source-port
+/// entropy is the whole defense against off-path spoofing).
+fn random_txn_id() -> io::Result<u16> {
+    let mut b = [0u8; 2];
+    getrandom::getrandom(&mut b)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("CSPRNG unavailable: {e}")))?;
+    Ok(u16::from_be_bytes(b))
+}
+
 /// Build a standard, recursion-desired query packet for `qname`/`qtype`/IN.
 pub fn encode_query(id: u16, qname: &str, qtype: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(qname.len() + 18);
@@ -245,11 +256,13 @@ impl UdpDnsClient {
     /// decoding) that must re-decode a compression pointer inside an answer's rdata against the
     /// original buffer.
     pub fn query_raw(&self, qname: &str, qtype: u16) -> io::Result<(Vec<u8>, DnsMessage)> {
-        let id = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-            & 0xFFFF) as u16;
+        // The 16-bit query id is drawn from the OS CSPRNG, not a clock reading. Without DNSSEC
+        // validation the only defenses against an OFF-PATH forged answer are the unpredictability
+        // of the query id and the ephemeral source port; a predictable id (e.g. derived from
+        // `subsec_nanos`) collapses the id-guessing cost to near zero, so a CSPRNG id is what
+        // actually raises the bar (RFC 5452). It is not a substitute for DNSSEC — an on-path
+        // attacker still wins — but it removes the cheap off-path spoof.
+        let id = random_txn_id()?;
         let query = encode_query(id, qname, qtype);
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(self.timeout))?;
@@ -408,6 +421,18 @@ mod tests {
         let packet = build_response("example.org", TYPE_MX, &[(TYPE_MX, mx_rdata(10, "mail.example.org"))]);
         // Chop the packet mid-rdata.
         assert!(parse_response(&packet[..packet.len() - 3]).is_err());
+    }
+
+    #[test]
+    fn txn_id_is_not_a_constant_and_spans_the_16_bit_space() {
+        // Draw many ids; a CSPRNG source yields many distinct values and both high and low bytes
+        // vary. A predictable/constant id (the old `subsec_nanos & 0xFFFF` under a coarse clock, or
+        // a hard-coded value) would collapse this set — this guards the off-path-spoof fix.
+        let ids: std::collections::HashSet<u16> =
+            (0..256).map(|_| random_txn_id().expect("csprng")).collect();
+        assert!(ids.len() > 200, "CSPRNG ids should be overwhelmingly distinct, got {}", ids.len());
+        assert!(ids.iter().any(|&x| x > 0x00FF), "high byte varies");
+        assert!(ids.iter().any(|&x| x & 0x00FF != 0), "low byte varies");
     }
 
     #[test]

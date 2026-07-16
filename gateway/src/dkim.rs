@@ -151,7 +151,109 @@ pub fn verify(message: &[u8], public_key: &[u8]) -> Result<(), DkimError> {
     vk.verify(&digest, &sig).map_err(|_| DkimError::SignatureInvalid)
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+// --- Inbound DKIM verification (spec §7.2 step 2 / §9): resolver-driven ----------------------
+
+/// Resolves the DKIM public key published at `<selector>._domainkey.<domain>` (RFC 6376 §3.6.1) —
+/// the DNS TXT lookup, abstracted so inbound verification is testable in-process. **The live DNS
+/// fetch is a documented seam**: a production impl queries `<selector>._domainkey.<domain>` for a
+/// `TYPE_TXT` record (via [`crate::dns`]) and feeds the record's value through
+/// [`parse_public_key_txt`] to get the raw key bytes; [`StaticDkimKeys`] is the in-process double.
+pub trait DkimKeyResolver {
+    /// Return the raw Ed25519 public key (32 bytes) published for `domain`/`selector`, or `None`
+    /// when the domain publishes no key under that selector (verification then cannot proceed).
+    fn resolve_dkim_key(&self, domain: &str, selector: &str) -> Option<Vec<u8>>;
+}
+
+/// An in-memory `DkimKeyResolver` for tests and single-domain deployments: a static map of
+/// `(domain, selector) → public key`, modelling the sender domain's `_domainkey` TXT records.
+#[derive(Debug, Default, Clone)]
+pub struct StaticDkimKeys {
+    entries: Vec<(String, String, Vec<u8>)>,
+}
+
+impl StaticDkimKeys {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Publish `key` at `<selector>._domainkey.<domain>`.
+    pub fn publish(mut self, domain: impl Into<String>, selector: impl Into<String>, key: Vec<u8>) -> Self {
+        self.entries.push((domain.into(), selector.into(), key));
+        self
+    }
+}
+
+impl DkimKeyResolver for StaticDkimKeys {
+    fn resolve_dkim_key(&self, domain: &str, selector: &str) -> Option<Vec<u8>> {
+        self.entries
+            .iter()
+            .find(|(d, s, _)| d.eq_ignore_ascii_case(domain) && s == selector)
+            .map(|(_, _, k)| k.clone())
+    }
+}
+
+/// The outcome of verifying an inbound message's DKIM signature against the resolved public key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DkimVerdict {
+    /// The signature is present and cryptographically verifies as `domain`/`selector`.
+    Pass { domain: String, selector: String },
+    /// A signature is present but does not verify (bad body hash, bad signature, wrong algorithm).
+    Fail(DkimError),
+    /// The message carries no DKIM-Signature header at all (unsigned legacy mail).
+    NoSignature,
+    /// A signature names `domain`/`selector` but no key is published there — cannot verify (the
+    /// `_domainkey` TXT lookup returned nothing). Treated as "unverified", never as pass.
+    KeyUnavailable { domain: String, selector: String },
+}
+
+/// Extract the signing domain (`d=`) and selector (`s=`) from a message's DKIM-Signature header,
+/// so a verifier knows which `<selector>._domainkey.<domain>` key to resolve. `None` if the message
+/// has no DKIM-Signature or the header lacks either tag.
+pub fn signing_domain_selector(message: &[u8]) -> Option<(String, String)> {
+    let (headers, _body) = split_headers_body(message);
+    let (_name, value) = find_header(&headers, "dkim-signature")?;
+    let tags = parse_tags(value);
+    let get = |k: &str| tags.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    Some((get("d")?, get("s")?))
+}
+
+/// Verify an inbound message's DKIM signature (RFC 6376), resolving the public key via `resolver`.
+/// This composes [`signing_domain_selector`] (which key to fetch) with the independent [`verify`]
+/// (the actual cryptographic check) — a real, checkable verification, not a stub. The only external
+/// dependency (the `_domainkey` DNS TXT fetch) is behind the [`DkimKeyResolver`] seam.
+pub fn verify_with_resolver(message: &[u8], resolver: &dyn DkimKeyResolver) -> DkimVerdict {
+    let (domain, selector) = match signing_domain_selector(message) {
+        Some(ds) => ds,
+        None => return DkimVerdict::NoSignature,
+    };
+    match resolver.resolve_dkim_key(&domain, &selector) {
+        Some(key) => match verify(message, &key) {
+            Ok(()) => DkimVerdict::Pass { domain, selector },
+            Err(e) => DkimVerdict::Fail(e),
+        },
+        None => DkimVerdict::KeyUnavailable { domain, selector },
+    }
+}
+
+/// Parse the `p=` base64 public key out of a DKIM `_domainkey` DNS TXT record value
+/// (`v=DKIM1; k=ed25519; p=<base64>`, RFC 6376 §3.6.1 / RFC 8463). Returns the raw key bytes, or
+/// `None` if there is no `p=` tag or it does not decode. This is the pure half of the DNS seam: a
+/// real [`DkimKeyResolver`] queries the TXT record via [`crate::dns`] and pipes the value here.
+pub fn parse_public_key_txt(txt: &str) -> Option<Vec<u8>> {
+    for part in txt.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("p=") {
+            let v: String = v.chars().filter(|c| !c.is_whitespace()).collect();
+            // An empty p= (RFC 6376: a revoked key) is treated as "no usable key".
+            if v.is_empty() {
+                return None;
+            }
+            return b64::decode(&v).ok();
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum DkimError {
     #[error("message carries no DKIM-Signature header")]
     NoSignature,
@@ -332,4 +434,77 @@ fn empty_b_value(value: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MSG: &[u8] =
+        b"From: alice@sender.example\r\nTo: bob@host.net\r\nSubject: hi\r\nDate: Tue, 15 Jul 2026 00:00:00 +0000\r\n\r\nhello over the bridge\r\n";
+
+    fn signed_msg(domain: &str, selector: &str, seed: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
+        let key = DkimKey::from_seed(domain, selector, seed);
+        let pubk = key.public_bytes();
+        let header = sign(&key, MSG, 1_752_600_000);
+        let mut out = header.into_bytes();
+        out.extend_from_slice(MSG);
+        (out, pubk)
+    }
+
+    #[test]
+    fn inbound_verify_passes_for_a_genuinely_signed_message() {
+        let (msg, pubk) = signed_msg("sender.example", "s1", &[3u8; 32]);
+        let resolver = StaticDkimKeys::new().publish("sender.example", "s1", pubk.to_vec());
+        assert_eq!(
+            verify_with_resolver(&msg, &resolver),
+            DkimVerdict::Pass { domain: "sender.example".into(), selector: "s1".into() }
+        );
+    }
+
+    #[test]
+    fn inbound_verify_fails_on_a_tampered_body() {
+        let (msg, pubk) = signed_msg("sender.example", "s1", &[4u8; 32]);
+        let mut tampered = msg.clone();
+        let pos = tampered.windows(5).position(|w| w == b"hello").unwrap();
+        tampered[pos] ^= 0x20;
+        let resolver = StaticDkimKeys::new().publish("sender.example", "s1", pubk.to_vec());
+        assert!(matches!(verify_with_resolver(&tampered, &resolver), DkimVerdict::Fail(_)));
+    }
+
+    #[test]
+    fn inbound_verify_reports_no_signature_and_key_unavailable() {
+        // Unsigned message → NoSignature.
+        assert_eq!(verify_with_resolver(MSG, &StaticDkimKeys::new()), DkimVerdict::NoSignature);
+        // Signed, but the domain publishes no key under that selector → KeyUnavailable, not Pass.
+        let (msg, _pubk) = signed_msg("sender.example", "s1", &[5u8; 32]);
+        assert_eq!(
+            verify_with_resolver(&msg, &StaticDkimKeys::new()),
+            DkimVerdict::KeyUnavailable { domain: "sender.example".into(), selector: "s1".into() }
+        );
+    }
+
+    #[test]
+    fn signing_domain_selector_extracts_d_and_s() {
+        let (msg, _pubk) = signed_msg("sender.example", "sel7", &[6u8; 32]);
+        assert_eq!(
+            signing_domain_selector(&msg),
+            Some(("sender.example".to_string(), "sel7".to_string()))
+        );
+        assert_eq!(signing_domain_selector(MSG), None);
+    }
+
+    #[test]
+    fn parse_public_key_txt_extracts_the_p_tag() {
+        let key = DkimKey::from_seed("d", "s", &[9u8; 32]);
+        let p = key.public_p_tag();
+        let txt = format!("v=DKIM1; k=ed25519; p={p}");
+        assert_eq!(parse_public_key_txt(&txt), Some(key.public_bytes().to_vec()));
+        // A revoked (empty p=) record yields no key.
+        assert_eq!(parse_public_key_txt("v=DKIM1; k=ed25519; p="), None);
+        // A round trip: the parsed key verifies a message the private half signed.
+        let (msg, _) = signed_msg("d", "s", &[9u8; 32]);
+        let parsed = parse_public_key_txt(&txt).unwrap();
+        assert!(verify(&msg, &parsed).is_ok());
+    }
 }

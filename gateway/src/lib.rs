@@ -57,10 +57,14 @@ pub mod outbound_tcp;
 pub mod provenance;
 
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
-pub use dkim::{DkimError, DkimKey};
+pub use dkim::{
+    parse_public_key_txt, signing_domain_selector, verify_with_resolver, DkimError, DkimKey,
+    DkimKeyResolver, DkimVerdict, StaticDkimKeys,
+};
 pub use inbound::{
-    AbuseDecision, AllowAllAbuse, AntiAbuse, DeliveryOutcome, InboundError, InboundGateway,
-    KeyDirectory, MeshDelivery, MxSession, RecipientKey, SmtpReply,
+    AbuseDecision, AllowAllAbuse, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy,
+    InboundBridged, InboundError, InboundGateway, KeyDirectory, MeshDelivery, MxSession,
+    RecipientKey, SmtpReply, SystemClock,
 };
 pub use inbound_tcp::{
     load_certs, load_private_key, server_config, server_config_from_pem, MxListener,

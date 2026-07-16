@@ -8,11 +8,12 @@ use dmtap_core::mote::{
 };
 
 use envoir_gateway::attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
-use envoir_gateway::dkim::{self, DkimError, DkimKey};
+use envoir_gateway::dkim::{self, DkimError, DkimKey, StaticDkimKeys};
 use envoir_gateway::inbound::{
-    AbuseDecision, AntiAbuse, DeliveryOutcome, InboundGateway, KeyDirectory, MeshDelivery,
-    MxSession, RecipientKey,
+    AbuseDecision, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy, InboundGateway,
+    KeyDirectory, MeshDelivery, MxSession, RecipientKey,
 };
+use envoir_gateway::provenance::{Origin, ProvenanceError, ProvenanceRecord};
 use envoir_gateway::mta_sts::{InMemoryPolicyFetcher, InMemoryTxtResolver, MtaStsTlsPolicy};
 use envoir_gateway::mx::{InMemoryMxResolver, MxHost};
 use envoir_gateway::outbound::{
@@ -814,6 +815,210 @@ fn mx_host_struct_is_reachable_from_the_public_api() {
     // Sanity: MxHost is part of the public surface tests (and operators) construct directly.
     let h = MxHost { host: "mx.example.org".into(), preference: 10 };
     assert_eq!(h.preference, 10);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Inbound legacy→DMTAP: DKIM verification (§7.2 step 2) + provenance stamping (§7.8 / §18.8.1)
+// ---------------------------------------------------------------------------------------------
+
+/// DKIM-sign a legacy RFC 5322 message as `domain`/`selector`, returning `(signed_bytes, pubkey)`.
+fn dkim_signed_inbound(domain: &str, selector: &str, to: &str) -> (Vec<u8>, [u8; 32]) {
+    let mut seed = [0u8; 32];
+    for (i, b) in domain.bytes().chain(selector.bytes()).enumerate().take(32) {
+        seed[i] = b;
+    }
+    let key = DkimKey::from_seed(domain, selector, &seed);
+    let pubk = key.public_bytes();
+    let msg = format!(
+        "From: alice@{domain}\r\nTo: {to}\r\nSubject: hi\r\nDate: Tue, 15 Jul 2026 00:00:00 +0000\r\n\r\nsigned legacy body\r\n"
+    )
+    .into_bytes();
+    let header = dkim::sign(&key, &msg, NOW / 1000);
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&msg);
+    (out, pubk)
+}
+
+#[test]
+fn inbound_dkim_enforce_rejects_a_broken_signature_but_accepts_a_valid_one() {
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, _d) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let (signed, pubk) = dkim_signed_inbound("sender.example", "s1", &recip.email);
+    let resolver = StaticDkimKeys::new().publish("sender.example", "s1", pubk.to_vec());
+    let gw = base_gw.with_dkim(Box::new(resolver), DkimPolicy::Enforce);
+
+    // A valid inbound signature is accepted (durable ack → 250).
+    let ok = gw.accept_message("alice@sender.example", &recip.email, &signed, NOW);
+    assert_eq!(ok.code, 250, "a genuinely DKIM-signed legacy message is accepted");
+
+    // Tamper the body: the signature no longer verifies → enforce rejects it (5xx), before wrapping.
+    let mut tampered = signed.clone();
+    let pos = tampered.windows(6).position(|w| w == b"signed").unwrap();
+    tampered[pos] ^= 0x20;
+    let bad = gw.accept_message("alice@sender.example", &recip.email, &tampered, NOW);
+    assert_eq!(bad.code, 550, "a present-but-invalid DKIM signature is refused under enforce");
+    assert!(bad.text.to_lowercase().contains("dkim"));
+}
+
+#[test]
+fn inbound_dkim_annotate_delivers_regardless_of_verdict() {
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, _d) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let (signed, pubk) = dkim_signed_inbound("sender.example", "s1", &recip.email);
+    let resolver = StaticDkimKeys::new().publish("sender.example", "s1", pubk.to_vec());
+    let gw = base_gw.with_dkim(Box::new(resolver), DkimPolicy::Annotate);
+
+    // Even a broken signature is delivered under annotate (DMARC p= enforcement is a seam), but the
+    // verdict is still computable for downstream policy.
+    let mut tampered = signed.clone();
+    let pos = tampered.windows(6).position(|w| w == b"signed").unwrap();
+    tampered[pos] ^= 0x20;
+    let reply = gw.accept_message("alice@sender.example", &recip.email, &tampered, NOW);
+    assert_eq!(reply.code, 250, "annotate mode delivers regardless of the DKIM verdict");
+    assert!(matches!(
+        gw.verify_inbound_dkim(&tampered),
+        envoir_gateway::dkim::DkimVerdict::Fail(_)
+    ));
+}
+
+#[test]
+fn inbound_stamps_a_verifiable_gateway_provenance_record() {
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let att_pub = att_key.public();
+    let published = StaticGwKeys::new().publish(DOMAIN, GW_SELECTOR, att_pub.clone());
+    let (gw, _d) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+
+    let data = sample_message(&recip.email);
+    let bridged = gw
+        .wrap_attest_and_stamp("sender@gmail.com", &recip.email, &data, NOW)
+        .expect("bridge + stamp");
+
+    // The normative gateway attestation is signed over the EXACT legacy bytes and verifies under the
+    // domain-published _dmtap-gw key.
+    let key = published.resolve_gw_key(DOMAIN, GW_SELECTOR);
+    bridged
+        .gateway_attestation
+        .verify(key.as_deref(), &data)
+        .expect("gateway attestation verifies over the exact bytes");
+    // Lifted onto different bytes → digest no longer binds → rejected.
+    assert_eq!(
+        bridged.gateway_attestation.verify(key.as_deref(), b"different bytes"),
+        Err(ProvenanceError::Invalid)
+    );
+    assert_eq!(bridged.gateway_attestation.legacy_from.as_deref(), Some("sender@gmail.com"));
+
+    // The client-facing provenance record is gateway-touched with exactly one hop, and round-trips.
+    assert_eq!(bridged.provenance.origin, Origin::GatewayTouched);
+    assert_eq!(bridged.provenance.gateway_hops(), 1);
+    assert!(!bridged.provenance.is_pure_mesh());
+    let decoded = ProvenanceRecord::from_det_cbor(&bridged.provenance.det_cbor()).unwrap();
+    assert_eq!(decoded, bridged.provenance);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cold-sender anti-abuse gate (§9 / §7.2 step 2)
+// ---------------------------------------------------------------------------------------------
+
+/// A manual clock whose backing counter is shared via `Arc` between the clone handed to the gate and
+/// the handle a test keeps to advance time — so time moves without sleeping.
+#[derive(Clone)]
+struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+impl ManualClock {
+    fn new(t: u64) -> Self {
+        ManualClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(t)))
+    }
+}
+impl Clock for ManualClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+fn advance(c: &ManualClock, d: u64) {
+    c.0.fetch_add(d, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn rejected(d: &AbuseDecision) -> u16 {
+    match d {
+        AbuseDecision::Reject { code, .. } => *code,
+        AbuseDecision::Accept => 0,
+    }
+}
+
+#[test]
+fn cold_sender_is_greylisted_then_accepted_on_retry() {
+    let clock = ManualClock::new(1_000_000);
+    let gate = ColdSenderGate::with_clock(Box::new(clock.clone()))
+        .with_greylist(60_000, 12 * 3_600_000)
+        .with_rate_limit(1000, 60_000);
+
+    // First contact from a cold (ip, from) pair → deferred 451 (cost for cold contact).
+    let first = gate.check("203.0.113.9", "stranger@gmail.com");
+    assert_eq!(rejected(&first), 451);
+    // An immediate retry (delay not elapsed) is still deferred.
+    assert_eq!(rejected(&gate.check("203.0.113.9", "stranger@gmail.com")), 451);
+    // After the retry delay a legitimate MTA's re-send is accepted.
+    advance(&clock, 60_000);
+    assert_eq!(gate.check("203.0.113.9", "stranger@gmail.com"), AbuseDecision::Accept);
+}
+
+#[test]
+fn cold_sender_gate_lets_known_contacts_and_blocks_the_blocked() {
+    let clock = ManualClock::new(1_000_000);
+    let gate = ColdSenderGate::with_clock(Box::new(clock.clone()))
+        .allow_ip_prefix("198.51.100.")
+        .allow_sender("friend@partner.example")
+        .block_ip_prefix("192.0.2.")
+        .block_sender("spammer@bad.example");
+
+    // Known IP prefix and known sender are free (no greylist delay).
+    assert_eq!(gate.check("198.51.100.7", "anyone@wherever.example"), AbuseDecision::Accept);
+    assert_eq!(gate.check("203.0.113.1", "friend@partner.example"), AbuseDecision::Accept);
+    // Blocked IP and blocked sender are hard-rejected 554.
+    assert_eq!(rejected(&gate.check("192.0.2.5", "x@y.example")), 554);
+    assert_eq!(rejected(&gate.check("203.0.113.1", "spammer@bad.example")), 554);
+}
+
+#[test]
+fn cold_sender_gate_enforces_a_per_ip_rate_limit() {
+    let clock = ManualClock::new(1_000_000);
+    // Zero greylist delay so a retry is accepted immediately; budget of 2 accepts per window.
+    let gate = ColdSenderGate::with_clock(Box::new(clock.clone()))
+        .with_greylist(0, 12 * 3_600_000)
+        .with_rate_limit(2, 60_000);
+
+    // First sight greylists (no accept recorded); the next two pass, then the budget is spent.
+    assert_eq!(rejected(&gate.check("203.0.113.50", "s@gmail.com")), 451); // greylist
+    assert_eq!(gate.check("203.0.113.50", "s@gmail.com"), AbuseDecision::Accept); // accept 1
+    assert_eq!(gate.check("203.0.113.50", "s@gmail.com"), AbuseDecision::Accept); // accept 2
+    let over = gate.check("203.0.113.50", "s@gmail.com");
+    assert_eq!(rejected(&over), 451, "over budget → deferred");
+    if let AbuseDecision::Reject { reason, .. } = over {
+        assert!(reason.to_lowercase().contains("rate limit"));
+    }
+    // The window slides: well past it, the sender is served again.
+    advance(&clock, 61_000);
+    assert_eq!(gate.check("203.0.113.50", "s@gmail.com"), AbuseDecision::Accept);
 }
 
 // ---------------------------------------------------------------------------------------------

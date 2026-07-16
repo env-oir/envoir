@@ -16,6 +16,8 @@ use dmtap_core::TimestampMs;
 use dmtap_mail::smtp::build_mote_draft;
 
 use crate::attestation::{Attestation, AttestationKey};
+use crate::dkim::{verify_with_resolver, DkimKeyResolver, DkimVerdict};
+use crate::provenance::{GatewayAttestation, Profile, ProvenanceRecord, Tier};
 
 /// A recipient's DMTAP key material, resolved from `RCPT TO` (§3 `resolve`, run by the gateway on
 /// the recipient's behalf, §19.7.1 step 2).
@@ -83,6 +85,221 @@ impl AntiAbuse for AllowAllAbuse {
     }
 }
 
+/// A monotonic-ish wall-clock source, abstracted so the greylist/rate windows in [`ColdSenderGate`]
+/// are testable without sleeping. The real impl reads the system clock.
+pub trait Clock: Send + Sync {
+    /// Milliseconds since the Unix epoch.
+    fn now_ms(&self) -> u64;
+}
+
+/// The production clock: `SystemTime::now()`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    }
+}
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+#[derive(Default)]
+struct GateState {
+    /// (peer_ip, mail_from) → first-seen ms, for greylisting cold triples.
+    greylist: HashMap<(String, String), u64>,
+    /// peer_ip → timestamps (ms) of recently *accepted* messages, for the per-IP rate window.
+    accepts: HashMap<String, Vec<u64>>,
+}
+
+/// A real **cold-sender anti-abuse gate** for the inbound legacy MX (spec §9, §7.2 step 2).
+///
+/// Legacy senders cannot present a DMTAP anonymous-token / PoW / postage proof (§9.3–§9.5) — those
+/// live inside the sealed mesh envelope, which a legacy MTA never produces. So the gateway applies
+/// §9's **"cost for cold contact"** principle in the terms the SMTP world *does* support, evaluated
+/// entirely on connection/envelope metadata **before `DATA`** (§7.2 step 2):
+///
+/// - **Known contacts are free (§9.1).** A peer IP on the allow-prefix list, or a `MAIL FROM` on
+///   the known-sender list, is accepted immediately with no greylist delay and no rate cost.
+/// - **Explicit blocks (RBL-style).** A blocked IP prefix or sender is hard-rejected `554`.
+/// - **Greylisting = the cost for cold contact.** A never-before-seen `(ip, from)` pair is
+///   deferred `451` on first sight; a legitimate MTA retries after its queue delay and is then
+///   accepted, while spam cannons that never retry are shed. This is the SMTP-native analogue of
+///   §9.3's cold-contact cost — imposing a real (time/retry) cost without deanonymizing anyone.
+/// - **Per-IP rate limiting.** More than `rate_limit` *accepted* messages from one IP within
+///   `rate_window_ms` is deferred `451` (§7.2 step 2 "per-IP rate limits").
+///
+/// State is in-memory and ephemeral (it is operational anti-abuse state, **not** message durability
+/// — the gateway remains stateless about mail, §7.4): losing it just means a cold sender is
+/// greylisted again, which is safe. Interior mutability + a [`Clock`] seam keep it testable.
+pub struct ColdSenderGate {
+    known_ip_prefixes: Vec<String>,
+    known_senders: Vec<String>,
+    blocked_ip_prefixes: Vec<String>,
+    blocked_senders: Vec<String>,
+    /// Minimum delay before a greylisted triple's retry is accepted.
+    greylist_min_retry_ms: u64,
+    /// How long a greylist entry is remembered; a retry after this is treated as a fresh cold sighting.
+    greylist_ttl_ms: u64,
+    /// Max accepted messages per IP within `rate_window_ms` before deferring.
+    rate_limit: u32,
+    rate_window_ms: u64,
+    clock: Box<dyn Clock>,
+    state: Mutex<GateState>,
+}
+
+impl ColdSenderGate {
+    /// A gate with sensible defaults: 60 s greylist retry delay, 12 h greylist memory, and a
+    /// per-IP budget of 60 accepted messages per 60 s. Tune via the builder methods.
+    pub fn new() -> Self {
+        Self::with_clock(Box::new(SystemClock))
+    }
+
+    /// As [`Self::new`] but with an explicit clock (tests inject a manual clock).
+    pub fn with_clock(clock: Box<dyn Clock>) -> Self {
+        ColdSenderGate {
+            known_ip_prefixes: Vec::new(),
+            known_senders: Vec::new(),
+            blocked_ip_prefixes: Vec::new(),
+            blocked_senders: Vec::new(),
+            greylist_min_retry_ms: 60_000,
+            greylist_ttl_ms: 12 * 3_600_000,
+            rate_limit: 60,
+            rate_window_ms: 60_000,
+            clock,
+            state: Mutex::new(GateState::default()),
+        }
+    }
+
+    /// Trust a peer-IP prefix as a known contact (free, no greylist/rate cost).
+    pub fn allow_ip_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.known_ip_prefixes.push(prefix.into());
+        self
+    }
+    /// Trust a `MAIL FROM` address as a known contact (free). Matched case-insensitively.
+    pub fn allow_sender(mut self, addr: impl Into<String>) -> Self {
+        self.known_senders.push(addr.into().to_ascii_lowercase());
+        self
+    }
+    /// Hard-block a peer-IP prefix (RBL-style `554`).
+    pub fn block_ip_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.blocked_ip_prefixes.push(prefix.into());
+        self
+    }
+    /// Hard-block a `MAIL FROM` address (`554`). Matched case-insensitively.
+    pub fn block_sender(mut self, addr: impl Into<String>) -> Self {
+        self.blocked_senders.push(addr.into().to_ascii_lowercase());
+        self
+    }
+    /// Set the greylist retry delay / memory TTL (ms).
+    pub fn with_greylist(mut self, min_retry_ms: u64, ttl_ms: u64) -> Self {
+        self.greylist_min_retry_ms = min_retry_ms;
+        self.greylist_ttl_ms = ttl_ms;
+        self
+    }
+    /// Set the per-IP accepted-message rate limit (`max` per `window_ms`).
+    pub fn with_rate_limit(mut self, max: u32, window_ms: u64) -> Self {
+        self.rate_limit = max;
+        self.rate_window_ms = window_ms;
+        self
+    }
+
+    fn is_known(&self, peer_ip: &str, from: &str) -> bool {
+        let from_l = from.to_ascii_lowercase();
+        self.known_ip_prefixes.iter().any(|p| peer_ip.starts_with(p.as_str()))
+            || self.known_senders.iter().any(|s| *s == from_l)
+    }
+    fn is_blocked(&self, peer_ip: &str, from: &str) -> bool {
+        let from_l = from.to_ascii_lowercase();
+        self.blocked_ip_prefixes.iter().any(|p| peer_ip.starts_with(p.as_str()))
+            || self.blocked_senders.iter().any(|s| *s == from_l)
+    }
+}
+
+impl Default for ColdSenderGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AntiAbuse for ColdSenderGate {
+    fn check(&self, peer_ip: &str, mail_from: &str) -> AbuseDecision {
+        // 1. Explicit block wins (RBL-style hard reject).
+        if self.is_blocked(peer_ip, mail_from) {
+            return AbuseDecision::Reject { code: 554, reason: "5.7.1 sender blocked by policy".into() };
+        }
+        // 2. Known contacts are free (§9.1) — no greylist, no rate cost.
+        if self.is_known(peer_ip, mail_from) {
+            return AbuseDecision::Accept;
+        }
+
+        let now = self.clock.now_ms();
+        let mut st = self.state.lock().expect("gate state poisoned");
+
+        // 3. Per-IP rate limit over accepted messages in the sliding window.
+        {
+            let window_start = now.saturating_sub(self.rate_window_ms);
+            let hits = st.accepts.entry(peer_ip.to_string()).or_default();
+            hits.retain(|&t| t >= window_start);
+            if hits.len() as u32 >= self.rate_limit {
+                return AbuseDecision::Reject {
+                    code: 451,
+                    reason: "4.7.1 rate limit exceeded, slow down and retry later".into(),
+                };
+            }
+        }
+
+        // 4. Greylist the cold (ip, from) pair: defer on first sight; accept a retry after the delay.
+        let key = (peer_ip.to_string(), mail_from.to_string());
+        let first_seen = st.greylist.get(&key).copied();
+        let cold = match first_seen {
+            // Expired entry ⇒ treat as never-seen (a fresh cold sighting).
+            Some(ts) if now.saturating_sub(ts) > self.greylist_ttl_ms => true,
+            Some(_) => false,
+            None => true,
+        };
+        if cold {
+            st.greylist.insert(key, now);
+            return AbuseDecision::Reject {
+                code: 451,
+                reason: "4.7.1 greylisted — please retry shortly (cost for cold contact, §9)".into(),
+            };
+        }
+        // Seen before: enforce the minimum retry delay so an instant re-send does not pass.
+        let ts = first_seen.expect("cold==false implies a stored timestamp");
+        if now.saturating_sub(ts) < self.greylist_min_retry_ms {
+            return AbuseDecision::Reject {
+                code: 451,
+                reason: "4.7.1 greylisted — retry interval not yet elapsed".into(),
+            };
+        }
+
+        // Accept: record it against the per-IP rate window.
+        st.accepts.entry(peer_ip.to_string()).or_default().push(now);
+        AbuseDecision::Accept
+    }
+}
+
+/// How the inbound gateway treats an incoming legacy message's DKIM signature (spec §7.2 step 2 /
+/// §9 — DKIM/DMARC-style validation is part of the pre-delivery spam checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DkimPolicy {
+    /// Verify the DKIM signature (if a resolver is configured) and let the verdict inform
+    /// downstream policy, but **deliver regardless** of the verdict. This is the honest default:
+    /// full DMARC alignment (fetching the sender domain's `_dmarc` `p=` record and requiring an
+    /// aligned pass) is a documented seam this gateway does not implement, so it does not
+    /// unilaterally bounce unsigned or unaligned mail.
+    #[default]
+    Annotate,
+    /// **Reject** (SMTP `550`) an inbound message that carries a DKIM-Signature which does **not**
+    /// verify. A present-but-broken signature is a strong forgery/tamper signal, so it is refused
+    /// before it is ever wrapped into a MOTE. Unsigned mail and mail whose key cannot be resolved
+    /// are still delivered (that is DMARC-`p=` territory — the seam above), not hard-bounced here.
+    Enforce,
+}
+
 /// The inbound gateway: MX for one or more domains, stateless (§7.4).
 pub struct InboundGateway {
     /// The gateway's own identity key. An inbound legacy MOTE is *from* the gateway (legacy-origin);
@@ -93,6 +310,11 @@ pub struct InboundGateway {
     directory: Box<dyn KeyDirectory>,
     delivery: Box<dyn MeshDelivery>,
     abuse: Box<dyn AntiAbuse>,
+    /// Optional inbound-DKIM key resolver (the `_domainkey` TXT lookup seam). `None` ⇒ inbound DKIM
+    /// verification is not performed (the DNS resolver is the documented external dependency).
+    dkim_resolver: Option<Box<dyn DkimKeyResolver>>,
+    /// What to do with the DKIM verdict (see [`DkimPolicy`]).
+    dkim_policy: DkimPolicy,
 }
 
 /// Why an inbound message could not be wrapped/delivered — mapped to an SMTP reply by the session.
@@ -108,6 +330,22 @@ pub enum InboundError {
     SealFailed,
 }
 
+/// The full output of bridging one legacy message into the mesh with provenance stamped
+/// ([`InboundGateway::wrap_attest_and_stamp`]): the sealed MOTE, the §7.2a [`Attestation`], the
+/// normative signed [`GatewayAttestation`] (§18.3.11), and the derived client-facing
+/// [`ProvenanceRecord`] (§18.8.1). A stateless gateway holds none of this after handing it off.
+#[derive(Debug, Clone)]
+pub struct InboundBridged {
+    /// The encrypted MOTE sealed to the recipient's key.
+    pub env: Envelope,
+    /// The §7.2a attestation bound to the MOTE's content address.
+    pub attestation: Attestation,
+    /// The normative gateway attestation (§18.3.11) signed over the exact RFC 5322 bytes.
+    pub gateway_attestation: GatewayAttestation,
+    /// The client-facing transport-path record (§18.8.1): a single `gateway` hop, gateway-touched.
+    pub provenance: ProvenanceRecord,
+}
+
 impl InboundGateway {
     pub fn new(
         ik: IdentityKey,
@@ -116,11 +354,53 @@ impl InboundGateway {
         delivery: Box<dyn MeshDelivery>,
         abuse: Box<dyn AntiAbuse>,
     ) -> Self {
-        InboundGateway { ik, attest_keys, directory, delivery, abuse }
+        InboundGateway {
+            ik,
+            attest_keys,
+            directory,
+            delivery,
+            abuse,
+            dkim_resolver: None,
+            dkim_policy: DkimPolicy::Annotate,
+        }
+    }
+
+    /// Enable inbound DKIM verification (spec §7.2 step 2): resolve the sender's
+    /// `<selector>._domainkey.<domain>` key via `resolver` and apply `policy` to the verdict.
+    pub fn with_dkim(mut self, resolver: Box<dyn DkimKeyResolver>, policy: DkimPolicy) -> Self {
+        self.dkim_resolver = Some(resolver);
+        self.dkim_policy = policy;
+        self
     }
 
     fn attest_key_for(&self, domain: &str) -> Option<&AttestationKey> {
         self.attest_keys.iter().find(|k| k.domain().eq_ignore_ascii_case(domain))
+    }
+
+    /// Verify the inbound message's DKIM signature against the configured resolver (spec §7.2
+    /// step 2). Returns [`DkimVerdict::NoSignature`] when no resolver is configured (the DNS seam is
+    /// absent) — i.e. verification is simply not attempted, never falsely reported as a pass.
+    pub fn verify_inbound_dkim(&self, message: &[u8]) -> DkimVerdict {
+        match &self.dkim_resolver {
+            Some(resolver) => verify_with_resolver(message, resolver.as_ref()),
+            None => DkimVerdict::NoSignature,
+        }
+    }
+
+    /// Apply the DKIM policy as a pre-delivery gate. Returns `Err(reply)` only under
+    /// [`DkimPolicy::Enforce`] when a present signature fails to verify; otherwise `Ok(())`.
+    fn dkim_gate(&self, data: &[u8]) -> Result<(), SmtpReply> {
+        if self.dkim_resolver.is_none() || self.dkim_policy == DkimPolicy::Annotate {
+            return Ok(());
+        }
+        match self.verify_inbound_dkim(data) {
+            DkimVerdict::Fail(_) => {
+                Err(SmtpReply::new(550, "5.7.20 DKIM signature present but does not verify"))
+            }
+            // Pass, NoSignature, KeyUnavailable → not hard-bounced here (unsigned/unaligned mail is
+            // DMARC-`p=` territory, a documented seam) — deliver and let recipient policy decide.
+            _ => Ok(()),
+        }
     }
 
     /// Wrap + attest a single legacy message for one resolved recipient (§19.7.1 steps 3–4),
@@ -154,6 +434,46 @@ impl InboundGateway {
         Ok((env, attestation))
     }
 
+    /// Wrap + attest **and** stamp the normative transport-path provenance (spec §7.8 / §18.3.11 /
+    /// §18.8.1) for a single legacy message. In addition to the sealed MOTE and the §7.2a
+    /// [`Attestation`], this signs a [`GatewayAttestation`] over the **exact RFC 5322 bytes** with
+    /// the same domain-anchored `_dmtap-gw` key (via [`crate::provenance`]) and assembles the
+    /// `gateway`-touched [`ProvenanceRecord`] a recipient node derives from it — so the message
+    /// carries a *provable* `gateway` hop (its presence is the non-forgeable §7.8.1(b) marker),
+    /// not merely an inbox-visible "from a gateway" claim. `seq` is `0`: this is the (single)
+    /// legacy-inbound bridge hop.
+    pub fn wrap_attest_and_stamp(
+        &self,
+        mail_from: &str,
+        rcpt_to: &str,
+        data: &[u8],
+        now: TimestampMs,
+    ) -> Result<InboundBridged, InboundError> {
+        let domain = domain_of(rcpt_to).ok_or_else(|| InboundError::BadAddress(rcpt_to.into()))?;
+        let att_key = self
+            .attest_key_for(domain)
+            .ok_or_else(|| InboundError::NoAttestationKey(domain.into()))?;
+
+        let (env, attestation) = self.wrap_and_attest(mail_from, rcpt_to, data, now)?;
+
+        // Sign the normative gateway attestation over the exact legacy bytes (§18.9.11), then
+        // assemble the client-facing provenance record the recipient would surface: a single
+        // gateway hop, gateway-touched origin (never pure-mesh). Legacy delivery arrives fast/direct
+        // (not off the mixnet), so tier=Fast / profile=NotApplicable; min_hops/observed_at are
+        // recipient-node observations, left unset by the gateway.
+        let gateway_attestation =
+            GatewayAttestation::sign(att_key, data, Some(mail_from), now, 0);
+        let provenance = ProvenanceRecord::assemble(
+            Tier::Fast,
+            Profile::NotApplicable,
+            None,
+            None,
+            vec![gateway_attestation.clone()],
+        );
+
+        Ok(InboundBridged { env, attestation, gateway_attestation, provenance })
+    }
+
     /// The full `smtp-inbound` decision for one recipient (§19.7.1 steps 3–6): wrap, attest,
     /// deliver, and return the SMTP reply — `250` only on a durable ack, else `451`.
     pub fn accept_message(
@@ -163,6 +483,11 @@ impl InboundGateway {
         data: &[u8],
         now: TimestampMs,
     ) -> SmtpReply {
+        // Pre-delivery DKIM gate (§7.2 step 2): under an enforce policy, a present-but-invalid
+        // signature is refused here, before the body is ever wrapped into a MOTE.
+        if let Err(reply) = self.dkim_gate(data) {
+            return reply;
+        }
         let (env, attestation) = match self.wrap_and_attest(mail_from, rcpt_to, data, now) {
             Ok(pair) => pair,
             Err(InboundError::NoRecipient(_)) | Err(InboundError::BadAddress(_)) => {
