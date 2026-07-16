@@ -20,7 +20,9 @@ use dmtap::inbound::InboundOutcome;
 use dmtap::mote::{Headers, Kind, SealKeypair};
 use dmtap::node::Node;
 use dmtap::transport::{InMemoryNetwork, InMemoryTransport};
-use dmtap::{CertifiedInit, ContentId, DeniableRouteError, Suite};
+use dmtap::{CertifiedInit, ContentId, DeniableRouteError, Journal, JournalError, Snapshot, Suite};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 const NOW: u64 = 1_700_000_000_000;
 
@@ -41,6 +43,31 @@ fn deniable_payload(from: &[u8], body: &[u8]) -> DeniablePayload {
         refs: vec![],
         attach: vec![],
         expires: None,
+    }
+}
+
+/// A journal that counts `save` calls, so a test can assert *which* code paths persist. Backs a
+/// shared snapshot so `load`/restart still works like [`MemoryJournal`].
+#[derive(Clone, Default)]
+struct CountingJournal {
+    saves: Arc<AtomicUsize>,
+    snap: Arc<Mutex<Option<Snapshot>>>,
+}
+
+impl CountingJournal {
+    fn saves(&self) -> usize {
+        self.saves.load(Ordering::SeqCst)
+    }
+}
+
+impl Journal for CountingJournal {
+    fn save(&self, snapshot: &Snapshot) -> Result<(), JournalError> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        *self.snap.lock().unwrap() = Some(snapshot.clone());
+        Ok(())
+    }
+    fn load(&self) -> Result<Snapshot, JournalError> {
+        Ok(self.snap.lock().unwrap().clone().unwrap_or_default())
     }
 }
 
@@ -149,6 +176,64 @@ fn a_throttled_genuine_init_succeeds_on_retry_after_refill() {
     let got = bob.deniable_accept(&alice_ik, &init).expect("genuine init admitted after refill");
     assert_eq!(got, first, "the genuine first MOTE round-trips once admitted");
     assert_eq!(bob.deniable_opks_remaining(), Some(opks.len() - 2), "now the genuine OPK is consumed");
+}
+
+/// A rejected (throttled) init performs NO checkpoint, while an admitted init still persists. This
+/// closes the amplification vector where every self-signed `CertifiedInit` — even one the gate
+/// throttles before touching a prekey — forced a full-node-Snapshot disk write (audit #4). We count
+/// journal saves: the throttled flood adds none; the one admitted accept adds exactly one.
+#[test]
+fn a_throttled_init_performs_no_checkpoint_while_an_admitted_one_persists() {
+    let net = InMemoryNetwork::new();
+    let journal = CountingJournal::default();
+
+    let bob_id = IdentityKey::generate();
+    let bob_ik = bob_id.public();
+    let mut bob = Node::with_journal(
+        bob_id,
+        SealKeypair::generate(),
+        net.endpoint(bob_ik.clone()),
+        Box::new(journal.clone()),
+    )
+    .expect("build bob on a counting journal");
+
+    // A single global token: the first accept is admitted, every later distinct-source init throttled.
+    bob.configure_deniable_accept_gate(DeniableAcceptLimits {
+        global_burst: 1,
+        global_refill_ms: 1_000_000_000,
+        source_burst: 100,
+        source_refill_ms: 1_000_000_000,
+    });
+    let bundle = bob.deniable_publish_bundle();
+
+    // Baseline taken AFTER configure/publish so their (legitimate, admin-path) writes don't count.
+    let baseline = journal.saves();
+
+    // One genuine, admitted init — drains the token, accepts, and MUST persist (drained bucket +
+    // delivered state survive a restart).
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let hello = deniable_payload(&alice_ik, b"a real hello");
+    let init = alice.deniable_open(&bob_ik, &bundle, &hello).unwrap();
+    assert!(bob.deniable_accept(&alice_ik, &init).is_ok(), "genuine init admitted");
+    assert_eq!(journal.saves(), baseline + 1, "an admitted accept persists exactly once");
+
+    // A burst of throwaway (Sybil) inits: the global bucket is spent, so each is throttled BEFORE a
+    // prekey is touched — and, post-fix, WITHOUT any checkpoint. The save count must not move.
+    let after_admit = journal.saves();
+    for _ in 0..200 {
+        let (mut mallory, mallory_ik, _) = make_node(&net);
+        let noise = deniable_payload(&mallory_ik, b"flood");
+        let flood = mallory.deniable_open(&bob_ik, &bundle, &noise).unwrap();
+        assert!(matches!(
+            bob.deniable_accept(&mallory_ik, &flood),
+            Err(DeniableRouteError::RateLimited)
+        ));
+    }
+    assert_eq!(
+        journal.saves(),
+        after_admit,
+        "a throttled/rejected init must perform NO checkpoint (no disk-write amplification)"
+    );
 }
 
 // ============================================================================================

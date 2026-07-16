@@ -263,6 +263,13 @@ const MAX_FRAME: u32 = 16 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Read timeout on an accepted connection, so a stalled peer cannot wedge the accept loop.
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Upper bound on the depth of the inbound frame backlog awaiting [`drain`](Transport::drain). The
+/// inbox is emptied only on poll, so without a cap a peer streaming frames faster than the engine
+/// drains them grows it without bound — each frame is [`MAX_FRAME`]-bounded but the *aggregate* is
+/// not, an out-of-memory vector. At the cap the accept loop refuses further frames on that
+/// connection (fail-safe backpressure: the peer's socket writes block/reset), so the backlog can
+/// never exceed `MAX_INBOX_FRAMES`.
+const MAX_INBOX_FRAMES: usize = 1024;
 
 fn invalid(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
@@ -362,7 +369,14 @@ fn tcp_accept_loop(
                 // A connection carries one message (connect-per-send); read until EOF/timeout.
                 // On a clean EOF, timeout, or malformed frame we are simply done with this conn.
                 while let Ok(msg) = read_tcp_frame(&mut stream) {
-                    inbox.lock().unwrap().push_back(msg);
+                    let mut q = inbox.lock().unwrap();
+                    if q.len() >= MAX_INBOX_FRAMES {
+                        // Backlog full: refuse further frames and stop reading this connection so
+                        // the inbox cannot grow past the cap (memory-exhaustion backpressure). The
+                        // conn drops as the loop iterates; the peer's next write blocks/resets.
+                        break;
+                    }
+                    q.push_back(msg);
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -572,5 +586,48 @@ mod tests {
         };
         a.add_peer(b"bob".to_vec(), dead_socket);
         assert_eq!(a.send(b"bob", Frame::Mote(vec![1])), Err(TransportError::Unreachable));
+    }
+
+    /// A peer that streams far more frames than the engine drains cannot grow the inbound backlog
+    /// without bound: the listener refuses frames past `MAX_INBOX_FRAMES`, so memory stays capped
+    /// (the aggregate-exhaustion vector — each frame is bounded, the queue was not). We flood a
+    /// single connection with many small frames and never drain, then assert the depth never exceeds
+    /// the cap.
+    #[test]
+    fn tcp_inbox_depth_is_bounded_under_a_flood() {
+        let b = TcpTransport::bind(b"bob".to_vec(), "127.0.0.1:0").unwrap();
+        let flood = MAX_INBOX_FRAMES + 512;
+
+        // One connection carrying a back-to-back frame stream; the accept loop reads many per conn.
+        std::thread::spawn({
+            let addr = b.local_socket_addr();
+            move || {
+                if let Ok(mut stream) = TcpStream::connect(addr) {
+                    for _ in 0..flood {
+                        // Ignore write errors: once the reader hits the cap it drops the connection,
+                        // and further writes reset — exactly the backpressure being exercised.
+                        if write_tcp_frame(&mut stream, b"alice", &Frame::Ack(vec![0xAB])).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Wait until the backlog fills to the cap (proves the flood reached the inbox), never
+        // draining. The depth must never exceed the cap no matter how much more the peer streams.
+        assert!(
+            wait_until(|| b.inbox.lock().unwrap().len() >= MAX_INBOX_FRAMES),
+            "the flood should fill the inbox up to its cap"
+        );
+        // Give the sender extra time to keep pushing; the cap must still hold.
+        for _ in 0..50 {
+            let depth = b.inbox.lock().unwrap().len();
+            assert!(
+                depth <= MAX_INBOX_FRAMES,
+                "inbox depth {depth} exceeded the cap {MAX_INBOX_FRAMES} — backlog grew unbounded"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }

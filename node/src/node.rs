@@ -960,14 +960,21 @@ impl<T: Transport> Node<T> {
         // the bucket refills still succeeds. Keyed on the claimed root IK; the global bucket is what
         // bounds a Sybil flood of throwaway identities.
         let admitted = self.deniable_admission.admit(peer_root_ik, self.now);
-        // The admission buckets mutated (a token drained on admit, refill/prune bookkeeping either
-        // way) — persist so the anti-abuse accounting survives a restart rather than refilling to a
-        // fresh full burst against the OPK pool (audit #4).
-        self.checkpoint();
         if !admitted {
+            // Rejected path — do NOT checkpoint. The only mutation here is deterministic bucket
+            // bookkeeping (a clock-keyed refill/prune plus a lazy per-source entry), all recomputable
+            // at the next `admit`, so dropping it fails safe. Persisting per rejected init would let a
+            // cheap flood of self-signed `CertifiedInit`s force a full-node-Snapshot disk write each
+            // (outbound queue, seen-set, every mix directory re-encoded, admission buckets) — an
+            // I/O+CPU amplification the OPK/rate gate never covered (audit #4).
             return Err(DeniableRouteError::RateLimited);
         }
-        self.deniable.accept(&certified.init)
+        let payload = self.deniable.accept(&certified.init)?;
+        // Admitted *and* accepted — the path an attacker cannot cheaply spam (bounded by the global
+        // burst). Persist here so the drained admission token survives a restart rather than
+        // refilling to a fresh full burst against the OPK pool (audit #4).
+        self.checkpoint();
+        Ok(payload)
     }
 
     /// Reconfigure the inbound deniable-init admission gate (audit #4 OPK-depletion defense),
