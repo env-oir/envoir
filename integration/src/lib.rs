@@ -19,3 +19,36 @@
 //! - `deniable_repudiation.rs` — a `dmtap-deniable` 1:1 exchange proving the repudiation property
 //!   holds after a real `dmtap-core::deniable::DeniableFrame` wire round trip, not just as an
 //!   in-memory struct comparison.
+//! - `full_roundtrip.rs` — the whole naming → seal → mesh → mail chain in one composition: a
+//!   node's own `resolve_and_pin` (real `dmtap-naming` KT verification) pins a recipient, `send_mail`
+//!   HPKE-seals a real MOTE (`dmtap-core`) to the resolved key, delivery rides the real libp2p mesh
+//!   (`dmtap-p2p`), and the content is read back through a real `dmtap-mail` JMAP view.
+//! - `gateway_provenance.rs` — a gateway-bridged legacy message and a pure-mesh message land in the
+//!   same recipient inbox; only the bridged one produces a verifiable `envoir-gateway` attestation
+//!   (`captured.len()` distinguishes them), a bit-flipped signature and an attestation lifted onto a
+//!   different delivered MOTE both fail closed.
+//! - `mls_group_over_real_mesh.rs` — a real RFC 9420 MLS group (`dmtap-mls`) forms and exchanges an
+//!   application message over the real libp2p mesh (`dmtap-p2p`), a member is removed, and the
+//!   removed member's stale state cannot decrypt a message created after removal (post-compromise
+//!   security, §5.2) even when a network observer relays the exact ciphertext straight at them.
+//!
+//! ## Scenarios considered and deliberately not added here
+//! - **Suite-downgrade / capability-rollback rejection through a live node.** `dmtap_core::suite`'s
+//!   `SuiteRatchet` and `dmtap_core::capability`'s `CapsVersionTracker`/`CapabilityAnnouncement` are
+//!   real, and already unit-tested end-to-end at the library level in the `downgrade-tests` crate
+//!   (`suite_high_water_mark_ratchet_should_reject_downgrade_below_pinned_floor`,
+//!   `capability_announcement_anti_rollback_should_reject_stale_caps_version`), but neither is wired
+//!   into `envoir-node`'s real `Node::receive_mote` accept path (grep confirms no reference to
+//!   either type in `node/src`). A genuine *end-to-end* version — an established peer's downgrade
+//!   rejected by a live node, honest path accepted — needs that wiring first.
+//!   `// TODO(once Node::receive_mote consults SuiteRatchet/CapsVersionTracker): add an integration
+//!   test that sends a real peer through a live node at a high-water suite/caps version, then a
+//!   downgraded one, and asserts the node itself rejects it.`
+//! - **KT equivocation surfaced through `Resolver::resolve`.** `dmtap_naming::kt::detect_equivocation`
+//!   is real and already unit-tested directly (two conflicting `SignedTreeHead`s for one log).
+//!   `InMemoryResolver`/the `Resolver` trait has no split-view simulation hook — each pinned `KtLog`
+//!   returns one deterministic view, so nothing in the resolution pipeline can currently observe two
+//!   disagreeing STHs for the same log within one `resolve()` call. `// TODO(once Resolver supports
+//!   a per-observer/multi-fetch KtLog view): add an integration test where two fetches of the same
+//!   pinned log return mutually inconsistent STHs and resolve() surfaces KtEquivocation /
+//!   KtSthInconsistent.`
