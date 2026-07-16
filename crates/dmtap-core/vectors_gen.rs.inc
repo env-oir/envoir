@@ -8,9 +8,19 @@
 // Non-deterministic operations (HPKE ephemeral encapsulation, key generation) are NOT vectored;
 // their deterministic sub-operations (content-address, sender_sig, payload_sig) are.
 
+use dmtap_core::deniable::{
+    DeniableFrame, DeniableInit, DeniableMessage, DeniablePayload, DeniablePrekeyBundle,
+    DENIABLE_PREKEYS_DS, DENIABLE_SPK_DS,
+};
+use dmtap_core::directory::{Custody, DirEntry, DomainDirectory, Visibility, DOMAIN_DIRECTORY_DS};
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{verify_domain, Cap, DeviceCert, Identity, IdentityKey, KeyPackageBundleRef};
-use dmtap_core::mote::{DeliveryTag, Envelope, Headers, Kind, Payload, ENVELOPE_SENDER_DS, PAYLOAD_SIG_DS};
+use dmtap_core::mixnet::{
+    MixDirectory, MixKeyEntry, MixNodeDescriptor, MIX_DESCRIPTOR_DS, MIX_DIRECTORY_DS,
+};
+use dmtap_core::mote::{
+    DeliveryTag, Envelope, Headers, Kind, Manifest, Payload, ENVELOPE_SENDER_DS, PAYLOAD_SIG_DS,
+};
 use dmtap_core::safety;
 use dmtap_core::suite::Suite;
 use dmtap_core::keyname;
@@ -479,6 +489,283 @@ fn build_all() -> VectorFile {
         ));
     }
 
+    // === 8. Mixnet directory objects (§18.5.2 / §18.5.3) ====================================
+    // A mix node's signed self-descriptor (node_ik = seed 0x11), one Sphinx mix key for epoch 42.
+    let mix_descriptor = MixNodeDescriptor::issue(
+        &IdentityKey::from_seed(&SEED_A),
+        vec!["/ip4/198.51.100.7/udp/443/quic-v1".into()],
+        vec![MixKeyEntry { epoch: 42, mix_key: vec![0xa1; 32], valid_until: 1_700_000_600_000 }],
+        0, // entry layer
+        1_700_000_000_000,
+        None,
+        None,
+    );
+    {
+        let bytes = mix_descriptor.det_cbor();
+        vectors.push(v(
+            "cbor_mix_descriptor",
+            "cbor_encode",
+            json!({ "type": "MixNodeDescriptor", "note": "node_ik seed 0x11*32; one MixKeyEntry (epoch 42); layer 0; §18.5.2 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of an IK-signed MixNodeDescriptor",
+        ));
+        // Signing KAT (§18.9.9): Ed25519 over DS-tag ‖ det_cbor(MixNodeDescriptor ∖ {7}).
+        let sk = IdentityKey::from_seed(&SEED_A);
+        let body = mix_descriptor.signing_body();
+        let sig = sk.sign_domain(MIX_DESCRIPTOR_DS, &body);
+        vectors.push(v(
+            "mix_descriptor_sig",
+            "ed25519_sign",
+            json!({ "seed_hex": hex(&SEED_A), "domain_hex": hex(MIX_DESCRIPTOR_DS), "msg_hex": hex(&body) }),
+            json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
+            "§18.9.9 MixNodeDescriptor.sig: DS-tag 'DMTAP-v0/mix-descriptor\\0' ‖ det_cbor(descriptor ∖ {7}); node_ik seed 0x11*32",
+        ));
+        vectors.push(v(
+            "mix_descriptor_sig_verify",
+            "ed25519_verify",
+            json!({ "pubkey_hex": hex(&sk.public_array()), "domain_hex": hex(MIX_DESCRIPTOR_DS), "msg_hex": hex(&body), "sig_hex": hex(&sig) }),
+            json!({ "valid": true }),
+            "the MixNodeDescriptor signature above MUST verify under node_ik (§18.5.2 key 2)",
+        ));
+    }
+    // A signed MixDirectory (authority = seed 0x22) enclosing the descriptor above (+ a middle-layer
+    // one from seed 0x33), each independently signed by its own node_ik.
+    let mix_descriptor_mid = MixNodeDescriptor::issue(
+        &IdentityKey::from_seed(&SEED_B),
+        vec!["/ip4/203.0.113.9/udp/443/quic-v1".into()],
+        vec![MixKeyEntry { epoch: 42, mix_key: vec![0xb2; 32], valid_until: 1_700_000_600_000 }],
+        1, // middle layer
+        1_700_000_000_000,
+        None,
+        None,
+    );
+    let mix_directory = MixDirectory::issue(
+        &IdentityKey::from_seed(&SEED_EPH),
+        42,
+        1,
+        vec![mix_descriptor.clone(), mix_descriptor_mid],
+        ContentId::of(b"prev-mix-directory"),
+        1_700_000_000_000,
+    );
+    {
+        let bytes = mix_directory.det_cbor();
+        vectors.push(v(
+            "cbor_mix_directory",
+            "cbor_encode",
+            json!({ "type": "MixDirectory", "note": "authority seed 0x33*32; two independently-signed MixNodeDescriptors (layers 0,1); §18.5.3 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of an authority-signed MixDirectory",
+        ));
+        let sk = IdentityKey::from_seed(&SEED_EPH);
+        let body = mix_directory.signing_body();
+        let sig = sk.sign_domain(MIX_DIRECTORY_DS, &body);
+        vectors.push(v(
+            "mix_directory_sig",
+            "ed25519_sign",
+            json!({ "seed_hex": hex(&SEED_EPH), "domain_hex": hex(MIX_DIRECTORY_DS), "msg_hex": hex(&body) }),
+            json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
+            "§18.9.9 MixDirectory.sig: DS-tag 'DMTAP-v0/mix-directory\\0' ‖ det_cbor(directory ∖ {8}); authority seed 0x33*32",
+        ));
+        vectors.push(v(
+            "mix_directory_sig_verify",
+            "ed25519_verify",
+            json!({ "pubkey_hex": hex(&sk.public_array()), "domain_hex": hex(MIX_DIRECTORY_DS), "msg_hex": hex(&body), "sig_hex": hex(&sig) }),
+            json!({ "valid": true }),
+            "the MixDirectory signature above MUST verify under the pinned authority (§18.5.3 key 2)",
+        ));
+    }
+
+    // === 9. Organization directory (§18.4.7) ================================================
+    let domain_directory = DomainDirectory::issue(
+        &IdentityKey::from_seed(&SEED_A),
+        "abc.com",
+        7,
+        Visibility::Public,
+        vec![
+            DirEntry {
+                name: "alice@abc.com".into(),
+                ik: IdentityKey::from_seed(&SEED_B).public(),
+                id: ContentId::of(b"alice-identity"),
+                custody: Custody::Sovereign,
+                roles: Some(vec!["admin".into()]),
+                added: 1_700_000_000_000,
+            },
+            DirEntry {
+                name: "bob@abc.com".into(),
+                ik: IdentityKey::from_seed(&SEED_EPH).public(),
+                id: ContentId::of(b"bob-identity"),
+                custody: Custody::OrgManaged,
+                roles: None,
+                added: 1_700_000_000_000,
+            },
+        ],
+        None,
+        1_700_000_000_000,
+    );
+    {
+        let bytes = domain_directory.det_cbor();
+        vectors.push(v(
+            "cbor_domain_directory",
+            "cbor_encode",
+            json!({ "type": "DomainDirectory", "note": "authority seed 0x11*32; two DirEntry (sovereign + org-managed); §18.4.7 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of an authority-signed DomainDirectory",
+        ));
+        let sk = IdentityKey::from_seed(&SEED_A);
+        let body = domain_directory.signing_body();
+        let sig = sk.sign_domain(DOMAIN_DIRECTORY_DS, &body);
+        vectors.push(v(
+            "domain_directory_sig",
+            "ed25519_sign",
+            json!({ "seed_hex": hex(&SEED_A), "domain_hex": hex(DOMAIN_DIRECTORY_DS), "msg_hex": hex(&body) }),
+            json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
+            "§18.9.3 DomainDirectory.sig: DS-tag 'DMTAP-v0/domain-directory\\0' ‖ det_cbor(directory ∖ {9}); authority seed 0x11*32",
+        ));
+        vectors.push(v(
+            "domain_directory_sig_verify",
+            "ed25519_verify",
+            json!({ "pubkey_hex": hex(&sk.public_array()), "domain_hex": hex(DOMAIN_DIRECTORY_DS), "msg_hex": hex(&body), "sig_hex": hex(&sig) }),
+            json!({ "valid": true }),
+            "the DomainDirectory signature above MUST verify under the pinned domain authority (§18.4.7 key 3)",
+        ));
+    }
+
+    // === 10. Deniable 1:1 mode objects (§18.4.8 / §18.3.9 / §18.3.10) ========================
+    // (a) DeniablePrekeyBundle — two signatures: spk_sig over the raw spk, sig over the body.
+    let prekey_bundle = DeniablePrekeyBundle::issue(
+        &IdentityKey::from_seed(&SEED_A),
+        vec![0xab; 32],
+        vec![vec![0x01; 32], vec![0x02; 32]],
+        3,
+        1_700_000_000_000,
+    );
+    {
+        let bytes = prekey_bundle.det_cbor();
+        vectors.push(v(
+            "cbor_deniable_prekey_bundle",
+            "cbor_encode",
+            json!({ "type": "DeniablePrekeyBundle", "note": "ik seed 0x11*32; spk = 0xab*32; two one-time prekeys; §18.4.8 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of a device-signed DeniablePrekeyBundle",
+        ));
+        let sk = IdentityKey::from_seed(&SEED_A);
+        // spk_sig KAT (§18.9.10): Ed25519 over DS-tag ‖ raw spk bytes (field 3).
+        let spk = vec![0xabu8; 32];
+        let spk_sig = sk.sign_domain(DENIABLE_SPK_DS, &spk);
+        vectors.push(v(
+            "deniable_spk_sig",
+            "ed25519_sign",
+            json!({ "seed_hex": hex(&SEED_A), "domain_hex": hex(DENIABLE_SPK_DS), "msg_hex": hex(&spk) }),
+            json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&spk_sig) }),
+            "§18.9.10 DeniablePrekeyBundle.spk_sig: DS-tag 'DMTAP-v0/deniable-spk\\0' ‖ raw spk (field 3); device seed 0x11*32",
+        ));
+        // bundle sig KAT (§18.9.10): Ed25519 over DS-tag ‖ det_cbor(bundle ∖ {10}) (covers spk_sig).
+        let body = prekey_bundle.signing_body();
+        let sig = sk.sign_domain(DENIABLE_PREKEYS_DS, &body);
+        vectors.push(v(
+            "deniable_prekeys_sig",
+            "ed25519_sign",
+            json!({ "seed_hex": hex(&SEED_A), "domain_hex": hex(DENIABLE_PREKEYS_DS), "msg_hex": hex(&body) }),
+            json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
+            "§18.9.10 DeniablePrekeyBundle.sig: DS-tag 'DMTAP-v0/deniable-prekeys\\0' ‖ det_cbor(bundle ∖ {10}); device seed 0x11*32",
+        ));
+        vectors.push(v(
+            "deniable_prekeys_sig_verify",
+            "ed25519_verify",
+            json!({ "pubkey_hex": hex(&sk.public_array()), "domain_hex": hex(DENIABLE_PREKEYS_DS), "msg_hex": hex(&body), "sig_hex": hex(&sig) }),
+            json!({ "valid": true }),
+            "the DeniablePrekeyBundle body signature above MUST verify under ik (§18.4.8 key 2)",
+        ));
+    }
+    // (b) DeniableMessage frame (a subsequent Double-Ratchet message; NO signature).
+    let deniable_message = DeniableMessage { dh: vec![0x09; 32], pn: 0, n: 5, ct: b"ratchet-ciphertext-with-mac".to_vec() };
+    {
+        let frame = DeniableFrame::Message(deniable_message.clone());
+        let bytes = frame.det_cbor();
+        vectors.push(v(
+            "cbor_deniable_message",
+            "cbor_encode",
+            json!({ "type": "DeniableFrame", "note": "DeniableMessage (disc 2): dh=0x09*32, pn=0, n=5; NO signature; §18.3.9 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of a deniable subsequent-message frame (auth = ratchet MAC, no sig)",
+        ));
+    }
+    // (c) DeniableInit frame (the X3DH first message, embedding the DeniableMessage; NO signature).
+    let deniable_init = DeniableInit {
+        suite: Suite::Classical,
+        ik_a: IdentityKey::from_seed(&SEED_A).public(),
+        ek_a: vec![0x33; 32],
+        spk_ref: ContentId::of(b"responder-signed-prekey"),
+        opk_ref: Some(ContentId::of(b"responder-one-time-prekey")),
+        kem_ct: None,
+        kem_ref: None,
+        msg: deniable_message,
+    };
+    {
+        let frame = DeniableFrame::Init(deniable_init);
+        let bytes = frame.det_cbor();
+        vectors.push(v(
+            "cbor_deniable_init",
+            "cbor_encode",
+            json!({ "type": "DeniableFrame", "note": "DeniableInit (disc 1): ik_a seed 0x11*32, embeds the DeniableMessage; NO signature; §18.3.9 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of a deniable X3DH first-message frame (auth = ratchet MAC, no sig)",
+        ));
+    }
+    // (d) DeniablePayload — the ratchet plaintext (structural twin of Payload; NO signature field).
+    let deniable_payload = DeniablePayload {
+        from: IdentityKey::from_seed(&SEED_A).public(),
+        kind: Kind::Chat,
+        headers: Headers { subject: Some("deniable hi".into()), ..Default::default() },
+        body: b"deniable hello dmtap".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+    {
+        let bytes = deniable_payload.det_cbor();
+        vectors.push(v(
+            "cbor_deniable_payload",
+            "cbor_encode",
+            json!({ "type": "DeniablePayload", "note": "from seed 0x11*32; key 2 is the real content kind (chat), NOT a sig; §18.3.10 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of a DeniablePayload; a smuggled signature MUST be rejected (§18.3.10)",
+        ));
+    }
+
+    // === 11. File manifest (§18.3.8) + Merkle-DAG root (§18.9.5) =============================
+    let manifest = {
+        let chunks = vec![ContentId::of(b"chunk-0"), ContentId::of(b"chunk-1"), ContentId::of(b"chunk-2")];
+        let mut m = Manifest {
+            id: ContentId(Vec::new()),
+            size: 3 * 1024 * 1024,
+            chunk_sz: 1024 * 1024,
+            chunks,
+            suite: Suite::Classical,
+        };
+        m.id = m.merkle_root(); // §18.9.5: id MUST equal the Merkle root over the ordered chunks
+        m
+    };
+    {
+        let bytes = manifest.det_cbor();
+        vectors.push(v(
+            "cbor_manifest",
+            "cbor_encode",
+            json!({ "type": "Manifest", "note": "3 ordered chunk hashes; id = §18.9.5 Merkle root; forbidden key 5 absent; §18.3.8 integer-keyed" }),
+            json!({ "cbor_hex": hex(&bytes) }),
+            "§18-canonical integer-keyed CBOR of a swarm-distributed file Manifest",
+        ));
+        // Merkle-DAG root KAT (§18.9.5): RFC 6962 tree with domain-separated leaf/node prefixes.
+        let chunk_hexes: Vec<String> = manifest.chunks.iter().map(|c| hex(c.as_bytes())).collect();
+        vectors.push(v(
+            "manifest_root",
+            "manifest_root",
+            json!({ "chunk_hashes_hex": chunk_hexes }),
+            json!({ "id_hex": hex(manifest.id.as_bytes()) }),
+            "§18.9.5 Manifest.id = 0x1e ‖ MTH(chunks): leaf=BLAKE3(0x00‖h), node=BLAKE3(0x01‖l‖r), RFC 6962 split, 3 chunks",
+        ));
+    }
+
     VectorFile {
         format: "dmtap-conformance-vectors/1".into(),
         suite: "0x01 (classical): Ed25519 / X25519-HPKE / ChaCha20-Poly1305 / BLAKE3-256".into(),
@@ -543,6 +830,22 @@ fn recheck_against_reference(vf: &VectorFile) {
                 let bytes = unhex(inp["cbor_hex"].as_str().unwrap());
                 let r: Result<Suite, _> = ciborium::from_reader(&bytes[..]);
                 assert_eq!(r.is_ok(), exp["accepted"].as_bool().unwrap(), "{}", vec.name);
+            }
+            "manifest_root" => {
+                let chunks: Vec<ContentId> = inp["chunk_hashes_hex"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|h| ContentId(unhex(h.as_str().unwrap())))
+                    .collect();
+                let m = Manifest {
+                    id: ContentId(Vec::new()),
+                    size: 0,
+                    chunk_sz: 0,
+                    chunks,
+                    suite: Suite::Classical,
+                };
+                assert_eq!(hex(m.merkle_root().as_bytes()), exp["id_hex"].as_str().unwrap(), "{}", vec.name);
             }
             "cbor_encode" => { /* byte-exactness covered by whole-file equality + round-trip tests */ }
             other => panic!("unhandled operation in recheck: {other} ({})", vec.name),

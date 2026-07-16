@@ -593,7 +593,7 @@ pub struct Headers {
 }
 
 impl Headers {
-    fn to_cv(&self) -> Cv {
+    pub(crate) fn to_cv(&self) -> Cv {
         let mut m: Vec<(u64, Cv)> = Vec::new();
         if let Some(t) = &self.thread {
             m.push((1, Cv::Bytes(t.clone())));
@@ -608,7 +608,7 @@ impl Headers {
         Cv::Map(m)
     }
 
-    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+    pub(crate) fn from_cv(cv: Cv) -> Result<Self, CborError> {
         let mut f = Fields::from_cv(cv)?;
         let thread = f.take(1).map(as_bytes).transpose()?;
         let subject = f.take(2).map(as_text).transpose()?;
@@ -637,7 +637,7 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    fn to_cv(&self) -> Cv {
+    pub(crate) fn to_cv(&self) -> Cv {
         let mut m = vec![
             (1u64, Cv::Text(self.name.clone())),
             (2, Cv::Text(self.mime.clone())),
@@ -653,7 +653,7 @@ impl Attachment {
         Cv::Map(m)
     }
 
-    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+    pub(crate) fn from_cv(cv: Cv) -> Result<Self, CborError> {
         let mut f = Fields::from_cv(cv)?;
         let name = as_text(f.req(1)?)?;
         let mime = as_text(f.req(2)?)?;
@@ -725,6 +725,24 @@ impl Manifest {
         cbor::encode(&self.to_cv())
     }
 
+    /// The §18.9.5 Merkle-DAG root over the **ordered** chunk hashes (RFC 6962-style binary tree
+    /// with domain-separated leaf/node prefixes), returned as a content address
+    /// `0x1e ‖ MTH(chunks)`. This is the value `Manifest.id` (and `ManifestRef.id`) MUST equal.
+    /// Panics on an empty chunk list (a manifest MUST carry ≥ 1 chunk, §18.3.8).
+    pub fn merkle_root(&self) -> ContentId {
+        let leaves: Vec<[u8; 32]> = self
+            .chunks
+            .iter()
+            .map(|c| c.as_bytes().to_vec())
+            .map(|h| *blake3::hash(&[&[0x00u8], h.as_slice()].concat()).as_bytes())
+            .collect();
+        let root = merkle_tree_head(&leaves);
+        let mut v = Vec::with_capacity(33);
+        v.push(crate::id::MH_BLAKE3_256);
+        v.extend_from_slice(&root);
+        ContentId(v)
+    }
+
     /// Decode a manifest (§18.3.8), rejecting a present key `5` as `ERR_MANIFEST_KEY_PRESENT`.
     pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, CborError> {
         let mut f = Fields::from_cv(cbor::decode(bytes)?)?;
@@ -743,6 +761,30 @@ impl Manifest {
         let suite = suite_from_cv(f.req(6)?)?;
         f.deny_unknown()?;
         Ok(Manifest { id, size, chunk_sz, chunks, suite })
+    }
+}
+
+/// RFC 6962-style Merkle Tree Head over already-hashed leaves (§18.9.5). `leaves[i]` is the
+/// leaf digest `leaf(h_i) = BLAKE3-256(0x00 ‖ h_i)`; internal nodes are
+/// `node(l, r) = BLAKE3-256(0x01 ‖ l ‖ r)`. The non-power-of-two split takes `k` = the largest
+/// power of two strictly less than `n` (no padding). Requires `n ≥ 1`.
+fn merkle_tree_head(leaves: &[[u8; 32]]) -> [u8; 32] {
+    match leaves.len() {
+        0 => panic!("merkle root requires at least one leaf (§18.3.8)"),
+        1 => leaves[0],
+        n => {
+            let mut k = 1usize;
+            while k << 1 < n {
+                k <<= 1;
+            }
+            let left = merkle_tree_head(&leaves[..k]);
+            let right = merkle_tree_head(&leaves[k..]);
+            let mut buf = Vec::with_capacity(1 + 64);
+            buf.push(0x01);
+            buf.extend_from_slice(&left);
+            buf.extend_from_slice(&right);
+            *blake3::hash(&buf).as_bytes()
+        }
     }
 }
 

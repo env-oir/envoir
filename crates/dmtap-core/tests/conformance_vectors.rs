@@ -85,6 +85,44 @@ fn cbor_vectors_round_trip() {
                 assert!(obj.id.verify(&obj.ciphertext), "Envelope id must match ciphertext: {}", vec.name);
                 assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
             }
+            "MixNodeDescriptor" => {
+                let obj = dmtap_core::mixnet::MixNodeDescriptor::from_det_cbor(&bytes).unwrap();
+                assert!(obj.verify().is_ok(), "decoded MixNodeDescriptor must verify: {}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "MixDirectory" => {
+                let obj = dmtap_core::mixnet::MixDirectory::from_det_cbor(&bytes).unwrap();
+                assert!(obj.verify().is_ok(), "decoded MixDirectory must verify: {}", vec.name);
+                // Each enclosed descriptor also self-verifies (authority attests membership only).
+                for m in &obj.mixes {
+                    assert!(m.verify().is_ok(), "enclosed MixNodeDescriptor must verify: {}", vec.name);
+                }
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "DomainDirectory" => {
+                let obj = dmtap_core::directory::DomainDirectory::from_det_cbor(&bytes).unwrap();
+                assert!(obj.verify().is_ok(), "decoded DomainDirectory must verify: {}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "DeniablePrekeyBundle" => {
+                let obj = dmtap_core::deniable::DeniablePrekeyBundle::from_det_cbor(&bytes).unwrap();
+                assert!(obj.verify().is_ok(), "decoded DeniablePrekeyBundle must verify: {}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "DeniableFrame" => {
+                let obj = dmtap_core::deniable::DeniableFrame::from_det_cbor(&bytes).unwrap();
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "DeniablePayload" => {
+                let obj = dmtap_core::deniable::DeniablePayload::from_det_cbor(&bytes).unwrap();
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
+            "Manifest" => {
+                let obj = Manifest::from_det_cbor(&bytes).unwrap();
+                // A Manifest self-verifies: its id MUST equal the §18.9.5 Merkle root.
+                assert_eq!(obj.id, obj.merkle_root(), "Manifest id must equal Merkle root: {}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
+            }
             other => panic!("unknown cbor type {other}"),
         }
     }

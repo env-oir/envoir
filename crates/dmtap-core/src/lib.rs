@@ -18,15 +18,25 @@
 //!   of a *pair* of identity keys for OOB key verification (§3.4.1).
 //! - [`mote`] — the **MOTE** object: `Envelope` + `Payload`, HPKE payload sealing, and the
 //!   ordered recipient validation of §2.7 (anonymous checks before decryption).
+//! - [`mixnet`] — the mixnet directory objects: `MixNodeDescriptor` + `MixDirectory` (§18.5.2/.3),
+//!   signed per §18.9.9.
+//! - [`directory`] — the org directory: `DomainDirectory` + `DirEntry` (§18.4.7), signed per
+//!   §18.9.3.
+//! - [`deniable`] — the optional deniable 1:1 mode objects: `DeniablePrekeyBundle` (§18.4.8),
+//!   `DeniableFrame`/`DeniableInit`/`DeniableMessage` (§18.3.9), `DeniablePayload` (§18.3.10);
+//!   asymmetric signing per §18.9.10.
 //!
 //! ## Crypto suite `0x01` (v0 REQUIRED)
 //! Ed25519 signatures, HPKE `DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305`, BLAKE3-256 hashing.
 //! Suite `0x02` (PQ) is reserved and **fails closed** everywhere it is offered.
 
 pub mod cbor;
+pub mod deniable;
+pub mod directory;
 pub mod id;
 pub mod identity;
 pub mod keyname;
+pub mod mixnet;
 pub mod mote;
 pub mod safety;
 pub mod suite;

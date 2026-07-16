@@ -398,6 +398,243 @@
         "sig_hex": "38350f0b682ae7ab9d6f2497c83db330b95144a7b6014dc36e37068dbf9a9b45c675dc03df2f1fc3531f9da7a361b5d67bbae7bb1250a6af54ae63d781f14f05"
       },
       "note": "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig})) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32"
+    },
+    {
+      "name": "cbor_mix_descriptor",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "node_ik seed 0x11*32; one MixKeyEntry (epoch 42); layer 0; §18.5.2 integer-keyed",
+        "type": "MixNodeDescriptor"
+      },
+      "expected": {
+        "cbor_hex": "a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe568000758409b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803"
+      },
+      "note": "§18-canonical integer-keyed CBOR of an IK-signed MixNodeDescriptor"
+    },
+    {
+      "name": "mix_descriptor_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f6d69782d64657363726970746f7200",
+        "msg_hex": "a60101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe56800",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "9b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803"
+      },
+      "note": "§18.9.9 MixNodeDescriptor.sig: DS-tag 'DMTAP-v0/mix-descriptor\\0' ‖ det_cbor(descriptor ∖ {7}); node_ik seed 0x11*32"
+    },
+    {
+      "name": "mix_descriptor_sig_verify",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f6d69782d64657363726970746f7200",
+        "msg_hex": "a60101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe56800",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "9b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the MixNodeDescriptor signature above MUST verify under node_ik (§18.5.2 key 2)"
+    },
+    {
+      "name": "cbor_mix_directory",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "authority seed 0x33*32; two independently-signed MixNodeDescriptors (layers 0,1); §18.5.3 integer-keyed",
+        "type": "MixDirectory"
+      },
+      "expected": {
+        "cbor_hex": "a8010102582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce03182a04010582a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe568000758409b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803a70101025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0038178202f6970342f3230332e302e3131332e392f7564702f3434332f717569632d76310481a301182a025820b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2031b0000018bcfee8fc00501061b0000018bcfe568000758407ed3db5a011a18fc27c3dd80e0ab5691546914ea9ed4a6a23b757b16d280663b9490eee2ff216ee82433bdec7558c33ac87d50118fff50ee7a7d974774b4cb010658211ee6afd91a501e6697a2ffce17c2d045b9e035b23318a0f6ef27aa7056744a8bde071b0000018bcfe56800085840fd8960032c85661bfa9748627db7cb0651dc88db49687b965b8c8a9e43b451d61332b3385d8510867c355a0e8b3972edac44e3bbdffd036ace7cb1654aaf8204"
+      },
+      "note": "§18-canonical integer-keyed CBOR of an authority-signed MixDirectory"
+    },
+    {
+      "name": "mix_directory_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f6d69782d6469726563746f727900",
+        "msg_hex": "a7010102582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce03182a04010582a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe568000758409b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803a70101025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0038178202f6970342f3230332e302e3131332e392f7564702f3434332f717569632d76310481a301182a025820b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2031b0000018bcfee8fc00501061b0000018bcfe568000758407ed3db5a011a18fc27c3dd80e0ab5691546914ea9ed4a6a23b757b16d280663b9490eee2ff216ee82433bdec7558c33ac87d50118fff50ee7a7d974774b4cb010658211ee6afd91a501e6697a2ffce17c2d045b9e035b23318a0f6ef27aa7056744a8bde071b0000018bcfe56800",
+        "seed_hex": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "expected": {
+        "pubkey_hex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+        "sig_hex": "fd8960032c85661bfa9748627db7cb0651dc88db49687b965b8c8a9e43b451d61332b3385d8510867c355a0e8b3972edac44e3bbdffd036ace7cb1654aaf8204"
+      },
+      "note": "§18.9.9 MixDirectory.sig: DS-tag 'DMTAP-v0/mix-directory\\0' ‖ det_cbor(directory ∖ {8}); authority seed 0x33*32"
+    },
+    {
+      "name": "mix_directory_sig_verify",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f6d69782d6469726563746f727900",
+        "msg_hex": "a7010102582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce03182a04010582a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737038178212f6970342f3139382e35312e3130302e372f7564702f3434332f717569632d76310481a301182a025820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1031b0000018bcfee8fc00500061b0000018bcfe568000758409b52561dd88d473d1600032fe1d115f58cb6c643af5e1e3154acc5c9646b079f3695b211c83b3832a1496b771ce292988cbd67f5d37465b2f52243c3f3a41803a70101025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0038178202f6970342f3230332e302e3131332e392f7564702f3434332f717569632d76310481a301182a025820b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2031b0000018bcfee8fc00501061b0000018bcfe568000758407ed3db5a011a18fc27c3dd80e0ab5691546914ea9ed4a6a23b757b16d280663b9490eee2ff216ee82433bdec7558c33ac87d50118fff50ee7a7d974774b4cb010658211ee6afd91a501e6697a2ffce17c2d045b9e035b23318a0f6ef27aa7056744a8bde071b0000018bcfe56800",
+        "pubkey_hex": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+        "sig_hex": "fd8960032c85661bfa9748627db7cb0651dc88db49687b965b8c8a9e43b451d61332b3385d8510867c355a0e8b3972edac44e3bbdffd036ace7cb1654aaf8204"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the MixDirectory signature above MUST verify under the pinned authority (§18.5.3 key 2)"
+    },
+    {
+      "name": "cbor_domain_directory",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "authority seed 0x11*32; two DirEntry (sovereign + org-managed); §18.4.7 integer-keyed",
+        "type": "DomainDirectory"
+      },
+      "expected": {
+        "cbor_hex": "a8010102676162632e636f6d035820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737040705667075626c69630682a6016d616c696365406162632e636f6d025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00358211e6c531fbcc91ae2f0a5c28b1d48a66469c7db3cc2445d9346c612f4f0fd993fe30469736f7665726569676e05816561646d696e061b0000018bcfe56800a5016b626f62406162632e636f6d02582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0358211efd7fd379ab48ea3ab66cc631c76b80b936d93900247194e37087c1bf9aa153e8046b6f72672d6d616e61676564061b0000018bcfe56800081b0000018bcfe568000958403952bebafabea94dcf90e1285c980a5f246251bcb82a6c86091736f33013f056fed0ae538d4bec373aa83723d76660be8ca864866ac12ab151649da4da01e505"
+      },
+      "note": "§18-canonical integer-keyed CBOR of an authority-signed DomainDirectory"
+    },
+    {
+      "name": "domain_directory_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f646f6d61696e2d6469726563746f727900",
+        "msg_hex": "a7010102676162632e636f6d035820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737040705667075626c69630682a6016d616c696365406162632e636f6d025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00358211e6c531fbcc91ae2f0a5c28b1d48a66469c7db3cc2445d9346c612f4f0fd993fe30469736f7665726569676e05816561646d696e061b0000018bcfe56800a5016b626f62406162632e636f6d02582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0358211efd7fd379ab48ea3ab66cc631c76b80b936d93900247194e37087c1bf9aa153e8046b6f72672d6d616e61676564061b0000018bcfe56800081b0000018bcfe56800",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "3952bebafabea94dcf90e1285c980a5f246251bcb82a6c86091736f33013f056fed0ae538d4bec373aa83723d76660be8ca864866ac12ab151649da4da01e505"
+      },
+      "note": "§18.9.3 DomainDirectory.sig: DS-tag 'DMTAP-v0/domain-directory\\0' ‖ det_cbor(directory ∖ {9}); authority seed 0x11*32"
+    },
+    {
+      "name": "domain_directory_sig_verify",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f646f6d61696e2d6469726563746f727900",
+        "msg_hex": "a7010102676162632e636f6d035820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737040705667075626c69630682a6016d616c696365406162632e636f6d025820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00358211e6c531fbcc91ae2f0a5c28b1d48a66469c7db3cc2445d9346c612f4f0fd993fe30469736f7665726569676e05816561646d696e061b0000018bcfe56800a5016b626f62406162632e636f6d02582017cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce0358211efd7fd379ab48ea3ab66cc631c76b80b936d93900247194e37087c1bf9aa153e8046b6f72672d6d616e61676564061b0000018bcfe56800081b0000018bcfe56800",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "3952bebafabea94dcf90e1285c980a5f246251bcb82a6c86091736f33013f056fed0ae538d4bec373aa83723d76660be8ca864866ac12ab151649da4da01e505"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the DomainDirectory signature above MUST verify under the pinned domain authority (§18.4.7 key 3)"
+    },
+    {
+      "name": "cbor_deniable_prekey_bundle",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "ik seed 0x11*32; spk = 0xab*32; two one-time prekeys; §18.4.8 integer-keyed",
+        "type": "DeniablePrekeyBundle"
+      },
+      "expected": {
+        "cbor_hex": "a80101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737035820abababababababababababababababababababababababababababababababab0458403bb600dcb89dccdb1af4ed7c7df12991bb17f8831616a9dab59f2eac86ebbcd6a28f96764be9f0235f3ed520361cd562951e5fe3f27e1e47538f32626e6dc804058258200101010101010101010101010101010101010101010101010101010101010101582002020202020202020202020202020202020202020202020202020202020202020803091b0000018bcfe568000a5840dc20da73ce0c70bd69d3974ef3af7174279fa5c541e5ef1e062484ca2b2a156646f14aca2afc4dc8e1d0563d0f47a3978540af8cbd1f2dd35f9b6a8994c3550f"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a device-signed DeniablePrekeyBundle"
+    },
+    {
+      "name": "deniable_spk_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f64656e6961626c652d73706b00",
+        "msg_hex": "abababababababababababababababababababababababababababababababab",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "3bb600dcb89dccdb1af4ed7c7df12991bb17f8831616a9dab59f2eac86ebbcd6a28f96764be9f0235f3ed520361cd562951e5fe3f27e1e47538f32626e6dc804"
+      },
+      "note": "§18.9.10 DeniablePrekeyBundle.spk_sig: DS-tag 'DMTAP-v0/deniable-spk\\0' ‖ raw spk (field 3); device seed 0x11*32"
+    },
+    {
+      "name": "deniable_prekeys_sig",
+      "operation": "ed25519_sign",
+      "input": {
+        "domain_hex": "444d5441502d76302f64656e6961626c652d7072656b65797300",
+        "msg_hex": "a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737035820abababababababababababababababababababababababababababababababab0458403bb600dcb89dccdb1af4ed7c7df12991bb17f8831616a9dab59f2eac86ebbcd6a28f96764be9f0235f3ed520361cd562951e5fe3f27e1e47538f32626e6dc804058258200101010101010101010101010101010101010101010101010101010101010101582002020202020202020202020202020202020202020202020202020202020202020803091b0000018bcfe56800",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "expected": {
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "dc20da73ce0c70bd69d3974ef3af7174279fa5c541e5ef1e062484ca2b2a156646f14aca2afc4dc8e1d0563d0f47a3978540af8cbd1f2dd35f9b6a8994c3550f"
+      },
+      "note": "§18.9.10 DeniablePrekeyBundle.sig: DS-tag 'DMTAP-v0/deniable-prekeys\\0' ‖ det_cbor(bundle ∖ {10}); device seed 0x11*32"
+    },
+    {
+      "name": "deniable_prekeys_sig_verify",
+      "operation": "ed25519_verify",
+      "input": {
+        "domain_hex": "444d5441502d76302f64656e6961626c652d7072656b65797300",
+        "msg_hex": "a70101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737035820abababababababababababababababababababababababababababababababab0458403bb600dcb89dccdb1af4ed7c7df12991bb17f8831616a9dab59f2eac86ebbcd6a28f96764be9f0235f3ed520361cd562951e5fe3f27e1e47538f32626e6dc804058258200101010101010101010101010101010101010101010101010101010101010101582002020202020202020202020202020202020202020202020202020202020202020803091b0000018bcfe56800",
+        "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        "sig_hex": "dc20da73ce0c70bd69d3974ef3af7174279fa5c541e5ef1e062484ca2b2a156646f14aca2afc4dc8e1d0563d0f47a3978540af8cbd1f2dd35f9b6a8994c3550f"
+      },
+      "expected": {
+        "valid": true
+      },
+      "note": "the DeniablePrekeyBundle body signature above MUST verify under ik (§18.4.8 key 2)"
+    },
+    {
+      "name": "cbor_deniable_message",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "DeniableMessage (disc 2): dh=0x09*32, pn=0, n=5; NO signature; §18.3.9 integer-keyed",
+        "type": "DeniableFrame"
+      },
+      "expected": {
+        "cbor_hex": "a5000201582009090909090909090909090909090909090909090909090909090909090909090200030504581b726174636865742d636970686572746578742d776974682d6d6163"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a deniable subsequent-message frame (auth = ratchet MAC, no sig)"
+    },
+    {
+      "name": "cbor_deniable_init",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "DeniableInit (disc 1): ik_a seed 0x11*32, embeds the DeniableMessage; NO signature; §18.3.9 integer-keyed",
+        "type": "DeniableFrame"
+      },
+      "expected": {
+        "cbor_hex": "a700010101025820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c977873703582033333333333333333333333333333333333333333333333333333333333333330458211e136b2225292f25840e8a70b739511c6698a004a457de75fba2f52859e1d5855f0558211ed6f00b1cacf970ac3711bcb2335a17884dba6c9e8a78281b14349d3ddfd50aa208a5000201582009090909090909090909090909090909090909090909090909090909090909090200030504581b726174636865742d636970686572746578742d776974682d6d6163"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a deniable X3DH first-message frame (auth = ratchet MAC, no sig)"
+    },
+    {
+      "name": "cbor_deniable_payload",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "from seed 0x11*32; key 2 is the real content kind (chat), NOT a sig; §18.3.10 integer-keyed",
+        "type": "DeniablePayload"
+      },
+      "expected": {
+        "cbor_hex": "a6015820d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737020103a2026b64656e6961626c652068690480045464656e6961626c652068656c6c6f20646d74617005800680"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a DeniablePayload; a smuggled signature MUST be rejected (§18.3.10)"
+    },
+    {
+      "name": "cbor_manifest",
+      "operation": "cbor_encode",
+      "input": {
+        "note": "3 ordered chunk hashes; id = §18.9.5 Merkle root; forbidden key 5 absent; §18.3.8 integer-keyed",
+        "type": "Manifest"
+      },
+      "expected": {
+        "cbor_hex": "a50158211eda0a34b79b096cacec69da1d794e29482e7b31004226b3fa479b993d08715b00021a00300000031a00100000048358211ef629f739a1a64359d49d3a31eaa0a11e2de21efed3755238073a3cddd4600dc458211e2ed52c29dade3989ba736b4d0e0080bb796d77a15ecc6a26dd4289c2ca3d66b558211e1248fe96039335085532bebaafbb36c0c4d07dc187ea9c86c6e13ca1181ca7f50601"
+      },
+      "note": "§18-canonical integer-keyed CBOR of a swarm-distributed file Manifest"
+    },
+    {
+      "name": "manifest_root",
+      "operation": "manifest_root",
+      "input": {
+        "chunk_hashes_hex": [
+          "1ef629f739a1a64359d49d3a31eaa0a11e2de21efed3755238073a3cddd4600dc4",
+          "1e2ed52c29dade3989ba736b4d0e0080bb796d77a15ecc6a26dd4289c2ca3d66b5",
+          "1e1248fe96039335085532bebaafbb36c0c4d07dc187ea9c86c6e13ca1181ca7f5"
+        ]
+      },
+      "expected": {
+        "id_hex": "1eda0a34b79b096cacec69da1d794e29482e7b31004226b3fa479b993d08715b00"
+      },
+      "note": "§18.9.5 Manifest.id = 0x1e ‖ MTH(chunks): leaf=BLAKE3(0x00‖h), node=BLAKE3(0x01‖l‖r), RFC 6962 split, 3 chunks"
     }
   ]
 }
