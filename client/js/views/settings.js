@@ -6,10 +6,11 @@ import { state, saveSettings, applyFilters, uid, unblockSender, allowSender, blo
 import { LABELS } from '../seed.js';
 import { currentIdentity, displayAddress, displayName, logout, addAlias, removeAlias, makePrimary } from '../identity.js';
 import { claimHandle } from '../mesh-sim.js';
-import { el, esc, icon, toast, openModal, closeModal } from '../ui.js';
+import { el, esc, icon, avatar, toast, openModal, closeModal } from '../ui.js';
 import { renderSignin } from '../signin.js';
 import { bus } from '../bus.js';
 import { SHORTCUTS } from '../shell.js';
+import { openEditProfile } from '../profileModal.js';
 
 export function render(root) {
   const id = currentIdentity();
@@ -20,15 +21,19 @@ export function render(root) {
 
     <section class="set-card">
       <h2>${icon('key')} Identity</h2>
-      <p class="set-hint">Your <b>key</b> is your identity; your address is just a pointer to it. Your <b>safety number</b>, device cluster, recovery anchors, key rotation and signed-in apps all live on the dedicated <b>Identity</b> page.</p>
+      <p class="set-hint">Your <b>key</b> is your identity; your address is just a pointer to it — your <b>name and photo below are self-asserted profile fields</b>, pointers too. Your <b>safety number</b>, device cluster, recovery anchors, key rotation and signed-in apps all live on the dedicated <b>Identity</b> page.</p>
       <div class="id-grid">
-        <div class="id-facts">
-          <div class="kvr"><span>Display name</span><b>${esc(displayName(id))}</b></div>
-          <div class="kvr"><span>Primary address</span><b class="mono">${esc(displayAddress(id))}</b></div>
-          <div class="kvr"><span>Fingerprint</span><b class="mono">${esc(id.fingerprint)}</b></div>
-          <div class="kvr"><span>Algorithm</span><b class="mono">${esc(id.alg)}</b></div>
+        <div class="pf-summary">
+          ${avatar({ name: displayName(id), hue: id.hue ?? 250, trust: 'verified', avatarUrl: id.avatarUrl || null, _avatarSrc: id._avatarSrc }, 56, { ring: true })}
+          <div class="id-facts">
+            <div class="kvr"><span>Display name</span><b>${esc(displayName(id))}</b></div>
+            <div class="kvr"><span>Primary address</span><b class="mono">${esc(displayAddress(id))}</b></div>
+            <div class="kvr"><span>Fingerprint</span><b class="mono">${esc(id.fingerprint)}</b></div>
+            <div class="kvr"><span>Algorithm</span><b class="mono">${esc(id.alg)}</b></div>
+          </div>
         </div>
         <div class="set-id-cta">
+          <button class="btn" id="editprofile">${icon('edit')} Edit profile</button>
           <button class="btn primary" id="openidentity">${icon('fingerprint')} Open Identity</button>
         </div>
       </div>
@@ -120,6 +125,7 @@ export function render(root) {
 
   // Identity — the full surface (safety number, devices, recovery, rotation) lives in its own view.
   root.querySelector('#openidentity').onclick = () => bus.setView('identity');
+  root.querySelector('#editprofile').onclick = () => openEditProfile();
 
   drawAliases(root, id);
   drawSigs(root);

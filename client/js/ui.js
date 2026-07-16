@@ -117,13 +117,41 @@ export function initials(name) {
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return (parts[0] || '?').slice(0, 2).toUpperCase();
 }
+// A photo avatar (p.avatarUrl — a user-set public URL — or p._avatarSrc, the resolved
+// identity-avatar ladder from avatar.js) falls back to the initials tile on load error,
+// exactly like the identity hero has always done. Same call shape either way, so every caller
+// (contacts, mail/chat senders, rail, compose "From") gets photo support for free.
 export function avatar(p, size = 34, opts = {}) {
   const hue = p.hue ?? 220;
   const ring = opts.ring && p.trust === 'verified' ? ' ring' : '';
   const dot = opts.presence ? `<span class="pres ${opts.presence}"></span>` : '';
-  return `<span class="av${ring}" style="--h:${hue};width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px" title="${esc(p.name)}">${esc(initials(p.name))}${p.trust === 'verified' && opts.badge ? verifiedGlyph() : ''}${dot}</span>`;
+  const badge = p.trust === 'verified' && opts.badge ? verifiedGlyph() : '';
+  const src = p.avatarUrl || p._avatarSrc;
+  if (src) {
+    return `<span class="av-wrap" style="width:${size}px;height:${size}px">` +
+      `<img class="av-photo${ring}" style="--h:${hue};width:${size}px;height:${size}px" src="${esc(src)}" ` +
+      `alt="${esc(p.name)}" referrerpolicy="no-referrer" data-name="${esc(p.name)}" data-hue="${hue}" data-size="${size}" ` +
+      `onerror="window.__avFallback&&window.__avFallback(this)">${badge}${dot}</span>`;
+  }
+  return `<span class="av${ring}" style="--h:${hue};width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px" title="${esc(p.name)}">${esc(initials(p.name))}${badge}${dot}</span>`;
 }
 export function verifiedGlyph() { return `<span class="vglyph">${icon('verified')}</span>`; }
+
+// Fallback when a photo/avatarUrl fails to load (dead link, offline, blocked) — swaps the
+// broken <img> for the same gradient initials tile every other avatar uses. Attached to
+// `window` because inline onerror="" handlers run in the global scope; there's no framework
+// event system here to hook into instead.
+if (typeof window !== 'undefined') {
+  window.__avFallback = function (img) {
+    const size = Number(img.dataset.size) || img.width || 34;
+    const span = document.createElement('span');
+    span.className = 'av';
+    span.style.cssText = `--h:${img.dataset.hue || 220};width:${size}px;height:${size}px;font-size:${Math.round(size * 0.38)}px`;
+    span.title = img.dataset.name || '';
+    span.textContent = initials(img.dataset.name || '');
+    img.replaceWith(span);
+  };
+}
 
 export function trustPill(trust) {
   const map = {

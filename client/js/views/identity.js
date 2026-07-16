@@ -12,6 +12,7 @@ import { PEOPLE, person } from '../seed.js';
 import { el, esc, icon, avatar, initials, brandMark, toast, openModal, closeModal,
   safetyWords, safetyGrid, safetyNumeric, timeAgo, fmtLong } from '../ui.js';
 import { bus } from '../bus.js';
+import { openEditProfile } from '../profileModal.js';
 
 const DEVICE_ICON = { laptop: 'laptop', phone: 'phone', tablet: 'tablet', server: 'server', desktop: 'laptop' };
 const daysAgo = (t) => Math.max(0, Math.round((Date.now() - t) / 86400e3));
@@ -28,8 +29,8 @@ export function render(root) {
 
     <section class="id-hero">
       <div class="id-hero-aura"></div>
-      <div class="id-hero-mark">${id.avatarUrl
-        ? `<img class="id-hero-photo" src="${esc(id.avatarUrl)}" alt="${esc(displayName(id))}" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'av',style:'--h:250;width:72px;height:72px;font-size:27px',textContent:'${esc(initials(displayName(id)))}'}))">`
+      <div class="id-hero-mark">${id._avatarSrc
+        ? `<img class="id-hero-photo" src="${esc(id._avatarSrc)}" alt="${esc(displayName(id))}" referrerpolicy="no-referrer" data-name="${esc(displayName(id))}" data-hue="${id.hue ?? 250}" data-size="72" onerror="window.__avFallback&&window.__avFallback(this)">`
         : `<span class="av ring" style="--h:${id.hue ?? 250};width:72px;height:72px;font-size:27px" title="${esc(displayName(id))}">${esc(initials(displayName(id)))}</span>`}</div>
       <div class="id-hero-body">
         <div class="id-hero-eyebrow">${icon('shield')} Sovereign identity</div>
@@ -37,7 +38,8 @@ export function render(root) {
         <button class="id-addr-copy" id="copyaddr" title="Copy address">
           <span class="mono">${esc(displayAddress(id))}</span>${icon('copy')}
         </button>
-        <p class="id-hero-sub">Your <b>key</b> is your identity — no company holds it, so no company can read your data or lock you in. The address is just a pointer to the key.</p>
+        <button class="btn ghost sm" id="editprofile" style="margin-left:8px">${icon('edit')} Edit profile</button>
+        <p class="id-hero-sub">Your <b>key</b> is your identity — no company holds it, so no company can read your data or lock you in. The address and this name/photo are just pointers to the key.</p>
         <div class="id-hero-stats">
           <div class="id-stat"><b>${keyAge===0?'today':keyAge+'d'}</b><span>key age</span></div>
           <div class="id-stat"><b>${state.devices.length}</b><span>devices</span></div>
@@ -132,6 +134,7 @@ export function render(root) {
 
   // ---- wire ----
   root.querySelector('#copyaddr').onclick = () => { navigator.clipboard?.writeText(displayAddress(id)); toast(`${icon('check')} Copied ${displayAddress(id)}`); };
+  root.querySelector('#editprofile').onclick = () => openEditProfile();
   root.querySelector('#recompute').onclick = async () => {
     const { match, recomputed } = await verifySafety(fromB64u(id.ik), id.safety.full);
     toast(match ? `${icon('check')} Recomputed identical — ${esc(recomputed)}` : '✗ mismatch: ' + esc(recomputed), { ms: 5000 });

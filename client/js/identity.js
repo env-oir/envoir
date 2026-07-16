@@ -12,6 +12,7 @@
 // is localStorage (a real node holds keys in an OS keystore).
 
 import { deriveSafety } from './safety.js';
+import { resolveIdentityAvatar } from './avatar.js';
 
 const LS_KEY = 'envoir.identity.v2';
 
@@ -60,7 +61,8 @@ function persist() {
     name: _identity.name, primary: _identity.primary, addresses: _identity.addresses,
     alg: _identity.alg, ik: _identity.ik, fingerprint: _identity.fingerprint,
     phrase: _identity.phrase, safety: _identity.safety, created: _identity.created,
-    displayName: _identity.displayName,
+    displayName: _identity.displayName, givenName: _identity.givenName, familyName: _identity.familyName,
+    avatarUrl: _identity.avatarUrl, gravatarEnabled: _identity.gravatarEnabled,
   }));
 }
 
@@ -76,6 +78,7 @@ export async function createIdentity(primary, displayName) {
 
   _identity = {
     name: primary, primary, displayName: displayName || primary.split('@')[0],
+    givenName: '', familyName: '', avatarUrl: null, gravatarEnabled: false,
     addresses: [alias(primary, 'primary')],
     alg, ik, fingerprint, phrase, safety, created: Date.now(),
     _kp: kp,
@@ -84,6 +87,7 @@ export async function createIdentity(primary, displayName) {
   const s = { pk8: toB64u(pk8), pub: toB64u(raw) };
   localStorage.setItem(LS_KEY, JSON.stringify(s));
   persist();
+  await refreshAvatar(_identity, raw);
   return _identity;
 }
 
@@ -101,7 +105,44 @@ export async function loadIdentity() {
   _identity = { ...s, _kp: kp };
   if (!_identity.safety) _identity.safety = await deriveSafety(fromB64u(s.pub || s.ik));
   if (!_identity.addresses) _identity.addresses = [alias(_identity.primary || _identity.name, 'primary')];
+  if (_identity.givenName == null) _identity.givenName = '';
+  if (_identity.familyName == null) _identity.familyName = '';
+  if (_identity.avatarUrl == null) _identity.avatarUrl = null;
+  if (_identity.gravatarEnabled == null) _identity.gravatarEnabled = false;
+  await refreshAvatar(_identity, fromB64u(s.pub || s.ik));
   return _identity;
+}
+
+// Re-derive the effective avatar (the ladder in avatar.js) after load/create or a profile
+// edit, and cache it on the identity as a transient field. `rawKeyBytes` may be omitted if
+// already known to be unchanged — it's re-derived from the stored public key in that case.
+export async function refreshAvatar(id = _identity, rawKeyBytes) {
+  if (!id) return null;
+  const raw = rawKeyBytes || fromB64u(id.ik);
+  return resolveIdentityAvatar(id, raw);
+}
+
+// Self-asserted profile fields (spec framing: the KEY is the identity; name + photo are only
+// pointers to it, exactly like the address — see identity.js header comment). Persists and
+// re-resolves the avatar ladder; callers should re-render + refresh chrome afterward.
+export async function setProfile(fields = {}) {
+  if (!_identity) return _identity;
+  const allowed = ['givenName', 'familyName', 'displayName', 'avatarUrl', 'gravatarEnabled'];
+  for (const k of allowed) if (k in fields) _identity[k] = fields[k];
+  persist();
+  await refreshAvatar(_identity);
+  return _identity;
+}
+
+// A lightweight "person" shape for the self-identity, so the SAME avatar()/name rendering used
+// for contacts/senders also renders "you" consistently (rail, compose From, mail/chat "me").
+export function selfPerson() {
+  const id = _identity;
+  if (!id) return { name: 'You', hue: 220, address: 'you', trust: 'verified' };
+  return {
+    name: displayName(id), address: id.primary || 'you', hue: id.hue ?? 220, trust: 'verified',
+    avatarUrl: id.avatarUrl || null, _avatarSrc: id._avatarSrc || null,
+  };
 }
 
 export function currentIdentity() { return _identity; }
@@ -149,9 +190,16 @@ export function displayAddress(id) {
   id = id || _identity;
   return id ? id.primary || id.name || '' : '';
 }
+// Composes GIVEN + FAMILY name, unless a single explicit "display name" override is set (spec
+// framing, §3.9): these are self-asserted profile fields — a pointer to you, like the address —
+// never the identity itself. The address is a pointer to the key; the name is a pointer to you.
 export function displayName(id) {
   id = id || _identity;
-  return id ? (id.displayName || (id.primary || '').split('@')[0]) : '';
+  if (!id) return '';
+  if (id.displayName) return id.displayName;
+  const composed = [id.givenName, id.familyName].filter(Boolean).join(' ').trim();
+  if (composed) return composed;
+  return (id.primary || id.name || '').split('@')[0];
 }
 
 // Split a plus-addressed local part (spec §3.9.4): you+tag@domain → { base, tag }.

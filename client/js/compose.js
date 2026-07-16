@@ -4,10 +4,10 @@
 // UNDO window (§17#17). Building a message constructs a REAL MOTE (real signature) and animates
 // its simulated delivery through the inspector.
 
-import { openModal, closeModal, toast, icon, esc, showInspector, litHop, sanitizeHtml } from './ui.js';
+import { openModal, closeModal, toast, icon, esc, avatar, showInspector, litHop, sanitizeHtml } from './ui.js';
 import { buildMote, KIND } from './mote.js';
 import { planDelivery, animatePath } from './mesh-sim.js';
-import { currentIdentity, displayAddress } from './identity.js';
+import { currentIdentity, displayAddress, selfPerson } from './identity.js';
 import { state, thread, uid, stripHtml } from './store.js';
 import { person, PEOPLE, fmtBytes } from './seed.js';
 import { bus } from './bus.js';
@@ -38,7 +38,7 @@ export function openCompose(opts = {}) {
         <div class="spacer"></div>
         <button class="icon-btn" id="cx" aria-label="Close">${icon('x')}</button>
       </div>
-      <label class="cfield"><span>From</span><div class="from-chip">${esc(displayAddress(id))}</div></label>
+      <label class="cfield"><span>From</span><div class="from-chip">${avatar(selfPerson(), 22)}${esc(displayAddress(id))}</div></label>
       <label class="cfield"><span>To</span><div class="ac-wrap"><input id="cto" value="${esc(draft.to)}" placeholder="name@domain, @handle, or a group address" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false"><div class="ac-list" id="cac" role="listbox"></div></div></label>
       <label class="cfield"><span>Subject</span><input id="csubj" value="${esc(draft.subject)}" placeholder="Subject"></label>
       <div class="rt-toolbar" role="toolbar" aria-label="Formatting">

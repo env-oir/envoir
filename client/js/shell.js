@@ -3,9 +3,9 @@
 // the bus so view modules can trigger re-renders without importing the shell (no cycle).
 
 import { state, initStore, saveSettings } from './store.js';
-import { currentIdentity, displayAddress, displayName } from './identity.js';
+import { currentIdentity, displayAddress, displayName, selfPerson } from './identity.js';
 import { PEOPLE } from './seed.js';
-import { esc, icon, brandMark, openModal, closeModal, initials, hideInspector, applyStagger } from './ui.js';
+import { esc, icon, avatar, brandMark, openModal, closeModal, hideInspector, applyStagger } from './ui.js';
 import { bus } from './bus.js';
 import { openCompose } from './compose.js';
 
@@ -62,7 +62,7 @@ export function mountShell() {
       </div>
       <div class="rail-spacer"></div>
       <button class="rail-btn" data-view="settings" title="Settings" aria-label="Settings">${icon('settings')}<span>Settings</span></button>
-      <button class="rail-id" id="rail-id" title="${esc(displayAddress(id))}" aria-label="Open settings — signed in as ${esc(displayAddress(id))}">${esc(initials(displayName(id)))}</button>
+      <button class="rail-id" id="rail-id" title="${esc(displayAddress(id))}" aria-label="Open settings — signed in as ${esc(displayAddress(id))}">${avatar(selfPerson(), 40)}</button>
     </nav>
     <div class="workspace">
       <header class="topbar">
@@ -137,6 +137,9 @@ function refreshChrome() {
   const setBadge = (id, n) => { const e = app.querySelector(`[data-badge="${id}"]`); if (e) { e.textContent = n || ''; e.classList.toggle('on', !!n); } };
   setBadge('mail', unread); setBadge('chat', chatUnread);
   const t = app.querySelector('#theme-toggle'); if (t) t.innerHTML = icon(state.settings.theme === 'dark' ? 'sun' : 'moon');
+  const id = currentIdentity();
+  const railId = app.querySelector('#rail-id');
+  if (railId) { railId.innerHTML = avatar(selfPerson(), 40); railId.title = displayAddress(id); railId.setAttribute('aria-label', `Open settings — signed in as ${displayAddress(id)}`); }
 }
 
 function toggleTheme() {
