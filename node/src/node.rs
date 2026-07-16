@@ -49,10 +49,10 @@ use dmtap_core::{ContentId, TimestampMs};
 use dmtap_mail::store::{MailStore, Mailbox, MemoryStore};
 use dmtap_mls::{Committer, Member, Session};
 
-use dmtap_core::deniable::{DeniableInit, DeniableMessage, DeniablePayload, DeniablePrekeyBundle};
+use dmtap_core::deniable::{DeniableMessage, DeniablePayload};
 
 use crate::auth::{Challenge, Login, TrustedClient};
-use crate::deniable::{DeniableRouteError, DeniableState, DEFAULT_OPKS};
+use crate::deniable::{self, CertifiedBundle, CertifiedInit, DeniableRouteError, DeniableState, DEFAULT_OPKS};
 use crate::group::{GroupAdd, GroupError, GroupMote};
 use crate::inbound::{DropReason, InboundOutcome};
 use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
@@ -779,33 +779,56 @@ impl<T: Transport> Node<T> {
 
     /// Publish this node's deniable **prekey bundle** so a peer can open a deniable 1:1 session to
     /// it (§5.2.1): provisions the responder half (a dedicated deniable identity + one-time prekeys)
-    /// and returns the signed [`DeniablePrekeyBundle`] to advertise. Uses [`DEFAULT_OPKS`] one-time
-    /// prekeys and the node's injected clock for the bundle timestamp.
-    pub fn deniable_publish_bundle(&mut self) -> DeniablePrekeyBundle {
-        self.deniable.publish_bundle(DEFAULT_OPKS, 1, self.now)
+    /// and returns a [`CertifiedBundle`] to advertise — the signed [`DeniablePrekeyBundle`](dmtap_core::deniable::DeniablePrekeyBundle) plus a
+    /// root-IK [`DeviceCert`](dmtap_core::identity::DeviceCert) binding the bundle's dedicated deniable identity key to this node's
+    /// root identity (§5.2.1(a), §1.2). A peer verifies that cert against this node's KT-resolved
+    /// root IK before trusting the bundle. Uses [`DEFAULT_OPKS`] one-time prekeys and the node's
+    /// injected clock for the bundle timestamp and the cert `created`.
+    pub fn deniable_publish_bundle(&mut self) -> CertifiedBundle {
+        let bundle = self.deniable.publish_bundle(DEFAULT_OPKS, 1, self.now);
+        let cert = deniable::issue_deniable_binding(&self.ik, &bundle.ik, self.now);
+        CertifiedBundle { bundle, cert }
     }
 
-    /// **Initiator:** open a deniable 1:1 session to the peer whose signed `peer_bundle` we hold,
-    /// routing `first` (a [`DeniablePayload`] — a MOTE with its signature removed, §18.3.10) as the
-    /// embedded first ratchet message. Returns the [`DeniableInit`] to hand to the peer; the live
-    /// session is retained, keyed by the peer's deniable IK (§5.2.1(a)).
+    /// **Initiator:** open a deniable 1:1 session to the peer described by `peer` (their advertised
+    /// [`CertifiedBundle`]), routing `first` (a [`DeniablePayload`] — a MOTE with its signature
+    /// removed, §18.3.10) as the embedded first ratchet message.
+    ///
+    /// `peer_root_ik` is the peer's **KT-resolved root identity key** (e.g. from
+    /// [`resolve_and_pin`](Self::resolve_and_pin)). Before running X3DH this fails closed unless the
+    /// bundle's [`DeviceCert`](dmtap_core::identity::DeviceCert) binds `peer.bundle.ik` to `peer_root_ik` (§5.2.1(a), §1.2) — so a
+    /// session is never established with a deniable prekey the peer's identity has not vouched for.
+    ///
+    /// Returns a [`CertifiedInit`]: the [`DeniableInit`](dmtap_core::deniable::DeniableInit) to hand to the peer plus *this* node's
+    /// root-IK cert over its own deniable identity key, which the peer verifies symmetrically. The
+    /// live session is retained, keyed by the peer's deniable IK.
     pub fn deniable_open(
         &mut self,
-        peer_bundle: &DeniablePrekeyBundle,
+        peer_root_ik: &[u8],
+        peer: &CertifiedBundle,
         first: &DeniablePayload,
-    ) -> Result<DeniableInit, DeniableRouteError> {
-        self.deniable.open(peer_bundle, first)
+    ) -> Result<CertifiedInit, DeniableRouteError> {
+        deniable::verify_deniable_binding(peer_root_ik, &peer.bundle.ik, &peer.cert)?;
+        let init = self.deniable.open(&peer.bundle, first)?;
+        let cert = deniable::issue_deniable_binding(&self.ik, &init.ik_a, self.now);
+        Ok(CertifiedInit { init, cert })
     }
 
-    /// **Responder:** accept an incoming [`DeniableInit`], establishing the session and decrypting
+    /// **Responder:** accept an incoming [`CertifiedInit`], establishing the session and decrypting
     /// its embedded first payload (§5.2.1(a)). Requires a prior
-    /// [`deniable_publish_bundle`](Self::deniable_publish_bundle). Fails closed on a bad `idk`
-    /// certification, a consumed/absent prekey, or a replayed last-resort init.
+    /// [`deniable_publish_bundle`](Self::deniable_publish_bundle).
+    ///
+    /// `peer_root_ik` is the initiator's **KT-resolved root identity key**. Before touching any
+    /// prekey this fails closed unless the init's [`DeviceCert`](dmtap_core::identity::DeviceCert) binds `init.ik_a` to `peer_root_ik`
+    /// (§5.2.1(a), §1.2). It then also fails closed on a bad `idk` certification, a consumed/absent
+    /// prekey, or a replayed last-resort init.
     pub fn deniable_accept(
         &mut self,
-        init: &DeniableInit,
+        peer_root_ik: &[u8],
+        certified: &CertifiedInit,
     ) -> Result<DeniablePayload, DeniableRouteError> {
-        self.deniable.accept(init)
+        deniable::verify_deniable_binding(peer_root_ik, &certified.init.ik_a, &certified.cert)?;
+        self.deniable.accept(&certified.init)
     }
 
     /// Seal `payload` into a [`DeniableMessage`] on the live deniable session with `peer_ik`
@@ -834,6 +857,17 @@ impl<T: Transport> Node<T> {
     /// a session). Peers key their side of the session by this value (§5.2.1).
     pub fn deniable_identity_public(&self) -> Option<Vec<u8>> {
         self.deniable.identity_public()
+    }
+
+    /// Snapshot the live deniable session with `peer_ik` — the constructive-repudiation
+    /// demonstration surface (§5.2.1(e)). From the snapshot a recipient can forge a peer-authored
+    /// message with no signing key, proving the IK-certification binds the *key* to the identity
+    /// without making message *content* non-repudiable. Returns `None` if no session exists.
+    pub fn deniable_session_snapshot(
+        &self,
+        peer_ik: &[u8],
+    ) -> Option<dmtap_deniable::DeniableSession> {
+        self.deniable.session_snapshot(peer_ik)
     }
 }
 

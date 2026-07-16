@@ -57,7 +57,7 @@ pub use dmtap_auth;
 
 // Real deniable 1:1 messaging (spec §5.2.1): X3DH + Double Ratchet, distinct from the MLS group
 // path, re-exported here as `dmtap::dmtap_deniable`.
-pub use deniable::{DeniableRouteError, DeniableState};
+pub use deniable::{CertifiedBundle, CertifiedInit, DeniableRouteError, DeniableState};
 pub use dmtap_deniable;
 
 // Node-only planned modules (see README): the rest of the client side that *is* the mesh.
