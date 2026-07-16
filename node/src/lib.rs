@@ -22,10 +22,18 @@ pub use dmtap_core::{self, id, identity, keyname, mote, ContentId, Suite, Timest
 // re-exported here as `dmtap::clients`.
 pub use dmtap_mail as clients;
 
-// Node-only planned modules (see README): the client side that *is* the mesh.
-// pub mod naming;
-// pub mod transport;
-// pub mod messaging;
-// pub mod privacy;
-// pub mod abuse;
-// pub mod store;
+// --- Node delivery engine -------------------------------------------------------------------
+// The running client side that wires the shared crates into an end-to-end MOTE delivery path:
+// identity + store + outbound retry queue (§20.1) + inbound validation (§20.2) + transport (§4),
+// culminating in two in-process nodes exchanging a real end-to-end-encrypted MOTE (§2, §19.3).
+pub mod inbound;
+pub mod node;
+pub mod outbound;
+pub mod transport;
+
+pub use node::{Node, SendError};
+
+// Node-only planned modules (see README): the rest of the client side that *is* the mesh.
+// pub mod naming;      // §3 — name→key resolution, TOFU pinning, key transparency
+// pub mod messaging;   // §5 — MLS groups, KeyPackages, chat, chunked files
+// pub mod privacy;     // §6 — sealed sender, cover traffic, padding, tiers
