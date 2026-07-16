@@ -26,3 +26,7 @@ sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 # --- Errors ---
 thiserror = "1"
+
+[dev-dependencies]
+# Conformance vector generation + self-check (examples/gen_vectors.rs, tests/conformance_vectors.rs).
+serde_json = "1"

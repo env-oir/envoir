@@ -12,6 +12,8 @@
 //!   set), `DeviceCert`, `RecoveryPolicy`, `MoveRecord` — real signatures (§1).
 //! - [`keyname`] — the zero-authority **8-word key-name** derived from `BLAKE3(pubkey)`, with a
 //!   checksum word (§3.9.1, §16.2).
+//! - [`safety`] — out-of-band **safety numbers**: a deterministic, order-independent fingerprint
+//!   of a *pair* of identity keys for OOB key verification (§3.4.1).
 //! - [`mote`] — the **MOTE** object: `Envelope` + `Payload`, HPKE payload sealing, and the
 //!   ordered recipient validation of §2.7 (anonymous checks before decryption).
 //!
@@ -23,6 +25,7 @@ pub mod id;
 pub mod identity;
 pub mod keyname;
 pub mod mote;
+pub mod safety;
 pub mod suite;
 
 pub use suite::Suite;
