@@ -18,7 +18,7 @@ use dmtap::auth::{
     SessionKey, SystemClock, TrustedClientStub,
 };
 use dmtap::dmtap_core::deniable::DeniablePayload;
-use dmtap::identity::{Identity, IdentityKey};
+use dmtap::identity::{DeviceCert, Identity, IdentityKey};
 use dmtap::inbound::InboundOutcome;
 use dmtap::mote::{Headers, Kind, SealKeypair};
 use dmtap::names::{DmtapTxtRecord, InMemoryKeyPackages, InMemoryKtLog, InMemoryResolver};
@@ -235,21 +235,29 @@ fn make_node(net: &InMemoryNetwork) -> (Node<InMemoryTransport>, Vec<u8>, [u8; 3
 fn deniable_1to1_mote_round_trips_both_directions() {
     let net = InMemoryNetwork::new();
     let (mut alice, alice_ik, _) = make_node(&net);
-    let (mut bob, _bob_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
 
-    // Bob publishes a deniable prekey bundle; Alice opens a deniable session and routes the first
+    // Bob publishes a deniable prekey bundle (with a root-IK cert over his deniable identity key);
+    // Alice — holding Bob's KT-resolved root IK — opens a deniable session and routes the first
     // MOTE embedded in the X3DH init.
     let bundle = bob.deniable_publish_bundle();
-    let first = deniable_payload(&alice_ik, "deniable hello", b"you cannot prove I wrote this");
-    let init = alice.deniable_open(&bundle, &first).expect("X3DH initiate");
+    assert_eq!(bundle.cert.ik, bob_ik, "bundle cert is issued under Bob's root IK");
+    assert_eq!(bundle.cert.device_key, bundle.bundle.ik, "cert binds the deniable identity key");
+    assert_ne!(bundle.bundle.ik, bob_ik, "deniable IK is a dedicated key, NOT Bob's root IK (§5.2.1)");
 
-    // Bob accepts: establishes the session and recovers the first MOTE exactly.
-    let got = bob.deniable_accept(&init).expect("X3DH accept");
+    let first = deniable_payload(&alice_ik, "deniable hello", b"you cannot prove I wrote this");
+    let init = alice.deniable_open(&bob_ik, &bundle, &first).expect("X3DH initiate");
+    assert_eq!(init.cert.ik, alice_ik, "init cert is issued under Alice's root IK");
+    assert_eq!(init.cert.device_key, init.init.ik_a, "cert binds Alice's deniable identity key");
+
+    // Bob accepts against Alice's KT-resolved root IK: verifies the cert, establishes the session,
+    // and recovers the first MOTE exactly.
+    let got = bob.deniable_accept(&alice_ik, &init).expect("X3DH accept");
     assert_eq!(got, first, "the first deniable MOTE round-trips through X3DH");
 
     // The peers' session keys: Bob keys by Alice's deniable IK (init.ik_a); Alice by Bob's (bundle.ik).
-    let alice_deniable_ik = init.ik_a.clone();
-    let bob_deniable_ik = bundle.ik.clone();
+    let alice_deniable_ik = init.init.ik_a.clone();
+    let bob_deniable_ik = bundle.bundle.ik.clone();
     assert_eq!(
         alice.deniable_identity_public().as_deref(),
         Some(alice_deniable_ik.as_slice()),
@@ -268,18 +276,18 @@ fn deniable_1to1_mote_round_trips_both_directions() {
 fn deniable_tampered_message_fails_closed() {
     let net = InMemoryNetwork::new();
     let (mut alice, alice_ik, _) = make_node(&net);
-    let (mut bob, _bob_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
 
     let bundle = bob.deniable_publish_bundle();
     let first = deniable_payload(&alice_ik, "hi", b"opening message");
-    let init = alice.deniable_open(&bundle, &first).unwrap();
-    bob.deniable_accept(&init).unwrap();
+    let init = alice.deniable_open(&bob_ik, &bundle, &first).unwrap();
+    bob.deniable_accept(&alice_ik, &init).unwrap();
 
     // Bob sends; the ciphertext is flipped in transit; Alice's open MUST fail (shared-key MAC).
-    let reply = deniable_payload(&bundle.ik, "re", b"authentic content");
-    let mut msg = bob.deniable_send(&init.ik_a, &reply).unwrap();
+    let reply = deniable_payload(&bundle.bundle.ik, "re", b"authentic content");
+    let mut msg = bob.deniable_send(&init.init.ik_a, &reply).unwrap();
     msg.ct[0] ^= 0xff;
-    let err = alice.deniable_recv(&bundle.ik, &msg);
+    let err = alice.deniable_recv(&bundle.bundle.ik, &msg);
     assert!(err.is_err(), "a tampered deniable message fails closed (AEAD tag / shared-key MAC)");
 }
 
@@ -287,18 +295,149 @@ fn deniable_tampered_message_fails_closed() {
 fn deniable_accept_without_bundle_is_rejected() {
     let net = InMemoryNetwork::new();
     let (mut alice, alice_ik, _) = make_node(&net);
-    let (mut bob, _bob_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
 
     // Bob is a responder; Alice is NOT (never published a bundle) — so Alice cannot accept an init.
     let bundle = bob.deniable_publish_bundle();
-    let init = alice.deniable_open(&bundle, &deniable_payload(&alice_ik, "x", b"y")).unwrap();
+    let init = alice
+        .deniable_open(&bob_ik, &bundle, &deniable_payload(&alice_ik, "x", b"y"))
+        .unwrap();
     // Bob (the real responder) accepts fine; a fresh non-responder node cannot.
-    assert!(bob.deniable_accept(&init).is_ok());
+    assert!(bob.deniable_accept(&alice_ik, &init).is_ok());
     let (mut carol, _c_ik, _) = make_node(&net);
     assert!(matches!(
-        carol.deniable_accept(&init),
+        carol.deniable_accept(&alice_ik, &init),
         Err(dmtap::DeniableRouteError::NotResponder)
     ));
+}
+
+// --- The IK-certification of the deniable identity key (§5.2.1(a), §1.2) ---------------------
+//
+// The deniable `idk` is bound to the root identity by a `DeviceCert` chain
+// (`root IK ▶ deniable Ed25519 IK ▶ idk`). A responder VERIFIES that chain against the peer's
+// KT-resolved root IK and fails closed on any break: a wrong/attacker root IK, a cert that
+// vouches for a different deniable key, or a tampered cert. Certifying the KEY does not make any
+// MESSAGE non-repudiable — repudiation is preserved.
+
+#[test]
+fn deniable_accept_rejects_uncertified_identity_wrong_root_ik() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
+    let (_mallory, mallory_ik, _) = make_node(&net);
+
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    let init = alice.deniable_open(&bob_ik, &bundle, &first).unwrap();
+
+    // Bob accepts the init but checks it against the WRONG root identity (Mallory's, not Alice's).
+    // The DeviceCert (`init.cert`) is Alice's, so it does not chain to Mallory's root IK ⇒ reject,
+    // and no one-time prekey is consumed.
+    assert!(matches!(
+        bob.deniable_accept(&mallory_ik, &init),
+        Err(dmtap::DeniableRouteError::UncertifiedIdentity)
+    ));
+    // The genuine KT-resolved root IK still verifies (proving the reject was the binding, not the
+    // crypto), and the still-unspent prekey means the session establishes cleanly.
+    assert!(bob.deniable_accept(&alice_ik, &init).is_ok());
+}
+
+#[test]
+fn deniable_accept_rejects_attacker_forged_cert() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
+
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    let mut init = alice.deniable_open(&bob_ik, &bundle, &first).unwrap();
+
+    // An attacker cannot sign a binding under Alice's real root IK (that is the whole security
+    // property), so the best she can do is present a cert she CAN sign — under a root IK she
+    // controls. It is internally valid but does not chain to Alice's KT-resolved root IK ⇒ reject.
+    let attacker_root = IdentityKey::from_seed(&[0x99; 32]);
+    init.cert = DeviceCert::issue(
+        &attacker_root,
+        init.init.ik_a.clone(),
+        "deniable-1to1",
+        NOW,
+        None,
+        vec![],
+    );
+    assert!(matches!(
+        bob.deniable_accept(&alice_ik, &init),
+        Err(dmtap::DeniableRouteError::UncertifiedIdentity)
+    ));
+}
+
+#[test]
+fn deniable_accept_rejects_tampered_cert() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
+
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    let mut init = alice.deniable_open(&bob_ik, &bundle, &first).unwrap();
+
+    // Flip a byte of the cert signature — its own verification fails, so the binding is rejected.
+    init.cert.sig[0] ^= 0xff;
+    assert!(matches!(
+        bob.deniable_accept(&alice_ik, &init),
+        Err(dmtap::DeniableRouteError::UncertifiedIdentity)
+    ));
+}
+
+#[test]
+fn deniable_open_rejects_uncertified_responder_bundle() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
+
+    let mut bundle = bob.deniable_publish_bundle();
+    // Tamper Bob's bundle cert: now it no longer chains bundle.ik to Bob's root IK. Alice's open
+    // MUST fail closed BEFORE running X3DH (she never talks to an uncertified deniable identity).
+    bundle.cert.sig[0] ^= 0xff;
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    assert!(matches!(
+        alice.deniable_open(&bob_ik, &bundle, &first),
+        Err(dmtap::DeniableRouteError::UncertifiedIdentity)
+    ));
+}
+
+#[test]
+fn deniable_certification_preserves_repudiation() {
+    // The IK-cert binds the deniable KEY to the identity; it must NOT turn the message stream into
+    // non-repudiable content. We prove repudiation survives: from her own receiving-chain state
+    // Alice forges a message that opens as if Bob authored it — no Bob secret, no signature — so a
+    // genuine Bob message and Alice's forgery are indistinguishable (§5.2.1(e)).
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, bob_ik, _) = make_node(&net);
+
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    let init = alice.deniable_open(&bob_ik, &bundle, &first).unwrap();
+    bob.deniable_accept(&alice_ik, &init).unwrap();
+
+    let bob_deniable_ik = bundle.bundle.ik.clone();
+
+    // Bob sends a genuine reply; Alice opens it (this advances her receiving chain).
+    let genuine = deniable_payload(&bob_deniable_ik, "re", b"a thing Bob really said");
+    let msg = bob.deniable_send(&init.init.ik_a, &genuine).unwrap();
+    let opened = alice.deniable_recv(&bob_deniable_ik, &msg).unwrap();
+    assert_eq!(opened, genuine);
+
+    // Alice, using ONLY her own session state, forges a message attributed to Bob — no signing key
+    // is involved. That a valid "from-Bob" message can be fabricated by the recipient is exactly
+    // what repudiation means; the cert (over the key) did not add non-repudiation to content.
+    let forged_content = deniable_payload(&bob_deniable_ik, "re", b"words Bob never actually wrote");
+    let alice_session = alice.deniable_session_snapshot(&bob_deniable_ik).expect("live session");
+    let forgery = alice_session
+        .forge_peer_message(&forged_content)
+        .expect("recipient can forge a peer message");
+    let forged_open = alice_session.snapshot().decrypt(&forgery).expect("forgery opens as authentic");
+    assert_eq!(forged_open, forged_content, "a recipient-forged 'from-Bob' message is indistinguishable");
 }
 
 // ============================================================================================
