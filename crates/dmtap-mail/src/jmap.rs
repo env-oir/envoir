@@ -244,7 +244,12 @@ fn mailbox_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
                 continue;
             }
         }
-        let mb = store.mailbox(&name).unwrap();
+        // `name` came from `mailbox_names()` above; skip rather than unwrap so a store that can
+        // mutate between the two calls (e.g. a shared/concurrent backend) never panics here.
+        let mb = match store.mailbox(&name) {
+            Some(m) => m,
+            None => continue,
+        };
         list.push(json!({
             "id": name,
             "name": name,
@@ -326,7 +331,10 @@ fn email_query<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
                 continue;
             }
         }
-        let mb = store.mailbox(&name).unwrap();
+        let mb = match store.mailbox(&name) {
+            Some(m) => m,
+            None => continue,
+        };
         for m in &mb.messages {
             ids.push(email_id(&name, m.uid));
         }
@@ -348,7 +356,10 @@ fn email_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
             // null ids = all emails.
             let mut all = Vec::new();
             for name in store.mailbox_names() {
-                let mb = store.mailbox(&name).unwrap();
+                let mb = match store.mailbox(&name) {
+                    Some(m) => m,
+                    None => continue,
+                };
                 for m in &mb.messages {
                     all.push(email_id(&name, m.uid));
                 }
@@ -534,15 +545,18 @@ fn compose_email<S: MailStore>(store: &mut S, obj: &Value) -> Result<(String, u3
     }
 
     let mut headers = String::new();
+    // `name`/`email` come from the request body (untrusted JSON) — sanitize before splicing into a
+    // raw header line, same as `subject` below, so a crafted address can't inject a sibling header
+    // or an early blank line via an embedded CR/LF.
     let addr_header = |key: &str, label: &str, out: &mut String| {
         if let Some(list) = obj.get(key).and_then(|v| v.as_array()) {
             let rendered: Vec<String> = list
                 .iter()
                 .filter_map(|a| {
-                    let email = a.get("email").and_then(Value::as_str)?;
+                    let email = sanitize_header(a.get("email").and_then(Value::as_str)?);
                     Some(match a.get("name").and_then(Value::as_str) {
-                        Some(n) if !n.is_empty() => format!("{n} <{email}>"),
-                        _ => email.to_string(),
+                        Some(n) if !n.is_empty() => format!("{} <{email}>", sanitize_header(n)),
+                        _ => email,
                     })
                 })
                 .collect();
@@ -652,7 +666,10 @@ fn thread_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
             // Gather emails whose thread matches (reference: single-message threads).
             let mut email_ids = Vec::new();
             for name in store.mailbox_names() {
-                let mb = store.mailbox(&name).unwrap();
+                let mb = match store.mailbox(&name) {
+                    Some(m) => m,
+                    None => continue,
+                };
                 for m in &mb.messages {
                     let parsed = ParsedMessage::parse(&m.raw);
                     if thread_id(&parsed, m.uid) == tid {
@@ -1205,6 +1222,37 @@ mod tests {
         let raw = String::from_utf8_lossy(&s.mailbox(&mb).unwrap().by_uid(uid).unwrap().raw).to_string();
         // The CRLF-injected "Bcc" must be flattened into the Subject, not a real header line.
         assert!(!raw.contains("\r\nBcc:"), "header injection leaked: {raw}");
+    }
+
+    #[test]
+    fn create_rejects_header_injection_via_address_fields() {
+        // The From/To/Cc "name"/"email" fields are just as attacker-reachable as Subject (all come
+        // straight off the request JSON) — a crafted display name or address must not be able to
+        // splice in a sibling header (e.g. a forged Bcc) via an embedded CR/LF.
+        let mut s = store_with_mail();
+        let r = call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "create": { "x": {
+                "mailboxIds": { "INBOX": true },
+                "subject": "hi",
+                "from": [{ "name": "Eve\r\nBcc: victim@example.com", "email": "eve@dmtap.local" }],
+                "to": [{ "email": "bob@example.net\r\nX-Injected: yes" }],
+                "bodyValues": { "1": { "value": "b" } },
+                "textBody": [{ "partId": "1", "type": "text/plain" }]
+            } } }),
+        );
+        let id = r["created"]["x"]["id"].as_str().unwrap();
+        let (mb, uid) = parse_email_id(id).unwrap();
+        let raw = String::from_utf8_lossy(&s.mailbox(&mb).unwrap().by_uid(uid).unwrap().raw).to_string();
+        assert!(!raw.contains("\r\nBcc:"), "From.name must not inject a header: {raw}");
+        assert!(!raw.contains("\r\nX-Injected"), "To.email must not inject a header: {raw}");
+        // The composed message must still parse as exactly one From line and one To line.
+        let parsed = ParsedMessage::parse(raw.as_bytes());
+        assert_eq!(parsed.header("bcc"), None);
+        assert_eq!(parsed.header("x-injected"), None);
+        assert!(parsed.header("from").unwrap().contains("eve@dmtap.local"));
+        assert!(parsed.header("to").unwrap().contains("bob@example.net"));
     }
 
     #[test]

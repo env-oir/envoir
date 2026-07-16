@@ -118,6 +118,17 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
 
     fn dispatch(&mut self, pc: ParsedCommand) -> Vec<u8> {
         let tag = pc.tag;
+        // A mailbox can be DELETEd or RENAMEd while it is this session's SELECTed mailbox — RFC
+        // 9051 does not forbid deleting/renaming the currently selected mailbox (§6.3.4/§6.3.5) —
+        // so `self.selected` can go stale mid-session. Self-heal back to Authenticated before
+        // running a SELECTED-state command rather than let a `cmd_*` handler assume the name still
+        // resolves (see also the defensive fallback at each such lookup, kept as a second layer).
+        if let Some(name) = self.selected.clone() {
+            if self.store.mailbox(&name).is_none() {
+                self.selected = None;
+                self.state = State::Authenticated;
+            }
+        }
         match pc.command {
             Command::Capability => {
                 let mut out = untagged(&capability_line(self.tls));
@@ -457,7 +468,13 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             if !wildcard_match(pattern, name) {
                 continue;
             }
-            let mb = self.store.mailbox(name).unwrap();
+            // `name` came from `mailbox_names()` a moment ago; a defensive `MailStore` impl could
+            // still have dropped it (e.g. a concurrent DELETE on a shared backend), so skip rather
+            // than trust the invariant and unwrap.
+            let mb = match self.store.mailbox(name) {
+                Some(m) => m,
+                None => continue,
+            };
             if (lsub || only_subscribed) && !mb.subscribed {
                 continue;
             }
@@ -687,7 +704,12 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         }
         let qresync = self.qresync;
         let uid_set = uid_set.map(|s| self.materialize(&s, true).into_owned());
-        let mb = self.store.mailbox_mut(&name).unwrap();
+        // The dispatch preamble already self-heals a vanished selected mailbox back to
+        // Authenticated; this is a defensive second layer, never expected to trigger.
+        let mb = match self.store.mailbox_mut(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let max_uid = mb.max_uid();
         // Collect the sequence numbers to expunge (removed descending, so seq numbers stay valid).
         let mut to_remove: Vec<usize> = Vec::new();
@@ -739,7 +761,10 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             None => return bad(tag, "no mailbox selected"),
         };
         let saved_uids = self.saved_search.clone();
-        let mb = self.store.mailbox(&name).unwrap();
+        let mb = match self.store.mailbox(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let max_seq = mb.exists() as u32;
         let max_uid = mb.max_uid();
         // Matched (seq, uid) pairs — we keep both so SEARCHRES can SAVE UIDs regardless of mode.
@@ -819,7 +844,10 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             None => return bad(tag, "no mailbox selected"),
         };
         let saved = self.saved_search.clone();
-        let mb = self.store.mailbox(&name).unwrap();
+        let mb = match self.store.mailbox(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let max_seq = mb.exists() as u32;
         let max_uid = mb.max_uid();
         let mut matched: Vec<usize> = Vec::new();
@@ -856,7 +884,10 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
             None => return bad(tag, "no mailbox selected"),
         };
         let saved = self.saved_search.clone();
-        let mb = self.store.mailbox(&name).unwrap();
+        let mb = match self.store.mailbox(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let max_seq = mb.exists() as u32;
         let max_uid = mb.max_uid();
         let mut matched: Vec<usize> = Vec::new();
@@ -931,7 +962,10 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         let set = self.materialize(&set, uid_mode).into_owned();
         let read_only = self.read_only;
         let condstore = self.condstore || changedsince.is_some();
-        let mb = self.store.mailbox_mut(&name).unwrap();
+        let mb = match self.store.mailbox_mut(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let max_uid = mb.max_uid();
 
         let mut out = Vec::new();
@@ -988,7 +1022,10 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         }
         let condstore = self.condstore || sc.unchangedsince.is_some();
         let set = self.materialize(&sc.set, sc.uid).into_owned();
-        let mb = self.store.mailbox_mut(&name).unwrap();
+        let mb = match self.store.mailbox_mut(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
 
         let mut out = Vec::new();
         let mut modified: Vec<u32> = Vec::new();
@@ -1078,7 +1115,13 @@ impl<S: MailStore, A: Authenticator> Session<S, A> {
         // Remove the moved messages from the source, emitting EXPUNGE (or VANISHED under QRESYNC),
         // descending seq so numbers stay valid.
         let qresync = self.qresync;
-        let smb = self.store.mailbox_mut(&name).unwrap();
+        // MOVE-to-self (dest == name) has already released the mutable borrow above (`dmb`'s scope
+        // ended with the loop), so re-resolving the source by name here is safe; a same-name dest
+        // just means we already appended the copies into what we're about to expunge from.
+        let smb = match self.store.mailbox_mut(&name) {
+            Some(m) => m,
+            None => return bad(tag, "no mailbox selected"),
+        };
         let mut out = untagged(&format!(
             "OK [COPYUID {} {} {}] MOVE",
             dst_valid,

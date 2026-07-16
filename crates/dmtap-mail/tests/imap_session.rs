@@ -237,6 +237,53 @@ fn malformed_input_never_panics() {
 }
 
 #[test]
+fn selected_mailbox_deleted_mid_session_never_panics() {
+    // RFC 9051 does not forbid DELETE/RENAME of the currently SELECTed mailbox (§6.3.4/§6.3.5), so
+    // a client can legally: CREATE a mailbox, SELECT it, then DELETE (or RENAME) it out from under
+    // itself. Every SELECTED-state command issued afterwards must fail closed (BAD/NO), never
+    // panic, and the session must remain usable once the client SELECTs something real again.
+    let mut session = logged_in_selected(5);
+    assert!(run(&mut session, "c1 CREATE Scratch\r\n").contains("c1 OK"));
+    assert!(run(&mut session, "c2 SELECT Scratch\r\n").contains("c2 OK"));
+    assert!(run(&mut session, "c3 DELETE Scratch\r\n").contains("c3 OK"));
+
+    for cmd in [
+        "d1 FETCH 1 (FLAGS)\r\n",
+        "d2 SEARCH ALL\r\n",
+        "d3 SORT (ARRIVAL) UTF-8 ALL\r\n",
+        "d4 THREAD REFERENCES UTF-8 ALL\r\n",
+        "d5 STORE 1 +FLAGS (\\Seen)\r\n",
+        "d6 EXPUNGE\r\n",
+    ] {
+        let resp = run(&mut session, cmd);
+        assert!(
+            !resp.is_empty() && (resp.contains(" BAD") || resp.contains(" NO")),
+            "a command against a vanished mailbox must fail closed, not panic: {cmd:?} -> {resp}"
+        );
+    }
+    // The session self-healed back to Authenticated, so it's immediately usable again.
+    assert_eq!(session.state(), State::Authenticated);
+    assert!(run(&mut session, "e1 SELECT INBOX\r\n").contains("e1 OK"));
+    assert!(run(&mut session, "e2 NOOP\r\n").contains("e2 OK"));
+}
+
+#[test]
+fn selected_mailbox_renamed_mid_session_never_panics() {
+    // Same hazard as above, via RENAME instead of DELETE: the name in `self.selected` no longer
+    // resolves, even though a mailbox with the *content* still exists under a new name.
+    let mut session = logged_in_selected(6);
+    assert!(run(&mut session, "c1 CREATE Old\r\n").contains("c1 OK"));
+    assert!(run(&mut session, "c2 SELECT Old\r\n").contains("c2 OK"));
+    assert!(run(&mut session, "c3 RENAME Old New\r\n").contains("c3 OK"));
+
+    let resp = run(&mut session, "d1 SEARCH ALL\r\n");
+    assert!(resp.contains(" NO") || resp.contains(" BAD"), "must fail closed, not panic: {resp}");
+    assert_eq!(session.state(), State::Authenticated);
+    // The renamed mailbox is selectable under its new name.
+    assert!(run(&mut session, "e1 SELECT New\r\n").contains("e1 OK"));
+}
+
+#[test]
 fn uid_fetch_edge_cases() {
     let mut session = logged_in_selected(3);
     // Fetching a nonexistent UID returns just the tagged OK, no FETCH data.
