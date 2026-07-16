@@ -41,6 +41,27 @@ use dmtap_core::sphinx::{self, SphinxCell, SphinxError};
 use dmtap_core::suite::{Suite, SuiteRatchet, SuiteRatchetError};
 use dmtap_core::TimestampMs;
 
+// Additional workspace crates (see `Cargo.toml` comment): the behavior a handful of
+// `construction-todo` cases describe lives one layer above `dmtap-core` proper — the login
+// ceremony, name resolution + KT quorum/freshness, MLS groups, the legacy gateway, and the
+// deniable session — in crates that already exist in this workspace. Driving their real public
+// API is the honest way to execute those cases rather than leaving them skipped.
+use dmtap_auth::{
+    create_login, verify_login, AuthError, Challenge, Clock as AuthClock, DeviceCertAuthorizer,
+    InMemoryReplayCache, TrustedClientStub,
+};
+use dmtap_deniable::{initiate, DeniableIdentity, DeniableResponder};
+use dmtap_mls::Member;
+use dmtap_naming::resolver::{InMemoryResolver, Resolver};
+use dmtap_naming::{
+    check_freshness, verify_quorum, DmtapTxtRecord, InMemoryKtLog, KtLog, KtProof, ResolveError,
+    UnreachableLog,
+};
+use envoir_gateway::attestation::{AttestationError as GwAttestationError, AttestationKey};
+use envoir_gateway::outbound::{
+    AlwaysRequireTls, OutboundError, OutboundGateway, OutboundTransport, TransportResult,
+};
+
 use crate::{CaseOutcome, SuiteCase};
 
 /// Dispatch one `construction-todo` case by id: run the byte-exact construction against
@@ -87,6 +108,20 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-VAL-15" => Some(val_expired_mote_rejected()),
         "DMTAP-ATTEST-01" => Some(attest_gated_context_rejects_failing_root()),
         "DMTAP-ATTEST-02" => Some(attest_stale_evidence_rejected()),
+        "DMTAP-IDENT-04" => Some(ident_kt_unreachable_no_tofu()),
+        "DMTAP-ORG-02" => Some(org_directory_entry_unverified_rejected()),
+        "DMTAP-KTV1-02" => Some(kt_log_quorum_unmet_rejected()),
+        "DMTAP-KTV1-03" => Some(kt_sth_freshness_rejected()),
+        "DMTAP-AUTH-01" => Some(auth_assertion_sig_matches()),
+        "DMTAP-AUTH-02" => Some(auth_origin_mismatch_rejected()),
+        "DMTAP-AUTH-03" => Some(auth_nonce_replay_rejected()),
+        "DMTAP-AUTH-04" => Some(auth_expired_challenge_rejected()),
+        "DMTAP-AUTH-05" => Some(auth_session_bound_only_to_cnf()),
+        "DMTAP-DENIABLE-03" => Some(deniable_ratchet_mac_failure_rejected()),
+        "DMTAP-GRP-01" => Some(grp_foreign_commit_rejected()),
+        "DMTAP-GRP-03" => Some(grp_stale_epoch_decrypt_rejected()),
+        "DMTAP-LEG-01" => Some(leg_gateway_attestation_invalid_rejected()),
+        "DMTAP-LEG-02" => Some(leg_dkim_undelegated_domain_rejected()),
         _ => None,
     };
     match result {
@@ -97,31 +132,38 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
 }
 
 /// Explicit, per-case reasons for the `construction-todo` cases this crate does NOT execute,
-/// because the described behavior has no `dmtap-core` API surface to exercise (investigated by
-/// reading the relevant module, not guessed). Grouped by root cause so the coverage report reads
-/// as an honest, categorized gap list rather than one generic "todo".
+/// because the described behavior has no API surface to exercise ANYWHERE in this worktree's
+/// dependency graph (investigated by reading the relevant module — in `dmtap-core` and, since this
+/// crate now also depends on `dmtap-auth`/`dmtap-naming`/`dmtap-deniable`/`dmtap-mls`/
+/// `envoir-gateway` for the cases whose behavior lives one layer above `dmtap-core` proper, in
+/// those crates too — not guessed). Grouped by root cause so the coverage report reads as an
+/// honest, categorized gap list rather than one generic "todo".
 fn skip_reason(id: &str, operation: &str) -> String {
     let reason = match id {
         "DMTAP-VAL-05" => "dmtap_core::mote::validate() does not verify ChallengeResponse cryptographic \
             validity — its own doc comment states issuer-trust evaluation (ARC/PoW/postage grammar, §9) \
             is unimplemented and any *present* challenge is treated as meeting threshold, so a \
             tampered-but-present challenge cannot be made to fail closed against the current reference.",
-        "DMTAP-GRP-01" | "DMTAP-GRP-02" | "DMTAP-GRP-03" => "dmtap-core has no MLS/group-messaging \
-            implementation in this crate (no group_event, committer-log, or group-epoch-decrypt types) — \
-            group_event_verify/committer_log_check/group_decrypt are out of scope for the current reference.",
-        "DMTAP-AUTH-01" | "DMTAP-AUTH-02" | "DMTAP-AUTH-03" | "DMTAP-AUTH-04" | "DMTAP-AUTH-05" =>
-            "dmtap-core has no auth-assertion/session module (no Assertion/Challenge/cnf-bound-session \
-            types) — device/browser authentication is not yet implemented in this crate.",
-        "DMTAP-LEG-01" | "DMTAP-LEG-02" => "dmtap-core has no legacy-gateway or DKIM-delegation module — \
-            gateway_attestation_verify/dkim_delegation_verify live (if anywhere) outside this crate, not \
-            in dmtap-core.",
-        "DMTAP-CLI-01" => "dmtap-core has no JMAP mapping layer — jmap_roundtrip is a client/API-surface \
-            concern outside this crate.",
-        "DMTAP-IDENT-04" => "no KT-first-contact/TOFU-pinning policy function exists in kt.rs (only \
-            Merkle-tree math: identity_leaf_hash/SignedTreeHead/InclusionProof/ConsistencyProof) — \
-            'unreachable at first contact' is caller policy with no API to exercise.",
-        "DMTAP-IDENT-06" => "no suite-negotiation/intersection helper exists in identity.rs or suite.rs — \
-            sender/recipient suite-set intersection is caller logic, not a dmtap-core API.",
+        "DMTAP-GRP-02" => "dmtap-mls's Committer (crates/dmtap-mls/src/committer.rs) is a single \
+            in-process, single-writer ordered log — its own module doc states the real mesh committer's \
+            deterministic succession / >n/2 takeover / fork recovery is a separate concern NOT modeled \
+            here. There is no function that compares two independently-submitted logs/handshakes for a \
+            shared-position, shared-predecessor divergence; only the append-only `submit`, which can \
+            never itself produce two entries at one `seq`. Fabricating two `LogEntry`s by hand and \
+            noting their `link` fields differ would not be *executing a rejection* the crate performs —\
+            it would just be restating the hash function's collision-freedom, not a fork-detector this \
+            crate has and enforces, so this stays an honest skip rather than a dressed-up pass.",
+        "DMTAP-CLI-01" => "no crate in this workspace maps a dmtap-core MOTE (Envelope/Payload/Headers/ \
+            Kind) directly to/from a JMAP object. dmtap-mail's jmap.rs (crates/dmtap-mail/src/jmap.rs) \
+            is a full JMAP-over-RFC5322/MIME mail-server implementation keyed on its own `MailStore` \
+            (mailboxes of MIME messages), not a DMTAP-native store; round-tripping a MOTE through it \
+            would require bridging via RFC 5322 rendering + MIME parsing + a MailStore fixture, which \
+            tests dmtap-mail's own JMAP-over-MIME fidelity, not 'a MOTE renders to/from the JMAP object \
+            model without loss of §8-required fields' — a materially different property. Left an honest \
+            skip rather than substituting a lookalike check.",
+        "DMTAP-IDENT-06" => "no suite-negotiation/intersection helper exists anywhere in this workspace \
+            (identity.rs/suite.rs in dmtap-core, nor dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls) — \
+            sender/recipient suite-set intersection is caller logic with no function to call.",
         "DMTAP-PRIV-03" => "no per-epoch replay cache exists in dmtap-core (sphinx.rs is byte-layout only, \
             stateless) — mix-packet replay detection is caller/relay state.",
         "DMTAP-PRIV-04" => "no tier-enforcement function exists (Tier is a plain enum in mote.rs with no \
@@ -129,36 +171,34 @@ fn skip_reason(id: &str, operation: &str) -> String {
         "DMTAP-PRIV-05" => "no active-attack/loop-cover detection exists in dmtap-core — \
             mix_active_attack_detect is out of scope for this crate.",
         "DMTAP-PRIV-06" => "MixNodeDescriptor::verify() checks only its own signature; there is no \
-            freshness/expiry check against a re-attestation window in mixnet.rs — descriptor freshness is \
-            caller policy.",
+            freshness/expiry check against a re-attestation window in mixnet.rs. Note this is distinct \
+            from `MixDirectoryTracker` (mixnet.rs), which does now enforce whole-*directory* version \
+            monotonicity (`ERR_MIX_DIRECTORY_STALE`, 0x0311) — that is DMTAP-PRIV-02's territory (already \
+            executed) and a different granularity than THIS case's per-*descriptor* re-attestation window \
+            (`ERR_MIX_DESCRIPTOR_STALE`, 0x030C), which still has no dmtap-core function to call.",
         "DMTAP-PRIV-07" => "no capability-negotiation function exists in dmtap-core for high-security- \
             profile/PQ-Sphinx negotiation — capability_negotiate is caller/policy logic.",
-        "DMTAP-ORG-01" => "Custody (sovereign/org-managed) lives on DirEntry in directory.rs but there is \
-            no identity_validate function enforcing 'custody marker must be disclosed' — \
-            DomainDirectory::verify() only checks its own signature, not per-entry custody-disclosure \
-            policy.",
-        "DMTAP-ORG-02" => "directory_resolve (DNS+KT name -> ik forward verification) lives in the \
-            dmtap-naming crate, not dmtap-core, and is out of scope for a harness that links dmtap-core \
-            only.",
+        "DMTAP-ORG-01" => "DirEntry.custody (directory.rs) IS a required, structurally-enforced wire field \
+            (decode fails if absent) — so 'an org-managed entry with the marker simply missing' is not a \
+            distinct, honestly-executable scenario beyond ordinary missing-required-field decode failure. \
+            The property this case actually describes — an org self-asserting `custody=sovereign` while \
+            the key is REALLY escrowed — is a claim about ground truth outside the signed object itself \
+            (no amount of decoding a self-asserted DirEntry can prove or disprove who really holds the \
+            key); there is no identity_validate/cross-source check anywhere in this workspace that could \
+            catch a lying-but-well-formed entry, so this stays an honest skip rather than substituting the \
+            structurally-different 'missing field' case.",
         "DMTAP-ORG-03" => "DomainDirectory::verify() checks only self-consistency (the embedded \
             `authority` key matches its own signature); it takes no external pinned-authority parameter \
             (unlike Identity::verify's `pinned` arg), so 'signed by a key other than the PINNED authority' \
-            cannot be made to fail inside dmtap-core alone.",
-        "DMTAP-KTV1-02" => "kt_log_quorum_check needs a *set* of independently pinned logs and a > n/2 \
-            quorum vote over which name->ik binding they attest; kt.rs models exactly one \
-            SignedTreeHead/log at a time (verify()/verify_consistency() are single-log) — no \
-            multi-log quorum type or function exists to exercise.",
-        "DMTAP-KTV1-03" => "SignedTreeHead carries a `timestamp` field but kt.rs enforces no freshness \
-            window/re-fetch-on-staleness policy over it (unlike MixDirectoryTracker's explicit \
-            version-monotonicity gate) — 'older than the freshness window is stale and refreshed' is \
-            caller-side clock/cache policy with no dmtap-core function to call.",
-        "DMTAP-DENIABLE-02" => "deniable.rs has no session-establishment/capability-gating function; \
-            CapabilityAnnouncement (capability.rs) advertises capability sets generically but nothing in \
-            this crate ties 'peer has not advertised deniable-1:1' to a deniable-session refusal — that \
-            gating is caller/client policy, not a dmtap-core API.",
-        "DMTAP-DENIABLE-03" => "deniable.rs models only the DeniableMessage/DeniableInit wire frames \
-            (CBOR shape); it implements no actual Double-Ratchet AEAD (no seal/open, no chain-key \
-            derivation) — a ratchet MAC-tag failure has no dmtap-core function to exercise.",
+            cannot be made to fail inside dmtap-core alone. dmtap-naming's resolver/kt modules pin \
+            AUTHORITY keys for KT *logs*, not for a domain's `DomainDirectory`, so this gap is not closed \
+            by the crates this harness now depends on either.",
+        "DMTAP-DENIABLE-02" => "dmtap-deniable's session.rs (now a dependency of this crate) has no \
+            session-establishment/capability-gating function; CapabilityAnnouncement (dmtap-core's \
+            capability.rs) advertises capability sets generically but nothing ties 'peer has not \
+            advertised deniable-1:1' to a deniable-session refusal — a caller simply has no \
+            `DeniablePrekeyBundle` to call `initiate()` with in that case, which is a structural absence \
+            of input, not an executable 'refuse and notify' decision this crate makes.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
@@ -1256,6 +1296,596 @@ fn attest_stale_evidence_rejected() -> Result<(), String> {
     }
 }
 
+// ============================================================================================
+// IDENT/ORG/KTV1 (continued) — dmtap-naming: name -> key resolution + KT quorum/freshness
+// (§3.3, §3.5.2). These cases describe behavior that lives in dmtap-naming, a sibling workspace
+// crate this harness now depends on (see the Cargo.toml comment) — not in dmtap-core itself.
+// ============================================================================================
+
+fn naming_identity(name: &str, seed: u8) -> (IdentityKey, Identity) {
+    let ik = IdentityKey::from_seed(&[seed; 32]);
+    let id = Identity::create_classical(
+        &ik, 0, vec![], sample_keypkg_ref("naming"), ContentId::of(b"recovery-naming"),
+        vec![name.to_owned()], None, 1_700_000_000_000,
+    );
+    (ik, id)
+}
+
+/// Build the `_dmtap` TXT record string a resolver looks up, pointing at `identity`'s real content
+/// address and classical `ik` (mirrors dmtap-naming's own `resolver.rs` test helper, using only
+/// public API).
+fn naming_txt(seed: u8, identity: &Identity) -> String {
+    DmtapTxtRecord {
+        version: "dmtap1".into(),
+        suite: 1,
+        ik: IdentityKey::from_seed(&[seed; 32]).public(),
+        id: identity.content_id(),
+        kt: vec!["https://kt.example/log".into()],
+        keypkgs: "/mesh/kp".into(),
+    }
+    .to_txt()
+}
+
+/// DMTAP-IDENT-04: "KT log unreachable at first-contact pinning => MUST NOT silently TOFU-pin;
+/// block or hard-warn". `InMemoryResolver` pinned only to an `UnreachableLog` (its own `prove`
+/// always returns `None`, modeling a partitioned/censored log, §3.3) must fail closed with
+/// `ResolveError::KtUnreachable` rather than falling back to an unverified pin — mirrors
+/// dmtap-naming's own `resolver.rs` unit test `kt_unreachable_blocks_no_tofu`.
+fn ident_kt_unreachable_no_tofu() -> Result<(), String> {
+    let name = "conformance-ident04@example.com";
+    let (_ik, id) = naming_identity(name, 0x51);
+    let txt = naming_txt(0x51, &id);
+
+    let mut r = InMemoryResolver::new(1_700_000_000_000);
+    r.set_txt("conformance-ident04._dmtap.example.com", &txt);
+    r.publish_identity(id);
+    r.pin_log(UnreachableLog { log_id: IdentityKey::from_seed(&[0x99; 32]).public() });
+
+    match r.resolve(name) {
+        Err(ResolveError::KtUnreachable) => {
+            if ResolveError::KtUnreachable.code() != 0x0106 {
+                return Err(format!(
+                    "ERR_KT_UNREACHABLE code mismatch: got {:#06x}, want 0x0106",
+                    ResolveError::KtUnreachable.code()
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("expected Err(KtUnreachable) (fail-closed, no TOFU), got {other:?}")),
+    }
+}
+
+/// DMTAP-ORG-02: "a DirEntry whose name -> ik does not forward-verify against DNS+KT is rendered
+/// unverified, never used to address mail". Points the `_dmtap` TXT record's `ik=` at an attacker
+/// key while `id=` still names the real, honestly-signed `Identity` — the DNS pointer and the
+/// signed object disagree, exactly the forward-verification failure §3.10.3/§3.9.4 requires be
+/// rejected rather than used. Mirrors dmtap-naming's own
+/// `dns_pointing_at_wrong_identity_fails_closed` resolver test.
+fn org_directory_entry_unverified_rejected() -> Result<(), String> {
+    let name = "conformance-org02@example.com";
+    let (_ik, id) = naming_identity(name, 0x52);
+    let evil_ik = IdentityKey::from_seed(&[0xee; 32]).public();
+    let tampered = format!(
+        "v=dmtap1; suite=1; ik={}; id={}; kt=https://kt.example/log; keypkgs=/mesh/kp",
+        base64_url(&evil_ik),
+        base64_url(id.content_id().as_bytes()),
+    );
+
+    let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[0x53; 32]));
+    log.append_identity(name, &id).ok_or("append_identity: identity has no classical ik")?;
+
+    let mut r = InMemoryResolver::new(1_700_000_000_000);
+    r.set_txt("conformance-org02._dmtap.example.com", &tampered);
+    r.publish_identity(id);
+    r.pin_log(log);
+
+    match r.resolve(name) {
+        Err(ResolveError::DnsIdentityMismatch(_)) => Ok(()),
+        other => Err(format!(
+            "expected Err(DnsIdentityMismatch) (DNS pointer disagrees with the signed Identity, \
+             never used to address mail), got {other:?}"
+        )),
+    }
+}
+
+/// Minimal base64url-no-pad encoder mirroring dmtap-naming's private `base64url::encode` (needed
+/// here only to hand-splice one attacker-controlled TXT record; not a reimplementation of anything
+/// this crate treats as normative — the resolver itself does the real decode/verify).
+fn base64_url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6 & 0x3f) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// DMTAP-KTV1-02: "a name -> ik binding not attested by a > n/2 quorum of the pinned log set fails
+/// closed -> OOB". Pin three logs but make only one reachable (the other two model
+/// partitioned/censored logs, each `prove`-ing `None`) — a strict sub-quorum (1 of 3) — and assert
+/// `verify_quorum` rejects with `KtQuorumUnmet` rather than accepting a minority attestation.
+/// Mirrors dmtap-naming's own `kt.rs` unit test `quorum_accepts_strict_majority_and_fails_below`.
+fn kt_log_quorum_unmet_rejected() -> Result<(), String> {
+    let name = "conformance-ktv1-02@example.com";
+    let (_ik, id) = naming_identity(name, 0x54);
+    let leaf = dmtap_naming::kt::leaf_for(name, &id).ok_or("identity has no classical ik")?;
+
+    let logs: Vec<InMemoryKtLog> = (0..3)
+        .map(|s| {
+            let mut l = InMemoryKtLog::new(IdentityKey::from_seed(&[0x60 + s as u8; 32]));
+            let _ = l.append_identity(name, &id);
+            l
+        })
+        .collect();
+    let ids: Vec<Vec<u8>> = logs.iter().map(|l| l.log_id()).collect();
+
+    // Only the first log is reachable; the other two are modeled as unreachable (`None`) —
+    // 1 of 3 is a strict sub-quorum.
+    let attestations: Vec<(Vec<u8>, Option<KtProof>)> = vec![
+        (ids[0].clone(), logs[0].prove(&leaf)),
+        (ids[1].clone(), None),
+        (ids[2].clone(), None),
+    ];
+
+    match verify_quorum(name, &id, &attestations) {
+        Err(ResolveError::KtQuorumUnmet) => {
+            if ResolveError::KtQuorumUnmet.code() != 0x0111 {
+                return Err(format!(
+                    "ERR_KT_LOG_QUORUM_UNMET code mismatch: got {:#06x}, want 0x0111",
+                    ResolveError::KtQuorumUnmet.code()
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("expected Err(KtQuorumUnmet) (sub-quorum, fail closed), got {other:?}")),
+    }
+}
+
+/// DMTAP-KTV1-03: "a SignedTreeHead older than the freshness window (freeze attack) is treated as
+/// stale and refreshed". A log's STH stamped at `NOW`, checked from a verifier clock 2h later
+/// against a 1h freshness window, must be rejected as stale rather than silently accepted. Mirrors
+/// dmtap-naming's own `kt.rs` unit test `stale_sth_is_rejected`.
+fn kt_sth_freshness_rejected() -> Result<(), String> {
+    let now: TimestampMs = 1_700_000_000_000;
+    let log_key = IdentityKey::from_seed(&[0x61; 32]);
+    let sth = SignedTreeHead::issue(&log_key, 1, now, ContentId::of(b"conformance-ktv1-03-root"));
+    let window: TimestampMs = 3_600_000; // 1h
+
+    // Sanity: right at the edge of the window is still fresh.
+    check_freshness(&sth, now + window, window)
+        .map_err(|e| format!("sanity: an STH exactly at the freshness edge must pass: {e:?}"))?;
+
+    match check_freshness(&sth, now + 2 * window, window) {
+        Err(ResolveError::KtSthStale) => {
+            if ResolveError::KtSthStale.code() != 0x0112 {
+                return Err(format!(
+                    "ERR_KT_STH_STALE code mismatch: got {:#06x}, want 0x0112",
+                    ResolveError::KtSthStale.code()
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!("expected Err(KtSthStale) (freeze attack, HOLD_RESYNC), got {other:?}")),
+    }
+}
+
+// ============================================================================================
+// AUTH — DMTAP-Auth native login ceremony + key-bound session (§13.3, §13.4). This crate now
+// depends on dmtap-auth (a sibling workspace crate implementing the ceremony's crypto core, not
+// dmtap-core itself — see the Cargo.toml comment) so these cases are driven against real code
+// rather than left skipped.
+// ============================================================================================
+
+/// A fixed, injectable clock for the dmtap-auth ceremony (its `Clock` seam), so these
+/// constructions are fully deterministic.
+struct FixedClock(TimestampMs);
+impl AuthClock for FixedClock {
+    fn now_ms(&self) -> TimestampMs {
+        self.0
+    }
+}
+
+/// DMTAP-AUTH-01: "Assertion.sig over DS || BLAKE3-256(det_cbor([rp_origin,nonce,issued_at,exp,
+/// aud,cnf])) under the IK-authorized device key". Runs the REAL client ceremony
+/// (`dmtap_auth::create_login`) and then the REAL RP-side verification (`verify_login`), which
+/// reconstructs that exact §18.9.8 preimage from the challenge it issued and checks the signature
+/// against it — `verify_login` returning `Ok` IS the executable proof that `Assertion.sig` matches
+/// the specified preimage under the login key (an IK-direct signer is trivially IK-authorized,
+/// §1.2), since `verify_domain` is the same primitive `dmtap-core::identity::sign_domain`/`verify`
+/// use elsewhere in this harness.
+fn auth_assertion_sig_matches() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", 1_700_000_000_000, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+
+    let authorizer = DeviceCertAuthorizer::new(); // IK-direct signer is authorized on its own (§1.2)
+    let mut replay = InMemoryReplayCache::new();
+    let clock = FixedClock(1_700_000_000_500);
+    match verify_login(
+        &ik.public(),
+        rp_origin,
+        "mail.example.invalid",
+        &challenge,
+        &login.assertion,
+        &authorizer,
+        &mut replay,
+        &clock,
+    ) {
+        Ok(_bound) => Ok(()),
+        Err(e) => Err(format!(
+            "expected the RP to accept a genuinely §18.9.8-signed assertion (sig matches), got \
+             Err({e})"
+        )),
+    }
+}
+
+/// DMTAP-AUTH-02: "an assertion whose rp_origin/aud mismatch the issued Challenge is rejected".
+/// Tampers the signed assertion's echoed `rp_origin` (post-signing, so the signature itself is
+/// still well-formed bytes) to a look-alike origin and confirms `verify_login`'s very first check
+/// (§13.3.1's phishing defense) rejects it.
+fn auth_origin_mismatch_rejected() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", 1_700_000_000_000, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let mut login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+    login.assertion.rp_origin = "https://mail-example.invalid.evil.example".into();
+
+    let authorizer = DeviceCertAuthorizer::new();
+    let mut replay = InMemoryReplayCache::new();
+    let clock = FixedClock(1_700_000_000_500);
+    match verify_login(
+        &ik.public(),
+        rp_origin,
+        "mail.example.invalid",
+        &challenge,
+        &login.assertion,
+        &authorizer,
+        &mut replay,
+        &clock,
+    ) {
+        Err(AuthError::OriginMismatch) => Ok(()),
+        other => Err(format!("expected Err(OriginMismatch), got {other:?}")),
+    }
+}
+
+/// DMTAP-AUTH-03: "a replayed nonce is rejected". Presents the SAME genuine assertion to
+/// `verify_login` twice against one `ReplayCache`: the first presentation succeeds and reserves the
+/// nonce (§13.3 step 6's final gate), the second — a byte-identical replay — must fail with
+/// `AuthError::Replay`.
+fn auth_nonce_replay_rejected() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", 1_700_000_000_000, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+
+    let authorizer = DeviceCertAuthorizer::new();
+    let mut replay = InMemoryReplayCache::new();
+    let clock = FixedClock(1_700_000_000_500);
+    verify_login(
+        &ik.public(), rp_origin, "mail.example.invalid", &challenge, &login.assertion,
+        &authorizer, &mut replay, &clock,
+    )
+    .map_err(|e| format!("sanity: first presentation must succeed: {e}"))?;
+
+    match verify_login(
+        &ik.public(), rp_origin, "mail.example.invalid", &challenge, &login.assertion,
+        &authorizer, &mut replay, &clock,
+    ) {
+        Err(AuthError::Replay) => Ok(()),
+        other => Err(format!("expected Err(Replay) on the second, byte-identical presentation, got {other:?}")),
+    }
+}
+
+/// DMTAP-AUTH-04: "an expired Challenge is rejected". The RP's own clock is read past `exp`
+/// (`Challenge::new`'s `CHALLENGE_TTL_MS` window) at verification time — `verify_login` MUST judge
+/// expiry against its own clock, never the assertion's echoed timestamps (§16.1), and reject.
+fn auth_expired_challenge_rejected() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let issued_at: TimestampMs = 1_700_000_000_000;
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", issued_at, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+
+    let authorizer = DeviceCertAuthorizer::new();
+    let mut replay = InMemoryReplayCache::new();
+    // Well past `challenge.exp` (issued_at + 120_000ms).
+    let clock = FixedClock(challenge.exp + 1);
+    match verify_login(
+        &ik.public(), rp_origin, "mail.example.invalid", &challenge, &login.assertion,
+        &authorizer, &mut replay, &clock,
+    ) {
+        Err(AuthError::Expired) => Ok(()),
+        other => Err(format!("expected Err(Expired), got {other:?}")),
+    }
+}
+
+/// DMTAP-AUTH-05: "the session is bound ONLY to cnf (not the signing key) and MUST reject on cnf
+/// mismatch". Establishes a REAL `BoundSession` via `verify_login`, proves a DPoP proof from the
+/// genuine retained session key is ACCEPTED (bound to `cnf`, not to `ik`/the login key), then proves
+/// a proof from a DIFFERENT (attacker-generated) session key — the "stolen assertion without the
+/// session key" scenario §13.4 defends against — is REJECTED with `SessionKeyMismatch`.
+fn auth_session_bound_only_to_cnf() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", 1_700_000_000_000, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+
+    let authorizer = DeviceCertAuthorizer::new();
+    let mut replay = InMemoryReplayCache::new();
+    let clock = FixedClock(1_700_000_000_500);
+    let bound = verify_login(
+        &ik.public(), rp_origin, "mail.example.invalid", &challenge, &login.assertion,
+        &authorizer, &mut replay, &clock,
+    )
+    .map_err(|e| format!("sanity: login must verify: {e}"))?;
+
+    // The genuine session key proves possession and is accepted (bound to cnf, not to `ik`).
+    let mut proof_replay = InMemoryReplayCache::new();
+    let good_proof = login.session.prove("https://mail.example.invalid/api", "GET", &clock);
+    bound
+        .verify_request(&good_proof, "https://mail.example.invalid/api", "GET", &mut proof_replay, &clock)
+        .map_err(|e| format!("sanity: the genuine session key must be accepted: {e}"))?;
+
+    // An attacker holding the (public) assertion but NOT the session private key cannot forge a
+    // valid proof merely by presenting a different key.
+    let attacker_session = dmtap_auth::SessionKey::generate();
+    let forged_proof = attacker_session.prove("https://mail.example.invalid/api", "GET", &clock);
+    match bound.verify_request(
+        &forged_proof, "https://mail.example.invalid/api", "GET", &mut proof_replay, &clock,
+    ) {
+        Err(AuthError::SessionKeyMismatch) => Ok(()),
+        other => Err(format!(
+            "expected Err(SessionKeyMismatch) (session bound only to cnf, mismatch rejected), got {other:?}"
+        )),
+    }
+}
+
+// ============================================================================================
+// DENIABLE (continued) — the real Double-Ratchet session (dmtap-deniable), not just the wire
+// frames dmtap-core models (§5.2.1(b), §18.9.10).
+// ============================================================================================
+
+/// DMTAP-DENIABLE-03: "a DeniableMessage whose Double-Ratchet AEAD tag (shared-key MAC) fails is
+/// dropped". Runs a REAL X3DH handshake + Double Ratchet session (`dmtap_deniable::initiate` /
+/// `DeniableResponder::accept`) to get a live, mutually-established session, seals a message, flips
+/// a ciphertext byte, and confirms `decrypt` fails closed with `DeniableError::MacFailed` rather
+/// than accepting a tampered transcript.
+fn deniable_ratchet_mac_failure_rejected() -> Result<(), String> {
+    let ik_a = IdentityKey::generate();
+    let ik_b = IdentityKey::generate();
+    let id_a = DeniableIdentity::new(ik_a);
+    let id_b = DeniableIdentity::new(ik_b);
+    let mut responder = DeniableResponder::new(id_b, 1, 1, 1_700_000_000_000);
+
+    let first = DeniablePayload {
+        from: IdentityKey::generate().public(),
+        kind: Kind::Chat,
+        headers: Headers::default(),
+        body: b"conformance-runner deniable-03 first message".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+    let (mut initiator_session, init) =
+        initiate(&id_a, responder.bundle(), &first).map_err(|e| format!("initiate: {e}"))?;
+    let (mut responder_session, _payload) =
+        responder.accept(&init).map_err(|e| format!("responder accept: {e}"))?;
+
+    let second = DeniablePayload {
+        from: IdentityKey::generate().public(),
+        kind: Kind::Chat,
+        headers: Headers::default(),
+        body: b"a second, tampered-in-transit message".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+    let mut msg = initiator_session.encrypt(&second);
+    let last = msg.ct.len() - 1;
+    msg.ct[last] ^= 0xff; // tamper the ciphertext/AEAD tag after sealing
+
+    match responder_session.decrypt(&msg) {
+        Err(dmtap_deniable::DeniableError::MacFailed) => Ok(()),
+        other => Err(format!(
+            "expected Err(MacFailed) (tampered AEAD tag dropped, never accepted), got {other:?}"
+        )),
+    }
+}
+
+// ============================================================================================
+// GRP — the real MLS group layer (dmtap-mls, wrapping openmls) — spec §5, §5.1.
+// ============================================================================================
+
+const CONF_GROUP_ID: &[u8] = b"conformance-runner-group";
+
+/// DMTAP-GRP-01: "GroupEvent/GroupState committer_sig verifies under the committer's IK-authorized
+/// device key" (reject disjunct: "committer-sig / member-sig verification failure"). Builds a real
+/// 2-member MLS group (alice + bob, converged), then feeds `bob` a genuine, validly-MLS-signed
+/// Commit produced by a COMPLETELY UNRELATED group/signer (`carol`'s group) via the committer
+/// ordering seam — an inauthentic handshake claiming authority in a group it does not belong to.
+/// `Session::advance` must reject it rather than merge/accept it. Mirrors dmtap-mls's own
+/// `hostile_and_malformed_messages_are_rejected_never_panic` test's "a Commit from a completely
+/// unrelated group" case, but driven through the committer/`advance` path (`group_event_verify`)
+/// this case names, rather than `receive_message`.
+fn grp_foreign_commit_rejected() -> Result<(), String> {
+    // alice's group: alice + bob, converged.
+    let alice = Member::new(b"alice".to_vec(), "phone").map_err(|e| format!("alice: {e:?}"))?;
+    let bob = Member::new(b"bob".to_vec(), "phone").map_err(|e| format!("bob: {e:?}"))?;
+    let bob_kp = bob.publish_key_package().map_err(|e| format!("bob kp: {e:?}"))?;
+    let mut alice = alice.create_group(CONF_GROUP_ID).map_err(|e| format!("create_group: {e:?}"))?;
+
+    let mut committer_a = dmtap_mls::Committer::new();
+    let hs_ab = alice.add_member(&bob_kp).map_err(|e| format!("add bob: {e:?}"))?;
+    let welcome = hs_ab.welcome.clone().ok_or("an Add must produce a Welcome")?;
+    let seq = committer_a.submit(hs_ab);
+    alice.note_authored(seq);
+    alice.advance(&committer_a).map_err(|e| format!("alice advance: {e:?}"))?;
+    let mut bob = bob.join_from_welcome(&welcome).map_err(|e| format!("bob join: {e:?}"))?;
+    // Deliberately do NOT call `bob.note_joined_at(..)`: bob's `applied_seq` stays at its default
+    // (0), so the FAKE committer below (which starts its own numbering at 1) is not skipped over —
+    // this models bob being handed a foreign handshake as "the next thing to apply".
+
+    // carol's totally unrelated group: an entirely different signer/context.
+    let carol = Member::new(b"carol".to_vec(), "phone").map_err(|e| format!("carol: {e:?}"))?;
+    let dan = Member::new(b"dan".to_vec(), "phone").map_err(|e| format!("dan: {e:?}"))?;
+    let dan_kp = dan.publish_key_package().map_err(|e| format!("dan kp: {e:?}"))?;
+    let mut carol = carol
+        .create_group(b"a-totally-different-conformance-group")
+        .map_err(|e| format!("carol create_group: {e:?}"))?;
+    let hs_foreign = carol.add_member(&dan_kp).map_err(|e| format!("carol add dan: {e:?}"))?;
+
+    // Feed bob the foreign Commit via a fake committer, as though it were the next entry to apply.
+    let mut fake_committer = dmtap_mls::Committer::new();
+    fake_committer.submit(hs_foreign);
+    match bob.advance(&fake_committer) {
+        Err(_) => Ok(()),
+        Ok(n) => Err(format!(
+            "expected an inauthentic, foreign-group Commit to be rejected, but bob applied it \
+             (advanced {n} entries) as though it were legitimately authored in bob's own group"
+        )),
+    }
+}
+
+/// DMTAP-GRP-03: "wrong MLS epoch key selection is rejected" (`ERR_EPOCH_MISMATCH`). Builds a real
+/// 3-member group, desyncs one member (does not apply a later epoch-advancing Add), then confirms
+/// that member's OLD epoch key material cannot decrypt a message encrypted under the NEW epoch —
+/// the wrong-epoch-key selection is rejected, not silently misdecrypted. Mirrors dmtap-mls's own
+/// `desynced_member_cannot_decrypt_a_newer_epoch_until_it_resyncs` test.
+fn grp_stale_epoch_decrypt_rejected() -> Result<(), String> {
+    let alice = Member::new(b"alice".to_vec(), "phone").map_err(|e| format!("alice: {e:?}"))?;
+    let bob = Member::new(b"bob".to_vec(), "phone").map_err(|e| format!("bob: {e:?}"))?;
+    let charlie = Member::new(b"charlie".to_vec(), "phone").map_err(|e| format!("charlie: {e:?}"))?;
+    let erin = Member::new(b"erin".to_vec(), "phone").map_err(|e| format!("erin: {e:?}"))?;
+
+    let mut committer = dmtap_mls::Committer::new();
+    let mut alice = alice.create_group(CONF_GROUP_ID).map_err(|e| format!("create_group: {e:?}"))?;
+
+    let hs = alice.add_member(&bob.publish_key_package().map_err(|e| format!("{e:?}"))?)
+        .map_err(|e| format!("add bob: {e:?}"))?;
+    let w = hs.welcome.clone().ok_or("Add must have a Welcome")?;
+    let seq = committer.submit(hs);
+    alice.note_authored(seq);
+    alice.advance(&committer).map_err(|e| format!("alice advance: {e:?}"))?;
+    let mut bob = bob.join_from_welcome(&w).map_err(|e| format!("bob join: {e:?}"))?;
+    bob.note_joined_at(committer.head());
+
+    let hs = alice.add_member(&charlie.publish_key_package().map_err(|e| format!("{e:?}"))?)
+        .map_err(|e| format!("add charlie: {e:?}"))?;
+    let w = hs.welcome.clone().ok_or("Add must have a Welcome")?;
+    let seq = committer.submit(hs);
+    alice.note_authored(seq);
+    alice.advance(&committer).map_err(|e| format!("alice re-advance: {e:?}"))?;
+    bob.advance(&committer).map_err(|e| format!("bob advance: {e:?}"))?;
+    let mut charlie = charlie.join_from_welcome(&w).map_err(|e| format!("charlie join: {e:?}"))?;
+    charlie.note_joined_at(committer.head());
+
+    // Alice adds Erin (a new epoch) — only applied to alice + bob; Charlie stays on the OLD epoch.
+    // Erin's own Welcome/join is irrelevant to what this case proves (Charlie's stale-epoch
+    // decrypt failure), so it is not consumed here.
+    let hs = alice.add_member(&erin.publish_key_package().map_err(|e| format!("{e:?}"))?)
+        .map_err(|e| format!("add erin: {e:?}"))?;
+    let seq = committer.submit(hs);
+    alice.note_authored(seq);
+    alice.advance(&committer).map_err(|e| format!("alice final advance: {e:?}"))?;
+    bob.advance(&committer).map_err(|e| format!("bob final advance: {e:?}"))?;
+    let epoch_before = charlie.epoch();
+    if alice.epoch() == epoch_before {
+        return Err("sanity: adding Erin must advance alice's epoch past charlie's".into());
+    }
+
+    // A message under the NEW epoch: bob (resynced) decrypts fine; charlie (stale epoch key) must
+    // fail closed rather than silently misdecrypt.
+    let ct = alice.create_message(b"only the resynced can read this").map_err(|e| format!("{e:?}"))?;
+    bob.receive_message(&ct).map_err(|e| format!("sanity: bob (resynced) must decrypt: {e:?}"))?;
+    match charlie.receive_message(&ct) {
+        Err(_) => Ok(()),
+        Ok(_) => Err("expected charlie's stale-epoch key to fail closed on a new-epoch message, but it decrypted".into()),
+    }
+}
+
+// ============================================================================================
+// LEG — the legacy SMTP gateway (envoir-gateway) — spec §7, §7.2a, §7.3.
+// ============================================================================================
+
+/// DMTAP-LEG-01: "a gateway attestation that fails to verify under a trusted key is rejected"
+/// (`ERR_GATEWAY_ATTESTATION_INVALID`). Issues a genuine domain-anchored `Attestation`, tampers its
+/// signature after signing, and confirms the recipient-side `Attestation::verify` rejects it under
+/// the (correct) published key rather than accepting a forged/corrupted attestation.
+fn leg_gateway_attestation_invalid_rejected() -> Result<(), String> {
+    let key = AttestationKey::generate("recipient.example", "sel1");
+    let mote_id = ContentId::of(b"conformance-leg-01 wrapped mote");
+    let mut att = key.attest(&mote_id, "sender@legacy.example", "alice@recipient.example", 1_700_000_000_000);
+    att.sig[0] ^= 0xff; // tamper after signing
+
+    match att.verify("recipient.example", Some(&key.public()), &mote_id) {
+        Err(GwAttestationError::BadSignature(_)) => Ok(()),
+        other => Err(format!("expected Err(BadSignature) (attestation invalid, rejected), got {other:?}")),
+    }
+}
+
+/// A no-op [`OutboundTransport`]: DMTAP-LEG-02 only exercises `translate_and_sign` (the
+/// delegation-refusal gate), which returns before any transport call, so this stub is never
+/// actually invoked — it exists only to satisfy `OutboundGateway::new`'s constructor shape.
+struct UnusedTransport;
+impl OutboundTransport for UnusedTransport {
+    fn deliver(&self, _dest_domain: &str, _message: &[u8], _require_tls: bool) -> TransportResult {
+        TransportResult::Permanent { code: 550, text: "unused in this construction".into() }
+    }
+}
+
+/// DMTAP-LEG-02: "invalid DKIM delegation is rejected" (`ERR_DKIM_DELEGATION_INVALID`). The gateway
+/// MUST refuse to DKIM-sign for a domain it holds no delegated selector for (§7.3's hard refusal,
+/// `OutboundGateway::translate_and_sign`) — attempts to sign outbound mail for a domain absent from
+/// its delegated-key set and confirms it is refused (`OutboundError::NotDelegated`) rather than
+/// signing with some other domain's key or skipping the check.
+fn leg_dkim_undelegated_domain_rejected() -> Result<(), String> {
+    let gateway = OutboundGateway::new(
+        vec![], // no delegated DKIM keys at all — this gateway is delegated for NOTHING
+        Box::new(AlwaysRequireTls),
+        Box::new(UnusedTransport),
+    );
+    let payload = Payload {
+        from: IdentityKey::generate().public(),
+        sig: Vec::new(),
+        headers: Headers::default(),
+        body: b"conformance-runner leg-02 outbound body".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+    match gateway.translate_and_sign(&payload, "alice@undelegated.example", "bob@dest.example", 1_700_000_000_000) {
+        Err(OutboundError::NotDelegated(domain)) => {
+            if domain != "undelegated.example" {
+                return Err(format!(
+                    "NotDelegated named the wrong domain: got {domain}, want undelegated.example"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "expected Err(NotDelegated) (the gateway MUST refuse to sign for an undelegated domain), \
+             got {other:?}"
+        )),
+    }
+}
+
 /// Every `id` this dispatcher recognizes (used by tests to keep the executed-set and the reason
 /// table honest against each other and against `suite.json`).
 pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
@@ -1268,6 +1898,9 @@ pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
         "DMTAP-VAL-15", "DMTAP-ORG-04", "DMTAP-ORG-05", "DMTAP-KTV1-01", "DMTAP-KTV1-04",
         "DMTAP-DENIABLE-01", "DMTAP-DENIABLE-04", "DMTAP-DENIABLE-05", "DMTAP-PROFILE-01",
         "DMTAP-PROFILE-02", "DMTAP-PUSH-01", "DMTAP-PUSH-02", "DMTAP-ATTEST-01", "DMTAP-ATTEST-02",
+        "DMTAP-IDENT-04", "DMTAP-ORG-02", "DMTAP-KTV1-02", "DMTAP-KTV1-03", "DMTAP-AUTH-01",
+        "DMTAP-AUTH-02", "DMTAP-AUTH-03", "DMTAP-AUTH-04", "DMTAP-AUTH-05", "DMTAP-DENIABLE-03",
+        "DMTAP-GRP-01", "DMTAP-GRP-03", "DMTAP-LEG-01", "DMTAP-LEG-02",
     ]
     .into_iter()
     .map(|id| (id, ()))

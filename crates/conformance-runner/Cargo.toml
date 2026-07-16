@@ -9,6 +9,16 @@ publish = false
 
 [dependencies]
 dmtap-core = { path = "../dmtap-core" }
+# Additional workspace crates driven by `construction.rs` so more `suite.json` construction-todo
+# cases can be honestly EXECUTED against real reference code, rather than left skipped, when the
+# behavior the case describes lives outside dmtap-core proper (auth ceremony, name resolution/KT
+# quorum+freshness, MLS groups, the legacy gateway) — see the module docs on each construction
+# function for exactly what is proven and why the dependency is the honest way to test it.
+dmtap-auth = { path = "../dmtap-auth" }
+dmtap-naming = { path = "../dmtap-naming" }
+dmtap-deniable = { path = "../dmtap-deniable" }
+dmtap-mls = { path = "../dmtap-mls" }
+envoir-gateway = { path = "../../gateway" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"
