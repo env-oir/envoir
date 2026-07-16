@@ -33,6 +33,12 @@ getrandom = "0.2"
 # --- Errors ---
 thiserror = "1"
 
+# --- SIGINT/SIGTERM graceful-shutdown handling for the daemon runtime (`run`) ---
+# std has no signal API; libc's async-signal-safe `signal()` lets the daemon install a handler that
+# flips an atomic the accept loop polls. Already in the build graph (transitive); taken directly and
+# used only by the `run` binary. No async runtime, no signal-hook: one tiny, ubiquitous dependency.
+libc = "0.2"
+
 # --- Real SMTP-over-TLS sockets (the one dep worth taking, spec §7.3 STARTTLS) ---
 # rustls (ring provider) terminates/initiates STARTTLS; pemfile loads operator cert/key;
 # webpki-roots is the default trust anchor set for validating destination MX certs.
