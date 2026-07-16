@@ -24,13 +24,16 @@
   --ink: #eef1f7;
   --ink-dim: #a5adc0;
   --ink-faint: #656d80;
-  --accent-1: #5b9dff;
-  --accent-2: #7c5cff;
-  --accent-soft: rgba(124, 92, 255, 0.14);
-  --good: #6ee7b0;
+  /* Aurora Indigo — brand/README.md: Indigo -> Violet gradient, teal as the one
+     sparing accent (unread/new, verified/success). See also assets/logo-mark.svg. */
+  --accent-1: #4c4dff;
+  --accent-2: #9a4dff;
+  --accent-teal: #00e0c7;
+  --accent-soft: rgba(124, 77, 255, 0.14);
+  --good: #00e0c7;
   --warn: #ffcf7d;
   --shadow-lg: 0 30px 80px -30px rgba(0, 0, 0, 0.7);
-  --shadow-glow: 0 0 0 1px rgba(124, 92, 255, 0.25), 0 0 40px -8px rgba(91, 157, 255, 0.35);
+  --shadow-glow: 0 0 0 1px rgba(124, 77, 255, 0.25), 0 0 40px -8px rgba(76, 77, 255, 0.35);
 
   --radius-sm: 6px;
   --radius-md: 12px;
@@ -56,12 +59,14 @@
   /* Deepened versus the dark-theme hues so text, links, and icon labels set
      in these colors keep real contrast on a white/cream ground (WCAG AA,
      ≥4.5:1) — the dark-theme values are tuned for a near-black background
-     and fall far short (as low as 2.7:1) once the page flips to light. */
-  --accent-1: #2a5bb8;
-  --accent-2: #5436c4;
-  --good: #0f7a52;
+     and fall far short once the page flips to light. Same Indigo/Violet/teal
+     hues as the dark palette, just darkened to hold contrast on white. */
+  --accent-1: #4038c9;
+  --accent-2: #7a35c9;
+  --accent-teal: #067a68;
+  --good: #067a68;
   --warn: #8f5200;
-  --accent-soft: rgba(91, 157, 255, 0.12);
+  --accent-soft: rgba(76, 77, 255, 0.1);
   --shadow-lg: 0 30px 80px -30px rgba(20, 20, 30, 0.22);
   --shadow-glow: 0 0 0 1px rgba(124, 92, 255, 0.22), 0 0 40px -10px rgba(91, 157, 255, 0.3);
 }
@@ -601,6 +606,93 @@ section + section { border-top: 1px solid var(--line); }
 }
 .signin-strip .lbl { font-family: var(--font-mono); font-size: 0.85rem; color: var(--ink-dim); }
 .signin-strip .lbl b { color: var(--ink); }
+
+/* ---------- product: feature rows (Mail / Chat / Files / Identity) ---------- */
+.feature-row {
+  display: grid;
+  grid-template-columns: 1.05fr 0.95fr;
+  gap: clamp(28px, 5vw, 56px);
+  align-items: center;
+  padding: 40px 0;
+}
+.feature-row + .feature-row { border-top: 1px solid var(--line); }
+.feature-row.reverse .feature-media { order: 2; }
+@media (max-width: 860px) {
+  .feature-row { grid-template-columns: 1fr; padding: 28px 0; }
+  .feature-row.reverse .feature-media { order: 0; }
+}
+.feature-media img {
+  width: 100%;
+  display: block;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-lg);
+}
+.feature-tag {
+  display: inline-block;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  color: var(--accent-1);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  padding: 4px 12px;
+  margin-bottom: 14px;
+}
+.feature-copy h3 { font-size: 1.4rem; margin-bottom: 12px; }
+.feature-copy > p { color: var(--ink-dim); font-size: 0.98rem; line-height: 1.65; max-width: 52ch; margin-bottom: 16px; }
+.feature-copy strong, .feature-copy b { color: var(--ink); }
+.feature-points {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.feature-points li {
+  position: relative;
+  padding-left: 20px;
+  font-size: 0.9rem;
+  color: var(--ink-dim);
+  line-height: 1.55;
+  max-width: 54ch;
+}
+.feature-points li::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0.55em;
+  width: 9px; height: 1.5px;
+  background: linear-gradient(90deg, var(--accent-1), var(--accent-2));
+}
+.feature-points b { color: var(--ink); }
+
+/* ---------- transport traceability ---------- */
+.trace-showcase {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: clamp(28px, 5vw, 48px);
+  align-items: center;
+}
+@media (max-width: 900px) { .trace-showcase { grid-template-columns: 1fr; } }
+.trace-media img {
+  width: 100%;
+  display: block;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-lg);
+}
+.trace-copy h3 { font-size: 1.1rem; font-family: var(--font-sans); font-weight: 700; margin-bottom: 14px; }
+.trace-copy .feature-points { margin-bottom: 18px; }
+.trace-boundary {
+  font-size: 0.88rem;
+  color: var(--ink-dim);
+  line-height: 1.6;
+  padding: 16px 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+}
+.trace-boundary strong { color: var(--ink); }
 
 /* ---------- feature parity ---------- */
 .parity-tally {

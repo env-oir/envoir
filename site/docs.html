@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Envoir docs</title>
+<meta name="description" content="Envoir &amp; DMTAP documentation: architecture, protocol, privacy &amp; threat model, security, and per-feature guides for mail, chat, files, and identity.">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" type="image/svg+xml" href="assets/logo-mark.svg">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/favicon-180.png">
+<link rel="mask-icon" href="assets/logo-mono.svg" color="#4C4DFF">
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/docs.css">
+
+<meta property="og:title" content="Envoir docs">
+<meta property="og:description" content="Architecture, protocol, privacy model, security, and feature guides for Envoir — the open-source reference implementation of DMTAP.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Envoir">
+<meta property="og:image" content="assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Envoir docs">
+<meta name="twitter:description" content="Architecture, protocol, privacy model, security, and feature guides for Envoir — the open-source reference implementation of DMTAP.">
+<meta name="twitter:image" content="assets/og-image.png">
+<meta name="theme-color" content="#0a0c11" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f4f2ee" media="(prefers-color-scheme: light)">
+</head>
+<body>
+<a class="skip-link" href="#doc-content">Skip to content</a>
+
+<header class="site-nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="index.html" aria-label="Envoir home">
+      <img src="assets/logo-mark.svg" width="30" height="30" alt="" aria-hidden="true">
+      <span class="word">Envoir</span>
+    </a>
+
+    <nav class="nav-links" id="primary-nav" aria-label="Primary">
+      <a href="index.html#how">How it works</a>
+      <a href="index.html#privacy">Privacy</a>
+      <a href="index.html#open-source">Open source</a>
+      <a href="docs.html" class="active">Docs</a>
+    </nav>
+
+    <div class="nav-right">
+      <button class="switch" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Toggle light/dark theme"></button>
+      <a class="btn btn-ghost btn-mono nav-cta" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code</a>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="mobile-menu" aria-label="Open menu">
+        <span class="nav-toggle-bars" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="mobile-menu" id="mobile-menu" hidden>
+    <nav aria-label="Mobile">
+      <a href="index.html#how">How it works</a>
+      <a href="index.html#privacy">Privacy</a>
+      <a href="index.html#open-source">Open source</a>
+      <a href="docs.html">Docs</a>
+    </nav>
+    <a class="btn btn-primary btn-mono" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code →</a>
+  </div>
+</header>
+
+<div class="docs-shell">
+  <div class="docs-mobile-bar">
+    <button id="doc-nav-toggle" type="button" class="btn btn-ghost btn-mono docs-nav-btn">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18" stroke-linecap="round"/></svg>
+      Contents
+    </button>
+    <span class="docs-mobile-crumb" id="doc-breadcrumb-mobile">Envoir docs</span>
+  </div>
+
+  <div id="doc-nav-scrim" class="docs-nav-scrim"></div>
+
+  <aside class="docs-sidebar" aria-label="Documentation sections">
+    <div class="docs-sidebar-head">
+      <span class="eyebrow"><span class="tag">docs</span></span>
+      <h3>Envoir &amp; DMTAP</h3>
+      <p>Rendered straight from this repo’s <code class="mono">docs/*.md</code> — the same files that back the root README.</p>
+    </div>
+    <nav id="doc-sidebar" class="doc-nav" aria-label="Docs pages"></nav>
+  </aside>
+
+  <main id="main" class="docs-main">
+    <div class="docs-breadcrumb" id="doc-breadcrumb"></div>
+    <article id="doc-content" class="doc-content" aria-live="polite">
+      <p class="doc-loading">Loading…</p>
+    </article>
+    <nav class="doc-prevnext" id="doc-prevnext" aria-label="Adjacent pages"></nav>
+  </main>
+
+  <aside class="docs-toc" id="doc-toc" aria-label="On this page" hidden></aside>
+</div>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <div class="foot-brand">
+          <img src="assets/logo-mark.svg" width="26" height="26" alt="" aria-hidden="true">
+          <strong>Envoir</strong>
+        </div>
+        <p class="foot-desc">The open-source reference implementation of DMTAP — sovereign mail, chat, files, and login on one keypair identity.</p>
+      </div>
+
+      <div class="foot-col">
+        <h4>Product</h4>
+        <ul>
+          <li><a href="index.html#identity">Mail</a></li>
+          <li><a href="index.html#identity">Chat</a></li>
+          <li><a href="index.html#identity">Files</a></li>
+          <li><a href="index.html#identity">Sign in with Envoir</a></li>
+        </ul>
+      </div>
+
+      <div class="foot-col">
+        <h4>Docs</h4>
+        <ul>
+          <li><a href="#/architecture">Architecture</a></li>
+          <li><a href="#/protocol">Protocol</a></li>
+          <li><a href="#/privacy">Privacy model</a></li>
+          <li><a href="#/security">Security</a></li>
+        </ul>
+      </div>
+
+      <div class="foot-col">
+        <h4>Open source</h4>
+        <ul>
+          <li><a href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Source (env-oir/envoir)</a></li>
+          <li><a href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Spec (env-oir/dmtap)</a></li>
+          <li><a href="../LICENSE-MIT" target="_blank" rel="noopener">MIT license</a></li>
+          <li><a href="../brand/README.md" target="_blank" rel="noopener">Brand assets</a></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="foot-bottom">
+      <span>© 2026 Envoir. MIT licensed. DMTAP is an open protocol — Envoir is one implementation of it.</span>
+      <span class="legal-links">
+        <a href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Spec</a>
+        <a href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Repo</a>
+      </span>
+    </div>
+  </div>
+</footer>
+
+<script src="js/main.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/docs.js"></script>
+</body>
+</html>

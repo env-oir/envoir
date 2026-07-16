@@ -113,6 +113,10 @@
       a.addEventListener("click", function (e) {
         var id = a.getAttribute("href").slice(1);
         if (!id) return;
+        // "#/doc-id" is docs.js's own hash-router namespace (site/js/docs.js on
+        // docs.html) — never a real in-page anchor id, so leave it alone and
+        // let the browser's native hashchange handling drive it.
+        if (id.charAt(0) === "/") return;
         var target = document.getElementById(id);
         if (!target) return;
         e.preventDefault();

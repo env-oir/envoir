@@ -4,18 +4,31 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Envoir — sovereign mail, chat &amp; files on one key</title>
-<meta name="description" content="Envoir is the open-source reference of DMTAP: mail, chat, files and login on one keypair identity, held by a node you run, moving through a mesh and mixnet that hides who talks to whom.">
+<meta name="description" content="Envoir is the open-source reference of DMTAP: mail, chat, files and login on one keypair identity, held by a node you run, moving through a mesh and mixnet that hides who talks to whom. No crypto, no token — an open protocol with a legacy-email bridge.">
 <meta name="color-scheme" content="dark light">
-<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+
+<!-- Favicons — the Envoir mark (leaning e/at, Aurora Indigo gradient tile), see brand/README.md -->
+<link rel="icon" type="image/svg+xml" href="assets/logo-mark.svg">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png">
+<link rel="icon" type="image/png" sizes="180x180" href="assets/favicon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="assets/favicon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="assets/favicon-512.png">
+<link rel="apple-touch-icon" sizes="180x180" href="assets/favicon-180.png">
+<link rel="mask-icon" href="assets/logo-mono.svg" color="#4C4DFF">
 <link rel="stylesheet" href="css/style.css">
 
 <meta property="og:title" content="Envoir — your key is your identity">
-<meta property="og:description" content="Sovereign mail, chat, files and login on one keypair. Open source, MIT, self-hostable. The reference implementation of DMTAP.">
+<meta property="og:description" content="Sovereign, metadata-private mail, chat, files and login on one keypair — over a peer mesh, honest about what it protects. Open source, MIT, self-hostable. The reference implementation of DMTAP.">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Envoir">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="assets/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Envoir — your key is your identity">
-<meta name="twitter:description" content="Sovereign mail, chat, files and login on one keypair. Open source, MIT, self-hostable.">
+<meta name="twitter:description" content="Sovereign, metadata-private mail, chat, files and login on one keypair — over a peer mesh, honest about what it protects. Open source, MIT, self-hostable.">
+<meta name="twitter:image" content="assets/og-image.png">
 <meta name="theme-color" content="#0a0c11" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#f4f2ee" media="(prefers-color-scheme: light)">
 </head>
@@ -26,33 +39,22 @@
 <header class="site-nav">
   <div class="wrap nav-inner">
     <a class="brand" href="#top" aria-label="Envoir home">
-      <svg viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-        <defs>
-          <linearGradient id="nav-g" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse">
-            <stop stop-color="#5B9DFF"/><stop offset="1" stop-color="#7C5CFF"/>
-          </linearGradient>
-        </defs>
-        <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#nav-g)"/>
-        <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke="#fff" stroke-width="5"/>
-        <path d="M33 45 L64 68 L95 45" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="33" cy="45" r="6" fill="#fff"/><circle cx="95" cy="45" r="6" fill="#fff"/><circle cx="64" cy="68" r="7" fill="#fff"/>
-        <path d="M33 45 L95 45" stroke="#fff" stroke-width="2.5" stroke-opacity="0.45" stroke-dasharray="3 5"/>
-      </svg>
+      <img src="assets/logo-mark.svg" width="30" height="30" alt="" aria-hidden="true">
       <span class="word">Envoir</span>
     </a>
 
     <nav class="nav-links" id="primary-nav" aria-label="Primary">
       <a href="#how">How it works</a>
-      <a href="#naming">Naming</a>
-      <a href="#identity">One identity</a>
-      <a href="#parity">Parity</a>
+      <a href="#product">Product</a>
+      <a href="#traceability">Traceability</a>
       <a href="#privacy">Privacy</a>
       <a href="#open-source">Open source</a>
+      <a href="docs.html">Docs</a>
     </nav>
 
     <div class="nav-right">
       <button class="switch" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Toggle light/dark theme"></button>
-      <a class="btn btn-ghost btn-mono nav-cta" href="https://github.com/envoir" target="_blank" rel="noopener">Get the code</a>
+      <a class="btn btn-ghost btn-mono nav-cta" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code</a>
       <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="mobile-menu" aria-label="Open menu">
         <span class="nav-toggle-bars" aria-hidden="true"><span></span><span></span><span></span></span>
       </button>
@@ -63,12 +65,14 @@
     <nav aria-label="Mobile">
       <a href="#how">How it works</a>
       <a href="#naming">Naming</a>
-      <a href="#identity">One identity</a>
+      <a href="#product">Product</a>
+      <a href="#traceability">Traceability</a>
       <a href="#parity">Parity</a>
       <a href="#privacy">Privacy</a>
       <a href="#open-source">Open source</a>
+      <a href="docs.html">Docs</a>
     </nav>
-    <a class="btn btn-primary btn-mono" href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Get the code →</a>
+    <a class="btn btn-primary btn-mono" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code →</a>
   </div>
 </header>
 
@@ -87,8 +91,8 @@
           mesh and mixnet designed so that watching the wires never reveals who's talking to whom.
         </p>
         <div class="hero-ctas">
-          <a class="btn btn-primary" href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Get the code</a>
-          <a class="btn btn-ghost" href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Read the spec →</a>
+          <a class="btn btn-primary" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code</a>
+          <a class="btn btn-ghost" href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Read the spec →</a>
         </div>
         <div class="hero-address">
           <span class="label">Your address, the moment you generate a key — provider-issued or your own domain</span>
@@ -230,41 +234,108 @@
     </div>
   </section>
 
-  <!-- ============ ONE IDENTITY ============ -->
-  <section id="identity">
+  <!-- ============ PRODUCT: MAIL / CHAT / FILES / IDENTITY ============ -->
+  <section id="product">
     <div class="wrap">
       <div class="section-head reveal">
-        <p class="eyebrow"><span class="tag">§5 · §13</span> one identity</p>
+        <p class="eyebrow"><span class="tag">§2 · §5 · §8 · §13</span> one identity</p>
         <h2>Mail, chat, files, and login — one key, no central provider</h2>
-        <p class="lede">MLS groups carry 1:1 messages, chat, and file folders on the same substrate as mail. The same key that receives your mail signs you into the web.</p>
+        <p class="lede">Everything below is <em>kind</em> of the same object — a MOTE — rendered differently by the client. One identity, one mailbox, one set of devices, no separate service to trust per feature.</p>
       </div>
 
-      <div class="grid-4">
-        <div class="thing reveal" data-d="1">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 6.5 12 13 20 6.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div class="feature-row reveal" id="mail">
+        <div class="feature-media">
+          <img src="assets/screens/mail-dark.png" loading="lazy" alt="Envoir mail — three-pane inbox showing a verified sender, a legacy-origin label, and the transport-path provenance panel open on a received message.">
+        </div>
+        <div class="feature-copy">
+          <span class="feature-tag mono">kind = mail · private tier by default</span>
           <h3>Mail</h3>
-          <p>Async, store-and-forward, delivered even while your node sleeps. A legacy address you already own can be folded in as an alias, so switching doesn't mean losing it (§3.9.4).</p>
+          <p>Three-pane inbox, threading, folders and color labels, star/archive/snooze, scheduled and undo send, rich compose — over the same MOTE substrate as everything else, sealed and mixnet-routed by default.</p>
+          <ul class="feature-points">
+            <li>Real client protocols: JMAP natively, plus a genuinely complete IMAP/POP3/SMTP-submission surface (CONDSTORE, SEARCHRES, SORT/THREAD…) so existing mail apps just work.</li>
+            <li>A <b>verified ✓</b> badge once you've checked a sender's safety number, and a plain <b>legacy-origin</b> marker on anything that crossed the gateway.</li>
+            <li>Calendar and contacts ride the same node as JSCalendar/JSContact MOTEs, with CalDAV/CardDAV compatibility.</li>
+          </ul>
         </div>
-        <div class="thing reveal" data-d="2">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 5h16v11H8l-4 4V5Z" stroke-linejoin="round"/></svg>
+      </div>
+
+      <div class="feature-row reverse reveal" id="chat">
+        <div class="feature-media">
+          <img src="assets/screens/chat-dark.png" loading="lazy" alt="Envoir chat — a direct message thread with a verified badge and a Deniable 1:1 protocol indicator in the header.">
+        </div>
+        <div class="feature-copy">
+          <span class="feature-tag mono">kind = chat · fast tier · MLS or deniable 1:1</span>
           <h3>Chat</h3>
-          <p>1:1 and group messaging over MLS, with async join via KeyPackages — no one has to be online at the same time.</p>
+          <p>DMs and channels on the same substrate as mail — just a faster default tier. Every conversation states plainly which cryptographic mode it's using, because the two available modes make genuinely different tradeoffs.</p>
+          <ul class="feature-points">
+            <li><b>MLS group · signed</b> — the default for channels and any group of three or more; strong forward secrecy and post-compromise security, but non-repudiable by design (RFC 9420).</li>
+            <li><b>Deniable 1:1</b> — an explicit, opt-in X3DH/PQXDH + Double Ratchet mode for conversations that need cryptographic repudiation; never a silent default.</li>
+            <li>Presence and typing indicators are opt-in and off by default — metadata Envoir doesn't turn on unless you ask.</li>
+          </ul>
         </div>
-        <div class="thing reveal" data-d="3">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" stroke-linejoin="round"/></svg>
+      </div>
+
+      <div class="feature-row reveal" id="files">
+        <div class="feature-media">
+          <img src="assets/screens/files-dark.png" loading="lazy" alt="Envoir files — shared folders as groups, with content hashes and E2E badges on each file.">
+        </div>
+        <div class="feature-copy">
+          <span class="feature-tag mono">content-addressed · any size</span>
           <h3>Files</h3>
-          <p>Content-addressed, encrypted chunks shared through the same MLS groups as your conversations — no separate drive to trust.</p>
+          <p>A BLAKE3 Merkle-DAG manifest over encrypted chunks — resumable, deduplicated, swarmed BitTorrent-style, and self-verifying. A shared folder <em>is</em> a group: drop a file, and everyone with membership can read it.</p>
+          <ul class="feature-points">
+            <li>The file's key travels only inside the sealed MOTE that announces it — holders relay encrypted chunks blind, never able to read what they're serving.</li>
+            <li>Small and normal attachments keep the full mixnet privacy guarantee; only very large bulk transfers trade some of that for bandwidth — disclosed, not hidden.</li>
+            <li>Removing someone from a shared folder re-keys everything they had access to, by default.</li>
+          </ul>
         </div>
-        <div class="thing reveal" data-d="4">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="8" cy="14" r="4"/><path d="M11 11 19 3M15 5l2 2M18 2l2 2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          <h3>Sign-in</h3>
-          <p>An origin-bound challenge, signed by your key — phishing-resistant like a passkey, because a passkey is what gates it.</p>
+      </div>
+
+      <div class="feature-row reverse reveal" id="identity">
+        <div class="feature-media">
+          <img src="assets/screens/identity-dark.png" loading="lazy" alt="Envoir identity — safety number as words and a scannable grid, linked devices, and signed-in apps via DMTAP-Auth.">
+        </div>
+        <div class="feature-copy">
+          <span class="feature-tag mono">root key + device subkeys · §1 / §13</span>
+          <h3>Identity</h3>
+          <p>A safety number is a deterministic fingerprint of your whole keyset, rendered as words or a scannable grid so two people can verify each other's key out-of-band. The same keypair signs you into the web — no password, no central identity provider.</p>
+          <ul class="feature-points">
+            <li>Root key held cold; each device carries its own signed subkey, so compromising one device never hands over the root, and revoking it is cheap and targeted.</li>
+            <li>Recovery is a first-class, versioned policy (phrase / devices / social guardians) with two deliberately asymmetric thresholds.</li>
+            <li><b>DMTAP-Auth</b>: an origin-bound challenge signed by your key — phishing-resistant like a passkey, because a passkey is what gates it.</li>
+          </ul>
         </div>
       </div>
 
       <div class="signin-strip reveal">
         <span class="lbl">On any site: <b>“Sign in with Envoir”</b> → enter <span class="mono">alice@yourdomain</span> → approve on your device. No password created, no bearer token to steal.</span>
-        <a class="btn btn-ghost btn-mono" href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">DMTAP-Auth, §13 →</a>
+        <a class="btn btn-ghost btn-mono" href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">DMTAP-Auth, §13 →</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ TRANSPORT TRACEABILITY ============ -->
+  <section id="traceability">
+    <div class="wrap">
+      <div class="section-head reveal">
+        <p class="eyebrow"><span class="tag">§7</span> transport-path provenance</p>
+        <h2>Know which trust boundaries a message crossed — without weakening the mixnet</h2>
+        <p class="lede">Every message you receive carries a recipient-only, verifiable record of what it crossed on the way to you: which privacy tier, and whether it ever touched a legacy gateway. That record never leaves your own devices.</p>
+      </div>
+
+      <div class="trace-showcase reveal">
+        <div class="trace-media">
+          <img src="assets/screens/path-graph.png" loading="lazy" alt="Envoir's transport-path provenance panel: sender name, private-tier mixnet hop with a ≥3-hop floor, arrow to “you, this device”, and a green “pure-mesh — never plaintext at a gateway” attestation.">
+        </div>
+        <div class="trace-copy">
+          <h3>What you can learn about a message</h3>
+          <ul class="feature-points">
+            <li>Which tier it arrived on — the metadata-private <span class="mono">private</span> tier (mixnet + cover traffic) or the faster, direct <span class="mono">fast</span> tier — something your own node observed at receipt, not a claim the sender made.</li>
+            <li>Whether it's <b>pure-mesh</b> or <b>gateway-touched</b>. A gateway-touched message carries that gateway's cryptographic attestation, sealed inside the encrypted payload. A native message carries no such attestation — proof it was never plaintext at any gateway.</li>
+            <li>A coarse hop-count <em>floor</em> for the private tier (≥3 hops standard, ≥5 high-security) — never an exact path.</li>
+          </ul>
+          <p class="trace-boundary"><strong>What it deliberately withholds:</strong> no individual mix node, no exact hop count beyond the profile floor, no per-hop timing — a record that could reveal more would be leaking the exact thing the mixnet exists to hide. This is also the same attestation an operator would bill against, so a gateway charge is independently checkable, never taken on faith.</p>
+        </div>
       </div>
     </div>
   </section>
@@ -418,8 +489,8 @@
           <h2>Run your own front door.</h2>
           <p class="lede">Two pieces of software, plus DNS you already have. The node holds the mailbox; the gateway is optional and only needed if you correspond with the legacy world.</p>
           <div class="hero-ctas">
-            <a class="btn btn-primary" href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Get the code</a>
-            <a class="btn btn-ghost" href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Read the full spec</a>
+            <a class="btn btn-primary" href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Get the code</a>
+            <a class="btn btn-ghost" href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Read the full spec</a>
           </div>
           <div class="status-pill"><span class="dot"></span>pre-alpha — spec is detailed, reference implementation is a scaffold. not production-ready.</div>
         </div>
@@ -442,14 +513,7 @@ cargo run -p envoir-node -- --help
     <div class="foot-grid">
       <div>
         <div class="foot-brand">
-          <svg viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <g stroke="currentColor" fill="currentColor">
-              <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke-width="5"/>
-              <path d="M33 45 L64 68 L95 45" fill="none" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-              <circle cx="33" cy="45" r="6" stroke="none"/><circle cx="95" cy="45" r="6" stroke="none"/><circle cx="64" cy="68" r="7" stroke="none"/>
-              <path d="M33 45 L95 45" stroke-width="2.5" stroke-opacity="0.4" stroke-dasharray="3 5" fill="none"/>
-            </g>
-          </svg>
+          <img src="assets/logo-mark.svg" width="26" height="26" alt="" aria-hidden="true">
           <strong>Envoir</strong>
         </div>
         <p class="foot-desc">The open-source reference implementation of DMTAP — sovereign mail, chat, files, and login on one keypair identity.</p>
@@ -458,29 +522,30 @@ cargo run -p envoir-node -- --help
       <div class="foot-col">
         <h4>Product</h4>
         <ul>
-          <li><a href="#identity">Mail</a></li>
-          <li><a href="#identity">Chat</a></li>
-          <li><a href="#identity">Files</a></li>
+          <li><a href="#mail">Mail</a></li>
+          <li><a href="#chat">Chat</a></li>
+          <li><a href="#files">Files</a></li>
           <li><a href="#identity">Sign in with Envoir</a></li>
+          <li><a href="#traceability">Transport traceability</a></li>
         </ul>
       </div>
 
       <div class="foot-col">
-        <h4>Protocol</h4>
+        <h4>Docs</h4>
         <ul>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">DMTAP overview (§0)</a></li>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Naming &amp; directory (§3)</a></li>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Privacy model (§6)</a></li>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">DMTAP-Auth (§13)</a></li>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Feature parity (§17)</a></li>
+          <li><a href="docs.html#/architecture">Architecture</a></li>
+          <li><a href="docs.html#/protocol">Protocol</a></li>
+          <li><a href="docs.html#/privacy">Privacy model</a></li>
+          <li><a href="docs.html#/security">Security</a></li>
+          <li><a href="docs.html#/self-hosting">Self-hosting</a></li>
         </ul>
       </div>
 
       <div class="foot-col">
         <h4>Open source</h4>
         <ul>
-          <li><a href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Source (envoir/envoir)</a></li>
-          <li><a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Spec (envoir/dmtap)</a></li>
+          <li><a href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Source (env-oir/envoir)</a></li>
+          <li><a href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Spec (env-oir/dmtap)</a></li>
           <li><a href="../LICENSE-MIT" target="_blank" rel="noopener">MIT license</a></li>
           <li><a href="../brand/README.md" target="_blank" rel="noopener">Brand assets</a></li>
         </ul>
@@ -490,8 +555,8 @@ cargo run -p envoir-node -- --help
     <div class="foot-bottom">
       <span>© 2026 Envoir. MIT licensed. DMTAP is an open protocol — Envoir is one implementation of it.</span>
       <span class="legal-links">
-        <a href="https://github.com/envoir/dmtap" target="_blank" rel="noopener">Spec</a>
-        <a href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Repo</a>
+        <a href="https://github.com/env-oir/dmtap" target="_blank" rel="noopener">Spec</a>
+        <a href="https://github.com/env-oir/envoir" target="_blank" rel="noopener">Repo</a>
       </span>
     </div>
   </div>
