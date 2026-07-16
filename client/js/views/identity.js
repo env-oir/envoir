@@ -28,7 +28,9 @@ export function render(root) {
 
     <section class="id-hero">
       <div class="id-hero-aura"></div>
-      <div class="id-hero-mark">${brandMark(56)}</div>
+      <div class="id-hero-mark">${id.avatarUrl
+        ? `<img class="id-hero-photo" src="${esc(id.avatarUrl)}" alt="${esc(displayName(id))}" referrerpolicy="no-referrer" onerror="this.replaceWith(Object.assign(document.createElement('span'),{className:'av',style:'--h:250;width:72px;height:72px;font-size:27px',textContent:'${esc(initials(displayName(id)))}'}))">`
+        : `<span class="av ring" style="--h:${id.hue ?? 250};width:72px;height:72px;font-size:27px" title="${esc(displayName(id))}">${esc(initials(displayName(id)))}</span>`}</div>
       <div class="id-hero-body">
         <div class="id-hero-eyebrow">${icon('shield')} Sovereign identity</div>
         <h1 class="display">${esc(displayName(id))}</h1>
