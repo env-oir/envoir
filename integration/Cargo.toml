@@ -5,13 +5,19 @@ edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 publish = false
-description = "Cross-component end-to-end integration tests for the Envoir DMTAP reference stack — wiring the real node, mail, and gateway crates together (legacy↔DMTAP, DMTAP↔DMTAP over TCP, adversarial)"
+description = "Cross-component end-to-end integration tests for the Envoir DMTAP reference stack — wiring the real node, mail, gateway, p2p, naming, and deniable crates together (legacy↔DMTAP, DMTAP↔DMTAP over TCP, DMTAP↔DMTAP over real libp2p, adversarial, KT-verified resolution, deniable repudiation)"
 
 # A test-only crate: the library is empty; everything of interest is under `tests/`, which wires the
 # REAL crates (no mocks between components) into end-to-end paths:
 #   - legacy → DMTAP: gateway seals a MOTE → real node stores it → dmtap-mail JMAP view sees it
 #   - DMTAP → DMTAP:  two real nodes over the TCP transport exchange an encrypted MOTE + ack
+#   - DMTAP → DMTAP over real libp2p: two real nodes over the dmtap-p2p mesh transport, visible via
+#     a real dmtap-mail JMAP view
 #   - adversarial:    tampered/forged MOTE rejected pre-decryption; deferred cold MOTE held-but-unacked
+#   - KT resolution:  dmtap-naming resolves name → KT-verified identity; a forged inclusion proof is
+#     rejected; the resolved (real, `dmtap-core`-signing-capable) key mints/verifies a capability token
+#   - deniable repudiation: a dmtap-deniable 1:1 exchange proven repudiable at the real wire level
+#     (dmtap-core::deniable::DeniableFrame), not just as in-memory structs
 
 [lib]
 path = "src/lib.rs"
@@ -23,4 +29,11 @@ envoir-node = { path = "../node" }
 dmtap-core = { path = "../crates/dmtap-core" }
 dmtap-mail = { path = "../crates/dmtap-mail" }
 envoir-gateway = { path = "../gateway" }
+dmtap-p2p = { path = "../crates/dmtap-p2p" }
+dmtap-naming = { path = "../crates/dmtap-naming" }
+dmtap-deniable = { path = "../crates/dmtap-deniable" }
 serde_json = "1"
+# Only for the `Multiaddr`/`Protocol` types used to pick the bound TCP listen address in
+# `p2p_delivery.rs`; `dmtap-p2p` does the actual networking. Version pinned to match `dmtap-p2p`'s
+# own libp2p dependency so the `Multiaddr` types are the same crate version.
+libp2p = "0.56"

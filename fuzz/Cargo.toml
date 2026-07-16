@@ -19,6 +19,9 @@ libfuzzer-sys = "0.4"
 [dependencies.dmtap-core]
 path = "../crates/dmtap-core"
 
+[dependencies.dmtap-naming]
+path = "../crates/dmtap-naming"
+
 [workspace]
 members = ["."]
 
@@ -116,6 +119,83 @@ bench = false
 [[bin]]
 name = "deniable_payload"
 path = "fuzz_targets/deniable_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability_token"
+path = "fuzz_targets/capability_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability_revocation"
+path = "fuzz_targets/capability_revocation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kt_sth"
+path = "fuzz_targets/kt_sth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kt_inclusion_proof"
+path = "fuzz_targets/kt_inclusion_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kt_consistency_proof"
+path = "fuzz_targets/kt_consistency_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sphinx_cell"
+path = "fuzz_targets/sphinx_cell.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sphinx_routing_command"
+path = "fuzz_targets/sphinx_routing_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sphinx_surb"
+path = "fuzz_targets/sphinx_surb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sphinx_fragment_header"
+path = "fuzz_targets/sphinx_fragment_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_txt"
+path = "fuzz_targets/dns_txt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_svcb"
+path = "fuzz_targets/dns_svcb.rs"
 test = false
 doc = false
 bench = false
