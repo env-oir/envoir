@@ -15,29 +15,42 @@
 //!   §7.2a), and the **ack-before-`250` / `451`-on-no-ack** silent-loss-avoidance rule (§19.7.1).
 //! - **Outbound** ([`outbound`], spec §7.3 / §19.7.2): MOTE → RFC 5322, real **delegated-selector
 //!   DKIM** signing ([`dkim`], ed25519-sha256 / relaxed-relaxed, RFC 8463 / RFC 6376) with a
-//!   verifiable signature and a hard refusal to sign undelegated domains, plus **TLS enforcement**
-//!   via an MTA-STS/DANE policy hook that refuses cleartext fallback.
+//!   verifiable signature and a hard refusal to sign undelegated domains, plus real **MX resolution**
+//!   ([`mx`], RFC 5321 §5.1: preference-ordered, falling back to A/AAAA when a domain has no MX) and
+//!   real **MTA-STS enforcement** ([`mta_sts`], RFC 8461: TXT signal + HTTPS policy fetch/parse,
+//!   `enforce` mode requires TLS to an `mx:`-pattern-matching host and aborts rather than downgrading
+//!   otherwise). DANE (TLSA) is a documented, unimplemented seam (see [`outbound::TlsPolicy`] docs).
 //!
 //! ## Statelessness (spec §7.4)
 //! The gateway holds no queue and no mailbox. Durability is punted to the edges: inbound → the
 //! legacy sender's SMTP retry (hence `451`, never `250`, without a durable ack); outbound → the
 //! user's node retry queue. Every network effect — mesh delivery, the outbound SMTP socket, and the
-//! DNS lookups for recipient keys, attestation keys, and DKIM delegation — is abstracted behind a
-//! trait, so the whole bridge is exercised in-process.
+//! DNS lookups for recipient keys, attestation keys, MX records, MTA-STS TXT/HTTPS, and DKIM
+//! delegation — is abstracted behind a trait, so the whole bridge is exercised in-process. One
+//! consequence of statelessness specific to MTA-STS: there is no policy cache, so a policy
+//! fetch failure (as opposed to a fetched `enforce` policy) falls back to opportunistic TLS rather
+//! than fail-closed — see [`mta_sts`] module docs.
 //!
 //! ## Real sockets
-//! The trait-abstracted network legs now have concrete socket impls: [`inbound_tcp::MxListener`] is
-//! a real `TcpListener` MX that runs the SMTP dialog (with STARTTLS termination via rustls) and
+//! The trait-abstracted network legs now have concrete socket/DNS impls: [`inbound_tcp::MxListener`]
+//! is a real `TcpListener` MX that runs the SMTP dialog (with STARTTLS termination via rustls) and
 //! feeds the assembled message into the verified [`inbound::MxSession`] pipeline; [`SmtpTcpTransport`]
 //! is a real SMTP client that opens a TCP connection to the destination MX, negotiates STARTTLS, and
-//! enforces the TLS-required-never-cleartext rule (§7.3). The in-process trait doubles remain for
-//! unit tests; the socket impls are the production leg.
+//! enforces the TLS-required-never-cleartext rule (§7.3); [`mx::DnsMxResolver`] and
+//! [`mta_sts::DnsTxtResolver`] are a minimal dependency-free DNS-over-UDP client ([`dns`]) rather than
+//! a full async resolver crate (this crate is deliberately std-only and synchronous); and
+//! [`mta_sts::HttpsPolicyFetcher`] is a minimal HTTP/1.1-over-rustls GET. The in-process trait
+//! doubles remain for unit tests; the socket/DNS impls are the production leg (unit-tested via pure
+//! wire-format round-trips, not live network calls).
 
 pub mod attestation;
 pub mod b64;
 pub mod dkim;
+pub mod dns;
 pub mod inbound;
 pub mod inbound_tcp;
+pub mod mta_sts;
+pub mod mx;
 pub mod net;
 pub mod outbound;
 pub mod outbound_tcp;
@@ -51,6 +64,11 @@ pub use inbound::{
 pub use inbound_tcp::{
     load_certs, load_private_key, server_config, server_config_from_pem, MxListener,
 };
+pub use mta_sts::{
+    DnsTxtResolver, HttpsPolicyFetcher, InMemoryPolicyFetcher, InMemoryTxtResolver, MtaStsTlsPolicy,
+    PolicyFetcher, PolicyMode, StsParseError, StsPolicy, TxtResolver,
+};
+pub use mx::{DnsMxResolver, InMemoryMxResolver, MxHost, MxResolver};
 pub use outbound::{
     AlwaysRequireTls, OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy,
     TlsRequirement, TransportResult,

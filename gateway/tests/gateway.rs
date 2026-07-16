@@ -13,6 +13,8 @@ use envoir_gateway::inbound::{
     AbuseDecision, AntiAbuse, DeliveryOutcome, InboundGateway, KeyDirectory, MeshDelivery,
     MxSession, RecipientKey,
 };
+use envoir_gateway::mta_sts::{InMemoryPolicyFetcher, InMemoryTxtResolver, MtaStsTlsPolicy};
+use envoir_gateway::mx::{InMemoryMxResolver, MxHost};
 use envoir_gateway::outbound::{
     OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy, TlsRequirement,
     TransportResult,
@@ -400,6 +402,32 @@ impl TlsPolicy for FixedTls {
     }
 }
 
+/// A transport that records every host it was asked to dial (so a test can assert it was NEVER
+/// invoked — e.g. because MX-pattern filtering aborted before any dial was attempted) as well as
+/// enforcing TLS the same way `ScriptedTransport` does.
+struct RecordingTransport {
+    tls_capable: bool,
+    on_success: TransportResult,
+    dialed: std::sync::Mutex<Vec<String>>,
+}
+impl RecordingTransport {
+    fn new(tls_capable: bool, on_success: TransportResult) -> Self {
+        RecordingTransport { tls_capable, on_success, dialed: std::sync::Mutex::new(Vec::new()) }
+    }
+    fn dialed_hosts(&self) -> Vec<String> {
+        self.dialed.lock().unwrap().clone()
+    }
+}
+impl OutboundTransport for RecordingTransport {
+    fn deliver(&self, dest: &str, _message: &[u8], require_tls: bool) -> TransportResult {
+        self.dialed.lock().unwrap().push(dest.to_string());
+        if require_tls && !self.tls_capable {
+            return TransportResult::TlsUnavailable;
+        }
+        self.on_success.clone()
+    }
+}
+
 fn sample_payload() -> Payload {
     // A minimal, self-consistent mail payload (from a decrypted outbound MOTE).
     let sender = IdentityKey::generate();
@@ -553,6 +581,239 @@ fn dkim_signature_fails_under_the_wrong_key() {
     assert_eq!(dkim::verify(&signed, &other.public_bytes()), Err(DkimError::SignatureInvalid));
     // Sanity: the correct delegated key still verifies.
     dkim::verify(&signed, &correct_pub).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// MX resolution + MTA-STS enforcement, end to end through OutboundGateway::send (§7.3 step 4).
+// ---------------------------------------------------------------------------------------------
+
+/// A policy that requires TLS for every destination and constrains delivery to a fixed set of MX
+/// hostname patterns — models an MTA-STS `enforce` policy without going through the DNS/HTTPS seams.
+struct FixedMtaStsEnforce(Vec<String>);
+impl TlsPolicy for FixedMtaStsEnforce {
+    fn requirement_for(&self, _dest: &str) -> TlsRequirement {
+        TlsRequirement::Required
+    }
+    fn allowed_mx_patterns(&self, _dest: &str) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+#[test]
+fn send_dials_the_lowest_preference_mx_host() {
+    let mx = InMemoryMxResolver::new().with_mx(
+        "gmail.com",
+        &[("mx-backup.gmail.com", 20), ("mx-primary.gmail.com", 5)],
+    );
+    let transport = std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(report, OutboundReport::Delivered);
+    assert_eq!(
+        transport.dialed_hosts(),
+        vec!["mx-primary.gmail.com".to_string()],
+        "the lowest-preference (highest-priority) MX host is dialed"
+    );
+}
+
+#[test]
+fn send_falls_back_to_the_domain_when_no_mx_records() {
+    let mx = InMemoryMxResolver::new(); // nothing published for any domain
+    let transport = std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@no-mx.example", NOW);
+    assert_eq!(report, OutboundReport::Delivered);
+    assert_eq!(
+        transport.dialed_hosts(),
+        vec!["no-mx.example".to_string()],
+        "no MX records → dial the domain itself (A/AAAA fallback, RFC 5321 §5.1)"
+    );
+}
+
+#[test]
+fn mta_sts_enforce_delivers_over_tls_to_a_pattern_matching_mx() {
+    let mx = InMemoryMxResolver::new().with_mx("gmail.com", &[("mx1.gmail.com", 10)]);
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedMtaStsEnforce(vec!["*.gmail.com".to_string()])),
+        Box::new(ScriptedTransport::new(true, TransportResult::Delivered { code: 250 })),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(report, OutboundReport::Delivered);
+}
+
+#[test]
+fn mta_sts_enforce_aborts_when_peer_offers_no_tls_never_downgrades() {
+    // The resolved MX host DOES match the enforce policy's `mx:` pattern, but the transport (the
+    // "peer") is not TLS-capable. This MUST abort — never silently send in cleartext.
+    let mx = InMemoryMxResolver::new().with_mx("gmail.com", &[("mx1.gmail.com", 10)]);
+    let transport = std::sync::Arc::new(RecordingTransport::new(false, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedMtaStsEnforce(vec!["*.gmail.com".to_string()])),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(
+        report,
+        OutboundReport::Failed(OutboundError::TlsEnforcementFailed("gmail.com".into())),
+        "enforce policy + plaintext-only peer → aborted, not downgraded"
+    );
+    // The transport WAS dialed (it is the pattern-matching MX host) but never got to "succeed" in
+    // cleartext — `deliver` itself refused, and no cleartext send occurred.
+    assert_eq!(transport.dialed_hosts(), vec!["mx1.gmail.com".to_string()]);
+}
+
+#[test]
+fn mta_sts_enforce_aborts_when_no_resolved_mx_matches_any_pattern_never_downgrades() {
+    // The domain's actual MX hosts don't match the policy's `mx:` patterns at all (e.g. a stale
+    // policy, or an attacker who hijacked MX records to point somewhere the policy never
+    // authorized). MUST abort before ever dialing — not fall back to an unconstrained/plaintext
+    // host.
+    let mx = InMemoryMxResolver::new().with_mx("gmail.com", &[("mx1.attacker-controlled.example", 10)]);
+    let transport = std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedMtaStsEnforce(vec!["*.gmail.com".to_string()])),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(
+        report,
+        OutboundReport::Failed(OutboundError::NoMxMatchesPolicy(
+            "gmail.com".into(),
+            vec!["*.gmail.com".to_string()],
+            vec!["mx1.attacker-controlled.example".to_string()],
+        )),
+        "no resolved MX host matches the enforce policy's mx: patterns → aborted"
+    );
+    assert!(
+        transport.dialed_hosts().is_empty(),
+        "the non-matching host must never even be dialed, let alone sent to in cleartext"
+    );
+}
+
+#[test]
+fn mta_sts_enforce_picks_the_lowest_preference_mx_among_matching_candidates() {
+    // Two MX candidates; only the higher-preference-number (lower priority) one matches the
+    // enforce policy's pattern. The gateway must still dial the best MATCHING one, not just the
+    // globally-lowest-preference one that fails the pattern.
+    let mx = InMemoryMxResolver::new().with_mx(
+        "gmail.com",
+        &[("mx-unlisted.rogue.example", 1), ("mx-listed.gmail.com", 10)],
+    );
+    let transport = std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedMtaStsEnforce(vec!["*.gmail.com".to_string()])),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(report, OutboundReport::Delivered);
+    assert_eq!(transport.dialed_hosts(), vec!["mx-listed.gmail.com".to_string()]);
+}
+
+#[test]
+fn mta_sts_testing_mode_is_opportunistic_and_ignores_mx_patterns() {
+    // `testing` mode: TLS is opportunistic and non-matching MX hosts are NOT excluded — violations
+    // would be reported out-of-band, not blocked.
+    let mx = InMemoryMxResolver::new().with_mx("gmail.com", &[("mx1.gmail.com", 10)]);
+    let txt = InMemoryTxtResolver::new().with_txt("_mta-sts.gmail.com", &["v=STSv1; id=1"]);
+    let fetcher = InMemoryPolicyFetcher::new()
+        .with_policy("gmail.com", "version: STSv1\nmode: testing\nmx: mx.never-matches.example\n");
+    let policy = MtaStsTlsPolicy::new(Box::new(txt), Box::new(fetcher));
+
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(policy),
+        Box::new(ScriptedTransport::new(false, TransportResult::Delivered { code: 250 })), // no TLS offered
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(
+        report,
+        OutboundReport::Delivered,
+        "testing mode does not mandate TLS or filter MX hosts — cleartext delivery proceeds"
+    );
+}
+
+#[test]
+fn mta_sts_end_to_end_through_dns_txt_and_https_policy_seams() {
+    // The full composition: TXT signal + fetched policy text parsed into an enforce policy with a
+    // real (in-memory) DNS/HTTPS seam, driving OutboundGateway::send end to end.
+    let txt = InMemoryTxtResolver::new().with_txt("_mta-sts.gmail.com", &["v=STSv1; id=42"]);
+    let fetcher = InMemoryPolicyFetcher::new()
+        .with_policy("gmail.com", "version: STSv1\nmode: enforce\nmx: *.gmail.com\nmax_age: 86400\n");
+    let policy = MtaStsTlsPolicy::new(Box::new(txt), Box::new(fetcher));
+    let mx = InMemoryMxResolver::new().with_mx("gmail.com", &[("mx1.gmail.com", 10)]);
+
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(policy),
+        Box::new(ScriptedTransport::new(true, TransportResult::Delivered { code: 250 })),
+    )
+    .with_mx_resolver(Box::new(mx));
+
+    let report = gw.send(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", NOW);
+    assert_eq!(report, OutboundReport::Delivered);
+}
+
+#[test]
+fn mx_host_struct_is_reachable_from_the_public_api() {
+    // Sanity: MxHost is part of the public surface tests (and operators) construct directly.
+    let h = MxHost { host: "mx.example.org".into(), preference: 10 };
+    assert_eq!(h.preference, 10);
 }
 
 // ---------------------------------------------------------------------------------------------

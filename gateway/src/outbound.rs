@@ -15,6 +15,8 @@ use dmtap_mail::mime::format_rfc5322_date;
 
 use crate::b64;
 use crate::dkim::{self, DkimKey};
+use crate::mta_sts::any_pattern_matches;
+use crate::mx::{InMemoryMxResolver, MxHost, MxResolver};
 
 /// TLS requirement for a destination, from an MTA-STS/DANE policy lookup (§7.3 step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +27,24 @@ pub enum TlsRequirement {
     Opportunistic,
 }
 
-/// The MTA-STS/DANE policy hook (§7.3 step 4). Abstract so it is testable in-process; a real impl
-/// fetches the destination's MTA-STS policy and/or DANE TLSA records.
+/// The MTA-STS/DANE policy hook (§7.3 step 4). Abstract so it is testable in-process; the real impl
+/// ([`crate::mta_sts::MtaStsTlsPolicy`]) fetches the destination's MTA-STS policy (RFC 8461). DANE
+/// (TLSA records) is a documented, unimplemented seam: a `TlsPolicy` impl wanting DANE would consult
+/// TLSA lookups here too and fold them into the same `Required`/pattern decision — this crate does
+/// not do that lookup itself.
 pub trait TlsPolicy {
     fn requirement_for(&self, dest_domain: &str) -> TlsRequirement;
+
+    /// MX hostname patterns (MTA-STS `mx:` lines, RFC 8461 §4.1 syntax) delivery is constrained to
+    /// when [`Self::requirement_for`] returns [`TlsRequirement::Required`]. Empty (the default) means
+    /// "no hostname constraint" — any resolved MX candidate is acceptable, which is the right
+    /// behavior for a policy that mandates TLS but has no MTA-STS-style host allowlist (e.g.
+    /// [`AlwaysRequireTls`], or DANE-only enforcement). A real MTA-STS policy in `enforce` mode
+    /// returns its `mx:` patterns here, and the outbound gateway refuses to dial (or falls back to)
+    /// any resolved MX host that matches none of them (§7.3: never silently relax the policy).
+    fn allowed_mx_patterns(&self, _dest_domain: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// A policy that treats every destination as TLS-`Required` — a safe, strict default for a gateway
@@ -69,6 +85,7 @@ pub struct OutboundGateway {
     dkim_keys: Vec<DkimKey>,
     tls_policy: Box<dyn TlsPolicy>,
     transport: Box<dyn OutboundTransport>,
+    mx_resolver: Box<dyn MxResolver>,
 }
 
 /// The report handed back to the node after an outbound attempt (§19.7.2 step 5). The node's
@@ -93,17 +110,43 @@ pub enum OutboundError {
     BadDestAddress(String),
     #[error("TLS required by policy for {0} but the destination offered none; send aborted")]
     TlsEnforcementFailed(String),
+    #[error(
+        "MTA-STS enforce policy for {0} lists mx patterns {1:?} but none of the resolved MX hosts \
+         {2:?} match; send aborted rather than relaxed to an unconstrained host"
+    )]
+    NoMxMatchesPolicy(String, Vec<String>, Vec<String>),
     #[error("destination MX permanently rejected the message: {code} {text}")]
     DestinationRejected { code: u16, text: String },
+    #[error("no MX candidate host resolved for {0}; send aborted")]
+    NoMxHost(String),
 }
 
 impl OutboundGateway {
+    /// `mx_resolver` defaults to a resolver with no published records for anything, which — per
+    /// [`crate::mx::InMemoryMxResolver`]'s RFC 5321 §5.1 A/AAAA-fallback contract — means every
+    /// domain resolves to itself as its own single implicit MX. That reproduces the gateway's
+    /// pre-MX-resolution behavior (dial `dest_domain` directly) for callers that do not need real MX
+    /// preference ordering; use [`Self::with_mx_resolver`] to plug in [`crate::mx::DnsMxResolver`] or
+    /// a test double with real MX records.
     pub fn new(
         dkim_keys: Vec<DkimKey>,
         tls_policy: Box<dyn TlsPolicy>,
         transport: Box<dyn OutboundTransport>,
     ) -> Self {
-        OutboundGateway { dkim_keys, tls_policy, transport }
+        OutboundGateway {
+            dkim_keys,
+            tls_policy,
+            transport,
+            mx_resolver: Box::new(InMemoryMxResolver::new()),
+        }
+    }
+
+    /// Swap in a different MX resolver (spec §7.3 step 4 / RFC 5321 §5.1) — e.g.
+    /// [`crate::mx::DnsMxResolver`] for a real deployment, or an [`crate::mx::InMemoryMxResolver`]
+    /// pre-loaded with MX records for a test that exercises multi-MX preference ordering.
+    pub fn with_mx_resolver(mut self, mx_resolver: Box<dyn MxResolver>) -> Self {
+        self.mx_resolver = mx_resolver;
+        self
     }
 
     fn dkim_key_for(&self, domain: &str) -> Option<&DkimKey> {
@@ -158,7 +201,40 @@ impl OutboundGateway {
             self.tls_policy.requirement_for(&dest_domain),
             TlsRequirement::Required
         );
-        match self.transport.deliver(&dest_domain, &signed, require_tls) {
+        let allowed_patterns = self.tls_policy.allowed_mx_patterns(&dest_domain);
+
+        // Resolve the destination's MX candidates (RFC 5321 §5.1: sorted by preference, falling
+        // back to the domain's own A/AAAA if it has no MX). When the policy constrains delivery to
+        // specific MX hostnames (MTA-STS `enforce` `mx:` patterns), only a resolved candidate that
+        // matches one of them is eligible — never dial (or accept a cert from) a host the policy did
+        // not authorize, and if none match, abort rather than silently falling back to an
+        // unconstrained host (§7.3's no-downgrade stance).
+        let candidates = self.mx_resolver.resolve_mx(&dest_domain);
+        let eligible: Vec<&MxHost> = if allowed_patterns.is_empty() {
+            candidates.iter().collect()
+        } else {
+            candidates.iter().filter(|h| any_pattern_matches(&allowed_patterns, &h.host)).collect()
+        };
+
+        let dial_host = match eligible.first() {
+            Some(h) => h.host.clone(),
+            None if !allowed_patterns.is_empty() => {
+                let candidate_hosts: Vec<String> = candidates.iter().map(|h| h.host.clone()).collect();
+                return OutboundReport::Failed(OutboundError::NoMxMatchesPolicy(
+                    dest_domain,
+                    allowed_patterns,
+                    candidate_hosts,
+                ));
+            }
+            None => {
+                // MxResolver's contract is to always return at least the domain-fallback entry;
+                // this is a defensive guard against a resolver implementation that breaks it, not a
+                // path the shipped resolvers ever take.
+                return OutboundReport::Failed(OutboundError::NoMxHost(dest_domain));
+            }
+        };
+
+        match self.transport.deliver(&dial_host, &signed, require_tls) {
             TransportResult::Delivered { .. } => OutboundReport::Delivered,
             TransportResult::Transient { code, text } => OutboundReport::Deferred { code, text },
             TransportResult::Permanent { code, text } => {
