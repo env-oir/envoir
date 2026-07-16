@@ -65,15 +65,18 @@ function drawConvs(root) {
 }
 
 function convRow(c) {
-  const last = c.msgs[c.msgs.length - 1];
+  const last = c.msgs[c.msgs.length - 1]; // may be undefined — a freshly-started chat has no messages yet
   const isCh = c.type === 'channel';
   const p = isCh ? { name: convTitle(c), hue: 250, trust: 'verified' } : person(c.with);
   const sel = state.ui.selChat === c.id;
+  const preview = !last
+    ? 'No messages yet — say hello.'
+    : esc((last.me ? 'You: ' : (isCh ? person(last.from).name.split(' ')[0] + ': ' : '')) + last.body);
   const row = el(`<button class="conv ${sel ? 'sel' : ''}" data-id="${c.id}"${sel ? ' aria-current="true"' : ''} aria-label="${esc(convTitle(c))}${c.unread ? `, ${c.unread} unread` : ''}">
     ${isCh ? `<span class="av chgroup" style="--h:250;width:40px;height:40px">${icon('hash')}</span>` : avatar(p, 40, { presence: state.settings.presence ? c.presence : null })}
     <div class="conv-main">
-      <div class="conv-top"><span class="conv-name">${esc(convTitle(c))}</span><span class="conv-time">${timeAgo(last.t)}</span></div>
-      <div class="conv-prev">${c.typing ? '<i class="typing"><i></i><i></i><i></i></i> typing…' : esc((last.me ? 'You: ' : (isCh ? person(last.from).name.split(' ')[0] + ': ' : '')) + last.body)}</div>
+      <div class="conv-top"><span class="conv-name">${esc(convTitle(c))}</span><span class="conv-time">${last ? timeAgo(last.t) : ''}</span></div>
+      <div class="conv-prev">${c.typing ? '<i class="typing"><i></i><i></i><i></i></i> typing…' : preview}</div>
     </div>
     ${c.unread ? `<i class="conv-unread">${c.unread}</i>` : ''}
   </button>`);

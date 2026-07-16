@@ -9,20 +9,22 @@ const now = Date.now();
 // ---- People (shared across mail, chat, calendar, contacts, groups) -----------------------
 // trust ∈ verified (safety number compared) | tofu (pinned on first contact) | unverified | legacy
 export const PEOPLE = [
-  { id: 'ada',    name: 'Ada Okonkwo',    address: 'ada@envoir.org',      hue: 210, trust: 'verified',   org: 'DMTAP Core',        title: 'Protocol lead',   phone: '+1 555 0182', note: 'Wrote the MOTE framing.', tags: ['Team', 'Core'] },
-  { id: 'grace',  name: 'Grace Vasquez',  address: 'grace@navy.mil',      hue: 262, trust: 'verified',   org: 'Naval Research',    title: 'Cryptographer',   phone: '+1 555 0143', note: 'Verified in person at RWC.', tags: ['Work'] },
-  { id: 'linus',  name: 'Linus Bergström',address: 'linus@kernel.dev',    hue: 150, trust: 'tofu',       org: 'Kernel',            title: 'Maintainer',      phone: null,          note: 'Pinned on first contact.', tags: ['Work'] },
-  { id: 'mira',   name: 'Mira Chen',       address: 'mira@studio.design',  hue: 330, trust: 'verified',   org: 'Studio Chen',       title: 'Design partner',  phone: '+1 555 0119', note: 'Brand + product design.', tags: ['Design'] },
-  { id: 'theo',   name: 'Theo Marsh',      address: 'theo@envoir.org',     hue: 24,  trust: 'verified',   org: 'DMTAP Core',        title: 'Mesh & relays',   phone: '+1 555 0164', note: null, tags: ['Team', 'Core'] },
-  { id: 'nadia',  name: 'Nadia Farouk',    address: 'nadia@envoir.org',    hue: 190, trust: 'tofu',       org: 'DMTAP Core',        title: 'Gateway & interop', phone: null,        note: 'Compare safety number next call.', tags: ['Team', 'Core'] },
-  { id: 'omar',   name: 'Omar Haddad',     address: 'omar@fieldwork.io',   hue: 46,  trust: 'verified',   org: 'Fieldwork',         title: 'Ops',             phone: '+44 20 7946', note: null, tags: ['Work'] },
-  { id: 'satoshi',name: 'satoshi',         address: '@satoshi',            hue: 120, trust: 'unverified', org: null,                title: 'Key-only identity', phone: null,        note: 'Handle only — no domain.', tags: [] },
-  { id: 'carol',  name: 'Carol Reyes',     address: 'carol@gmail.com',     hue: 8,   trust: 'legacy',     org: null,                title: 'Old-world contact', phone: '+1 555 0177', note: 'Reaches you via the gateway.', tags: ['Personal'] },
+  { id: 'ada',    name: 'Ada Okonkwo',    givenName: 'Ada',    familyName: 'Okonkwo',    address: 'ada@envoir.org',      addresses: ['ada.o@envoir.org'], avatarUrl: null, hue: 210, trust: 'verified',   org: 'DMTAP Core',        title: 'Protocol lead',   phone: '+1 555 0182', note: 'Wrote the MOTE framing.', tags: ['Team', 'Core'] },
+  { id: 'grace',  name: 'Grace Vasquez',  givenName: 'Grace',  familyName: 'Vasquez',    address: 'grace@navy.mil',      addresses: [], avatarUrl: null, hue: 262, trust: 'verified',   org: 'Naval Research',    title: 'Cryptographer',   phone: '+1 555 0143', note: 'Verified in person at RWC.', tags: ['Work'] },
+  { id: 'linus',  name: 'Linus Bergström',givenName: 'Linus',  familyName: 'Bergström',  address: 'linus@kernel.dev',    addresses: [], avatarUrl: null, hue: 150, trust: 'tofu',       org: 'Kernel',            title: 'Maintainer',      phone: null,          note: 'Pinned on first contact.', tags: ['Work'] },
+  { id: 'mira',   name: 'Mira Chen',      givenName: 'Mira',   familyName: 'Chen',       address: 'mira@studio.design',  addresses: [], avatarUrl: null, hue: 330, trust: 'verified',   org: 'Studio Chen',       title: 'Design partner',  phone: '+1 555 0119', note: 'Brand + product design.', tags: ['Design'] },
+  { id: 'theo',   name: 'Theo Marsh',     givenName: 'Theo',   familyName: 'Marsh',      address: 'theo@envoir.org',     addresses: [], avatarUrl: null, hue: 24,  trust: 'verified',   org: 'DMTAP Core',        title: 'Mesh & relays',   phone: '+1 555 0164', note: null, tags: ['Team', 'Core'] },
+  { id: 'nadia',  name: 'Nadia Farouk',   givenName: 'Nadia',  familyName: 'Farouk',     address: 'nadia@envoir.org',    addresses: [], avatarUrl: null, hue: 190, trust: 'tofu',       org: 'DMTAP Core',        title: 'Gateway & interop', phone: null,        note: 'Compare safety number next call.', tags: ['Team', 'Core'] },
+  { id: 'omar',   name: 'Omar Haddad',    givenName: 'Omar',   familyName: 'Haddad',     address: 'omar@fieldwork.io',   addresses: ['omar.haddad@fieldwork.io'], avatarUrl: null, hue: 46,  trust: 'verified',   org: 'Fieldwork',         title: 'Ops',             phone: '+44 20 7946', note: null, tags: ['Work'] },
+  { id: 'satoshi',name: 'satoshi',        givenName: 'satoshi',familyName: '',           address: '@satoshi',            addresses: [], avatarUrl: null, hue: 120, trust: 'unverified', org: null,                title: 'Key-only identity', phone: null,        note: 'Handle only — no domain.', tags: [] },
+  { id: 'carol',  name: 'Carol Reyes',    givenName: 'Carol',  familyName: 'Reyes',      address: 'carol@gmail.com',     addresses: ['carol.reyes@oldmail.com'], avatarUrl: null, hue: 8,   trust: 'legacy',     org: null,                title: 'Old-world contact', phone: '+1 555 0177', note: 'Reaches you via the gateway.', tags: ['Personal'] },
 ];
 
 // Add or update a contact (JSContact MOTE, spec §8.4). Mutating PEOPLE keeps person() resolving
 // the same reference everywhere. A real client syncs these as encrypted MOTEs across devices.
 export function addPerson(p) { PEOPLE.push(p); return p; }
+// Remove a contact (spec §17#30 delete). Mutates PEOPLE in place for the same reason as above.
+export function removePerson(id) { const i = PEOPLE.findIndex(p => p.id === id); if (i >= 0) PEOPLE.splice(i, 1); }
 // All organizational tags in use (spec §17#31 local-tag contact groups — no address of their own).
 export function contactTags() { return [...new Set(PEOPLE.flatMap(p => p.tags || []))].sort(); }
 
@@ -199,6 +201,14 @@ export function seedCalendar() {
       recurrence: null, location: 'call', reminders: [10],
       organizer: 'omar@fieldwork.io', description: 'JHB egress numbers.',
       attendees: [{ address: 'you@envoir.org', rsvp: 'pending' }, { address: 'omar@fieldwork.io', rsvp: 'yes' }] },
+    { id: 'e7', title: '1:1 with Mira', color: 330, start: d(0, 17, 30), end: d(0, 18),
+      recurrence: 'Weekly', location: 'https://meet.envoir.org/mira-1on1', reminders: [10],
+      organizer: 'you@envoir.org', description: 'Weekly design check-in.',
+      attendees: [{ address: 'you@envoir.org', rsvp: 'yes' }, { address: 'mira@studio.design', rsvp: 'yes' }] },
+    { id: 'e8', title: 'DMTAP working offsite', color: 8, start: d(3, 0), end: d(3, 23, 59), allDay: true,
+      recurrence: null, location: 'Cape Town office', reminders: [1440],
+      organizer: 'you@envoir.org', description: 'Full-day in-person planning — bring laptops.',
+      attendees: [{ address: 'you@envoir.org', rsvp: 'yes' }, { address: 'ada@envoir.org', rsvp: 'yes' }, { address: 'theo@envoir.org', rsvp: 'maybe' }] },
   ];
 }
 

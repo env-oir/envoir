@@ -92,6 +92,7 @@ body {
   overflow: hidden;
 }
 .hidden { display: none !important; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 .mono { font-family: var(--mono); font-feature-settings: "tnum" 1; }
 .dim { color: var(--text-dim); }
 .spacer { flex: 1; }
@@ -635,6 +636,10 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .cal-nav #prev .ic { transform: none; } .cal-nav #next .ic { transform: none; }
 .cal-nav h1 { font-size: 19px; margin-left: 6px; }
 .cal-right { display: flex; align-items: center; gap: 12px; }
+.cal-agenda-toggle { display: none; } /* shown only ≤680px — desktop keeps the agenda always visible */
+.cal-agenda-toggle[aria-expanded="true"] { background: var(--bg-3); color: var(--accent-ink); }
+.cal-content { flex: 1; min-height: 0; display: flex; }
+.cal-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .cal-body { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
 .cal-body.week, .cal-body.day { overflow: hidden; }
 
@@ -658,19 +663,34 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
   background: color-mix(in srgb, hsl(var(--h) 70% 55%) 26%, var(--bg-1)); border: 1px solid color-mix(in srgb, hsl(var(--h) 70% 55%) 50%, transparent); border-left: 3px solid hsl(var(--h) 70% 60%); transition: transform .1s, box-shadow .12s; }
 .ev-block:hover { transform: scale(1.01); box-shadow: var(--sh-2); z-index: 3; }
 .ev-block b { display: block; font-size: 12px; font-weight: 640; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: hsl(var(--h) 75% 88%); }
+.ev-block b .ic { width: 11px; height: 11px; vertical-align: -1px; margin-right: 2px; }
 .ev-block span { font-size: 10.5px; opacity: .85; }
 
-.day-agenda { display: none; }
-.cal-body.day { flex-direction: row; }
-.cal-body.day .day-grid { flex: 1; }
-.day-agenda { display: block; width: 280px; border-left: 1px solid var(--line); padding: 16px; overflow-y: auto; flex-shrink: 0; }
-.day-agenda h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); margin-bottom: 12px; }
+/* all-day banner row above the hour grid (week/day views), Google-style */
+.wk-allday, .day-allday { display: grid; border-bottom: 1px solid var(--line); flex-shrink: 0; padding: 4px 0; }
+.wk-allday { grid-template-columns: 56px repeat(7, 1fr); }
+.day-allday { grid-template-columns: 56px 1fr; }
+.wk-allday-col, .day-allday-col { display: flex; flex-direction: column; gap: 3px; padding: 0 3px; }
+.allday-chip { display: flex; align-items: center; gap: 4px; width: 100%; text-align: left; font-size: 11px; font-weight: 620; padding: 3px 7px; border-radius: 6px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  color: hsl(var(--h) 75% 85%); background: color-mix(in srgb, hsl(var(--h) 70% 55%) 30%, var(--bg-1)); border-left: 3px solid hsl(var(--h) 70% 60%); }
+.allday-chip:hover { filter: brightness(1.1); }
+.allday-chip .ic { width: 11px; height: 11px; flex-shrink: 0; }
+
+/* ---- Agenda panel: persistent on desktop, collapsible on mobile (Google's "today" rail) ---- */
+.cal-agenda { width: 280px; border-left: 1px solid var(--line); padding: 16px; overflow-y: auto; flex-shrink: 0; }
+.cal-agenda h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); margin-bottom: 10px; }
+.ag-section-h { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--text-faint); margin: 16px 0 6px; }
+.ag-section-h:first-of-type { margin-top: 0; }
+.ag-day-h { font-size: 11.5px; font-weight: 650; color: var(--accent-ink); margin: 10px 0 4px; padding-left: 2px; }
 .ag-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 10px; border-radius: 9px; transition: background .12s; }
 .ag-item:hover { background: var(--bg-2); }
-.ag-item i { width: 4px; align-self: stretch; border-radius: 4px; background: hsl(var(--h) 70% 58%); }
+.ag-item i:first-child { width: 4px; align-self: stretch; border-radius: 4px; background: hsl(var(--h) 70% 58%); flex-shrink: 0; }
 .ag-item b { display: block; font-size: 13.5px; }
 .ag-item span { font-size: 12px; color: var(--text-faint); display: inline-flex; align-items: center; gap: 4px; }
 .ag-item span .ic { width: 12px; height: 12px; }
+.ag-item > div { flex: 1; min-width: 0; }
+.ag-meet { display: inline-grid; place-items: center; color: var(--accent-ink); flex-shrink: 0; }
+.ag-meet .ic { width: 14px; height: 14px; }
 .ag-empty, .add-list .ag-empty { color: var(--text-faint); font-size: 13px; padding: 12px; }
 
 .cal-body.month { padding: 0; }
@@ -685,6 +705,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .mo-cell.today .mo-num { background: var(--grad); color: #fff; border-radius: 50%; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; }
 .mo-ev { display: flex; align-items: center; gap: 5px; width: 100%; text-align: left; font-size: 11px; padding: 2px 6px; border-radius: 5px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-dim); background: color-mix(in srgb, hsl(var(--h) 70% 55%) 16%, transparent); }
 .mo-ev i { width: 6px; height: 6px; border-radius: 50%; background: hsl(var(--h) 70% 58%); flex-shrink: 0; }
+.mo-ev .ic { width: 10px; height: 10px; flex-shrink: 0; color: var(--accent-ink); }
 .mo-ev:hover { background: color-mix(in srgb, hsl(var(--h) 70% 55%) 28%, transparent); color: var(--text); }
 .mo-more { font-size: 10.5px; color: var(--text-faint); padding-left: 6px; }
 
@@ -694,6 +715,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .ev-detail-body { flex: 1; padding: 22px 24px; min-width: 0; }
 .ev-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
 .ev-detail-head h2 { font-size: 20px; }
+.ev-detail-head h2 .pill { vertical-align: middle; margin-left: 6px; font-size: 11px; }
 .ev-meta { display: flex; align-items: center; gap: 9px; font-size: 13.5px; color: var(--text-dim); margin-bottom: 8px; }
 .ev-meta .ic { width: 16px; height: 16px; color: var(--text-faint); }
 .ev-desc { font-size: 13.5px; color: var(--text-dim); margin: 12px 0; line-height: 1.6; }
@@ -713,8 +735,38 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .ev-new { padding: 22px 24px; }
 .ev-new-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
 .ev-new-row .cfield { grid-column: auto; }
+.ev-allday-row { margin-bottom: 14px; padding: 10px 12px; background: var(--bg-2); border-radius: 9px; border: 1px solid var(--line); }
 .modal-note { font-size: 12.5px; color: var(--text-dim); background: var(--bg-2); border-radius: 9px; padding: 11px 13px; margin: 6px 0 14px; display: flex; gap: 8px; line-height: 1.5; }
 .modal-note .ic { width: 15px; height: 15px; flex-shrink: 0; color: var(--accent); }
+
+/* color / label swatch picker (event editor) */
+.color-swatches { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 12px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 9px; }
+.color-swatch { width: 24px; height: 24px; border-radius: 50%; background: hsl(var(--h) 70% 55%); border: 2px solid transparent; transition: transform .1s, box-shadow .12s; flex-shrink: 0; }
+.color-swatch:hover { transform: scale(1.1); }
+.color-swatch.on { border-color: var(--text); box-shadow: 0 0 0 2px var(--bg-2), 0 0 0 3px hsl(var(--h) 70% 55%); }
+
+/* generic multi-select pill toggle (reminders, contact↔group membership) */
+.toggle-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.toggle-chip { font-size: 12px; font-weight: 620; padding: 6px 12px; border-radius: var(--r-pill); background: var(--bg-2); border: 1px solid var(--line); color: var(--text-dim); transition: .12s; }
+.toggle-chip:hover { border-color: var(--line-2); color: var(--text); }
+.toggle-chip.on { background: var(--grad); color: #fff; border-color: transparent; }
+
+/* invitee picker: avatar chips + a live search/results dropdown, sourced from Contacts */
+.invitee-picker { position: relative; }
+.invitee-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.invitee-chips:empty { display: none; }
+.invitee-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 6px 3px 3px; border-radius: var(--r-pill); background: var(--bg-2); border: 1px solid var(--line); font-size: 12.5px; font-weight: 600; }
+.invitee-chip .ic-x { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; color: var(--text-faint); flex-shrink: 0; }
+.invitee-chip .ic-x:hover { background: var(--bg-3); color: var(--text); }
+.invitee-chip .ic-x .ic { width: 11px; height: 11px; }
+.invitee-results { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5; background: var(--elev); border: 1px solid var(--line-2); border-radius: 10px; box-shadow: var(--sh-2); max-height: 240px; overflow-y: auto; padding: 6px; }
+.invitee-result { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 8px 9px; border-radius: 8px; font-size: 13px; }
+.invitee-result:hover { background: var(--bg-2); }
+.invitee-result .ir-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.invitee-result .ir-main small { color: var(--text-faint); font-size: 11.5px; }
+.invitee-result .ic { width: 15px; height: 15px; color: var(--good); flex-shrink: 0; }
+.invitee-result.invitee-raw { color: var(--text-dim); }
+.invitee-result.invitee-raw .ic { color: var(--accent-ink); }
 
 /* Edit-profile modal (profileModal.js) — avatar standard preview + name fields */
 .pf-avatar-row { display: flex; gap: 18px; align-items: flex-start; margin-bottom: 4px; }
@@ -1109,6 +1161,8 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .ct-tag-btn { font-size: 11.5px; padding: 3px 10px; border-radius: 20px; background: var(--bg-2); border: 1px solid var(--line); color: var(--text-dim); transition: .12s; }
 .ct-tag-btn:hover { border-color: var(--line-2); color: var(--text); }
 .ct-tag-btn.on { background: var(--grad); color: #fff; border-color: transparent; }
+.ct-filterbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; border-bottom: 1px solid var(--line); }
+.ct-filterbar select { width: auto; flex: 1 1 auto; min-width: 0; font-size: 12px; padding: 6px 26px 6px 9px; background-position: calc(100% - 10px) center, calc(100% - 6px) center; }
 .ct-card-tags { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-top: 4px; }
 .ct-head-actions { position: absolute; right: 14px; top: 14px; display: flex; gap: 4px; }
 
@@ -1384,6 +1438,7 @@ mark.hl.cur { background: var(--warn); color: #241a02; box-shadow: 0 0 0 2px col
   .id-row-label p { max-width: none; }
   .id-verify-bars { grid-template-columns: 1fr; }
   .bl-cols { grid-template-columns: 1fr; }
+  .cal-agenda { width: 220px; }
 }
 /* The mobile "back to list" control lives in every detail pane; desktop hides it. */
 .mobile-back { display: none; }
@@ -1435,10 +1490,15 @@ mark.hl.cur { background: var(--warn); color: #241a02; box-shadow: 0 0 0 2px col
   .contacts-view.detail .ct-detail, .groups-view.detail .gr-detail { display: block; }
   .mobile-back { display: inline-grid; }
 
-  /* calendar: month is the only grid that fits; week/day scroll horizontally in-pane */
+  /* calendar: month is the only grid that fits; week/day scroll horizontally in-pane.
+     The agenda panel collapses behind a header toggle (aria-expanded) and, when opened,
+     stacks ABOVE the grid instead of beside it. */
   .cal-head { flex-wrap: wrap; gap: 10px; padding: 12px 14px; }
   .cal-nav h1 { font-size: 16px; }
-  .day-agenda { display: none; }
+  .cal-content { flex-direction: column; }
+  .cal-agenda-toggle { display: inline-grid; }
+  .cal-agenda { display: none; width: 100%; max-height: 42vh; border-left: none; border-bottom: 1px solid var(--line); }
+  .cal-view.agenda-open .cal-agenda { display: block; order: -1; }
   .cal-body.day { flex-direction: column; }
   .mo-cell { min-height: 60px; padding: 4px 3px; gap: 2px; }
   .mo-num { font-size: 11.5px; padding: 1px 4px; }
