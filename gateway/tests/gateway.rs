@@ -9,17 +9,21 @@ use dmtap_core::mote::{
 
 use envoir_gateway::attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 use envoir_gateway::dkim::{self, DkimError, DkimKey, StaticDkimKeys};
+use envoir_gateway::dmarc::InMemoryDmarcResolver;
 use envoir_gateway::inbound::{
-    AbuseDecision, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy, InboundGateway,
-    KeyDirectory, MeshDelivery, MxSession, RecipientKey,
+    AbuseDecision, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy, DmarcHandling,
+    InboundGateway, KeyDirectory, MeshDelivery, MxSession, RecipientKey, SpfPolicy,
 };
-use envoir_gateway::provenance::{Origin, ProvenanceError, ProvenanceRecord};
+use envoir_gateway::provenance::{
+    chain_append, GatewayAttestation, Origin, Profile, ProvenanceError, ProvenanceRecord, Tier,
+};
 use envoir_gateway::mta_sts::{InMemoryPolicyFetcher, InMemoryTxtResolver, MtaStsTlsPolicy};
 use envoir_gateway::mx::{InMemoryMxResolver, MxHost};
 use envoir_gateway::outbound::{
     OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy, TlsRequirement,
     TransportResult,
 };
+use envoir_gateway::spf::{InMemorySpfResolver, SpfResult};
 
 const NOW: u64 = 1_752_600_000_000;
 const DOMAIN: &str = "example.org";
@@ -937,6 +941,261 @@ fn inbound_stamps_a_verifiable_gateway_provenance_record() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SPF (RFC 7208, spec item 1) + DMARC (RFC 7489, spec item 2) — end to end through MxSession.
+// ---------------------------------------------------------------------------------------------
+
+/// A legacy message whose `From:` header domain is `from_domain` (independent of the SMTP envelope
+/// `MAIL FROM`, so alignment tests can control both separately).
+fn message_with_from_domain(from_domain: &str, to: &str) -> Vec<u8> {
+    format!(
+        "From: spoofer@{from_domain}\r\nTo: {to}\r\nSubject: hi\r\n\r\nbody across the bridge\r\n"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn spf_enforce_rejects_a_hard_fail_sender_at_mail_from_before_data() {
+    let recip = TestRecipient::new("alice@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let spf = InMemorySpfResolver::new().with_txt("evil-sender.example", &["v=spf1 ip4:198.51.100.0/24 -all"]);
+    let gw = base_gw.with_spf(Box::new(spf), SpfPolicy::Enforce);
+
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW); // NOT in the authorized 198.51.100.0/24 range
+    assert_eq!(s.feed_line("EHLO gmail.com").code, 250);
+    let mail = s.feed_line("MAIL FROM:<attacker@evil-sender.example>");
+    assert_eq!(mail.code, 550, "SPF hard fail rejected at MAIL FROM, before DATA");
+    assert!(mail.text.to_lowercase().contains("spf"));
+    assert!(delivery.captured.lock().unwrap().is_none(), "no MOTE was ever built for the SPF-failed sender");
+}
+
+#[test]
+fn spf_enforce_accepts_a_pass_sender() {
+    let recip = TestRecipient::new("alice@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, _delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let spf = InMemorySpfResolver::new().with_txt("good-sender.example", &["v=spf1 ip4:203.0.113.0/24 -all"]);
+    let gw = base_gw.with_spf(Box::new(spf), SpfPolicy::Enforce);
+
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW); // inside the authorized range
+    assert_eq!(s.feed_line("EHLO gmail.com").code, 250);
+    assert_eq!(s.feed_line("MAIL FROM:<friend@good-sender.example>").code, 250);
+    assert_eq!(s.feed_line(&format!("RCPT TO:<{}>", recip.email)).code, 250);
+    assert_eq!(s.feed_line("DATA").code, 354);
+    assert_eq!(s.feed_line("From: friend@good-sender.example").code, 0);
+    assert_eq!(s.feed_line("").code, 0);
+    assert_eq!(s.feed_line("hello").code, 0);
+    assert_eq!(s.feed_line(".").code, 250, "SPF pass proceeds all the way to a durable-ack 250");
+}
+
+#[test]
+fn spf_annotate_delivers_despite_a_hard_fail_but_the_verdict_is_still_computable() {
+    let recip = TestRecipient::new("alice@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, _delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let spf = InMemorySpfResolver::new().with_txt("evil-sender.example", &["v=spf1 ip4:198.51.100.0/24 -all"]);
+    let gw = base_gw.with_spf(Box::new(spf), SpfPolicy::Annotate); // the default
+
+    // The verdict is computable regardless of policy...
+    let outcome = gw.evaluate_spf("203.0.113.9", "attacker@evil-sender.example", Some("gmail.com"));
+    assert_eq!(outcome.result, SpfResult::Fail);
+
+    // ...but Annotate never rejects: the full transaction still reaches 250.
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW);
+    s.feed_line("EHLO gmail.com");
+    assert_eq!(s.feed_line("MAIL FROM:<attacker@evil-sender.example>").code, 250);
+    assert_eq!(s.feed_line(&format!("RCPT TO:<{}>", recip.email)).code, 250);
+    s.feed_line("DATA");
+    s.feed_line("From: attacker@evil-sender.example");
+    s.feed_line("");
+    s.feed_line("hi");
+    assert_eq!(s.feed_line(".").code, 250, "annotate mode delivers regardless of the SPF verdict");
+}
+
+#[test]
+fn spf_null_reverse_path_falls_back_to_the_helo_domain() {
+    // A bounce (`MAIL FROM:<>`) is checked against the HELO/EHLO domain (RFC 7208 §2.4), not an
+    // empty domain — captured by `MxSession` at EHLO time.
+    let recip = TestRecipient::new("alice@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, _delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let spf = InMemorySpfResolver::new().with_txt("bounce-relay.example", &["v=spf1 ip4:203.0.113.0/24 -all"]);
+    let gw = base_gw.with_spf(Box::new(spf), SpfPolicy::Enforce);
+
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW);
+    s.feed_line("EHLO bounce-relay.example");
+    let mail = s.feed_line("MAIL FROM:<>");
+    assert_eq!(mail.code, 250, "bounce sender authorized via the HELO domain's SPF record");
+}
+
+#[test]
+fn dmarc_enforce_rejects_an_unaligned_reject_policy_message() {
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    // No SPF resolver (never evaluated) and no DKIM resolver (never verified) — the message cannot
+    // possibly align, so DMARC's `p=reject` policy for the spoofed header-from domain must bite.
+    let dmarc = InMemoryDmarcResolver::new().with_txt("_dmarc.big-bank.example", &["v=DMARC1; p=reject"]);
+    let gw = base_gw.with_dmarc(Box::new(dmarc), DmarcHandling::Enforce);
+
+    let mut s = MxSession::new(&gw, "203.0.113.9", NOW);
+    s.feed_line("EHLO spoofer.example");
+    assert_eq!(s.feed_line("MAIL FROM:<phisher@spoofer.example>").code, 250);
+    assert_eq!(s.feed_line(&format!("RCPT TO:<{}>", recip.email)).code, 250);
+    s.feed_line("DATA");
+    for line in String::from_utf8(message_with_from_domain("big-bank.example", &recip.email)).unwrap().lines() {
+        s.feed_line(line);
+    }
+    let reply = s.feed_line(".");
+    assert_eq!(reply.code, 550, "DMARC p=reject with no aligned SPF/DKIM is refused");
+    assert!(reply.text.to_lowercase().contains("dmarc"));
+    assert!(delivery.captured.lock().unwrap().is_none(), "no MOTE was built for the DMARC-failed message");
+}
+
+#[test]
+fn dmarc_pass_via_spf_alignment_delivers_normally() {
+    let recip = TestRecipient::new("bob@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    // The envelope (MAIL FROM) domain matches the header-From domain exactly, and that domain's SPF
+    // record passes unconditionally — SPF-aligned pass, so DMARC passes even under a p=reject policy.
+    let spf = InMemorySpfResolver::new().with_txt("aligned.example", &["v=spf1 +all"]);
+    let dmarc = InMemoryDmarcResolver::new().with_txt("_dmarc.aligned.example", &["v=DMARC1; p=reject"]);
+    let gw = base_gw
+        .with_spf(Box::new(spf), SpfPolicy::Annotate) // SPF itself not enforced; DMARC still uses it
+        .with_dmarc(Box::new(dmarc), DmarcHandling::Enforce);
+
+    let mut s = MxSession::new(&gw, "9.9.9.9", NOW);
+    s.feed_line("EHLO aligned.example");
+    assert_eq!(s.feed_line("MAIL FROM:<friend@aligned.example>").code, 250);
+    assert_eq!(s.feed_line(&format!("RCPT TO:<{}>", recip.email)).code, 250);
+    s.feed_line("DATA");
+    for line in String::from_utf8(message_with_from_domain("aligned.example", &recip.email)).unwrap().lines() {
+        s.feed_line(line);
+    }
+    let reply = s.feed_line(".");
+    assert_eq!(reply.code, 250, "SPF-aligned pass satisfies DMARC despite p=reject");
+    assert!(delivery.captured.lock().unwrap().is_some());
+}
+
+#[test]
+fn malformed_binary_garbage_data_never_panics_with_spf_dkim_dmarc_all_enforcing() {
+    // Spec item 3: a fully malformed inbound message (no headers, invalid UTF-8, embedded NULs)
+    // must never panic anywhere in the DKIM/SPF/DMARC pipeline, even with every check turned on to
+    // Enforce. It has no parseable `From:` header, so DMARC has nothing to align against
+    // (PermError, not a fabricated Fail) — the message still proceeds to normal delivery.
+    let recip = TestRecipient::new("carol@example.org");
+    let att_key = AttestationKey::generate(DOMAIN, GW_SELECTOR);
+    let (base_gw, delivery) = build_inbound(
+        IdentityKey::generate(),
+        att_key,
+        &recip,
+        DeliveryOutcome::Acked,
+        Box::new(AllowAll),
+    );
+    let dkim_resolver = StaticDkimKeys::new();
+    let spf = InMemorySpfResolver::new();
+    let dmarc = InMemoryDmarcResolver::new();
+    let gw = base_gw
+        .with_dkim(Box::new(dkim_resolver), DkimPolicy::Enforce)
+        .with_spf(Box::new(spf), SpfPolicy::Enforce)
+        .with_dmarc(Box::new(dmarc), DmarcHandling::Enforce);
+
+    let garbage: &[u8] = &[0xff, 0x00, 0xfe, 0xd8, 0x00, 0x01, 0x02, 0x00, 0xc0, 0xaf, 0x00];
+    // Drive it straight through `accept_message_with_spf` (bypassing the line-oriented MxSession,
+    // since raw NUL bytes aren't valid "lines" — this still exercises the exact same DKIM/SPF/DMARC
+    // pipeline a socket-fed DATA body would).
+    let reply = gw.accept_message_with_spf("attacker@nowhere.example", &recip.email, garbage, NOW, None);
+    assert!(reply.code == 250 || reply.code == 451 || reply.code == 550, "a sane SMTP code, not a panic");
+    // With no From: header at all, DMARC has nothing to align against.
+    assert_eq!(
+        gw.evaluate_dmarc(garbage, None, "attacker@nowhere.example"),
+        envoir_gateway::dmarc::DmarcVerdict::PermError
+    );
+    // Sanity: with DeliveryOutcome::Acked and a resolvable recipient, a 250 means a MOTE was built.
+    if reply.code == 250 {
+        assert!(delivery.captured.lock().unwrap().is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-hop provenance chains (spec §7.8.3) — more than the common single-gateway case.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn three_hop_gateway_chain_each_verifies_only_under_its_own_domain_and_the_record_carries_all_hops() {
+    const RFC: &[u8] = b"From: a@gmail.com\r\nTo: bob@host.net\r\nSubject: hi\r\n\r\nbody\r\n";
+    let k1 = AttestationKey::generate("relay-one.example", "gw1");
+    let k2 = AttestationKey::generate("relay-two.example", "gw1");
+    let k3 = AttestationKey::generate(DOMAIN, GW_SELECTOR); // the recipient's own domain, last hop
+
+    let a0 = GatewayAttestation::sign(&k1, RFC, Some("a@gmail.com"), 100, 0);
+    let chain = chain_append(&[], a0);
+    let a1 = GatewayAttestation::sign(&k2, RFC, Some("a@gmail.com"), 101, chain.len() as u8);
+    let chain = chain_append(&chain, a1);
+    let a2 = GatewayAttestation::sign(&k3, RFC, Some("a@gmail.com"), 102, chain.len() as u8);
+    let chain = chain_append(&chain, a2);
+
+    assert_eq!(chain.len(), 3);
+    assert_eq!(chain[0].seq, None, "the first hop's seq 0 is omitted on the wire");
+    assert_eq!(chain[1].seq, Some(1));
+    assert_eq!(chain[2].seq, Some(2));
+
+    // Each hop verifies under its OWN domain's key over the exact bridged bytes...
+    chain[0].verify(Some(&k1.public()), RFC).expect("hop 0 verifies under relay-one's key");
+    chain[1].verify(Some(&k2.public()), RFC).expect("hop 1 verifies under relay-two's key");
+    chain[2].verify(Some(&k3.public()), RFC).expect("hop 2 (recipient domain) verifies under its own key");
+    // ...and cross-domain verification fails (a hop never verifies under a DIFFERENT domain's key).
+    assert!(chain[2].verify(Some(&k1.public()), RFC).is_err());
+    assert!(chain[0].verify(Some(&k3.public()), RFC).is_err());
+
+    // Assembled into the client-facing record: all three hops present, gateway-touched, round-trips.
+    let record = ProvenanceRecord::assemble(Tier::Fast, Profile::NotApplicable, None, None, chain.clone());
+    assert_eq!(record.gateway_hops(), 3);
+    assert_eq!(record.origin, Origin::GatewayTouched);
+    assert!(!record.is_pure_mesh());
+    let decoded = ProvenanceRecord::from_det_cbor(&record.det_cbor()).expect("round-trips");
+    assert_eq!(decoded, record);
+    assert_eq!(decoded.gateways.len(), 3);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Cold-sender anti-abuse gate (§9 / §7.2 step 2)
 // ---------------------------------------------------------------------------------------------
 
@@ -1019,6 +1278,36 @@ fn cold_sender_gate_enforces_a_per_ip_rate_limit() {
     // The window slides: well past it, the sender is served again.
     advance(&clock, 61_000);
     assert_eq!(gate.check("203.0.113.50", "s@gmail.com"), AbuseDecision::Accept);
+}
+
+#[test]
+fn greylist_entry_expires_after_its_ttl_and_the_sender_is_greylisted_again() {
+    // A cold sender that finally retries and gets through, but then goes silent for LONGER than the
+    // greylist memory TTL, is treated as a brand-new cold sighting on its next contact — not waved
+    // through on the strength of a long-stale first-seen timestamp. This is the retry-window edge
+    // case distinct from the "immediate retry" and "per-IP rate limit" cases already covered.
+    let clock = ManualClock::new(1_000_000);
+    let gate = ColdSenderGate::with_clock(Box::new(clock.clone()))
+        .with_greylist(60_000, 300_000) // 60s min retry, 5-minute TTL
+        .with_rate_limit(1000, 60_000);
+
+    // First contact: greylisted.
+    assert_eq!(rejected(&gate.check("203.0.113.20", "occasional@gmail.com")), 451);
+    // Retry after the min-retry delay: accepted (the greylist entry now records this as "known").
+    advance(&clock, 60_000);
+    assert_eq!(gate.check("203.0.113.20", "occasional@gmail.com"), AbuseDecision::Accept);
+
+    // Silence for longer than the TTL: the remembered first-seen timestamp is now stale.
+    advance(&clock, 300_001);
+    // The next contact is treated as a fresh cold sighting — greylisted again, not waved through.
+    assert_eq!(
+        rejected(&gate.check("203.0.113.20", "occasional@gmail.com")),
+        451,
+        "a TTL-expired greylist entry is re-greylisted as if never seen before"
+    );
+    // And the normal retry-after-delay behavior resumes from this fresh sighting.
+    advance(&clock, 60_000);
+    assert_eq!(gate.check("203.0.113.20", "occasional@gmail.com"), AbuseDecision::Accept);
 }
 
 // ---------------------------------------------------------------------------------------------

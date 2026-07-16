@@ -11,10 +11,14 @@
 //! Ed25519 stack (no new primitive) and RFC 8463 is a first-class DKIM algorithm. The signer and
 //! an independent [`verify`] are both implemented so tests confirm a real, checkable signature.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::b64;
+use crate::dns::{self, UdpDnsClient, TYPE_TXT};
 
 /// A per-domain delegated DKIM signing key (the private half of what the domain published at
 /// `<selector>._domainkey.<domain>`).
@@ -188,6 +192,38 @@ impl DkimKeyResolver for StaticDkimKeys {
             .iter()
             .find(|(d, s, _)| d.eq_ignore_ascii_case(domain) && s == selector)
             .map(|(_, _, k)| k.clone())
+    }
+}
+
+/// The real, DNS-backed [`DkimKeyResolver`]: queries `<selector>._domainkey.<domain>` for a `TXT`
+/// record (RFC 6376 §3.6.1) and extracts the `p=` key via [`parse_public_key_txt`]. See
+/// [`crate::dns`] module docs for the underlying wire-format caveats (UDP-only, no TC/EDNS0/
+/// retries/caching/DNSSEC) — a lookup failure or a record with no usable `p=` both surface as
+/// [`DkimVerdict::KeyUnavailable`] (this trait, like [`crate::mta_sts::TxtResolver`], does not
+/// distinguish NODATA from a resolver error).
+pub struct DnsDkimKeyResolver {
+    client: UdpDnsClient,
+}
+
+impl DnsDkimKeyResolver {
+    pub fn new(dns_server: SocketAddr) -> Self {
+        DnsDkimKeyResolver { client: UdpDnsClient::new(dns_server) }
+    }
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = self.client.with_timeout(timeout);
+        self
+    }
+}
+
+impl DkimKeyResolver for DnsDkimKeyResolver {
+    fn resolve_dkim_key(&self, domain: &str, selector: &str) -> Option<Vec<u8>> {
+        let name = format!("{selector}._domainkey.{domain}");
+        let msg = self.client.query(&name, TYPE_TXT).ok()?;
+        msg.answers
+            .iter()
+            .filter(|rr| rr.rtype == TYPE_TXT)
+            .map(dns::parse_txt_rdata)
+            .find_map(|txt| parse_public_key_txt(&txt))
     }
 }
 
