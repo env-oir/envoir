@@ -1,8 +1,11 @@
 # Envoir brand
 
-The Envoir mark is an **"@" whose inner glyph is an "e"** — *Envoir*, *email*, and *one keypair*
-in a single simple shape. The `@` says mail and identity; the `e` names the product; the whole
-thing is a clean, recognizable ring that scales from an app icon to a 16px favicon.
+The Envoir mark is a **lowercase "e" whose tail sweeps once around and up the right side**,
+forming an **at-style symbol** — slanted slightly right for momentum. *Envoir*, *email*, and
+*one keypair* in a single continuous stroke: the `@` says mail and identity, the `e` names the
+product, and the whole thing is a clean, recognizable spiral that scales from an app icon to a
+16px favicon. It renders white-on-gradient as the app tile (`logo-mark.svg`), single-colour via
+`currentColor` (`logo-mono.svg`), and locked up with the wordmark (`wordmark.svg`).
 
 ## Palette — "Aurora Indigo"
 
