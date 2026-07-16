@@ -383,7 +383,12 @@ name = "conformance-runner"
 version = "0.0.1"
 dependencies = [
  "ciborium",
+ "dmtap-auth",
  "dmtap-core",
+ "dmtap-deniable",
+ "dmtap-mls",
+ "dmtap-naming",
+ "envoir-gateway",
  "serde",
  "serde_json",
 ]
