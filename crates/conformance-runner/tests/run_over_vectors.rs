@@ -106,3 +106,91 @@ fn suite_json_cross_reference_matches_known_state() {
     assert!(skip > 0, "expected at least some construction-todo cases to be skipped-with-note");
     assert!(pass > 0, "expected at least some vectored/self-contained cases to pass");
 }
+
+/// No silent coverage gaps: EVERY case marked `status: "vectored"` in `suite.json` MUST actually
+/// be executed (Pass or Fail), never `Skipped`. Structurally `run_vectored_case` never returns
+/// `Skipped`, but this is a dedicated regression test so a future refactor that accidentally
+/// routes a vectored case through the skip path is caught immediately, not discovered later as a
+/// silently-inflated coverage number.
+#[test]
+fn every_vectored_case_is_actually_executed() {
+    let sp = suite_path();
+    if !sp.exists() {
+        eprintln!("skipping: sibling spec repo not found at {}", sp.display());
+        return;
+    }
+    let vf = load_vectors(&vectors_path()).expect("vectors.json must load");
+    let suite = load_suite(&sp).expect("suite.json must parse");
+    let results: BTreeMap<String, Verdict> = check_all_vectors(&vf).into_iter().collect();
+    let outcomes = run_all_suite_cases(&suite, &vf, &results);
+
+    let vectored_ids: std::collections::BTreeSet<&str> = suite
+        .cases
+        .iter()
+        .filter(|c| c.status == "vectored")
+        .map(|c| c.id.as_str())
+        .collect();
+    assert!(!vectored_ids.is_empty(), "expected at least one `vectored` case in suite.json");
+
+    let silently_skipped: Vec<&str> = outcomes
+        .iter()
+        .filter(|(id, outcome)| {
+            vectored_ids.contains(id.as_str()) && matches!(outcome, CaseOutcome::Skipped(_))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert!(
+        silently_skipped.is_empty(),
+        "these `vectored` cases were SKIPPED instead of executed (coverage gap): {silently_skipped:?}"
+    );
+}
+
+/// Regression guard for task item 3 (construction-todo cases): a meaningful number of them must
+/// be ACTUALLY EXECUTED (Pass/Fail) against dmtap-core, not just uniformly skipped. This pins a
+/// floor so a future change that reverts `construction::run_construction_case` back to "skip
+/// everything" is caught here rather than silently shrinking real coverage.
+#[test]
+fn a_meaningful_share_of_construction_todo_cases_are_executed() {
+    let sp = suite_path();
+    if !sp.exists() {
+        eprintln!("skipping: sibling spec repo not found at {}", sp.display());
+        return;
+    }
+    let vf = load_vectors(&vectors_path()).expect("vectors.json must load");
+    let suite = load_suite(&sp).expect("suite.json must parse");
+    let results: BTreeMap<String, Verdict> = check_all_vectors(&vf).into_iter().collect();
+    let outcomes = run_all_suite_cases(&suite, &vf, &results);
+
+    let construction_todo_ids: std::collections::BTreeSet<&str> = suite
+        .cases
+        .iter()
+        .filter(|c| c.status == "construction-todo")
+        .map(|c| c.id.as_str())
+        .collect();
+    assert!(!construction_todo_ids.is_empty(), "expected at least one construction-todo case");
+
+    let executed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(id, outcome)| {
+            construction_todo_ids.contains(id.as_str()) && !matches!(outcome, CaseOutcome::Skipped(_))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let failed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(id, outcome)| {
+            construction_todo_ids.contains(id.as_str()) && matches!(outcome, CaseOutcome::Fail(_))
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "construction-todo cases FAILED their construction (not just skipped): {failed:?}"
+    );
+    assert!(
+        executed.len() >= 20,
+        "expected at least 20 construction-todo cases to be actually executed against dmtap-core, \
+         got {} ({executed:?}) — did construction::run_construction_case regress?",
+        executed.len()
+    );
+}

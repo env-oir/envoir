@@ -33,6 +33,9 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+mod construction;
+pub use construction::recognized_ids as construction_recognized_ids;
+
 use dmtap_core::capability::{CapabilityRevocation, CapabilityToken};
 use dmtap_core::cbor::{self, Cv};
 use dmtap_core::deniable::{DeniableFrame, DeniablePayload, DeniablePrekeyBundle};
@@ -554,9 +557,11 @@ pub enum CaseOutcome {
 /// by vector name) and, for `self-contained` cases, the literal inline bytes.
 pub fn run_suite_case(case: &SuiteCase, results: &BTreeMap<String, Verdict>) -> CaseOutcome {
     match case.status.as_str() {
-        "construction-todo" => CaseOutcome::Skipped(
-            "construction-todo: no byte-exact vector yet; recipe given in suite.json/SUITE.md".into(),
-        ),
+        // Actually build the byte-exact input per the case's `construction` recipe (where a
+        // dmtap-core API exists to exercise it) and execute it — see `construction.rs`. Cases with
+        // no dmtap-core API surface yet come back as an explicit `Skipped(reason)`, never a silent
+        // pass.
+        "construction-todo" => construction::run_construction_case(case),
         "vectored" => run_vectored_case(case, results),
         "self-contained" => run_self_contained_case(case),
         other => CaseOutcome::Fail(format!("unknown suite.json status `{other}`")),
