@@ -26,9 +26,12 @@ pub use dmtap_mail as clients;
 // The running client side that wires the shared crates into an end-to-end MOTE delivery path:
 // identity + store + outbound retry queue (§20.1) + inbound validation (§20.2) + transport (§4),
 // culminating in two in-process nodes exchanging a real end-to-end-encrypted MOTE (§2, §19.3).
+pub mod auth;
+pub mod deniable;
 pub mod group;
 pub mod inbound;
 pub mod journal;
+pub mod naming;
 pub mod node;
 pub mod outbound;
 pub mod transport;
@@ -41,6 +44,21 @@ pub use node::{Node, SendError};
 pub use dmtap_mls as groups;
 pub use group::{Committer, GroupAdd, GroupError, GroupMote, Handshake};
 
+// Real name→key resolution (spec §3): the node wraps the workspace-shared `dmtap-naming` crate
+// (DNS `_dmtap` parsing + RFC 6962 KT-verified, fail-closed resolution) and re-exports it here as
+// `dmtap::names`, with the node-facing `AddressError` for name-addressed sends.
+pub use dmtap_naming as names;
+pub use naming::{AddressError, KeyPackageSource, PinnedResolution, ResolveError, Resolver};
+
+// Real DMTAP-Auth login/session (spec §13): the node signs an RP challenge with its root IK to
+// establish its own key-bound session, re-exported here as `dmtap::dmtap_auth`.
+pub use auth::{BoundSession, Challenge, Login, SignedAssertion};
+pub use dmtap_auth;
+
+// Real deniable 1:1 messaging (spec §5.2.1): X3DH + Double Ratchet, distinct from the MLS group
+// path, re-exported here as `dmtap::dmtap_deniable`.
+pub use deniable::{DeniableRouteError, DeniableState};
+pub use dmtap_deniable;
+
 // Node-only planned modules (see README): the rest of the client side that *is* the mesh.
-// pub mod naming;      // §3 — name→key resolution, TOFU pinning, key transparency
 // pub mod privacy;     // §6 — sealed sender, cover traffic, padding, tiers

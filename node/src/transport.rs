@@ -84,6 +84,70 @@ pub trait Transport {
     fn drain(&self) -> Vec<(Vec<u8>, Frame)>;
 }
 
+/// A boxed transport is itself a [`Transport`], so the engine can be made **transport-agnostic at
+/// runtime** — `Node<Box<dyn Transport>>` — and the concrete transport chosen dynamically rather
+/// than monomorphized. This is the seam through which the out-of-tree **libp2p mesh transport**
+/// ([`dmtap_p2p::Libp2pTransport`], spec §4) is selected: that crate depends on THIS one and
+/// implements this very trait, so `Box::new(Libp2pTransport::new(..)?) as Box<dyn Transport>` drops
+/// straight into a `Node` with no cyclic dependency and no change to the engine.
+///
+/// [`dmtap_p2p::Libp2pTransport`]: https://docs.rs/dmtap-p2p (the separate mesh-transport crate)
+impl Transport for Box<dyn Transport> {
+    fn local_addr(&self) -> Vec<u8> {
+        (**self).local_addr()
+    }
+    fn send(&self, to: &[u8], frame: Frame) -> Result<(), TransportError> {
+        (**self).send(to, frame)
+    }
+    fn drain(&self) -> Vec<(Vec<u8>, Frame)> {
+        (**self).drain()
+    }
+}
+
+/// A runtime-**selectable** transport: pick the in-tree in-process fabric or the loopback-TCP
+/// transport (or, via [`SelectableTransport::Boxed`], *any* [`Transport`] impl — the real
+/// `dmtap_p2p::Libp2pTransport` mesh, §4) behind one concrete type, so a caller can choose the
+/// delivery substrate at run time without the engine being generic over each one. Every variant
+/// simply forwards the [`Transport`] method to the selected leg.
+///
+/// This is what makes the mesh transport *selectable from the node* even though the node cannot
+/// depend on `dmtap-p2p` (that would be a cycle): the boxed variant accepts the p2p transport
+/// through the trait object, keeping the existing in-memory/TCP transports fully working.
+pub enum SelectableTransport {
+    /// The deterministic in-process fabric ([`InMemoryTransport`]) — fast, socket-free tests.
+    InMemory(InMemoryTransport),
+    /// The loopback/real-socket [`TcpTransport`] — two OS processes over TCP.
+    Tcp(TcpTransport),
+    /// Any other [`Transport`] behind a trait object — notably the out-of-tree libp2p mesh
+    /// transport (spec §4). The escape hatch that keeps the mesh selectable without a dependency
+    /// cycle.
+    Boxed(Box<dyn Transport>),
+}
+
+impl Transport for SelectableTransport {
+    fn local_addr(&self) -> Vec<u8> {
+        match self {
+            SelectableTransport::InMemory(t) => t.local_addr(),
+            SelectableTransport::Tcp(t) => t.local_addr(),
+            SelectableTransport::Boxed(t) => t.local_addr(),
+        }
+    }
+    fn send(&self, to: &[u8], frame: Frame) -> Result<(), TransportError> {
+        match self {
+            SelectableTransport::InMemory(t) => t.send(to, frame),
+            SelectableTransport::Tcp(t) => t.send(to, frame),
+            SelectableTransport::Boxed(t) => t.send(to, frame),
+        }
+    }
+    fn drain(&self) -> Vec<(Vec<u8>, Frame)> {
+        match self {
+            SelectableTransport::InMemory(t) => t.drain(),
+            SelectableTransport::Tcp(t) => t.drain(),
+            SelectableTransport::Boxed(t) => t.drain(),
+        }
+    }
+}
+
 // --- In-process implementation -------------------------------------------------------------
 
 #[derive(Default)]

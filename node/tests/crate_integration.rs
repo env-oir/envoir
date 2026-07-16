@@ -1,0 +1,422 @@
+//! Integration tests for the crates wired into the node (spec §3, §5.2.1, §13, §4).
+//!
+//! These prove the four subsystems are *really* wired end-to-end — types flow from the shared
+//! crates through the [`Node`] API, not `todo!()`:
+//!
+//! 1. **Resolution (§3):** a KT-verified `name@domain` resolve pins the recipient and an outbound
+//!    MOTE round-trips to them; an unverifiable KT fails closed and pins nothing (no TOFU).
+//! 2. **Deniable 1:1 (§5.2.1):** a deniable session opens and a MOTE round-trips through it
+//!    (distinct from the MLS group path); a tampered message fails closed.
+//! 3. **Auth (§13):** the node runs its own login ceremony, the RP establishes a key-bound session,
+//!    and a DPoP-style request round-trips; a stolen assertion without the session key is useless.
+//! 4. **Transport (§4):** the mesh transport is *selectable* — a `Node` drives delivery over both
+//!    the [`SelectableTransport`] enum and a `Box<dyn Transport>` (the seam the out-of-tree
+//!    `dmtap_p2p::Libp2pTransport` plugs into).
+
+use dmtap::auth::{
+    verify_login, AuthError, Challenge, Clock, DeviceCertAuthorizer, InMemoryReplayCache,
+    SessionKey, SystemClock, TrustedClientStub,
+};
+use dmtap::dmtap_core::deniable::DeniablePayload;
+use dmtap::identity::{Identity, IdentityKey};
+use dmtap::inbound::InboundOutcome;
+use dmtap::mote::{Headers, Kind, SealKeypair};
+use dmtap::names::{DmtapTxtRecord, InMemoryKeyPackages, InMemoryKtLog, InMemoryResolver};
+use dmtap::naming::{seal_key_bundle, ResolveError};
+use dmtap::node::Node;
+use dmtap::outbound::OutState;
+use dmtap::transport::{
+    Frame, InMemoryNetwork, InMemoryTransport, SelectableTransport, Transport, TransportError,
+};
+use dmtap::{ContentId, SendError};
+
+const NOW: u64 = 1_700_000_000_000;
+
+// ============================================================================================
+// 1. Resolution (§3): KT-verified resolve → pin → deliver, and fail-closed on unverifiable KT.
+// ============================================================================================
+
+/// A recipient whose DMTAP identity + DNS + KT are all consistent, publishable into an
+/// [`InMemoryResolver`]. The node built from the same seed decrypts what the resolver's key seals.
+struct Recipient {
+    seed: [u8; 32],
+    node_seal: SealKeypair,
+    seal_pub: [u8; 32],
+    identity: Identity,
+    txt: String,
+}
+
+impl Recipient {
+    fn new(name: &str, seed: u8) -> Self {
+        let seed = [seed; 32];
+        let id_key = IdentityKey::from_seed(&seed);
+        let node_seal = SealKeypair::generate();
+        let seal_pub = *node_seal.public();
+
+        // The recipient advertises its SEALING key as its (content-addressed) KeyPackage bundle.
+        let mut kps = InMemoryKeyPackages::new();
+        let bref = kps.publish(format!("/mesh/kp/{name}"), seal_key_bundle(&seal_pub));
+
+        let identity = Identity::create_classical(
+            &id_key,
+            0,
+            vec![],
+            bref.clone(),
+            ContentId::of(b"recovery"),
+            vec![name.to_owned()],
+            None,
+            NOW,
+        );
+        let txt = DmtapTxtRecord {
+            version: "dmtap1".into(),
+            suite: 1,
+            ik: id_key.public(),
+            id: identity.content_id(),
+            kt: vec!["https://kt.example/log".into()],
+            keypkgs: bref.loc.clone(),
+        }
+        .to_txt();
+        Recipient { seed, node_seal, seal_pub, identity, txt }
+    }
+
+    fn ik_public(&self) -> Vec<u8> {
+        IdentityKey::from_seed(&self.seed).public()
+    }
+}
+
+/// A [`KeyPackageSource`] seeded with a recipient's sealing bundle so the node can fetch + verify it.
+fn kps_for(name: &str, seal_pub: &[u8; 32]) -> InMemoryKeyPackages {
+    let mut kps = InMemoryKeyPackages::new();
+    kps.publish(format!("/mesh/kp/{name}"), seal_key_bundle(seal_pub));
+    kps
+}
+
+#[test]
+fn kt_verified_resolution_pins_and_delivers() {
+    let net = InMemoryNetwork::new();
+
+    // Bob: identity + DNS + KT, plus a live node built from the SAME identity seed so his transport
+    // address equals the resolved `ik` and his seal secret opens what the resolved key seals.
+    let bob = Recipient::new("bob@example.com", 3);
+    let bob_ik = bob.ik_public();
+    let bob_node_ik = IdentityKey::from_seed(&bob.seed);
+    let mut bob_node = Node::with_identity(bob_node_ik, bob.node_seal, net.endpoint(bob_ik.clone()));
+
+    // A resolver with Bob's identity published, DNS TXT set, and a single honest KT log pinned.
+    let mut resolver = InMemoryResolver::new(NOW);
+    resolver.set_txt("bob._dmtap.example.com", &bob.txt);
+    resolver.publish_identity(bob.identity.clone());
+    let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+    log.append_identity("bob@example.com", &bob.identity).unwrap();
+    resolver.pin_log(log);
+    let kps = kps_for("bob@example.com", &bob.seal_pub);
+
+    // Alice resolves Bob by NAME — KT-verified — and it pins the binding.
+    let alice_ik = IdentityKey::generate();
+    let alice_seal = SealKeypair::generate();
+    let alice_ik_pub = alice_ik.public();
+    let alice_seal_pub = *alice_seal.public();
+    let mut alice = Node::with_identity(alice_ik, alice_seal, net.endpoint(alice_ik_pub.clone()));
+    bob_node.add_contact(&alice_ik_pub, alice_seal_pub); // Bob knows Alice (so she is not cold)
+
+    let resolved = alice.resolve_and_pin("bob@example.com", &resolver, &kps).expect("KT-verified");
+    assert_eq!(resolved, bob_ik, "resolution returns the KT-verified identity key");
+
+    // A one-call name-addressed send: resolve (fail-closed) + seal + dispatch, round-tripping.
+    let body = b"resolved you by name, KT-verified";
+    let id = alice
+        .send_mail_to_name("bob@example.com", &resolver, &kps, "hi", body)
+        .expect("name-addressed send");
+
+    let outcomes = bob_node.poll();
+    assert!(matches!(outcomes[0], InboundOutcome::Stored { .. }), "delivered to the resolved key");
+    assert_eq!(bob_node.inbox().exists(), 1);
+    let raw = &bob_node.inbox().messages[0].raw;
+    assert!(raw.windows(body.len()).any(|w| w == body), "correct plaintext delivered");
+
+    alice.poll(); // consume Bob's ack
+    assert_eq!(alice.outbound_state(&id), Some(OutState::Acked), "sender queue reaches ACKED");
+}
+
+#[test]
+fn kt_unreachable_fails_closed_and_pins_nothing() {
+    let net = InMemoryNetwork::new();
+    let bob = Recipient::new("bob@example.com", 4);
+    let bob_ik = bob.ik_public();
+
+    // A resolver with a REACHABLE identity/DNS but only an UNREACHABLE KT log pinned — the §3.3
+    // fail-closed condition: it MUST NOT TOFU-pin.
+    let mut resolver = InMemoryResolver::new(NOW);
+    resolver.set_txt("bob._dmtap.example.com", &bob.txt);
+    resolver.publish_identity(bob.identity.clone());
+    resolver.pin_log(dmtap::names::UnreachableLog {
+        log_id: IdentityKey::from_seed(&[7; 32]).public(),
+    });
+    let kps = kps_for("bob@example.com", &bob.seal_pub);
+
+    let alice_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let mut alice =
+        Node::with_identity(alice_ik, SealKeypair::generate(), net.endpoint(alice_ik_pub));
+
+    // Resolution fails closed with the KT-unreachable code, pinning nothing.
+    let err = alice.resolve_and_pin("bob@example.com", &resolver, &kps).unwrap_err();
+    assert_eq!(err, ResolveError::KtUnreachable, "unreachable KT ⇒ BLOCK, never TOFU (§3.3)");
+    assert_eq!(err.code(), 0x0106, "the normative ERR_KT_UNREACHABLE code");
+
+    // Nothing was pinned: a subsequent direct send to Bob's ik is still Unresolved.
+    assert_eq!(
+        alice.send_mail(&bob_ik, "x", b"y"),
+        Err(SendError::Unresolved),
+        "a failed KT resolve leaves the recipient unpinned"
+    );
+}
+
+#[test]
+fn tampered_dns_pointer_fails_closed() {
+    let net = InMemoryNetwork::new();
+    let bob = Recipient::new("bob@example.com", 5);
+
+    // A TXT whose `ik=` is swapped for an attacker key: the DNS pointer and the signed Identity
+    // disagree ⇒ resolution fails closed before anything is trusted.
+    let evil_ik = IdentityKey::from_seed(&[0xee; 32]).public();
+    let tampered = DmtapTxtRecord {
+        version: "dmtap1".into(),
+        suite: 1,
+        ik: evil_ik,
+        id: bob.identity.content_id(),
+        kt: vec!["https://kt.example/log".into()],
+        keypkgs: format!("/mesh/kp/{}", "bob@example.com"),
+    }
+    .to_txt();
+    let mut resolver = InMemoryResolver::new(NOW);
+    resolver.set_txt("bob._dmtap.example.com", &tampered);
+    resolver.publish_identity(bob.identity.clone());
+    let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+    log.append_identity("bob@example.com", &bob.identity).unwrap();
+    resolver.pin_log(log);
+    let kps = kps_for("bob@example.com", &bob.seal_pub);
+
+    let alice_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let mut alice =
+        Node::with_identity(alice_ik, SealKeypair::generate(), net.endpoint(alice_ik_pub));
+    assert!(matches!(
+        alice.resolve_and_pin("bob@example.com", &resolver, &kps),
+        Err(ResolveError::DnsIdentityMismatch(_))
+    ));
+}
+
+// ============================================================================================
+// 2. Deniable 1:1 (§5.2.1): a MOTE round-trips through a deniable session; tamper fails closed.
+// ============================================================================================
+
+fn deniable_payload(from: &[u8], subject: &str, body: &[u8]) -> DeniablePayload {
+    DeniablePayload {
+        from: from.to_vec(),
+        kind: Kind::Chat,
+        headers: Headers { subject: Some(subject.into()), ..Headers::default() },
+        body: body.to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    }
+}
+
+fn make_node(net: &InMemoryNetwork) -> (Node<InMemoryTransport>, Vec<u8>, [u8; 32]) {
+    let ik = IdentityKey::generate();
+    let seal = SealKeypair::generate();
+    let ik_pub = ik.public();
+    let seal_pub = *seal.public();
+    (Node::with_identity(ik, seal, net.endpoint(ik_pub.clone())), ik_pub, seal_pub)
+}
+
+#[test]
+fn deniable_1to1_mote_round_trips_both_directions() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, _bob_ik, _) = make_node(&net);
+
+    // Bob publishes a deniable prekey bundle; Alice opens a deniable session and routes the first
+    // MOTE embedded in the X3DH init.
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "deniable hello", b"you cannot prove I wrote this");
+    let init = alice.deniable_open(&bundle, &first).expect("X3DH initiate");
+
+    // Bob accepts: establishes the session and recovers the first MOTE exactly.
+    let got = bob.deniable_accept(&init).expect("X3DH accept");
+    assert_eq!(got, first, "the first deniable MOTE round-trips through X3DH");
+
+    // The peers' session keys: Bob keys by Alice's deniable IK (init.ik_a); Alice by Bob's (bundle.ik).
+    let alice_deniable_ik = init.ik_a.clone();
+    let bob_deniable_ik = bundle.ik.clone();
+    assert_eq!(
+        alice.deniable_identity_public().as_deref(),
+        Some(alice_deniable_ik.as_slice()),
+        "Alice provisioned a dedicated deniable identity, distinct from her root IK"
+    );
+    assert_ne!(alice_deniable_ik, alice_ik, "deniable IK is NOT the node's root IK (§5.2.1)");
+
+    // Bob replies over the ratchet; Alice opens it — the reverse-direction MOTE round-trips.
+    let reply = deniable_payload(&bob_deniable_ik, "deniable reply", b"nor can you prove I did");
+    let msg = bob.deniable_send(&alice_deniable_ik, &reply).expect("ratchet encrypt");
+    let got_reply = alice.deniable_recv(&bob_deniable_ik, &msg).expect("ratchet decrypt");
+    assert_eq!(got_reply, reply, "the reply MOTE round-trips back over the ratchet");
+}
+
+#[test]
+fn deniable_tampered_message_fails_closed() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, _bob_ik, _) = make_node(&net);
+
+    let bundle = bob.deniable_publish_bundle();
+    let first = deniable_payload(&alice_ik, "hi", b"opening message");
+    let init = alice.deniable_open(&bundle, &first).unwrap();
+    bob.deniable_accept(&init).unwrap();
+
+    // Bob sends; the ciphertext is flipped in transit; Alice's open MUST fail (shared-key MAC).
+    let reply = deniable_payload(&bundle.ik, "re", b"authentic content");
+    let mut msg = bob.deniable_send(&init.ik_a, &reply).unwrap();
+    msg.ct[0] ^= 0xff;
+    let err = alice.deniable_recv(&bundle.ik, &msg);
+    assert!(err.is_err(), "a tampered deniable message fails closed (AEAD tag / shared-key MAC)");
+}
+
+#[test]
+fn deniable_accept_without_bundle_is_rejected() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, _) = make_node(&net);
+    let (mut bob, _bob_ik, _) = make_node(&net);
+
+    // Bob is a responder; Alice is NOT (never published a bundle) — so Alice cannot accept an init.
+    let bundle = bob.deniable_publish_bundle();
+    let init = alice.deniable_open(&bundle, &deniable_payload(&alice_ik, "x", b"y")).unwrap();
+    // Bob (the real responder) accepts fine; a fresh non-responder node cannot.
+    assert!(bob.deniable_accept(&init).is_ok());
+    let (mut carol, _c_ik, _) = make_node(&net);
+    assert!(matches!(
+        carol.deniable_accept(&init),
+        Err(dmtap::DeniableRouteError::NotResponder)
+    ));
+}
+
+// ============================================================================================
+// 3. Auth (§13): the node logs itself in; a key-bound session authorizes a request; a stolen
+//    assertion without the session key is useless.
+// ============================================================================================
+
+#[test]
+fn node_login_establishes_a_key_bound_session_and_authorizes_a_request() {
+    let net = InMemoryNetwork::new();
+    let (alice, alice_ik, _) = make_node(&net);
+    let clock = SystemClock;
+    let origin = "https://rp.example";
+    let aud = "rp.example";
+
+    // RP issues an origin-bound challenge; the node's trusted client observes the same origin.
+    let challenge = Challenge::new(origin, aud, clock.now_ms(), None);
+    let client = TrustedClientStub::new(origin);
+
+    // The node runs its OWN login ceremony: its root IK is the login signer (§13.3).
+    let login = alice.login(&client, &challenge).expect("node login");
+    assert_eq!(login.assertion.from, alice_ik, "the node's root IK is the login signer");
+
+    // RP verifies and binds the session ONLY to cnf (IK-direct is authorized, §1.2).
+    let authorizer = DeviceCertAuthorizer::new();
+    let mut replay = InMemoryReplayCache::new();
+    let session = verify_login(
+        &alice_ik,
+        origin,
+        aud,
+        &challenge,
+        &login.assertion,
+        &authorizer,
+        &mut replay,
+        &clock,
+    )
+    .expect("RP verifies the node's login");
+    assert_eq!(session.subject_ik, alice_ik, "session subject is the node identity");
+
+    // A DPoP-style request signed by the retained session key is authorized.
+    let htu = "https://rp.example/api/mail";
+    let htm = "GET";
+    let proof = login.session.prove(htu, htm, &clock);
+    let mut req_replay = InMemoryReplayCache::new();
+    session
+        .verify_request(&proof, htu, htm, &mut req_replay, &clock)
+        .expect("key-bound request authorized");
+
+    // A stolen assertion (hence cnf) WITHOUT the session key is useless: an attacker-chosen key
+    // fails the proof-of-possession binding (§13.4).
+    let stolen = SessionKey::generate();
+    let forged = stolen.prove(htu, htm, &clock);
+    assert!(matches!(
+        session.verify_request(&forged, htu, htm, &mut req_replay, &clock),
+        Err(AuthError::SessionKeyMismatch)
+    ));
+}
+
+#[test]
+fn node_login_refuses_on_origin_mismatch() {
+    let net = InMemoryNetwork::new();
+    let (alice, _ik, _) = make_node(&net);
+    let clock = SystemClock;
+    // The challenge is for the real RP, but the trusted client observes a look-alike origin: the
+    // client refuses to sign before any assertion is produced (§13.3.1 phishing defense).
+    let challenge = Challenge::new("https://rp.example", "rp.example", clock.now_ms(), None);
+    let phishing_client = TrustedClientStub::new("https://rp.example.evil.com");
+    assert!(matches!(alice.login(&phishing_client, &challenge), Err(AuthError::OriginMismatch)));
+}
+
+// ============================================================================================
+// 4. Transport (§4): the mesh transport is selectable — the same engine drives delivery over the
+//    SelectableTransport enum and over a Box<dyn Transport> (the seam dmtap-p2p plugs into).
+// ============================================================================================
+
+#[test]
+fn transport_is_selectable_enum_and_boxed() {
+    let net = InMemoryNetwork::new();
+
+    // Alice runs over the SelectableTransport ENUM; Bob runs over a Box<dyn Transport> — exactly the
+    // shape the out-of-tree `dmtap_p2p::Libp2pTransport` uses to plug into a `Node`.
+    let alice_ik = IdentityKey::generate();
+    let bob_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let bob_ik_pub = bob_ik.public();
+
+    let alice_t = SelectableTransport::InMemory(net.endpoint(alice_ik_pub.clone()));
+    let bob_boxed: Box<dyn Transport> = Box::new(net.endpoint(bob_ik_pub.clone()));
+
+    let mut alice = Node::with_identity(alice_ik, SealKeypair::generate(), alice_t);
+    let mut bob = Node::with_identity(bob_ik, SealKeypair::generate(), bob_boxed);
+
+    let (alice_seal, bob_seal) = (alice.seal_public(), bob.seal_public());
+    alice.add_contact(&bob_ik_pub, bob_seal);
+    bob.add_contact(&alice_ik_pub, alice_seal);
+
+    // A real end-to-end MOTE flows over the selected transports and the ack returns.
+    let body = b"delivered over a runtime-selected transport";
+    let id = alice.send_mail(&bob_ik_pub, "select", body).expect("send over selectable transport");
+    assert_eq!(alice.outbound_state(&id), Some(OutState::InFlight));
+
+    let outcomes = bob.poll();
+    assert!(matches!(outcomes[0], InboundOutcome::Stored { .. }), "delivered over the boxed transport");
+    assert_eq!(bob.inbox().exists(), 1);
+
+    alice.poll();
+    assert_eq!(
+        alice.outbound_state(&id),
+        Some(OutState::Acked),
+        "the enum + boxed transport carry the full seal→validate→ack path"
+    );
+}
+
+#[test]
+fn boxed_transport_reports_local_addr_and_unreachable() {
+    let net = InMemoryNetwork::new();
+    let boxed: Box<dyn Transport> = Box::new(net.endpoint(b"alice".to_vec()));
+    assert_eq!(boxed.local_addr(), b"alice".to_vec(), "boxed transport forwards local_addr");
+    // Unknown peer is unreachable — the trait-object forwards send() faithfully.
+    assert_eq!(boxed.send(b"ghost", Frame::Ack(vec![1])), Err(TransportError::Unreachable));
+}
