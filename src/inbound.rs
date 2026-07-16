@@ -529,11 +529,18 @@ impl InboundGateway {
             Some(r) => r.as_ref(),
             None => return DmarcVerdict::NoPolicy,
         };
-        let header_domain = match dmarc::header_from_domain(data) {
-            Some(d) => d,
-            // No parseable `From:` header/domain at all — nothing to align against. Malformed
+        let header_domain = match dmarc::header_from(data) {
+            dmarc::HeaderFrom::Single(d) => d,
+            // No parseable single `From:` header/domain at all — nothing to align against. Malformed
             // legacy mail is `dkim_gate`/recipient-resolution's problem, not fabricated here.
-            None => return DmarcVerdict::PermError,
+            dmarc::HeaderFrom::Unusable => return DmarcVerdict::PermError,
+            // RFC 7489 §6.6.1: more than one `From:` header, or more than one address, MUST NOT be
+            // evaluated as single-origin. Fail closed to a reject disposition so
+            // `DmarcHandling::Enforce` refuses the message rather than aligning against a From a
+            // downstream client might render differently.
+            dmarc::HeaderFrom::Ambiguous => {
+                return DmarcVerdict::Fail { disposition: DmarcDisposition::Reject }
+            }
         };
         let envelope_domain = domain_of(mail_from).unwrap_or("").to_string();
         dmarc::evaluate(resolver, &header_domain, &envelope_domain, spf.map(|o| o.result), dkim_verdict)

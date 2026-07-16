@@ -204,7 +204,7 @@ fn e2e_inbound_bridge_directory_mesh_and_provenance() {
     let gw_key = published.resolve_gw_key(GW_DOMAIN, GW_SELECTOR);
     bridged
         .gateway_attestation
-        .verify(gw_key.as_deref(), &signed)
+        .verify(GW_DOMAIN, gw_key.as_deref(), &signed)
         .expect("gateway attestation verifies over the exact legacy bytes");
     assert_eq!(bridged.provenance.origin, Origin::GatewayTouched);
     assert_eq!(bridged.provenance.gateway_hops(), 1, "exactly one gateway hop in the provenance chain");

@@ -5,15 +5,20 @@
 //! inbound (spec §7.2 step 2).
 //!
 //! **Honest narrowings (documented, not silent):**
-//! - **Organizational-domain approximation.** RFC 7489 §3.2's "Organizational Domain" is properly
-//!   determined against a Public Suffix List (so e.g. `a.b.co.uk`'s organizational domain is
-//!   `b.co.uk`, not `co.uk`). This crate ships no PSL, so [`organizational_domain`] approximates it
-//!   as **the last two DNS labels** — correct for ordinary domains (`mail.example.com` →
-//!   `example.com`) but wrong for multi-part public suffixes (`foo.co.uk` would be treated as its
-//!   own organizational domain rather than folding under `co.uk`'s registrant). This can only ever
-//!   make relaxed alignment **more permissive** than a PSL-correct implementation on such domains
-//!   (it may accept an alignment a real PSL would reject), never less — a deliberate, documented
-//!   trade-off given no PSL dependency is taken.
+//! - **Organizational domain via a real Public Suffix List.** RFC 7489 §3.2's "Organizational
+//!   Domain" (the registrable "public-suffix + 1 label") is computed against Mozilla's Public
+//!   Suffix List, embedded via the [`psl`] crate (a self-contained, compiled snapshot of the list —
+//!   no build-time fetch, no runtime data file, pinned in `Cargo.lock`). So `mail.example.com` →
+//!   `example.com`, but `attacker.co.uk` and `victim.co.uk` are recognized as **distinct**
+//!   registrants (their organizational domains are themselves, not the shared `co.uk` suffix), and
+//!   likewise for private-section multi-label suffixes (`github.io`, `s3.amazonaws.com`). This
+//!   closes the former "last two labels" hole where any two domains sharing a 2-label public suffix
+//!   were mis-treated as aligned under relaxed mode. Residual narrowing: the embedded list is a
+//!   fixed snapshot (the version pinned in `Cargo.lock`), not refreshed at runtime; a public suffix
+//!   added upstream after that snapshot is unknown until the dependency is bumped — but see the
+//!   fail-closed guard below, which requires **strict** alignment whenever a name has no registrable
+//!   domain (i.e. is itself a public suffix / unlistable), so an unknown or bare suffix can never be
+//!   folded together under relaxed alignment.
 //! - **`pct=` is parsed but not applied as probabilistic sampling.** RFC 7489 §6.3's `pct` tag lets
 //!   a domain roll out enforcement to only a percentage of failing messages. This gateway always
 //!   applies the full effective policy to every failing message (as if `pct=100`) — a conservative
@@ -160,23 +165,35 @@ impl DmarcTxtResolver for DnsDmarcResolver {
     }
 }
 
-/// Approximate RFC 7489 §3.2's Organizational Domain as the last two DNS labels (no Public Suffix
-/// List — see module docs on the narrowing this implies).
+fn normalize(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// RFC 7489 §3.2's Organizational Domain: the registrable "public-suffix + 1 label" determined
+/// against the Public Suffix List (via the embedded [`psl`] snapshot — see module docs). Returns
+/// the input (normalized) unchanged when it has **no** registrable domain — i.e. it is itself a
+/// public suffix (`co.uk`, `github.io`) or a single unlistable label (`localhost`) — so callers
+/// still get a stable value, and [`domains_aligned`] treats that case fail-closed (strict-only).
 pub fn organizational_domain(domain: &str) -> String {
-    let d = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let labels: Vec<&str> = d.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() <= 2 {
-        d
-    } else {
-        labels[labels.len() - 2..].join(".")
+    let d = normalize(domain);
+    match psl::domain_str(&d) {
+        Some(registrable) => registrable.to_string(),
+        None => d,
     }
 }
 
 fn domains_aligned(auth_domain: &str, header_domain: &str, strict: bool) -> bool {
     if strict {
-        auth_domain.eq_ignore_ascii_case(header_domain)
-    } else {
-        organizational_domain(auth_domain).eq_ignore_ascii_case(&organizational_domain(header_domain))
+        return auth_domain.eq_ignore_ascii_case(header_domain);
+    }
+    // Relaxed alignment compares organizational (registrable) domains. Fail-closed guard: if
+    // *either* name has no registrable domain — it is itself a public suffix (`co.uk`, `github.io`,
+    // `s3.amazonaws.com`) or otherwise unlistable — then "public-suffix + 1 label" is undefined and
+    // folding the two together would let any two co-tenants of that suffix spoof each other. In that
+    // case require STRICT (exact) alignment instead of a relaxed organizational match.
+    match (psl::domain_str(&normalize(auth_domain)), psl::domain_str(&normalize(header_domain))) {
+        (Some(org_auth), Some(org_header)) => org_auth.eq_ignore_ascii_case(org_header),
+        _ => auth_domain.eq_ignore_ascii_case(header_domain),
     }
 }
 
@@ -299,17 +316,63 @@ fn discover(resolver: &dyn DmarcTxtResolver, header_domain: &str) -> Discovery {
     Discovery::None
 }
 
-/// Extract the `RFC5322.From` domain from a decoded legacy message (spec item 2). Reuses
+/// The `RFC5322.From` selection for DMARC (RFC 7489 §6.6.1). DMARC is only evaluated normally for a
+/// message carrying **exactly one** `From:` header bearing **exactly one** address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderFrom {
+    /// Exactly one `From:` header with exactly one address carrying an `@domain` — the domain to
+    /// align against.
+    Single(String),
+    /// No `From:` header at all, or the sole single-address `From:` carries no usable `@domain`.
+    /// Nothing to align — DMARC reports [`DmarcVerdict::PermError`] rather than guessing.
+    Unusable,
+    /// More than one `From:` header, **or** a single `From:` bearing more than one address
+    /// (RFC 7489 §6.6.1): such a message MUST NOT be evaluated as if it had one origin. A
+    /// fail-closed reject signal — the caller maps it to a rejectable verdict (never a silent pass).
+    Ambiguous,
+}
+
+/// Select the `RFC5322.From` domain for DMARC per RFC 7489 §6.6.1 (spec item 2). Reuses
 /// `dmtap-mail`'s existing header/address parsing (already a gateway dependency for SMTP→MOTE
-/// translation) rather than duplicating an RFC 5322 header parser. `None` if there is no `From:`
-/// header at all, or it carries no `@domain` — a message this malformed cannot be aligned against
-/// anything, so DMARC evaluation reports [`DmarcVerdict::PermError`] rather than guessing.
-pub fn header_from_domain(data: &[u8]) -> Option<String> {
+/// translation) rather than duplicating an RFC 5322 header parser. Enforces §6.6.1's cardinality
+/// rules: more than one `From:` header, or more than one address in the `From:`, yields
+/// [`HeaderFrom::Ambiguous`] instead of arbitrarily picking one (the previous behavior — last
+/// header, first address — which a spoofer could exploit by appending a second `From:` the DKIM
+/// oversigning or a downstream client renders differently).
+pub fn header_from(data: &[u8]) -> HeaderFrom {
     let headers = dmtap_mail::mime::headers_only(data);
-    let (_, value) = headers.iter().rev().find(|(n, _)| n.trim().eq_ignore_ascii_case("from"))?;
+    let froms: Vec<&String> =
+        headers.iter().filter(|(n, _)| n.trim().eq_ignore_ascii_case("from")).map(|(_, v)| v).collect();
+    let value = match froms.as_slice() {
+        [] => return HeaderFrom::Unusable,
+        [only] => *only,
+        // RFC 7489 §6.6.1: more than one From header ⇒ do not evaluate as single-origin.
+        _ => return HeaderFrom::Ambiguous,
+    };
     let addrs = dmtap_mail::mime::parse_address_list(value);
-    let addr = addrs.first()?;
-    addr.host.clone().filter(|h| !h.is_empty())
+    match addrs.as_slice() {
+        [] => HeaderFrom::Unusable,
+        // The one-and-only address; consistent with the delivered-message parser
+        // (`dmtap_mail::mime::ParsedMessage::header`, which takes the FIRST — here also the only —
+        // occurrence), never the previous last-header/first-address mix.
+        [addr] => match addr.host.clone().filter(|h| !h.is_empty()) {
+            Some(h) => HeaderFrom::Single(h),
+            None => HeaderFrom::Unusable,
+        },
+        // RFC 7489 §6.6.1: a From with more than one address ⇒ do not evaluate as single-origin.
+        _ => HeaderFrom::Ambiguous,
+    }
+}
+
+/// The single `RFC5322.From` domain, or `None` when there is not exactly one usable single-address
+/// `From:` header. A thin convenience wrapper over [`header_from`]: an ambiguous multi-From /
+/// multi-address message collapses to `None` here (its distinct fail-closed reject is available via
+/// [`header_from`] directly, which the inbound DMARC path uses).
+pub fn header_from_domain(data: &[u8]) -> Option<String> {
+    match header_from(data) {
+        HeaderFrom::Single(d) => Some(d),
+        HeaderFrom::Unusable | HeaderFrom::Ambiguous => None,
+    }
 }
 
 /// Evaluate DMARC (RFC 7489 §3, spec item 2): discover the `header_from_domain`'s policy (falling
@@ -355,13 +418,54 @@ mod tests {
     use crate::dkim::DkimError;
 
     #[test]
-    fn organizational_domain_approximation() {
+    fn organizational_domain_uses_the_public_suffix_list() {
         assert_eq!(organizational_domain("mail.example.com"), "example.com");
         assert_eq!(organizational_domain("a.b.c.example.com"), "example.com");
         assert_eq!(organizational_domain("example.com"), "example.com");
+        // Single unlistable label / bare public suffix ⇒ returned unchanged.
         assert_eq!(organizational_domain("localhost"), "localhost");
-        // The documented PSL-less narrowing: this is NOT what a PSL-aware implementation would say.
-        assert_eq!(organizational_domain("foo.co.uk"), "co.uk");
+        // PSL-correct: a multi-label public suffix is respected — `foo.co.uk`'s registrable domain
+        // is itself (NOT `co.uk`), and a bare public suffix has no registrable domain (kept as-is).
+        assert_eq!(organizational_domain("foo.co.uk"), "foo.co.uk");
+        assert_eq!(organizational_domain("a.b.foo.co.uk"), "foo.co.uk");
+        assert_eq!(organizational_domain("co.uk"), "co.uk");
+        // Private-section multi-label suffixes are honored too (co-tenant isolation).
+        assert_eq!(organizational_domain("myuser.github.io"), "myuser.github.io");
+        assert_eq!(organizational_domain("bucket.s3.amazonaws.com"), "bucket.s3.amazonaws.com");
+    }
+
+    #[test]
+    fn relaxed_alignment_is_psl_correct_across_public_suffixes() {
+        // The closed hole: two registrants sharing a 2-label public suffix are NOT aligned under
+        // relaxed mode (previously `organizational_domain` = "last two labels" wrongly aligned them).
+        assert!(!domains_aligned("attacker.co.uk", "victim.co.uk", false));
+        assert!(!domains_aligned("attacker.com.au", "victim.com.au", false));
+        assert!(!domains_aligned("evil.github.io", "good.github.io", false));
+        assert!(!domains_aligned("evil.s3.amazonaws.com", "good.s3.amazonaws.com", false));
+        // Legitimate relaxed alignment still holds (subdomain ↔ its registrable domain).
+        assert!(domains_aligned("mail.example.com", "example.com", false));
+        assert!(domains_aligned("bounce.example.co.uk", "www.example.co.uk", false));
+        // Same registrant under the multi-label suffix aligns; different ones do not.
+        assert!(domains_aligned("a.example.co.uk", "b.example.co.uk", false));
+        // Fail-closed guard: a name that is ITSELF a public suffix (no registrable domain) demands
+        // strict/exact alignment — it can never be folded together with a sibling under relaxed mode.
+        assert!(!domains_aligned("co.uk", "example.co.uk", false));
+        assert!(domains_aligned("co.uk", "co.uk", false)); // exact still matches
+        assert!(!domains_aligned("github.io", "victim.github.io", false));
+    }
+
+    #[test]
+    fn dmarc_pass_requires_psl_correct_alignment_not_a_shared_suffix() {
+        // End-to-end: `victim.co.uk` publishes p=reject; a DKIM pass for `attacker.co.uk` shares the
+        // `co.uk` public suffix but is a DIFFERENT registrant, so it must NOT align → reject.
+        let r = dmarc_txt("victim.co.uk", "v=DMARC1; p=reject");
+        let dkim = DkimVerdict::Pass { domain: "attacker.co.uk".into(), selector: "s1".into() };
+        let v = evaluate(&r, "victim.co.uk", "attacker.co.uk", Some(SpfResult::Fail), &dkim);
+        assert_eq!(v, DmarcVerdict::Fail { disposition: DmarcDisposition::Reject });
+        // The same registrant (a subdomain) DOES align.
+        let dkim_ok = DkimVerdict::Pass { domain: "mail.victim.co.uk".into(), selector: "s1".into() };
+        let v_ok = evaluate(&r, "victim.co.uk", "x", Some(SpfResult::Fail), &dkim_ok);
+        assert_eq!(v_ok, DmarcVerdict::Pass);
     }
 
     #[test]
@@ -375,6 +479,28 @@ mod tests {
         // Garbage bytes never panic, just yield None.
         let garbage: &[u8] = &[0xff, 0x00, 0xfe, 0x10, 0x00, 0x00];
         assert_eq!(header_from_domain(garbage), None);
+    }
+
+    #[test]
+    fn header_from_rejects_multiple_from_headers_and_addresses() {
+        // Exactly one single-address From ⇒ Single.
+        let ok = b"From: alice@example.org\r\nTo: bob@host.net\r\n\r\nbody\r\n";
+        assert_eq!(header_from(ok), HeaderFrom::Single("example.org".to_string()));
+
+        // Two From headers (RFC 7489 §6.6.1) ⇒ Ambiguous, never an arbitrary pick.
+        let two_headers =
+            b"From: alice@example.org\r\nFrom: eve@attacker.example\r\nTo: bob@host.net\r\n\r\nbody\r\n";
+        assert_eq!(header_from(two_headers), HeaderFrom::Ambiguous);
+        assert_eq!(header_from_domain(two_headers), None);
+
+        // A single From bearing two addresses ⇒ Ambiguous.
+        let two_addrs = b"From: alice@example.org, eve@attacker.example\r\nTo: bob@host.net\r\n\r\nbody\r\n";
+        assert_eq!(header_from(two_addrs), HeaderFrom::Ambiguous);
+        assert_eq!(header_from_domain(two_addrs), None);
+
+        // No From at all / no domain ⇒ Unusable.
+        assert_eq!(header_from(b"Subject: x\r\n\r\nbody\r\n"), HeaderFrom::Unusable);
+        assert_eq!(header_from(b"From: not-an-address\r\n\r\nbody\r\n"), HeaderFrom::Unusable);
     }
 
     fn dmarc_txt(name: &str, body: &str) -> InMemoryDmarcResolver {
