@@ -26,6 +26,16 @@
 //!   alignment combining the SPF result with the existing DKIM verdict, `_dmarc` two-level policy
 //!   discovery, `p=`/`sp=` disposition) evaluated once the message is in hand — both wired into
 //!   [`inbound::InboundGateway`]'s annotate/enforce policy seams (spec §7.2 step 2, §9).
+//! - **Recipient directory** ([`directory`], §3 resolve): [`directory::FileDirectory`] /
+//!   [`directory::InMemoryDirectory`] map an inbound `user@domain` to a DMTAP [`inbound::RecipientKey`]
+//!   from a configurable file, so a message for a configured local recipient is sealed to their key
+//!   (the KT inclusion proof is the documented next seam on top of the raw mapping).
+//! - **Mesh delivery** ([`mesh`], §4): [`mesh::HttpMeshDelivery`] hands the converted MOTE to a
+//!   node's HTTP ingest endpoint (a `2xx` = durable-custody ack → SMTP `250`), with
+//!   [`mesh::NullMesh`] the honest unconfigured default and the `dmtap-p2p` node transport the
+//!   documented drop-in behind the same [`inbound::MeshDelivery`] trait (kept above the gateway to
+//!   avoid a dependency cycle). The `run` binary composes these into a real daemon with graceful
+//!   `SIGINT`/`SIGTERM` shutdown ([`inbound_tcp::MxListener::serve_until`]).
 //!
 //! ## Statelessness (spec §7.4)
 //! The gateway holds no queue and no mailbox. Durability is punted to the edges: inbound → the
@@ -51,11 +61,13 @@
 
 pub mod attestation;
 pub mod b64;
+pub mod directory;
 pub mod dkim;
 pub mod dmarc;
 pub mod dns;
 pub mod inbound;
 pub mod inbound_tcp;
+pub mod mesh;
 pub mod mta_sts;
 pub mod mx;
 pub mod net;
@@ -69,10 +81,12 @@ pub use dkim::{
     parse_public_key_txt, signing_domain_selector, verify_with_resolver, DkimError, DkimKey,
     DkimKeyResolver, DkimVerdict, DnsDkimKeyResolver, StaticDkimKeys,
 };
+pub use directory::{DirectoryError, FileDirectory, InMemoryDirectory};
 pub use dmarc::{
     organizational_domain, DmarcDisposition, DmarcPolicy, DmarcRecord, DmarcTxtResolver,
     DmarcVerdict, DnsDmarcResolver, InMemoryDmarcResolver,
 };
+pub use mesh::{HttpMeshDelivery, MeshConfigError, NullMesh};
 pub use inbound::{
     AbuseDecision, AllowAllAbuse, AntiAbuse, Clock, ColdSenderGate, DeliveryOutcome, DkimPolicy,
     DmarcHandling, InboundBridged, InboundError, InboundGateway, KeyDirectory, MeshDelivery,

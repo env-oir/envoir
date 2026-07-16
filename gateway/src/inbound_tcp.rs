@@ -8,7 +8,9 @@
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
@@ -72,7 +74,8 @@ impl MxListener {
 
     /// Serve connections forever, one at a time, stamping each with the current wall-clock time. A
     /// per-connection error is logged to stderr and does not stop the listener (statelessness means
-    /// a dropped connection loses nothing — the legacy sender retries).
+    /// a dropped connection loses nothing — the legacy sender retries). This variant never returns;
+    /// prefer [`Self::serve_until`] for a daemon that must shut down gracefully.
     pub fn serve_forever(&self, gw: &InboundGateway) -> io::Result<()> {
         for stream in self.listener.incoming() {
             let stream = match stream {
@@ -91,6 +94,50 @@ impl MxListener {
             }
         }
         Ok(())
+    }
+
+    /// Serve connections one at a time until `shutdown` flips to `true`, then return cleanly — the
+    /// long-running daemon loop with **graceful shutdown**. The listener is switched to non-blocking
+    /// and the accept loop polls `shutdown` between connections (and while idle), so a `SIGINT`/
+    /// `SIGTERM` handler that sets the flag makes the daemon stop accepting and return without
+    /// aborting mid-transaction. Each accepted connection is handled in blocking mode exactly as
+    /// [`Self::serve_forever`] does (statelessness: an interrupted connection loses nothing — the
+    /// legacy sender retries). A per-connection error is logged and does not stop the loop.
+    pub fn serve_until(&self, gw: &InboundGateway, shutdown: &AtomicBool) -> io::Result<()> {
+        self.listener.set_nonblocking(true)?;
+        // Idle poll cadence: small enough that shutdown is near-instant, large enough not to spin.
+        let idle = Duration::from_millis(100);
+        let outcome = loop {
+            if shutdown.load(Ordering::SeqCst) {
+                break Ok(());
+            }
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    // accept(2) does not inherit the listener's non-blocking flag on every platform;
+                    // force blocking so the per-connection SMTP dialog uses ordinary blocking I/O.
+                    if let Err(e) = stream.set_nonblocking(false) {
+                        eprintln!("gateway: could not set connection blocking: {e}");
+                        continue;
+                    }
+                    let peer_ip = peer.ip().to_string();
+                    if let Err(e) =
+                        handle_connection(stream, gw, &peer_ip, now_ms(), self.tls.clone())
+                    {
+                        eprintln!("gateway: session with {peer_ip} ended: {e}");
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(idle);
+                }
+                Err(e) => {
+                    eprintln!("gateway: accept error: {e}");
+                    std::thread::sleep(idle);
+                }
+            }
+        };
+        // Restore blocking mode so a caller that reuses the listener is not surprised.
+        let _ = self.listener.set_nonblocking(false);
+        outcome
     }
 }
 
