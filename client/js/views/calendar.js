@@ -11,13 +11,34 @@ import { bus } from '../bus.js';
 
 const DAY = 86400e3;
 const DAY_START = 6, DAY_END = 23; // visible hours in week/day grid
-const RSVP = { yes: 'Going', no: 'No', maybe: 'Maybe', pending: 'Pending' };
+export const RSVP = { yes: 'Going', no: 'No', maybe: 'Maybe', pending: 'Pending' };
 const COLORS = [210, 262, 330, 150, 46, 8, 190]; // preset event color/label swatches (hues)
 const REMINDER_OPTS = [[0, 'At start'], [10, '10 min before'], [30, '30 min before'], [60, '1 hour before'], [1440, '1 day before']];
 
 // Persistent (module-level) UI state — same pattern as contacts.js's selId/tagFilter: it must
 // survive the full-innerHTML re-render every view refresh does.
 let agendaOpen = false;
+
+// ---- Invitations you've received but haven't answered yet — surfaced on the rail badge, the
+// agenda panel (quick accept/decline), and as an inline banner on the companion mail thread
+// (see views/mail.js). "you@envoir.org" mirrors the constant used everywhere else in this demo.
+export function pendingInvites() {
+  return state.events
+    .filter(e => e.organizer !== 'you@envoir.org' && (e.attendees.find(a => a.address === 'you@envoir.org') || {}).rsvp === 'pending')
+    .sort((a, b) => a.start - b.start);
+}
+
+// Answer an invitation: updates local RSVP state and seals a real signed RSVP MOTE back to the
+// organizer (spec §8.4, iTIP-style) — shared by the event detail modal, the agenda's quick
+// actions, and the inline banner mail.js shows on the invite's mail thread.
+export async function respondRsvp(ev, response) {
+  const me = ev.attendees.find(a => a.address === 'you@envoir.org');
+  if (!me) return;
+  me.rsvp = response;
+  await buildMote({ to: ev.organizer, kind: KIND.calendar, subject: 'RSVP: ' + ev.title, body: JSON.stringify({ type: 'rsvp', rsvp: response }), tier: state.settings.tierDefault });
+  bus.rerender(); bus.refreshChrome();
+  toast(`${icon('check')} RSVP '${RSVP[response]}' sent to ${person(ev.organizer).name} — peer-to-peer, no server`);
+}
 
 export function render(root) {
   root.className = 'view cal-view';
@@ -97,10 +118,23 @@ function agendaItemHtml(e) {
     <div><b>${esc(e.title)}</b><span>${e.allDay ? 'All day' : fmtClock(e.start) + '–' + fmtClock(e.end)}${e.recurrence ? ' · ' + icon('repeat') : ''}</span></div>
     ${isMeeting(e) ? `<i class="ag-meet" title="Meeting">${icon('groups')}</i>` : ''}</button>`;
 }
+// An invitation row in the agenda: same look as a regular agenda item, plus inline Accept/Decline
+// so you never have to open the full event modal just to answer (spec §8.4 RSVP-as-a-message).
+function inviteAgendaHtml(e) {
+  return `<div class="ag-item ag-invite" data-id="${e.id}" tabindex="0" role="button" aria-label="Invitation: ${esc(e.title)} from ${esc(person(e.organizer).name)}">
+    <i style="--h:${e.color}"></i>
+    <div><b>${esc(e.title)}</b><span>${esc(person(e.organizer).name)} · ${e.allDay ? 'All day' : fmtClock(e.start)}</span></div>
+    <div class="ag-invite-actions">
+      <button class="icon-btn sm" data-r="yes" title="Accept" aria-label="Accept">${icon('check')}</button>
+      <button class="icon-btn sm" data-r="no" title="Decline" aria-label="Decline">${icon('x')}</button>
+    </div>
+  </div>`;
+}
 function drawAgenda(root) {
   const list = root.querySelector('#cal-agenda-list');
   const now = new Date();
   const todays = eventsOn(now);
+  const invites = pendingInvites();
   let weekHtml = '';
   for (let i = 1; i <= 6; i++) {
     const day = new Date(now.getTime() + i * DAY);
@@ -109,11 +143,17 @@ function drawAgenda(root) {
     weekHtml += `<div class="ag-day-h">${day.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</div>${evs.map(agendaItemHtml).join('')}`;
   }
   list.innerHTML = `
+    ${invites.length ? `<div class="ag-section-h">Invitations <i class="list-count">${invites.length}</i></div>${invites.map(inviteAgendaHtml).join('')}` : ''}
     <div class="ag-section-h">Today</div>
     ${todays.length ? todays.map(agendaItemHtml).join('') : '<div class="ag-empty">Nothing scheduled today.</div>'}
     <div class="ag-section-h ag-week">This week</div>
     ${weekHtml || '<div class="ag-empty">Nothing else this week.</div>'}`;
-  list.querySelectorAll('.ag-item').forEach(b => b.onclick = () => eventModal(state.events.find(e => e.id === b.dataset.id)));
+  list.querySelectorAll('.ag-item:not(.ag-invite)').forEach(b => b.onclick = () => eventModal(state.events.find(e => e.id === b.dataset.id)));
+  list.querySelectorAll('.ag-invite').forEach(row => {
+    row.onclick = (ev) => { if (ev.target.closest('[data-r]')) return; eventModal(state.events.find(e => e.id === row.dataset.id)); };
+    row.onkeydown = (ev) => { if ((ev.key === 'Enter' || ev.key === ' ') && !ev.target.closest('[data-r]')) { ev.preventDefault(); eventModal(state.events.find(e => e.id === row.dataset.id)); } };
+    row.querySelectorAll('[data-r]').forEach(b => b.onclick = (ev) => { ev.stopPropagation(); respondRsvp(state.events.find(e => e.id === row.dataset.id), b.dataset.r); });
+  });
 }
 
 // ---- Week view (default) ------------------------------------------------------------------
@@ -215,13 +255,17 @@ function eventModal(e, presetDay) {
   // Replace the detail modal with the editor in place. Do NOT closeModal() first — its deferred
   // innerHTML clear (180ms) would wipe the editor we open synchronously right after.
   card.querySelector('#evedit')?.addEventListener('click', () => newEventModal(null, e));
-  card.querySelector('#evdel').onclick = () => { state.events = state.events.filter(x => x.id !== e.id); closeModal(); bus.rerender(); toast('Event deleted'); };
+  card.querySelector('#evdel').onclick = async () => {
+    const isOrganizer = e.organizer === 'you@envoir.org';
+    const guests = isOrganizer ? e.attendees.filter(a => a.address !== 'you@envoir.org').map(a => a.address) : [];
+    state.events = state.events.filter(x => x.id !== e.id);
+    closeModal(); bus.rerender();
+    toast(guests.length ? `${icon('trash')} Event deleted — cancellation sealed to ${guests.length} guest(s)` : 'Event deleted');
+    for (const g of guests) await buildMote({ to: g, kind: KIND.calendar, subject: 'Cancelled: ' + e.title, body: JSON.stringify({ type: 'cancel' }), tier: state.settings.tierDefault });
+  };
   if (me) card.querySelectorAll('[data-r]').forEach(b => b.onclick = async () => {
-    me.rsvp = b.dataset.r;
-    const mote = await buildMote({ to: e.organizer, kind: KIND.calendar, subject: 'RSVP: ' + e.title, body: JSON.stringify({ rsvp: me.rsvp }), tier: state.settings.tierDefault });
+    await respondRsvp(e, b.dataset.r);
     card.querySelectorAll('[data-r]').forEach(x => x.classList.toggle('on', x.dataset.r === me.rsvp));
-    toast(`${icon('check')} RSVP '${RSVP[me.rsvp]}' sent to ${person(e.organizer).name} — peer-to-peer, no server`);
-    bus.rerender();
   });
 }
 
@@ -370,19 +414,38 @@ export function newEventModal(presetDay, existing, presetGuestAddrs) {
       existing.allDay = allDay; existing.description = description;
       // preserve RSVPs for guests still invited; add pending for new ones
       existing.attendees = existing.attendees.filter(a => a.address.startsWith('you@') || guests.includes(a.address));
-      guests.filter(g => !oldGuests.has(g)).forEach(g => existing.attendees.push({ address: g, rsvp: 'pending' }));
+      const newGuests = guests.filter(g => !oldGuests.has(g));
+      const keptGuests = guests.filter(g => oldGuests.has(g));
+      newGuests.forEach(g => existing.attendees.push({ address: g, rsvp: 'pending' }));
+      // A real signed MOTE per invitee (spec §8.4) — a fresh invite for anyone newly added, an
+      // honest "update" MOTE for anyone already invited, so "re-sealed" is actually true.
+      for (const g of newGuests) await buildMote({ to: g, kind: KIND.calendar, subject: 'Invite: ' + title, body: JSON.stringify({ type: 'invite', start, end, location }), tier: state.settings.tierDefault });
+      for (const g of keptGuests) await buildMote({ to: g, kind: KIND.calendar, subject: 'Update: ' + title, body: JSON.stringify({ type: 'update', start, end, location }), tier: state.settings.tierDefault });
       closeModal(); bus.rerender();
-      toast(`${icon('check')} Event updated — changes re-sealed to guests`);
+      const bits = [];
+      if (newGuests.length) bits.push(`invitations sealed to ${newGuests.length} new guest(s)`);
+      if (keptGuests.length) bits.push(`updates re-sealed to ${keptGuests.length} guest(s)`);
+      toast(`${icon('check')} Event updated${bits.length ? ' · ' + bits.join(' · ') : ''}`);
       return;
     }
     const ev = { id: uid('e'), title, color, start, end, recurrence, location, reminders, allDay, description,
       organizer: 'you@envoir.org',
       attendees: [{ address: 'you@envoir.org', rsvp: 'yes' }, ...guests.map(g => ({ address: g, rsvp: 'pending' }))] };
     state.events.push(ev);
-    const mote = await buildMote({ to: guests[0] || 'you@envoir.org', kind: KIND.calendar, subject: title, body: JSON.stringify({ start, end }), tier: state.settings.tierDefault });
+    // One real signed invite MOTE per invitee (spec §8.4, iTIP-style) — not just a single
+    // representative send; every guest gets their own sealed copy addressed to their own key.
+    const motes = [];
+    for (const g of guests) motes.push(await buildMote({ to: g, kind: KIND.calendar, subject: 'Invite: ' + title, body: JSON.stringify({ type: 'invite', start, end, location }), tier: state.settings.tierDefault }));
     closeModal(); bus.rerender();
-    if (guests.length) showInspector(mote, { path: ['your node', 'mixnet', 'guests'], latencyMs: 0, kind: 'mixnet' });
-    toast(`${icon('check')} Event created${guests.length ? ' · meeting invitations sealed to ' + guests.length + ' guest(s)' : ''}`);
+    if (motes.length) showInspector(motes[0], { path: ['your node', 'mixnet', 'guests'], latencyMs: 0, kind: 'mixnet' });
+    toast(`${icon('check')} Event created${motes.length ? ` · ${motes.length} individually-sealed invitation MOTE(s) sent` : ''}`);
   };
-  if (existing) card.querySelector('#evdel2').onclick = () => { state.events = state.events.filter(x => x.id !== existing.id); closeModal(); bus.rerender(); toast('Event deleted'); };
+  if (existing) card.querySelector('#evdel2').onclick = async () => {
+    const isOrganizer = existing.organizer === 'you@envoir.org';
+    const guests = isOrganizer ? existing.attendees.filter(a => a.address !== 'you@envoir.org').map(a => a.address) : [];
+    state.events = state.events.filter(x => x.id !== existing.id);
+    closeModal(); bus.rerender();
+    toast(guests.length ? `${icon('trash')} Event deleted — cancellation sealed to ${guests.length} guest(s)` : 'Event deleted');
+    for (const g of guests) await buildMote({ to: g, kind: KIND.calendar, subject: 'Cancelled: ' + existing.title, body: JSON.stringify({ type: 'cancel' }), tier: state.settings.tierDefault });
+  };
 }

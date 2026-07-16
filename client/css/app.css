@@ -397,6 +397,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .chip-lbl .ic { width: 11px; height: 11px; }
 .chip-lbl.legacy { --h: 32; color: var(--legacy); background: color-mix(in srgb, var(--legacy) 15%, transparent); }
 .chip-lbl.snoozed { --h: 40; color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+.chip-lbl.invite { --h: 262; }
 .tstar { flex-shrink: 0; color: var(--text-faint); opacity: 0; transition: .12s; }
 .tstar .ic { width: 17px; height: 17px; }
 .trow:hover .tstar, .tstar.on { opacity: 1; }
@@ -692,6 +693,18 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .ag-meet { display: inline-grid; place-items: center; color: var(--accent-ink); flex-shrink: 0; }
 .ag-meet .ic { width: 14px; height: 14px; }
 .ag-empty, .add-list .ag-empty { color: var(--text-faint); font-size: 13px; padding: 12px; }
+.ag-invite { cursor: pointer; }
+.ag-invite-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.ag-invite-actions .icon-btn.sm { width: 26px; height: 26px; }
+
+/* Inline calendar-invite banner shown at the top of the reading pane (mail.js) for a thread
+   that carries a companion calendar event — RSVP right here, or from Calendar. */
+.invite-banner { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 14px 18px; }
+.invite-banner-main { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 180px; }
+.invite-banner-main .ic { width: 20px; height: 20px; color: var(--accent-ink); flex-shrink: 0; }
+.invite-banner-main b { display: block; font-size: 14px; }
+.invite-banner-main span { font-size: 12.5px; color: var(--text-faint); }
+.invite-banner-actions { display: flex; gap: 6px; }
 
 .cal-body.month { padding: 0; }
 .mo-dow { display: grid; grid-template-columns: repeat(7, 1fr); border-bottom: 1px solid var(--line); }

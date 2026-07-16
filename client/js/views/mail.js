@@ -10,6 +10,7 @@ import { planDelivery, animatePath } from '../mesh-sim.js';
 import { pathBadge, pathSummary, pathToggleButton, pathGraphHtml, threadProvenance } from '../provenance.js';
 import { bus } from '../bus.js';
 import { openCompose } from '../compose.js';
+import { respondRsvp, RSVP } from './calendar.js';
 
 export function render(root) {
   const ui = state.ui;
@@ -119,7 +120,7 @@ function drawList(root) {
         </div>
         <div class="tsubj">${esc(t.subject)}</div>
         <div class="tprev">${esc(last.body.split('\n')[0])}</div>
-        <div class="tchips">${t.labels.map(id => { const l = LABELS.find(x => x.id === id); return l ? `<i class="chip-lbl" style="--h:${l.hue}">${esc(l.name)}</i>` : ''; }).join('')}${t.snoozeUntil ? `<i class="chip-lbl snoozed">${icon('snooze')} snoozed</i>` : ''}${t.legacy ? `<i class="chip-lbl legacy">legacy-origin</i>` : ''}</div>
+        <div class="tchips">${t.labels.map(id => { const l = LABELS.find(x => x.id === id); return l ? `<i class="chip-lbl" style="--h:${l.hue}">${esc(l.name)}</i>` : ''; }).join('')}${t.snoozeUntil ? `<i class="chip-lbl snoozed">${icon('snooze')} snoozed</i>` : ''}${t.legacy ? `<i class="chip-lbl legacy">legacy-origin</i>` : ''}${t.calendarEventId ? `<i class="chip-lbl invite">${icon('calendar')} invite</i>` : ''}</div>
       </div>
       <button class="tstar ${t.starred ? 'on' : ''}" data-star="${t.id}" aria-label="Star">${icon('star')}</button>
     </div>`);
@@ -205,6 +206,20 @@ function drawRead(root) {
     </footer>`;
 
   const scroll = wrap.querySelector('#read-scroll');
+  // A calendar invite MOTE arriving in Mail (spec §8.4) — RSVP right here, or from Calendar.
+  if (t.calendarEventId) {
+    const ev = state.events.find(x => x.id === t.calendarEventId);
+    if (ev) {
+      const me = ev.attendees.find(a => a.address === 'you@envoir.org');
+      const when = new Date(ev.start).toLocaleString([], { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+      const banner = el(`<div class="invite-banner">
+        <div class="invite-banner-main">${icon('calendar')}<div><b>${esc(ev.title)}</b><span>${ev.allDay ? 'All day' : esc(when)}</span></div></div>
+        ${me ? `<div class="invite-banner-actions">${['yes', 'maybe', 'no'].map(r => `<button class="btn sm ${me.rsvp === r ? 'primary' : ''}" data-rsvp="${r}">${RSVP[r]}</button>`).join('')}</div>` : ''}
+      </div>`);
+      if (me) banner.querySelectorAll('[data-rsvp]').forEach(b => b.onclick = () => respondRsvp(ev, b.dataset.rsvp));
+      scroll.appendChild(banner);
+    }
+  }
   t.msgs.forEach((m, i) => {
     const p = m.from === 'you' ? { name: 'You', hue: 220, address: 'you', trust: 'verified' } : person(m.from);
     const last = i === t.msgs.length - 1;

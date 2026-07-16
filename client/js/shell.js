@@ -12,7 +12,7 @@ import { onInstallPromptChange } from './pwa.js';
 
 import { render as renderMail, mailKeys } from './views/mail.js';
 import { render as renderChat } from './views/chat.js';
-import { render as renderCalendar } from './views/calendar.js';
+import { render as renderCalendar, pendingInvites } from './views/calendar.js';
 import { render as renderContacts } from './views/contacts.js';
 import { render as renderFiles } from './views/files.js';
 import { render as renderIdentity } from './views/identity.js';
@@ -139,8 +139,9 @@ function refreshChrome() {
   const app = document.getElementById('app');
   const unread = state.mail.filter(t => t.folder === 'inbox' && !t.read).length;
   const chatUnread = state.chats.reduce((n, c) => n + (c.unread || 0), 0);
+  const inviteCount = pendingInvites().length;
   const setBadge = (id, n) => { const e = app.querySelector(`[data-badge="${id}"]`); if (e) { e.textContent = n || ''; e.classList.toggle('on', !!n); } };
-  setBadge('mail', unread); setBadge('chat', chatUnread);
+  setBadge('mail', unread); setBadge('chat', chatUnread); setBadge('calendar', inviteCount);
   const t = app.querySelector('#theme-toggle'); if (t) t.innerHTML = icon(state.settings.theme === 'dark' ? 'sun' : 'moon');
   const id = currentIdentity();
   const railId = app.querySelector('#rail-id');

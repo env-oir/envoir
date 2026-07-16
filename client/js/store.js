@@ -55,6 +55,48 @@ export function initStore() {
   state.ui.selGroup = state.groups[0]?.id || null;
 }
 
+// ---- Wake-ping demo: simulate a fresh incoming calendar invite arriving over the mesh --------
+// Wired from app.js's onWakeSync handler. Both a REAL Push event and the Settings "Send test
+// wake-ping" button funnel through the exact same service-worker message (sw.js), so this one
+// path exercises the whole push -> sync -> new content loop honestly, end-to-end, in-browser.
+// Like the rest of the seed data, the INCOMING side is simulated (we can't sign as someone
+// else's key in this demo) — only messages *you* send build a real MOTE (mote.js).
+const INVITE_TITLES = ['Quick sync', 'Roadmap check-in', 'Coffee chat', 'Relay planning', 'Spec walkthrough', 'Design pairing'];
+const INVITE_COLORS = [210, 262, 330, 150, 46, 8, 190];
+let _inviteSeq = 0;
+export function simulateIncomingInvite() {
+  const candidates = PEOPLE.filter(p => p.trust !== 'legacy' && !(p.address || '').startsWith('you@'));
+  const organizer = candidates[_inviteSeq++ % candidates.length];
+  const title = INVITE_TITLES[Math.floor(Math.random() * INVITE_TITLES.length)];
+  const start = new Date();
+  start.setDate(start.getDate() + 1 + Math.floor(Math.random() * 4));
+  start.setHours(9 + Math.floor(Math.random() * 7), 0, 0, 0);
+  const startMs = start.getTime();
+  const endMs = startMs + (30 + Math.floor(Math.random() * 3) * 15) * 60e3;
+  const ev = {
+    id: uid('e'), title, color: INVITE_COLORS[Math.floor(Math.random() * INVITE_COLORS.length)],
+    start: startMs, end: endMs, recurrence: null, location: null, reminders: [10], allDay: false,
+    description: 'Arrived just now over the mesh — a calendar MOTE sealed to your key.',
+    organizer: organizer.address,
+    attendees: [{ address: organizer.address, rsvp: 'yes' }, { address: 'you@envoir.org', rsvp: 'pending' }],
+  };
+  state.events.push(ev);
+  const when = new Date(startMs).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }) +
+    ' at ' + new Date(startMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const inviteThread = {
+    id: uid('t'), subject: `Invitation: ${title}`, labels: [], folder: 'inbox', read: false, starred: false,
+    snoozeUntil: null, tier: 'private', verified: organizer.trust === 'verified', legacy: false,
+    calendarEventId: ev.id,
+    msgs: [{
+      id: uid('m'), from: organizer.id, to: ['you@envoir.org'], time: Date.now(), tier: 'private',
+      provenance: { tier: 'private', profile: 'standard', origin: 'pure-mesh', minHops: 3, observedAt: Date.now(), gateways: [] },
+      body: `${organizer.name} invited you to "${title}" — ${when}. Sealed as a calendar MOTE straight to your key; RSVP below or from Calendar.`,
+    }],
+  };
+  state.mail.unshift(inviteThread);
+  return { event: ev, thread: inviteThread, organizer };
+}
+
 export function saveSettings() {
   localStorage.setItem(LS_SETTINGS, JSON.stringify(state.settings));
 }
