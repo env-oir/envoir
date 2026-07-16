@@ -97,13 +97,48 @@ export const rolesOf = (address) => state.caps.filter(c => c.subject === address
 export const member = (id) => state.members.find(m => m.id === id);
 export const group = (id) => state.groups.find(g => g.id === id);
 
+// ---- billing: gateway-metered vs self-host $0 (spec §7.2a legacy bridge, §4 relay) ---------
+// The seam only ever meters OPERATIONS that actually cross operator infrastructure — never a
+// protocol capability. Native DMTAP mail, mixnet routing, KT reads/appends and directory
+// resolution are always $0. Hosted storage / legacy-bridge sends / relay bytes are $0 too the
+// moment the corresponding policy switch says this domain isn't drawing on operator infra.
+export function effectiveMeters() {
+  const raw = state.domain.meters;
+  const p = state.domain.policy;
+  return {
+    storage_bytes: p.selfHost === 'self-hosted' ? 0 : raw.storage_bytes,
+    gateway_sends: p.legacyBridge ? raw.gateway_sends : 0,
+    inbound_legacy: p.legacyBridge ? raw.inbound_legacy : 0,
+    // direct-first still falls back to relay occasionally; relay-required routes everything.
+    relay_bytes: p.relayMode === 'relay-required' ? raw.relay_bytes : Math.round(raw.relay_bytes * 0.12),
+  };
+}
+
+// ---- Key Transparency pin (spec §3.5) -------------------------------------------------------
+// The tree size is derived from the domain's own KT-logged audit trail (every admin act is an
+// append) plus a base offset standing in for the rest of the global log this domain shares.
+export const ktTreeSize = () => 118402 + state.audit.length;
+export const ktRootHash = () => state.audit[0]?.hash || 'kt:genesis';
+export const KT_FRESHNESS_MS = 24 * 3600e3;
+export const ktIsFresh = (w) => (Date.now() - w.lastSeen) < KT_FRESHNESS_MS;
+
+// Re-gossip: every witness re-confirms the pinned root right now. This is the console's own
+// re-verification, not a silent auto-refresh — it is KT-logged like any other administrative act.
+export async function verifyKtCheckpoint() {
+  const d = state.domain;
+  const now = Date.now();
+  d.ktCheckpointAt = now;
+  d.ktWitnesses = d.ktWitnesses.map(w => ({ ...w, lastSeen: now }));
+  await logEvent('directory', `KT checkpoint re-verified across ${d.ktWitnesses.length} witnesses — consistent, no split-view`);
+}
+
 // ---- seed a believable demo domain --------------------------------------------------------
 // Produces @abc.com with a threshold-held authority, a mix of sovereign + org-managed members,
 // standing groups, delegated admin roles, and an initial KT trail. `authority` is created by
 // session.js (real keypair); this fills the rest.
 export async function seed(domainName, authority) {
   const now = Date.now();
-  const DAY = 86400e3;
+  const DAY = 86400e3, HOUR = 3600e3, MIN = 60e3;
   state.domain = {
     name: domainName,
     authorityIk: authority.ik,
@@ -124,6 +159,33 @@ export async function seed(domainName, authority) {
     dirSigningKeyId: authority.fingerprint.slice(0, 12) + '·dir',
     membershipVisibility: 'members-only',
     created: now - 210 * DAY,
+
+    // ---- gateway / relay policy (spec §7.2a legacy bridge, §4 relay) — who may self-host, and
+    // which operators this domain trusts to bridge/relay its traffic. Read by Billing to decide
+    // what's gateway-metered vs $0 self-hosted.
+    policy: {
+      selfHost: 'org-hosted', // 'org-hosted' | 'self-hosted'
+      legacyBridge: true,
+      trustedGateways: [`gw1.eu-central.envoir.net`, `gw1.eu-west.envoir.net`],
+      relayMode: 'direct-first', // 'direct-first' | 'relay-required'
+      trustedRelays: [`relay1.eu-central.envoir.net`],
+    },
+
+    // ---- billing tier (mirrors the superadmin's dmtap-seam TIERS: key_only / gateway_domain /
+    // vanity_domain) + the raw metered usage this period. Billing.js derives what's actually
+    // charged (effectiveMeters) from these + the policy above.
+    billing: { tier: 'gateway_domain' },
+    meters: { storage_bytes: 0, gateway_sends: 1830, inbound_legacy: 940, relay_bytes: 64e9 },
+
+    // ---- Key Transparency pin (spec §3.5) — the checkpoint this domain trusts, cross-checked
+    // by independent gossiping witnesses. A stale witness doesn't mean a split-view, but it can't
+    // yet corroborate the pinned root; "Verify latest checkpoint" re-gossips and re-timestamps.
+    ktCheckpointAt: now - 42 * MIN,
+    ktWitnesses: [
+      { name: 'witness-eu.envoir.dev', lastSeen: now - 6 * MIN },
+      { name: 'witness-af.mesh.example', lastSeen: now - 11 * MIN },
+      { name: 'community-audit.example', lastSeen: now - 26 * HOUR },
+    ],
   };
 
   const mk = async (name, local, custody, opts = {}) => {
@@ -151,6 +213,7 @@ export async function seed(domainName, authority) {
     await mk('Billing', 'billing', 'org-managed', { title: 'Finance shared inbox · legal discovery', added: now - 120 * DAY }),
     await mk('Jordan Lee', 'jordan', 'sovereign', { title: 'Contractor', added: now - 20 * DAY, dirVerified: false }),
   ];
+  state.domain.meters.storage_bytes = state.members.filter(m => m.status === 'active').length * 620e6 + 1.4e9;
 
   const gk = async (name, local, mode, memberLocals, opts = {}) => {
     const kp = await generateKeypair();

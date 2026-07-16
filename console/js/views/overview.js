@@ -3,10 +3,10 @@
 // sovereignty guarantee — made legible up front: a domain owner should SEE what they can and
 // cannot do to a member (spec §3.10.1–§3.10.2).
 
-import { state, republishDirectory } from '../store.js';
+import { state, republishDirectory, ktTreeSize, ktRootHash, ktIsFresh, verifyKtCheckpoint } from '../store.js';
 import { collectThreshold } from '../session.js';
 import { bus } from '../bus.js';
-import { esc, icon, safetyGrid, safetyWords, emptyState, toast, timeAgo, copyBtn } from '../ui.js';
+import { esc, icon, safetyGrid, safetyWords, emptyState, toast, timeAgo, copyBtn, fmtNum } from '../ui.js';
 
 export function render(root) {
   root.className = 'view scroll-view';
@@ -15,6 +15,10 @@ export function render(root) {
   const sovereign = active.filter(m => m.custody === 'sovereign').length;
   const managed = active.filter(m => m.custody === 'org-managed').length;
   const caps = state.caps.filter(c => !c.revoked).length;
+  const treeSize = ktTreeSize();
+  const rootHash = ktRootHash();
+  const staleCount = d.ktWitnesses.filter(w => !ktIsFresh(w)).length;
+  const allFresh = staleCount === 0;
   const dnsRows = [
     ['dmtap', '_dmtap anchor', 'Publishes the domain authority IK and directory locator'],
     ['kt', 'kt= transparency', 'Append-only log of every name→key binding change'],
@@ -106,6 +110,35 @@ export function render(root) {
       </div>
     </section>
 
+    <section class="card kt-card">
+      <div class="card-h">
+        <h2>${icon('kt')} Key Transparency — pinned checkpoint</h2>
+        <span class="pill ${allFresh ? 'good' : 'warn'} sm">${allFresh ? icon('check') + ' fresh' : icon('warn') + ' stale witness'}</span>
+      </div>
+      <p class="card-sub">The append-only name→key log this domain pins against (spec §3.5). Freshness and cross-witness consistency are what make a covert re-key or split-view detectable.</p>
+      <div class="kt-grid">
+        <div class="kvr"><span>Tree size</span><b class="mono">${fmtNum(treeSize)}</b></div>
+        <div class="kvr"><span>Pinned root</span><b class="mono ellip">${esc(rootHash)}</b></div>
+        <div class="kvr"><span>Last verified</span><b class="mono">${esc(timeAgo(d.ktCheckpointAt))}</b></div>
+      </div>
+      <div class="kt-witnesses">
+        ${d.ktWitnesses.map(w => {
+          const fresh = ktIsFresh(w);
+          return `<div class="kt-w ${fresh ? 'ok' : 'stale'}">
+            <span class="kt-w-dot ${fresh ? 'good' : 'warn'}"></span>
+            <div class="kt-w-main"><b class="mono">${esc(w.name)}</b><small>${fresh ? 'consistent · pinned root confirmed' : "stale — hasn't gossiped a fresh checkpoint"}</small></div>
+            <span class="muted">${esc(timeAgo(w.lastSeen))}</span>
+          </div>`;
+        }).join('')}
+      </div>
+      ${!allFresh ? `<div class="banner warn">${icon('warn')} <span><b>${staleCount}</b> witness${staleCount === 1 ? '' : 'es'} ${staleCount === 1 ? "hasn't" : "haven't"} gossiped a fresh checkpoint in over 24h. This alone isn't a split-view, but a stale witness can't yet corroborate the pinned root.</span></div>` : ''}
+      <div class="card-foot">
+        <span class="sim-tag">${icon('info')} witness gossip is simulated</span>
+        <div class="spacer"></div>
+        <button class="btn sm" id="ktverify">${icon('refresh')} Verify latest checkpoint</button>
+      </div>
+    </section>
+
     <section class="card">
       <div class="card-h"><h2>${icon('audit')} Recent activity</h2><button class="btn ghost sm" data-go="audit">View full log →</button></div>
       <div class="ov-audit" id="ov-audit"></div>
@@ -131,6 +164,12 @@ export function render(root) {
     d.dirSigningKeyId = Math.random().toString(36).slice(2, 14) + '·dir';
     await republishDirectory('directory-signing key rotated (threshold)');
     toast(`${icon('check')} Directory key rotated · directory re-signed`);
+    bus.rerender();
+  };
+
+  root.querySelector('#ktverify').onclick = async () => {
+    await verifyKtCheckpoint();
+    toast(`${icon('check')} Checkpoint re-verified across ${d.ktWitnesses.length} witnesses`);
     bus.rerender();
   };
 }

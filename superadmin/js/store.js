@@ -30,6 +30,7 @@ export const state = {
   signals: [],     // aggregate anti-abuse signals (metadata only — content-blind)
   incidents: [],   // ops incident / alert feed
   pool: [],        // warm-pool / capacity per region
+  kt: null,        // Key Transparency log health: tree size, root, witness gossip
   ui: { search: '', theme: 'dark', selNode: null, fleetKind: 'all', billingSort: 'storage', ackd: {} },
 };
 
@@ -54,8 +55,8 @@ export const uid = (p = 'x') => p + '_' + (++_seq).toString(36) + Date.now().toS
 
 // ---- persistence --------------------------------------------------------------------------
 export function persist() {
-  const { fleet, accounts, signals, incidents, pool, ui } = state;
-  localStorage.setItem(LS, JSON.stringify({ fleet, accounts, signals, incidents, pool, theme: ui.theme, ackd: ui.ackd }));
+  const { fleet, accounts, signals, incidents, pool, kt, ui } = state;
+  localStorage.setItem(LS, JSON.stringify({ fleet, accounts, signals, incidents, pool, kt, theme: ui.theme, ackd: ui.ackd }));
 }
 export function hasSession() { return !!localStorage.getItem(LS); }
 export function wipe() { localStorage.removeItem(LS); }
@@ -65,7 +66,7 @@ export async function load() {
   if (!raw) return false;
   try {
     const s = JSON.parse(raw);
-    Object.assign(state, { fleet: s.fleet, accounts: s.accounts, signals: s.signals, incidents: s.incidents, pool: s.pool });
+    Object.assign(state, { fleet: s.fleet, accounts: s.accounts, signals: s.signals, incidents: s.incidents, pool: s.pool, kt: s.kt });
     state.ui.theme = s.theme || 'dark';
     state.ui.ackd = s.ackd || {};
     document.documentElement.setAttribute('data-theme', state.ui.theme);
@@ -93,6 +94,26 @@ export function meterTotals() {
   return t;
 }
 export const openIncidents = () => state.incidents.filter(i => i.status !== 'resolved');
+
+// ---- Key Transparency log health (spec §3.5) — split-view + freshness ---------------------
+// A witness is STALE once its gossip is older than the freshness SLA (not itself a split-view —
+// just a witness that can't yet corroborate the pinned root). A SPLIT is any witness whose last
+// gossiped root hash disagrees with the canonical published root — the severe case.
+export const ktWitnessFresh = (w) => (Date.now() - w.lastGossip) < (state.kt?.freshnessSla ?? 30 * 60e3);
+export const ktWitnessSplit = (w) => w.rootHash !== state.kt?.rootHash;
+export function ktStaleCount() { return state.kt ? state.kt.witnesses.filter(w => !ktWitnessFresh(w)).length : 0; }
+export function ktSplitCount() { return state.kt ? state.kt.witnesses.filter(w => ktWitnessSplit(w)).length : 0; }
+
+// Force a fresh gossip round: every witness re-confirms the published root right now. KT-logged
+// implicitly by the incident feed staying honest — this is the operator's own re-verification,
+// not a silent auto-heal.
+export function ktReverify() {
+  if (!state.kt) return;
+  const now = Date.now();
+  state.kt.publishedAt = now;
+  state.kt.witnesses = state.kt.witnesses.map(w => ({ ...w, lastGossip: now, rootHash: state.kt.rootHash }));
+  persist();
+}
 
 // ---- seed a believable operator fleet -----------------------------------------------------
 export function seed() {
@@ -207,7 +228,25 @@ export function seed() {
     { id: uid('inc'), sev: 'critical', status: 'investigating', title: 'gw1.af-south unreachable', body: 'Legacy gateway in Johannesburg not answering health probes. Egress failing over to eu-central; inbound-legacy queued.', components: ['gateway', 'af-south'], started: now - 18 * MIN, updated: now - 3 * MIN },
     { id: uid('inc'), sev: 'minor', status: 'resolved', title: 'Attestation key rotation on gw2.eu-central', body: 'Rotated the domain-anchored attestation key; recipients re-verified within one TTL. No egress interruption.', components: ['gateway'], started: now - 5 * HOUR, updated: now - 4.2 * HOUR },
     { id: uid('inc'), sev: 'minor', status: 'resolved', title: 'Warm-pool drained in eu-west', body: 'Claim spike consumed the eu-west warm pool; autoscaler refilled to target in 4m.', components: ['eu-west'], started: now - 2 * DAY, updated: now - 2 * DAY + 9 * MIN },
+    { id: uid('inc'), sev: 'critical', status: 'resolved', title: 'KT witness split-view detected (community-audit.example)', body: 'A gossiping witness briefly reported a divergent root hash after a network partition. Cross-witness quorum confirmed the canonical root within one gossip round; the divergent witness was flagged and re-synced. No name→key binding was ever served inconsistently to clients.', components: ['kt'], started: now - 9 * DAY, updated: now - 9 * DAY + 40 * MIN },
   ];
+
+  // ---- Key Transparency log health (spec §3.5) — split-view + freshness monitoring ---------
+  // Content-blind like everything else here: this is metadata about the LOG (tree size, root
+  // hash, witness gossip timing), never about what any binding resolves to for whom.
+  const ktRoot = b64key(rnd).slice(0, 24);
+  state.kt = {
+    treeSize: 118402 + iBetween(400, 1600),
+    rootHash: ktRoot,
+    publishedAt: now - iBetween(2, 14) * MIN,
+    freshnessSla: 30 * MIN,
+    witnesses: [
+      { name: 'witness-eu.envoir.dev', region: 'eu-central', rootHash: ktRoot, lastGossip: now - iBetween(1, 8) * MIN },
+      { name: 'witness-af.mesh.example', region: 'af-south', rootHash: ktRoot, lastGossip: now - iBetween(2, 12) * MIN },
+      { name: 'witness-us.gossip.example', region: 'us-east', rootHash: ktRoot, lastGossip: now - 5 * HOUR },
+      { name: 'community-audit.example', region: 'eu-west', rootHash: ktRoot, lastGossip: now - iBetween(3, 20) * MIN },
+    ],
+  };
 
   // ---- Warm-pool / capacity per region (conceptual provisioning view) ----------------------
   state.pool = REGIONS.map(r => {

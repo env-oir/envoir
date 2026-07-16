@@ -291,6 +291,20 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .meters-more { align-self: flex-start; margin-top: 14px; }
 .wide-tiles { grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
 
+.card-foot { display: flex; align-items: center; gap: 12px; padding-top: 12px; margin-top: 2px; border-top: 1px solid var(--line); }
+
+/* ---------- Key Transparency log health ---------- */
+.kt-figs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
+.kt-fig { display: flex; flex-direction: column; gap: 2px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; }
+.kf-n { font-size: 16px; font-weight: 800; letter-spacing: -.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kf-l { font-size: 11px; color: var(--text-faint); }
+.kt-witness-list { display: grid; gap: 8px; margin-bottom: 4px; }
+.kt-witness { display: flex; align-items: center; gap: 12px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r); padding: 11px 13px; }
+.kt-witness.warn { border-color: color-mix(in srgb, var(--warn) 30%, var(--line)); }
+.kt-witness.bad { border-color: color-mix(in srgb, var(--bad) 34%, var(--line)); }
+.kt-witness-main { flex: 1; min-width: 0; } .kt-witness-main b { display: block; font-size: 12.5px; } .kt-witness-main small { font-size: 10.5px; color: var(--text-faint); }
+.kt-witness-t { font-size: 11px; color: var(--text-faint); flex-shrink: 0; }
+
 .incident-feed { display: grid; gap: 2px; }
 .incident-row { display: flex; gap: 12px; padding: 14px 4px; border-bottom: 1px solid var(--line); align-items: flex-start; }
 .incident-row:last-child { border-bottom: none; }
@@ -514,6 +528,6 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .signal-side { flex-direction: row; align-items: center; }
 }
 @media (max-width: 440px) {
-  .kind-grid, .abuse-stats, .prov-stats, .metric-grid, .pr-figs, .meter-tiles, .wide-tiles { grid-template-columns: 1fr; }
+  .kind-grid, .abuse-stats, .prov-stats, .metric-grid, .pr-figs, .meter-tiles, .wide-tiles, .kt-figs { grid-template-columns: 1fr; }
   .load-figs { gap: 12px; }
 }

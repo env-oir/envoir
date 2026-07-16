@@ -20,6 +20,7 @@ export const state = {
   overall: 'operational',
   user: null,
   loading: false,
+  transparency: null, // KT consistency + gateway attestation freshness (public "Transparency" panel)
 };
 
 // The six public components (spec-mapped surfaces of the protocol).
@@ -131,8 +132,28 @@ export function rebuild() {
     ];
   }
 
+  state.transparency = buildTransparency(sc, now);
   if (state.signedIn) buildUser();
   state.loading = false;
+}
+
+// ---- transparency: KT consistency + gateway attestation freshness (spec §3.5, §7.2a) ------
+// The public counterpart to the superadmin's KT-log-health + attestation views: cross-witness
+// consistency and how fresh the last re-verification was, without exposing any operator detail
+// beyond what a correspondent needs to trust the log and the bridge.
+function buildTransparency(sc, now) {
+  return {
+    kt: {
+      consistent: true, // a real split-view would be its own incident, surfaced above like any other
+      treeSize: 118402 + Math.floor(now / 3.6e9), // ticks up slowly — a standing append-only counter
+      checkpointAgeMin: sc === 'outage' ? 34 : sc === 'degraded' ? 12 : 4,
+      witnesses: 4,
+    },
+    gateway: {
+      status: sc === 'outage' ? 'stale' : 'valid',
+      lastVerifiedMin: sc === 'outage' ? 46 : sc === 'degraded' ? 18 : 7,
+    },
+  };
 }
 
 // ---- authenticated per-user health --------------------------------------------------------

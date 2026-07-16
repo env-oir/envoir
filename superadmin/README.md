@@ -30,7 +30,7 @@ across reloads). "Reseed demo fleet" (top-right ⋯) regenerates it.
 
 | Screen | Spec | What you see |
 |--------|------|--------------|
-| **Overview** | §7, §9 | Fleet health at a glance — counts by component kind (nodes · gateways · mix nodes · relays), up / degraded / down, a per-region rollup, aggregate metered operations, and the incident feed. A standing **content-blind** marker. |
+| **Overview** | §7, §9, §3.5 | Fleet health at a glance — counts by component kind (nodes · gateways · mix nodes · relays), up / degraded / down, a per-region rollup, aggregate metered operations, **Key Transparency log health** (tree size, published root, per-witness gossip freshness, split-view detection), and the incident feed. A standing **content-blind** marker. |
 | **Fleet** | §7.2a, §4.4.8, §9.6 | A filterable directory of every component with a detail pane: health + load + uptime, version, region, operator, **attestation** (domain-anchored §7.2a for nodes+gateways, operator-diversity §4.4.8 for mix nodes), **reputation** (§9.6 for gateways+mix), per-kind operational metrics, and **enroll / decommission**. |
 | **Billing** | `dmtap-seam` | Per-account metered **operations** from the `Metering` + `Provisioning` seam — hosted storage, gateway sends, inbound legacy, relayed bytes, managed domains, native messages — with tier and suspend/resume. Loudly surfaces that **privacy is never metered**. |
 | **Abuse ops** | §9, §9.6, §6.2 | Aggregate anti-abuse **signals** (rate ceilings, ARC-token revocations, bounce/complaint spikes, spam-trap hits, PoW clearances) and **operator reputation** for gateways + mix operators. Accountability **without content**: every signal is attributed to an anonymous accountable credential, never a message or a sender identity in clear. |
@@ -73,10 +73,10 @@ css/superadmin.css        the Aurora Indigo design system — all components, li
 js/app.js                 boot: load a persisted fleet snapshot or seed one, then mount the shell
 js/shell.js               rail (Overview · Fleet · Billing · Abuse ops · Provisioning), topbar glance, dispatch
 js/bus.js                 late-bound rerender/setView dispatch (no import cycle)
-js/store.js               THE SIMULATED SEAM: fleet + accounts + signals + incidents + warm-pool; persistence
+js/store.js               THE SIMULATED SEAM: fleet + accounts + signals + incidents + warm-pool + KT log health (witness gossip, split-view/freshness); persistence
 js/ui.js                  DOM helpers, icon set, health dots/pills, attestation + reputation badges, meters, sparkline, modal, toast, empty/loading/error
 
-js/views/overview.js      fleet health at a glance: kind counts, region rollup, metered ops, incidents
+js/views/overview.js      fleet health at a glance: kind counts, region rollup, metered ops, KT log health (witnesses, split-view/freshness alerts), incidents
 js/views/fleet.js         component directory + detail: health, attestation, reputation, enroll / decommission
 js/views/billing.js       dmtap-seam metering per account + tier + suspend/resume
 js/views/abuse.js         anti-abuse signals + gateway/mix operator reputation (content-blind)

@@ -305,6 +305,20 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .guar-note { font-size: 12px; color: var(--text-dim); line-height: 1.55; background: var(--bg-2); border-radius: var(--r); padding: 12px 14px; } .guar-note .ic { width: 14px; height: 14px; vertical-align: -2px; color: var(--warn); }
 .guar-note .pill { vertical-align: middle; }
 
+/* ---------- Key Transparency pin card ---------- */
+.kt-grid { display: grid; gap: 9px; margin: 4px 0 14px; }
+.kt-witnesses { display: grid; gap: 8px; margin-bottom: 4px; }
+.kt-w { display: flex; align-items: center; gap: 12px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 13px; }
+.kt-w.stale { border-color: color-mix(in srgb, var(--warn) 32%, var(--line)); }
+.kt-w-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.kt-w-dot.good { background: var(--good); box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent); }
+.kt-w-dot.warn { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+.kt-w-main { flex: 1; min-width: 0; } .kt-w-main b { display: block; font-size: 12.5px; } .kt-w-main small { color: var(--text-faint); font-size: 11px; }
+
+/* ---------- trust-list add row (gateway policy) ---------- */
+.trust-add { display: flex; gap: 10px; margin-top: 12px; }
+.trust-add input { flex: 1; }
+
 .ov-audit { display: grid; gap: 2px; }
 .ov-ev { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .ov-ev:last-child { border-bottom: none; }
@@ -458,6 +472,25 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .grant-cap p { font-size: 12.5px; color: var(--text-dim); } .grant-cap small { font-size: 11.5px; color: var(--text-faint); }
 
 /* ============================================================================================
+   BILLING
+   ============================================================================================ */
+.bill-lines { display: grid; gap: 8px; margin-bottom: 14px; }
+.bill-line { display: flex; align-items: center; gap: 12px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r); padding: 11px 13px; }
+.bl-ic { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: var(--bg-3); color: var(--accent); flex-shrink: 0; } .bl-ic .ic { width: 16px; height: 16px; }
+.bl-main { flex: 1; min-width: 0; } .bl-main b { display: block; font-size: 13px; } .bl-main small { color: var(--text-faint); font-size: 11.5px; }
+.bl-cost { font-size: 13.5px; }
+.bill-adjust { margin-bottom: 14px; }
+.bill-total { display: flex; align-items: center; justify-content: space-between; padding: 9px 2px; font-size: 13px; color: var(--text-dim); border-top: 1px solid var(--line); }
+.bill-total b { font-size: 13.5px; color: var(--text); }
+.bill-total.grand { border-top: 1px solid var(--line-2); margin-top: 2px; padding-top: 12px; font-weight: 650; }
+.bill-total.grand span { color: var(--text); font-size: 13.5px; }
+.bill-total.grand b { font-size: 17px; }
+.always-free { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.af-item { display: flex; align-items: center; gap: 10px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 13px; }
+.af-item .ic { color: var(--good); flex-shrink: 0; }
+.af-item b { display: block; font-size: 12.5px; } .af-item small { color: var(--text-faint); font-size: 10.5px; }
+
+/* ============================================================================================
    AUDIT
    ============================================================================================ */
 .audit-filter { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
@@ -524,6 +557,7 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .ov-grid, .ov-grid-2, .dir-summary, .detail-cols, .guar-cols { grid-template-columns: 1fr; }
   .stat-col { grid-template-rows: none; grid-template-columns: 1fr 1fr; }
   .roles-legend { grid-template-columns: 1fr 1fr; }
+  .always-free { grid-template-columns: 1fr 1fr; }
   .split-view { grid-template-columns: 300px 1fr; }
 }
 @media (max-width: 760px) {
@@ -533,7 +567,8 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
   .page, .detail-scroll { padding: 18px 16px 50px; }
   .page-head { flex-direction: column; gap: 12px; }
   .model-select { grid-template-columns: 1fr; }
-  .roles-legend, .stat-col { grid-template-columns: 1fr; }
+  .roles-legend, .stat-col, .always-free { grid-template-columns: 1fr; }
+  .trust-add { flex-direction: column; }
   .domain-chip .dir-ver { display: none; }
   /* master/detail: one pane at a time on phones */
   .split-view { grid-template-columns: 1fr; }

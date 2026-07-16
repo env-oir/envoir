@@ -3,9 +3,12 @@
 // the standing content-blind guarantee made legible up front. Everything a superadmin needs to
 // answer "is the fleet healthy, and where does it hurt?" in one screen.
 
-import { state, counts, byKind, liveFleet, KIND, REGIONS, regionName, regionFlag, meterTotals, openIncidents } from '../store.js';
+import {
+  state, counts, byKind, liveFleet, KIND, REGIONS, regionName, regionFlag, meterTotals, openIncidents,
+  ktWitnessFresh, ktWitnessSplit, ktStaleCount, ktSplitCount, ktReverify,
+} from '../store.js';
 import { bus } from '../bus.js';
-import { esc, icon, healthDot, emptyState, timeAgo, fmtBytes, fmtNum } from '../ui.js';
+import { esc, icon, healthDot, emptyState, timeAgo, fmtBytes, fmtNum, toast } from '../ui.js';
 
 const SEV = { critical: 'bad', major: 'bad', minor: 'warn', info: 'accent' };
 
@@ -16,6 +19,9 @@ export function render(root) {
   const mt = meterTotals();
   const incidents = openIncidents();
   const allIncidents = state.incidents;
+  const kt = state.kt;
+  const ktStale = kt ? ktStaleCount() > 0 : false;
+  const ktSplit = kt ? ktSplitCount() > 0 : false;
 
   // region rollup
   const regions = REGIONS.map(r => {
@@ -91,6 +97,35 @@ export function render(root) {
       </div>
     </section>
 
+    ${kt ? `
+    <section class="card kt-card">
+      <div class="card-h">
+        <h2>${icon('kt')} Key Transparency log health <span class="pill dim sm">spec §3.5</span></h2>
+        <span class="pill ${ktSplit ? 'bad' : ktStale ? 'warn' : 'good'} sm">${ktSplit ? icon('warn') + ' split-view' : ktStale ? icon('warn') + ' stale witness' : icon('check') + ' consistent'}</span>
+      </div>
+      <p class="card-sub">Independent witnesses gossip the published root so a covert re-key or split-view is detectable, not just trusted (spec §3.5). Content-blind: this is metadata about the <b>log</b>, never about what any binding resolves to for whom.</p>
+      <div class="kt-figs">
+        <div class="kt-fig"><span class="kf-n mono">${fmtNum(kt.treeSize)}</span><span class="kf-l">tree size</span></div>
+        <div class="kt-fig"><span class="kf-n mono ellip">${esc(kt.rootHash.slice(0, 16))}…</span><span class="kf-l">published root</span></div>
+        <div class="kt-fig"><span class="kf-n ${(Date.now() - kt.publishedAt) > kt.freshnessSla ? 'warn' : ''}">${esc(timeAgo(kt.publishedAt))}</span><span class="kf-l">last published</span></div>
+      </div>
+      <div class="kt-witness-list">
+        ${kt.witnesses.map(w => {
+          const split = ktWitnessSplit(w), fresh = ktWitnessFresh(w);
+          const cls = split ? 'bad' : fresh ? 'good' : 'warn';
+          return `<div class="kt-witness ${cls}">
+            <span class="hdot ${split ? 'down' : fresh ? 'up' : 'degraded'}"></span>
+            <div class="kt-witness-main"><b class="mono">${esc(w.name)}</b><small>${regionFlag(w.region)} ${esc(regionName(w.region))}</small></div>
+            <span class="pill ${cls} sm">${split ? 'SPLIT' : fresh ? 'consistent' : 'stale'}</span>
+            <span class="kt-witness-t">${esc(timeAgo(w.lastGossip))}</span>
+          </div>`;
+        }).join('')}
+      </div>
+      ${ktSplit ? `<div class="banner bad">${icon('warn')} <span><b>Split-view detected.</b> ${ktSplitCount()} witness(es) report a root hash that disagrees with the published checkpoint. Treat as a critical incident until cross-witness quorum re-confirms a single canonical root.</span></div>`
+        : ktStale ? `<div class="banner warn">${icon('warn')} <span><b>${ktStaleCount()}</b> witness(es) haven't gossiped within the ${Math.round(kt.freshnessSla / 60000)}m freshness SLA. Not a split-view on its own, but re-verify to confirm they still agree.</span></div>` : ''}
+      <div class="card-foot"><span class="sim-tag">${icon('info')} witness gossip is simulated</span><div class="spacer"></div><button class="btn sm" id="ktreverify">${icon('refresh')} Force gossip round</button></div>
+    </section>` : ''}
+
     <section class="card">
       <div class="card-h">
         <h2>${icon('bell')} Incident &amp; alert feed</h2>
@@ -117,6 +152,11 @@ export function render(root) {
 
   root.querySelectorAll('[data-kind]').forEach(b => b.onclick = () => { state.ui.fleetKind = b.dataset.kind; bus.setView('fleet'); });
   root.querySelectorAll('[data-go]').forEach(b => b.onclick = () => bus.setView(b.dataset.go));
+  root.querySelector('#ktreverify')?.addEventListener('click', () => {
+    ktReverify();
+    toast(`${icon('check')} Gossip round forced — ${kt.witnesses.length} witnesses re-confirmed`);
+    bus.rerender();
+  });
 }
 
 function bars(r) {

@@ -46,6 +46,15 @@ Copy is honest about scope — e.g. an outage banner still notes that *native ma
 messages are held and retried at the edges until delivery* (DMTAP puts durability at the sender's
 outbound queue, not the middle).
 
+## Transparency
+
+A public panel beneath the component list — the honest counterpart to the operator's own KT-log-
+health and attestation views: **Key Transparency** (spec §3.5) shows the tree size, how long ago
+the checkpoint was last verified, and how many independent witnesses agree; **Gateway attestation**
+(spec §7.2a) shows how fresh the legacy bridge's domain-anchored attestation key verification is.
+Tracks the active scenario — e.g. the outage scenario shows a stale gateway attestation, since the
+bridge itself is down and can't be re-verified until it's back.
+
 ## My status (authenticated)
 
 Answers a personal question the public page can't: *is **my** mail working right now, and if not,
@@ -89,10 +98,10 @@ css/status.css         the Aurora Indigo design system — banner, uptime bars, 
 
 js/app.js              boot: load prefs, mount the shell
 js/shell.js            header (brand, System-status / My-status tabs, demo scenario switch, theme, sign-in) + loading/error orchestration
-js/store.js            THE SIMULATED SEAM: scenarios → components + incidents + per-user health; prefs persistence
+js/store.js            THE SIMULATED SEAM: scenarios → components + incidents + transparency (KT + gateway attestation) + per-user health; prefs persistence
 js/ui.js               DOM helpers, icon set, status vocabulary, health dot/pill, 90-day uptime bars, modal, toast, empty/loading/error
 
-js/views/public.js     public status page: banner, components + uptime, active incidents, history
+js/views/public.js     public status page: banner, components + uptime, transparency (KT consistency, gateway attestation freshness), active incidents, history
 js/views/user.js       authenticated "My status": mailbox, reachability, legacy bridge, affecting-you, recent deliveries
 ```
 

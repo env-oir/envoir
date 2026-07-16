@@ -80,6 +80,7 @@ const P = {
   users: '<circle cx="9" cy="9" r="3.2"/><circle cx="17" cy="10" r="2.4"/><path d="M3 20c0-3 2.7-4.8 6-4.8s6 1.8 6 4.8"/><path d="M15.5 20c0-2.2 1.4-3.6 3.2-3.6 1.3 0 2.5.7 3.1 1.9"/>',
   block: '<circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/>',
   flame: '<path d="M12 3s5 4 5 9a5 5 0 01-10 0c0-1.5.6-2.6 1.3-3.4C9 10 9.5 9 9 7c2 .5 3 2.5 3 4 .8-.8 1-2 1-3 0-2-1-5-1-5z"/>',
+  kt: '<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13l1.6 1.6L14 11" stroke-width="1.6"/><path d="M9 17h6"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;

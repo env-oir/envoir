@@ -14,6 +14,7 @@ export function renderPublic(root, actions) {
   const active = state.incidents.filter(i => i.status !== 'resolved');
   const past = state.incidents.filter(i => i.status === 'resolved');
   const overallUptime = state.components.reduce((a, c) => a + c.uptime, 0) / state.components.length;
+  const t = state.transparency;
 
   root.innerHTML = `
   <div class="status-page">
@@ -49,6 +50,33 @@ export function renderPublic(root, actions) {
       </div>
       <div class="comp-foot"><span>90 days ago</span><span>Today</span></div>
     </section>
+
+    ${t ? `
+    <section class="transparency card">
+      <div class="comp-head">
+        <h2>${icon('shield')} Transparency</h2>
+        <span class="comp-legend"><span class="cl">${icon('info')} cross-checked, not just trusted</span></span>
+      </div>
+      <div class="transp-grid">
+        <div class="transp-tile">
+          <div class="transp-h"><span>${icon('kt')} Key Transparency</span><span class="pill ${t.kt.consistent ? 'good' : 'bad'} sm">${t.kt.consistent ? icon('check') + ' consistent' : icon('warn') + ' split-view'}</span></div>
+          <p>Append-only name→key log, cross-checked by independent witnesses (spec §3.5).</p>
+          <div class="transp-figs">
+            <div><b>${t.kt.treeSize.toLocaleString()}</b><span>tree size</span></div>
+            <div><b class="${t.kt.checkpointAgeMin > 20 ? 'warn' : ''}">${t.kt.checkpointAgeMin}m</b><span>checkpoint age</span></div>
+            <div><b>${t.kt.witnesses}</b><span>witnesses agree</span></div>
+          </div>
+        </div>
+        <div class="transp-tile">
+          <div class="transp-h"><span>${icon('gateway')} Gateway attestation</span><span class="pill ${t.gateway.status === 'valid' ? 'good' : 'warn'} sm">${t.gateway.status === 'valid' ? icon('check') + ' fresh' : icon('warn') + ' stale'}</span></div>
+          <p>Domain-anchored attestation key the legacy bridge signs bridged mail with (spec §7.2a).</p>
+          <div class="transp-figs">
+            <div><b class="${t.gateway.status === 'valid' ? '' : 'warn'}">${t.gateway.lastVerifiedMin}m</b><span>since last verify</span></div>
+          </div>
+          ${t.gateway.status !== 'valid' ? `<p class="transp-note">${icon('warn')} Attestation re-verification is delayed. Bridged legacy mail is unaffected until the key is due for rotation.</p>` : ''}
+        </div>
+      </div>
+    </section>` : ''}
 
     <section class="history">
       <h2 class="history-h">${icon('clock')} Incident history</h2>

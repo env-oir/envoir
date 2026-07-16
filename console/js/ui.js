@@ -18,6 +18,24 @@ export const fmtDate = (t) => new Date(t).toLocaleDateString([], { month: 'short
 export const fmtLong = (t) => new Date(t).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) +
   ' · ' + new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 
+// ---- byte + number formatting (billing) ---------------------------------------------------
+export function fmtBytes(n) {
+  if (n == null) return '—';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + u[i];
+}
+export function fmtNum(n) {
+  if (n == null) return '—';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + 'k';
+  return String(n);
+}
+export function fmtUsd(n) {
+  return '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 // ---- Icon set (stroke SVGs) --------------------------------------------------------------
 const P = {
   home: '<path d="M4 11l8-7 8 7"/><path d="M6 10v9h12v-9"/><path d="M10 19v-5h4v5"/>',
@@ -55,6 +73,15 @@ const P = {
   link: '<path d="M9 15l6-6"/><path d="M8 12l-2 2a3 3 0 004 4l2-2"/><path d="M16 12l2-2a3 3 0 00-4-4l-2 2"/>',
   building: '<rect x="4" y="3" width="16" height="18" rx="1.5"/><path d="M8 7h.01M12 7h.01M16 7h.01M8 11h.01M12 11h.01M16 11h.01M10 21v-4h4v4"/>',
   scale: '<path d="M12 3v18M6 21h12"/><path d="M12 6l-6 2 3 5a3 3 0 006 0l3-5z" fill="none"/>',
+  gateway: '<path d="M4 20V10l8-5 8 5v10"/><path d="M4 20h16"/><path d="M9 20v-5h6v5"/><path d="M12 5V2"/>',
+  billing: '<path d="M6 3h9l4 4v14l-2.5-1.5L14 21l-2.5-1.5L9 21l-2.5-1.5L4 21V3z"/><path d="M8 9h8M8 13h5"/>',
+  relay: '<path d="M12 13a2 2 0 100-4 2 2 0 000 4z"/><path d="M7.8 16.2a6 6 0 010-8.4M16.2 7.8a6 6 0 010 8.4M5 19a10 10 0 010-14M19 5a10 10 0 010 14"/>',
+  wifi: '<path d="M2 8.8a16 16 0 0120 0M5 12a11 11 0 0114 0M8 15.2a6 6 0 018 0"/><circle cx="12" cy="19" r="1.1"/>',
+  server: '<rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h4M11 16.5h4"/>',
+  database: '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
+  tag: '<path d="M3 12l9-9 8 8-9 9z"/><circle cx="14.5" cy="9.5" r="1.4"/>',
+  kt: '<path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/><path d="M9 13l1.6 1.6L14 11" stroke-width="1.6"/><path d="M9 17h6"/>',
+  mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M4 7l8 6 8-6"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;

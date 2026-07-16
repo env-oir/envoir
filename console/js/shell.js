@@ -12,6 +12,8 @@ import { render as renderMembers } from './views/members.js';
 import { render as renderDirectory } from './views/directory.js';
 import { render as renderGroups } from './views/groups.js';
 import { render as renderRoles } from './views/roles.js';
+import { render as renderGateway } from './views/gateway.js';
+import { render as renderBilling } from './views/billing.js';
 import { render as renderAudit } from './views/audit.js';
 
 const VIEWS = [
@@ -20,6 +22,8 @@ const VIEWS = [
   { id: 'directory', name: 'Directory', icon: 'directory', render: renderDirectory, search: 'Search directory' },
   { id: 'groups', name: 'Groups', icon: 'groups', render: renderGroups, search: 'Search groups' },
   { id: 'roles', name: 'Admin roles', icon: 'roles', render: renderRoles, search: 'Search capabilities' },
+  { id: 'gateway', name: 'Gateway policy', icon: 'gateway', render: renderGateway },
+  { id: 'billing', name: 'Billing', icon: 'billing', render: renderBilling },
   { id: 'audit', name: 'Audit log', icon: 'audit', render: renderAudit, search: 'Search events' },
 ];
 
