@@ -833,10 +833,14 @@ fn method_at_least_as_strong(prev: &RecoveryMethod, cand: &RecoveryMethod) -> bo
 /// Additive, non-weakening changes (adding a redundant factor, raising a bar) return `false` and
 /// MAY be signed by `IK` alone without the guardian quorum or the veto delay.
 ///
-/// This is a conservative structural detector: it flags every removal or threshold reduction. It
-/// does **not** attempt to model the §1.4 rule 5 *cryptographic* re-key/resharing obligation (that
-/// a rotated-out secret is actually re-keyed) — that is a key-management concern outside this
-/// deterministic core; see the crate docs.
+/// This is a conservative structural detector: it flags every removal or threshold reduction,
+/// **including a guardian-set swap** — replacing any guardian (even at an unchanged M-of-N count)
+/// fails [`method_at_least_as_strong`]'s subset test, so a swapped-in attacker guardian cannot slip
+/// through as "not weakening". Purely additive changes (adding a redundant factor or an extra
+/// guardian at the same threshold, or *raising* a bar) are correctly **not** flagged, so benign
+/// hardening still travels the fast path. It does **not** attempt to model the §1.4 rule 5
+/// *cryptographic* re-key/resharing obligation (that a rotated-out secret is actually re-keyed) —
+/// that is a key-management concern outside this deterministic core; see the crate docs.
 pub fn recovery_change_is_weakening(prev: &RecoveryPolicy, next: &RecoveryPolicy) -> bool {
     let methods_weakened = prev
         .methods
@@ -1155,6 +1159,42 @@ mod tests {
         assert!(!recovery_change_is_weakening(&prev, &next));
         // Even with no guardians, no approvals, and now == announced (window not elapsed): OK.
         assert!(authorize_recovery_change(&prev, &next, &[], &[], &[], 0, 0).is_ok());
+    }
+
+    #[test]
+    fn guardian_set_swap_and_threshold_drop_are_weakening_but_additions_are_not() {
+        let ik = IdentityKey::generate();
+        let g: Vec<Vec<u8>> = (0..4u8).map(|s| IdentityKey::from_seed(&[s; 32]).public()).collect();
+        let base = |social: RecoveryMethod, ver: u64| {
+            policy(
+                &ik,
+                vec![social],
+                Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+                Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+                ver,
+            )
+        };
+        let prev = base(RecoveryMethod::Social { guardians: g[..3].to_vec(), threshold: 2 }, 1);
+
+        // Swap one guardian out for a fresh (possibly attacker-controlled) key at the SAME 2-of-3
+        // count: still a weakening — an evicted guardian is a removed factor.
+        let swapped = base(
+            RecoveryMethod::Social {
+                guardians: vec![g[0].clone(), g[1].clone(), g[3].clone()],
+                threshold: 2,
+            },
+            2,
+        );
+        assert!(recovery_change_is_weakening(&prev, &swapped), "guardian swap must be weakening");
+
+        // Lower the M-of-N threshold on the same guardian set: weakening.
+        let lowered = base(RecoveryMethod::Social { guardians: g[..3].to_vec(), threshold: 1 }, 3);
+        assert!(recovery_change_is_weakening(&prev, &lowered), "threshold drop must be weakening");
+
+        // Add a guardian while keeping the 2-of-N count (2-of-3 → 2-of-4): purely additive, the
+        // collusion bar M is unchanged — must NOT be flagged (no false positive on hardening).
+        let widened = base(RecoveryMethod::Social { guardians: g[..4].to_vec(), threshold: 2 }, 4);
+        assert!(!recovery_change_is_weakening(&prev, &widened), "adding a guardian is not weakening");
     }
 
     #[test]
