@@ -10,10 +10,11 @@
 //! §2.7 — cheap/anonymous checks *before* any decryption (a decryption-DoS defense).
 //!
 //! ## Reference-implementation notes (where the wire shape is pinned down)
-//! - `sender_sig` is a detached signature by an *ephemeral* per-message key (§2.2). The spec
-//!   leaves distribution of that ephemeral public key implicit; the reference carries it
-//!   explicitly in `Envelope.sender_eph` so the recipient can verify it in step 3 without
-//!   decrypting.
+//! - `sender_sig` is a detached signature by an *ephemeral* per-message key (§2.2). The wire
+//!   format carries the matching public key explicitly in `Envelope.sender_key` (§2.2 field 12,
+//!   CDDL key 12, §18.3.1) so the recipient can verify it in step 3 without decrypting; this
+//!   reference exposes it as `Envelope.sender_eph`. The `challenge` proof is bound to that key
+//!   (§9.2a) so a stripped proof cannot be replayed under a different ephemeral key.
 //! - Payload sealing is abstracted behind [`PayloadSeal`]; [`Hpke`] is the real suite-`0x01`
 //!   implementation (RFC 9180 DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305 via the `hpke`
 //!   crate). Suite `0x02` (PQ) would supply a different `PayloadSeal`.
