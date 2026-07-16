@@ -1,0 +1,10 @@
+{
+  "name": "envoir",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Envoir monorepo tooling. See docs/SCREENSHOTS.md for the screenshotter.",
+  "type": "module",
+  "scripts": {
+    "screenshotter": "node docs/capture-screenshots.mjs"
+  }
+}

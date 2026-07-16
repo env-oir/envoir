@@ -1,126 +1,117 @@
-// docs/capture-screenshots.mjs
+#!/usr/bin/env node
+// docs/capture-screenshots.mjs — run via `npm run screenshotter`. Full usage: docs/SCREENSHOTS.md.
 //
-// Throwaway dev script — captures real screenshots of the client (client/) for the root
-// README. Not part of the build, not imported by anything. Requires:
-//   - the client served statically (see README below)
-//   - a local Chrome binary (path below) and puppeteer-core from the sibling dmtap build tree
+// One command that regenerates every screenshot used by the docs/README from the REAL UIs in
+// this repo — the client, the three cloud-side apps (console, superadmin, status), and the
+// marketing site (site/). For each app it:
+//
+//   1. spins up a tiny built-in static file server rooted at that app's directory (no python3,
+//      no extra installs — just node's http module) on a free localhost port,
+//   2. drives it with real headless Chrome via puppeteer-core (reused from the sibling dmtap
+//      build's node_modules — nothing new is installed; see PUPPETEER_CORE_PATH below),
+//   3. navigates by clicking the app's real nav / theme-toggle / scenario controls (never by
+//      pixel coordinates), asserting the expected screen actually rendered (a view-specific DOM
+//      node, or matching visible text) before every shot,
+//   4. writes deterministic PNG filenames into docs/img/, overwriting in place so doc/README
+//      image references never need to change.
 //
 // Usage:
-//   cd client && python3 -m http.server 8137 &
-//   node docs/capture-screenshots.mjs
-//   kill %1   # stop the http.server job when done
+//   npm run screenshotter                              # capture every app
+//   npm run screenshotter -- --only=client,status       # capture a subset (comma-separated)
 //
-// Output: PNGs written to docs/img/.
+// Environment overrides (only needed if your machine differs from this dev box):
+//   CHROME_PATH           path to a Chrome/Chromium binary
+//                          (default: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
+//   PUPPETEER_CORE_PATH    path to puppeteer-core's ESM entrypoint
+//                          (default: sibling .../dmtap/build/node_modules/puppeteer-core/lib/esm/puppeteer/puppeteer-core.js)
+//
+// A per-app run is wrapped so one broken capture never aborts the others; the process exit code
+// is non-zero iff any REQUIRED shot failed (a handful of onboarding "bonus" shots are marked
+// non-required, since they document a transient step rather than the deliverable app views).
+// Servers, pages and the browser are always cleaned up, including on error or Ctrl-C.
 
-import puppeteer from '/Users/pc/code/envoir/dmtap/build/node_modules/puppeteer-core/lib/esm/puppeteer/puppeteer-core.js';
-import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { mkdirSync } from 'node:fs';
+import { launchBrowser, serveStatic, Results, shooter } from './screenshotter/lib.mjs';
+
+import * as clientApp from './screenshotter/apps/client.mjs';
+import * as consoleApp from './screenshotter/apps/console.mjs';
+import * as superadminApp from './screenshotter/apps/superadmin.mjs';
+import * as statusApp from './screenshotter/apps/status.mjs';
+import * as siteApp from './screenshotter/apps/site.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, '..');
 const OUT = join(__dirname, 'img');
 mkdirSync(OUT, { recursive: true });
 
-const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const URL = 'http://localhost:8137/';
+const APPS = [
+  { name: 'client', dir: join(REPO_ROOT, 'client'), run: clientApp.run },
+  { name: 'console', dir: join(REPO_ROOT, 'console'), run: consoleApp.run },
+  { name: 'superadmin', dir: join(REPO_ROOT, 'superadmin'), run: superadminApp.run },
+  { name: 'status', dir: join(REPO_ROOT, 'status'), run: statusApp.run },
+  { name: 'site', dir: join(REPO_ROOT, 'site'), run: siteApp.run },
+];
 
-async function shot(page, name) {
-  const path = join(OUT, name);
-  await page.screenshot({ path });
-  console.log('captured', name);
+function parseOnly() {
+  const arg = process.argv.find((a) => a.startsWith('--only='));
+  if (!arg) return null;
+  return new Set(arg.slice('--only='.length).split(',').map((s) => s.trim()).filter(Boolean));
 }
 
-async function setTheme(page, theme) {
-  // Use the real theme-toggle button so in-app state (icon, persisted settings) stays correct,
-  // rather than poking data-theme directly.
-  await page.evaluate((t) => {
-    const current = document.documentElement.getAttribute('data-theme');
-    if (current !== t) document.getElementById('theme-toggle')?.click();
-  }, theme);
-  await new Promise((r) => setTimeout(r, 200));
-}
+let browser; // module-scope so the SIGINT/SIGTERM handlers below can always reach it
 
-async function goToView(page, id) {
-  await page.evaluate((viewId) => {
-    document.querySelector(`.rail-btn[data-view="${viewId}"]`)?.click();
-  }, id);
-  await new Promise((r) => setTimeout(r, 250));
+async function shutdown(code) {
+  await browser?.close().catch(() => {});
+  process.exit(code);
 }
+process.on('SIGINT', () => shutdown(130));
+process.on('SIGTERM', () => shutdown(143));
 
 (async () => {
-  const browser = await puppeteer.launch({
-    executablePath: CHROME,
-    headless: true,
-    defaultViewport: { width: 1440, height: 900, deviceScaleFactor: 2 },
-  });
-  const page = await browser.newPage();
-  page.on('pageerror', (e) => console.error('pageerror:', e));
-  page.on('console', (m) => { if (m.type() === 'error') console.error('console error:', m.text()); });
-
-  await page.goto(URL, { waitUntil: 'networkidle0' });
-
-  // ---- Onboarding: create a demo identity -------------------------------------------------
-  await page.waitForSelector('#disp', { timeout: 5000 });
-  await page.type('#disp', 'Ada Okonkwo');
-  await page.type('#local', 'ada');
-  await page.click('#next');
-
-  await page.waitForSelector('.ob-phrase', { timeout: 5000 });
-  await shot(page, 'onboarding-safety.png'); // bonus: recovery-phrase / identity-creation step (not referenced yet)
-  await page.click('#next');
-
-  await page.waitForSelector('.ob-final', { timeout: 5000 });
-  await new Promise((r) => setTimeout(r, 200));
-  await shot(page, 'onboarding-identity.png');
-  await page.click('#go');
-
-  // ---- Shell mounted -------------------------------------------------------------------------
-  await page.waitForSelector('.app', { timeout: 5000 });
-  await new Promise((r) => setTimeout(r, 300));
-
-  // Mail — dark (default theme)
-  await goToView(page, 'mail');
-  await new Promise((r) => setTimeout(r, 300));
-  await shot(page, 'mail-dark.png');
-
-  // Mail — light
-  await setTheme(page, 'light');
-  await new Promise((r) => setTimeout(r, 250));
-  await shot(page, 'mail-light.png');
-  await setTheme(page, 'dark');
-
-  // Mail reading pane with transport path graph expanded
-  await goToView(page, 'mail');
-  await new Promise((r) => setTimeout(r, 250));
-  const pathBtn = await page.$('[data-pathbtn]');
-  if (pathBtn) {
-    await pathBtn.click();
-    await new Promise((r) => setTimeout(r, 300));
-    await shot(page, 'path-graph.png');
-  } else {
-    console.error('WARNING: no [data-pathbtn] found on the currently-open message — path-graph.png skipped');
+  const only = parseOnly();
+  const targets = only ? APPS.filter((a) => only.has(a.name)) : APPS;
+  if (!targets.length) {
+    console.error(`No matching apps for --only filter. Known apps: ${APPS.map((a) => a.name).join(', ')}`);
+    process.exit(1);
   }
 
-  // Chat — dark, with the deniable-vs-MLS protocol pill visible
-  await goToView(page, 'chat');
-  await new Promise((r) => setTimeout(r, 300));
-  await shot(page, 'chat-dark.png');
+  try {
+    browser = await launchBrowser();
+  } catch (err) {
+    console.error(`Could not launch Chrome:\n${err.message}`);
+    process.exit(1);
+  }
 
-  // Chat — light
-  await setTheme(page, 'light');
-  await new Promise((r) => setTimeout(r, 250));
-  await shot(page, 'chat-light.png');
-  await setTheme(page, 'dark');
+  const results = new Results();
 
-  // Files
-  await goToView(page, 'files');
-  await new Promise((r) => setTimeout(r, 300));
-  await shot(page, 'files-dark.png');
+  for (const app of targets) {
+    console.log(`\n--- ${app.name} (${app.dir}) ---`);
+    let server;
+    let page;
+    try {
+      server = await serveStatic(app.dir);
+      page = await browser.newPage();
+      page.on('pageerror', (e) => console.error(`  [${app.name}] pageerror:`, e.message));
+      page.on('console', (m) => { if (m.type() === 'error') console.error(`  [${app.name}] console error:`, m.text()); });
 
-  // Identity (safety number view)
-  await goToView(page, 'identity');
-  await new Promise((r) => setTimeout(r, 300));
-  await shot(page, 'identity-dark.png');
+      const capture = shooter(page, OUT, app.name, results);
+      await app.run(page, server.baseUrl, capture);
+    } catch (err) {
+      results.fail(app.name, '(app run)', err.stack || err.message);
+    } finally {
+      await page?.close().catch(() => {});
+      await server?.close().catch(() => {});
+    }
+  }
 
-  await browser.close();
-})();
+  await browser.close().catch(() => {});
+
+  const allOk = results.summary();
+  process.exit(allOk ? 0 : 1);
+})().catch(async (err) => {
+  console.error('Fatal:', err.stack || err.message);
+  await browser?.close().catch(() => {});
+  process.exit(1);
+});
