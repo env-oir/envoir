@@ -6,6 +6,8 @@
 //! (`../../../dmtap/`). Where this code and the spec disagree, the spec governs (spec §10.4).
 //!
 //! ## Modules
+//! - [`cbor`] — canonical **integer-keyed** deterministic CBOR (spec §18.1.1/§18.1.2); the single
+//!   wire/signing/content-address codec (serde/`ciborium` text-keyed encodings are NOT the wire).
 //! - [`suite`] — algorithm suites & crypto-agility (spec §1.1, §16.7); fail-closed decoding.
 //! - [`id`] — content addressing: `[0x1e] || BLAKE3-256(bytes)` with an agility prefix (§2.2).
 //! - [`identity`] — the identity lifecycle: `IdentityKey` (Ed25519), `Identity` (multi-suite
@@ -21,6 +23,7 @@
 //! Ed25519 signatures, HPKE `DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305`, BLAKE3-256 hashing.
 //! Suite `0x02` (PQ) is reserved and **fails closed** everywhere it is offered.
 
+pub mod cbor;
 pub mod id;
 pub mod identity;
 pub mod keyname;

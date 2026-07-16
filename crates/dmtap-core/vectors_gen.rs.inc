@@ -9,18 +9,19 @@
 // their deterministic sub-operations (content-address, sender_sig, payload_sig) are.
 
 use dmtap_core::id::ContentId;
-use dmtap_core::identity::{verify_domain, Cap, DeviceCert, Identity, IdentityKey};
-use dmtap_core::mote::{Envelope, Headers, Kind, Payload};
+use dmtap_core::identity::{verify_domain, Cap, DeviceCert, Identity, IdentityKey, KeyPackageBundleRef};
+use dmtap_core::mote::{DeliveryTag, Envelope, Headers, Kind, Payload, ENVELOPE_SENDER_DS, PAYLOAD_SIG_DS};
 use dmtap_core::safety;
 use dmtap_core::suite::Suite;
 use dmtap_core::keyname;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-// The exact domain-separation labels the reference MOTE layer signs under (mote.rs). Reproduced
-// here so the sender_sig / payload_sig preimages are machine-checkable by any implementation.
-const PAYLOAD_SIG_DOMAIN: &[u8] = b"dmtap-payload-sig-v0";
-const SENDER_SIG_DOMAIN: &[u8] = b"dmtap-sender-sig-v0";
+// The exact §18.9 domain-separation tags (ASCII + trailing 0x00) the reference MOTE layer signs
+// under, re-exported from `dmtap_core::mote`, so the sender_sig / payload_sig preimages are
+// machine-checkable by any implementation.
+const PAYLOAD_SIG_DOMAIN: &[u8] = PAYLOAD_SIG_DS;
+const SENDER_SIG_DOMAIN: &[u8] = ENVELOPE_SENDER_DS;
 
 // ---- helpers ------------------------------------------------------------------------------
 
@@ -290,20 +291,20 @@ fn build_all() -> VectorFile {
         &IdentityKey::from_seed(&SEED_A),
         0,
         vec![],
-        ContentId::of(b"keypkgs-bundle"),
+        KeyPackageBundleRef::new("/mesh/keypkgs", ContentId::of(b"keypkgs-bundle")),
         ContentId::of(b"recovery-policy"),
         vec!["alice@example.com".into()],
         None,
         1_700_000_000_000,
     );
     {
-        let bytes = cbor(&identity);
+        let bytes = identity.det_cbor();
         vectors.push(v(
             "cbor_identity",
             "cbor_encode",
-            json!({ "type": "Identity", "note": "created via Identity::create_classical, seed 0x11*32, version 0" }),
+            json!({ "type": "Identity", "note": "created via Identity::create_classical, seed 0x11*32, version 0; §18.4.1 integer-keyed" }),
             json!({ "cbor_hex": hex(&bytes), "content_id_hex": hex(identity.content_id().as_bytes()) }),
-            "deterministic CBOR of a signed single-suite Identity; also its content address",
+            "§18-canonical integer-keyed CBOR of a signed single-suite Identity; also its §18.9.4 content address",
         ));
     }
     // (b) A signed DeviceCert (fixed IK + fixed device key).
@@ -318,13 +319,13 @@ fn build_all() -> VectorFile {
             None,
             vec![Cap::Send, Cap::Recv, Cap::Relay],
         );
-        let bytes = cbor(&cert);
+        let bytes = cert.det_cbor();
         vectors.push(v(
             "cbor_device_cert",
             "cbor_encode",
-            json!({ "type": "DeviceCert", "note": "IK seed 0x11*32 signs device key seed 0x22*32" }),
+            json!({ "type": "DeviceCert", "note": "IK seed 0x11*32 signs device key seed 0x22*32; §18.4.2 integer-keyed" }),
             json!({ "cbor_hex": hex(&bytes) }),
-            "deterministic CBOR of an IK-signed DeviceCert",
+            "§18-canonical integer-keyed CBOR of an IK-signed DeviceCert",
         ));
     }
     // (c) A fixed Payload (no crypto RNG → fully deterministic).
@@ -343,13 +344,13 @@ fn build_all() -> VectorFile {
         expires: None,
     };
     {
-        let bytes = cbor(&payload);
+        let bytes = payload.det_cbor();
         vectors.push(v(
             "cbor_payload",
             "cbor_encode",
-            json!({ "type": "Payload", "note": "fixed fields; sig is a fixed 64-byte placeholder" }),
+            json!({ "type": "Payload", "note": "fixed fields; sig is a fixed 64-byte placeholder; §18.3.5 integer-keyed" }),
             json!({ "cbor_hex": hex(&bytes) }),
-            "deterministic CBOR of a MOTE Payload",
+            "§18-canonical integer-keyed CBOR of a MOTE Payload",
         ));
     }
     // (d) A fully-fixed Envelope (fixed ciphertext/sig bytes → deterministic; HPKE not invoked).
@@ -358,7 +359,7 @@ fn build_all() -> VectorFile {
         v: 0,
         suite: Suite::Classical,
         id: ContentId::of(&fixed_ciphertext),
-        to: IdentityKey::from_seed(&SEED_B).public(),
+        to: DeliveryTag::Key(IdentityKey::from_seed(&SEED_B).public()),
         epoch: None,
         ts: 1_700_000_000_000,
         kind: Kind::Mail,
@@ -369,13 +370,13 @@ fn build_all() -> VectorFile {
         sender_eph: Some(IdentityKey::from_seed(&SEED_EPH).public()),
     };
     {
-        let bytes = cbor(&envelope);
+        let bytes = envelope.det_cbor();
         vectors.push(v(
             "cbor_envelope",
             "cbor_encode",
-            json!({ "type": "Envelope", "note": "fixed ciphertext (48 bytes) + fixed sig placeholders; id = content address of ciphertext" }),
+            json!({ "type": "Envelope", "note": "fixed ciphertext (48 bytes) + fixed sig placeholders; to = KeyTag; id = content address of ciphertext; §18.3.1 integer-keyed" }),
             json!({ "cbor_hex": hex(&bytes) }),
-            "deterministic CBOR of a MOTE Envelope; round-trip-checked in the self-test",
+            "§18-canonical integer-keyed CBOR of a MOTE Envelope; round-trip-checked in the self-test",
         ));
     }
 
@@ -427,15 +428,12 @@ fn build_all() -> VectorFile {
             "a tampered ciphertext MUST fail the content-address check (drop before decrypt)",
         ));
     }
-    // (b) sender_sig KAT (§2.7 step 3) — Ed25519 over (id || to || ts_be || kind || challenge).
+    // (b) sender_sig KAT (§2.7 step 3, §18.9.1) — Ed25519 over the DS-tag ‖
+    //     (id ‖ det_cbor(to) ‖ ts_be64 ‖ kind ‖ challenge_enc) preimage. `challenge_enc` is the
+    //     single byte 0xf6 (CBOR null) when the challenge is absent.
     {
         let eph = IdentityKey::from_seed(&SEED_EPH);
-        // Reproduce mote.rs `sender_authed_bytes` exactly (challenge absent → nothing appended).
-        let mut preimage = Vec::new();
-        preimage.extend_from_slice(envelope.id.as_bytes());
-        preimage.extend_from_slice(&envelope.to);
-        preimage.extend_from_slice(&envelope.ts.to_be_bytes());
-        preimage.push(envelope.kind.as_u8());
+        let preimage = envelope.sender_sig_body();
         let sig = eph.sign_domain(SENDER_SIG_DOMAIN, &preimage);
         vectors.push(v(
             "mote_sender_sig",
@@ -446,7 +444,7 @@ fn build_all() -> VectorFile {
                 "msg_hex": hex(&preimage),
             }),
             json!({ "pubkey_hex": hex(&eph.public_array()), "sig_hex": hex(&sig) }),
-            "envelope sender_sig preimage = id||to||ts_be64||kind (challenge absent); ephemeral key seed 0x33*32",
+            "§18.9.1 sender_sig body = id||det_cbor(to)||ts_be64||kind||0xf6 (challenge absent); DS-tag 'DMTAP-v0/envelope-sender\\0'; ephemeral key seed 0x33*32",
         ));
         vectors.push(v(
             "mote_sender_sig_verify",
@@ -458,15 +456,14 @@ fn build_all() -> VectorFile {
                 "sig_hex": hex(&sig),
             }),
             json!({ "valid": true }),
-            "the sender_sig above MUST verify under the ephemeral key",
+            "the sender_sig above MUST verify under the ephemeral key (sender_key, §18.3.1 key 12)",
         ));
     }
-    // (c) payload_sig KAT (§2.7 step 8) — Ed25519 over BLAKE3(CBOR(payload with sig cleared)).
+    // (c) payload_sig KAT (§2.7 step 8, §18.9.2) — Ed25519 over the DS-tag ‖
+    //     BLAKE3-256(det_cbor(Payload ∖ {sig})).
     {
         let sk = IdentityKey::from_seed(&SEED_A);
-        let mut p = payload.clone();
-        p.sig = Vec::new();
-        let ph = *blake3::hash(&cbor(&p)).as_bytes();
+        let ph = payload.signing_hash();
         let sig = sk.sign_domain(PAYLOAD_SIG_DOMAIN, &ph);
         vectors.push(v(
             "mote_payload_sig",
@@ -478,7 +475,7 @@ fn build_all() -> VectorFile {
                 "payload_hash_hex": hex(&ph),
             }),
             json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
-            "payload signature preimage = BLAKE3-256(CBOR(payload with sig cleared)); IK seed 0x11*32",
+            "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig})) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32",
         ));
     }
 
@@ -486,7 +483,7 @@ fn build_all() -> VectorFile {
         format: "dmtap-conformance-vectors/1".into(),
         suite: "0x01 (classical): Ed25519 / X25519-HPKE / ChaCha20-Poly1305 / BLAKE3-256".into(),
         generated_by: "dmtap-core (reference crate) — examples/gen_vectors.rs".into(),
-        methodology: "All values computed from FIXED seeds/inputs by the reference crate. Ed25519 is deterministic (RFC 8032); BLAKE3 and CBOR are deterministic. Non-deterministic ops (HPKE ephemeral, keygen) are excluded; their deterministic sub-operations are vectored. CBOR here is the reference crate's serde/ciborium encoding (text field-name keys); the §18 integer-keyed canonical form is a separate target — see README.".into(),
+        methodology: "All values computed from FIXED seeds/inputs by the reference crate. Ed25519 is deterministic (RFC 8032); BLAKE3 and CBOR are deterministic. Non-deterministic ops (HPKE ephemeral, keygen) are excluded; their deterministic sub-operations are vectored. CBOR here is the §18 canonical, INTEGER-KEYED (COSE/CWT-style) deterministic encoding (RFC 8949 §4.2, spec §18.1.1/§18.1.2/§18.3.x); signing preimages and content addresses follow §18.9. A second implementer following §18 alone reproduces these bytes.".into(),
         vectors,
     }
 }

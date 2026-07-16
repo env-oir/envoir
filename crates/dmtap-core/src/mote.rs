@@ -30,6 +30,7 @@ use rand_core::OsRng;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
+use crate::cbor::{self, as_array, as_bytes, as_text, as_u32, as_u64, as_u8, CborError, Cv, Fields};
 use crate::id::ContentId;
 use crate::identity::{verify_domain, IdentityKey};
 use crate::suite::Suite;
@@ -39,8 +40,13 @@ use crate::TimestampMs;
 pub const MOTE_VERSION: u8 = 0;
 
 const HPKE_INFO: &[u8] = b"dmtap-mote-payload-v0";
-const PAYLOAD_SIG_DOMAIN: &[u8] = b"dmtap-payload-sig-v0";
-const SENDER_SIG_DOMAIN: &[u8] = b"dmtap-sender-sig-v0";
+
+// Domain-separation tags (§18.9), each an ASCII string terminated by one `0x00` byte. The
+// signing preimage is `DS-tag ‖ body`; `sign_domain` concatenates `domain ‖ msg`, so these
+// constants carry the trailing NUL and callers pass the §18.9 body as `msg`. Public so
+// conformance vectors and independent implementations can reconstruct the exact preimages.
+pub const PAYLOAD_SIG_DS: &[u8] = b"DMTAP-v0/payload\x00";
+pub const ENVELOPE_SENDER_DS: &[u8] = b"DMTAP-v0/envelope-sender\x00";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MoteError {
@@ -62,6 +68,8 @@ pub enum MoteError {
     SealFailed,
     #[error("malformed key material")]
     BadKey,
+    #[error("canonical CBOR decode failed: {0}")]
+    BadEncoding(#[from] CborError),
 }
 
 // --- Message kinds (§2.3) ------------------------------------------------------------------
@@ -129,17 +137,174 @@ pub enum Tier {
 // --- Anti-abuse challenge (§2.2b, §9) ------------------------------------------------------
 
 /// A cold-sender anti-abuse proof carried in the *envelope* so the recipient can evaluate
-/// policy **without decrypting** (spec §2.2b, validated at §2.7 step 6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// policy **without decrypting** (spec §2.2b/§18.3.3, validated at §2.7 step 6). A tagged choice:
+/// key `0` is the variant discriminator (§18.1.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeResponse {
-    /// An ARC (Authenticated Received Chain / attested reputation) token (§9).
-    ArcToken(Vec<u8>),
-    /// A memory-hard proof-of-work solution over `id ‖ recipient ‖ epoch-nonce` (§9.4, §16.5).
-    ProofOfWork { nonce: Vec<u8>, solution: Vec<u8> },
-    /// A redeemable postage stamp (§9.5).
-    Postage(Vec<u8>),
-    /// A vouch from an existing contact (§9).
-    Vouch(Vec<u8>),
+    /// ARC anonymous rate-limited credential (disc 1, §9.3, §18.3.3).
+    Arc(ArcToken),
+    /// Memory-hard proof-of-work (disc 2, §9.4, §16.5).
+    Pow(PowSolution),
+    /// Prepaid real-money stamp (disc 3, §9.5).
+    Postage(PostageStamp),
+    /// Social introduction (disc 4, §9.7).
+    Vouch(Vouch),
+}
+
+/// ARC presentation (§18.3.3, disc 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcToken {
+    pub issuer: Vec<u8>,
+    pub token: Vec<u8>,
+    pub origin: Vec<u8>,
+    pub nonce: Option<Vec<u8>>,
+}
+
+/// Memory-hard PoW solution (§18.3.3, disc 2). `params` = Argon2id `(m_KiB, t_iters, p_lanes)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowSolution {
+    pub algo: String,
+    pub params: [u32; 3],
+    pub epoch_nonce: Vec<u8>,
+    pub solution: Vec<u8>,
+    pub difficulty: u8,
+}
+
+/// Prepaid postage stamp (§18.3.3, disc 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostageStamp {
+    pub issuer: Vec<u8>,
+    pub serial: Vec<u8>,
+    pub amount: u64,
+    pub currency: String,
+    pub expiry: TimestampMs,
+    pub audience: Option<Vec<u8>>,
+    pub sig: Vec<u8>,
+}
+
+/// Social vouch (§18.3.3, disc 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vouch {
+    pub voucher: Vec<u8>,
+    pub subject: Vec<u8>,
+    pub recipient: Vec<u8>,
+    pub exp: TimestampMs,
+    pub sig: Vec<u8>,
+}
+
+impl ChallengeResponse {
+    /// Integer-keyed canonical form (§18.3.3); key 0 is the variant discriminator.
+    pub fn to_cv(&self) -> Cv {
+        match self {
+            ChallengeResponse::Arc(a) => {
+                let mut m = vec![
+                    (0u64, Cv::U64(1)),
+                    (1, Cv::Bytes(a.issuer.clone())),
+                    (2, Cv::Bytes(a.token.clone())),
+                    (3, Cv::Bytes(a.origin.clone())),
+                ];
+                if let Some(n) = &a.nonce {
+                    m.push((4, Cv::Bytes(n.clone())));
+                }
+                Cv::Map(m)
+            }
+            ChallengeResponse::Pow(p) => Cv::Map(vec![
+                (0, Cv::U64(2)),
+                (1, Cv::Text(p.algo.clone())),
+                (
+                    2,
+                    Cv::Array(vec![
+                        Cv::U64(p.params[0] as u64),
+                        Cv::U64(p.params[1] as u64),
+                        Cv::U64(p.params[2] as u64),
+                    ]),
+                ),
+                (3, Cv::Bytes(p.epoch_nonce.clone())),
+                (4, Cv::Bytes(p.solution.clone())),
+                (5, Cv::U64(p.difficulty as u64)),
+            ]),
+            ChallengeResponse::Postage(s) => {
+                let mut m = vec![
+                    (0u64, Cv::U64(3)),
+                    (1, Cv::Bytes(s.issuer.clone())),
+                    (2, Cv::Bytes(s.serial.clone())),
+                    (3, Cv::U64(s.amount)),
+                    (4, Cv::Text(s.currency.clone())),
+                    (5, Cv::U64(s.expiry)),
+                ];
+                if let Some(a) = &s.audience {
+                    m.push((6, Cv::Bytes(a.clone())));
+                }
+                m.push((7, Cv::Bytes(s.sig.clone())));
+                Cv::Map(m)
+            }
+            ChallengeResponse::Vouch(vch) => Cv::Map(vec![
+                (0, Cv::U64(4)),
+                (1, Cv::Bytes(vch.voucher.clone())),
+                (2, Cv::Bytes(vch.subject.clone())),
+                (3, Cv::Bytes(vch.recipient.clone())),
+                (4, Cv::U64(vch.exp)),
+                (5, Cv::Bytes(vch.sig.clone())),
+            ]),
+        }
+    }
+
+    /// Deterministic CBOR of the challenge (§18.3.3), as fed into the `sender_sig` preimage.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv())
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let disc = as_u64(f.req(0)?)?;
+        let out = match disc {
+            1 => ChallengeResponse::Arc(ArcToken {
+                issuer: as_bytes(f.req(1)?)?,
+                token: as_bytes(f.req(2)?)?,
+                origin: as_bytes(f.req(3)?)?,
+                nonce: f.take(4).map(as_bytes).transpose()?,
+            }),
+            2 => {
+                let algo = as_text(f.req(1)?)?;
+                let params = as_array(f.req(2)?)?;
+                if params.len() != 3 {
+                    return Err(CborError::TypeMismatch);
+                }
+                let mut it = params.into_iter();
+                let params = [
+                    as_u32(it.next().unwrap())?,
+                    as_u32(it.next().unwrap())?,
+                    as_u32(it.next().unwrap())?,
+                ];
+                ChallengeResponse::Pow(PowSolution {
+                    algo,
+                    params,
+                    epoch_nonce: as_bytes(f.req(3)?)?,
+                    solution: as_bytes(f.req(4)?)?,
+                    difficulty: as_u8(f.req(5)?)?,
+                })
+            }
+            3 => ChallengeResponse::Postage(PostageStamp {
+                issuer: as_bytes(f.req(1)?)?,
+                serial: as_bytes(f.req(2)?)?,
+                amount: as_u64(f.req(3)?)?,
+                currency: as_text(f.req(4)?)?,
+                expiry: as_u64(f.req(5)?)?,
+                audience: f.take(6).map(as_bytes).transpose()?,
+                sig: as_bytes(f.req(7)?)?,
+            }),
+            4 => ChallengeResponse::Vouch(Vouch {
+                voucher: as_bytes(f.req(1)?)?,
+                subject: as_bytes(f.req(2)?)?,
+                recipient: as_bytes(f.req(3)?)?,
+                exp: as_u64(f.req(4)?)?,
+                sig: as_bytes(f.req(5)?)?,
+            }),
+            other => return Err(CborError::UnknownDiscriminant(other)),
+        };
+        f.deny_unknown()?;
+        Ok(out)
+    }
 }
 
 // --- Delivery tag (§2.2a) ------------------------------------------------------------------
@@ -157,11 +322,83 @@ pub enum DeliveryTag {
 }
 
 impl DeliveryTag {
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The tag's opaque value bytes (recipient key, group id, or blinded tag).
+    pub fn value_bytes(&self) -> &[u8] {
         match self {
-            DeliveryTag::Key(b) | DeliveryTag::Group(b) | DeliveryTag::Blinded(b) => b.clone(),
+            DeliveryTag::Key(b) | DeliveryTag::Group(b) | DeliveryTag::Blinded(b) => b,
         }
     }
+
+    /// True iff this is a [`DeliveryTag::Key`] naming exactly `ik` (default-tag resolution, §2.7
+    /// step 4). Group/blinded-tag recognition is out of the core's scope (see [`validate`]).
+    pub fn resolves_to_key(&self, ik: &[u8]) -> bool {
+        matches!(self, DeliveryTag::Key(k) if k.as_slice() == ik)
+    }
+
+    /// Integer-keyed canonical form (§18.3.2). Key `0` is the variant discriminator
+    /// (`KeyTag`=1, `GroupTag`=2, `BlindedTag`=3); key `1` carries the value.
+    pub fn to_cv(&self) -> Cv {
+        let (disc, val) = match self {
+            DeliveryTag::Key(b) => (1u64, b),
+            DeliveryTag::Group(b) => (2, b),
+            DeliveryTag::Blinded(b) => (3, b),
+        };
+        Cv::Map(vec![(0, Cv::U64(disc)), (1, Cv::Bytes(val.clone()))])
+    }
+
+    /// Deterministic CBOR of the tag (§18.3.2), as fed into the `sender_sig` preimage (§18.9.1).
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv())
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let disc = as_u64(f.req(0)?)?;
+        let val = as_bytes(f.req(1)?)?;
+        f.deny_unknown()?;
+        match disc {
+            1 => Ok(DeliveryTag::Key(val)),
+            2 => Ok(DeliveryTag::Group(val)),
+            3 => Ok(DeliveryTag::Blinded(val)),
+            other => Err(CborError::UnknownDiscriminant(other)),
+        }
+    }
+}
+
+/// Reference to a single recipient KeyPackage consumed to initiate an MLS session (§18.3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageRef {
+    pub reference: ContentId, // key 1 (`ref` in the grammar)
+    pub suite: Suite,         // key 2
+    pub loc: Option<String>,  // key 3 (optional locator hint)
+}
+
+impl KeyPackageRef {
+    fn to_cv(&self) -> Cv {
+        let mut m = vec![
+            (1u64, Cv::Bytes(self.reference.as_bytes().to_vec())),
+            (2, Cv::U64(self.suite.as_u8() as u64)),
+        ];
+        if let Some(l) = &self.loc {
+            m.push((3, Cv::Text(l.clone())));
+        }
+        Cv::Map(m)
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let reference = ContentId(as_bytes(f.req(1)?)?);
+        let suite = suite_from_cv(f.req(2)?)?;
+        let loc = f.take(3).map(as_text).transpose()?;
+        f.deny_unknown()?;
+        Ok(KeyPackageRef { reference, suite, loc })
+    }
+}
+
+/// Decode a `suite` field (a `u8`), failing closed on any unknown byte (§18.1.4).
+fn suite_from_cv(cv: Cv) -> Result<Suite, CborError> {
+    let b = as_u8(cv)?;
+    Suite::from_u8(b).ok_or(CborError::UnknownSuite(b))
 }
 
 /// Derive a blinded delivery tag `BT = HKDF(shared_secret, epoch_day)` (spec §2.2a). The
@@ -176,68 +413,337 @@ pub fn blinded_tag(shared_secret: &[u8], epoch_day: u64) -> Vec<u8> {
 
 // --- Envelope & payload (§2.2, §2.4) -------------------------------------------------------
 
-/// The signed, per-recipient envelope (spec §2.2). `id = [0x1e] || BLAKE3-256(ciphertext)`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The signed, per-recipient envelope (spec §2.2, §18.3.1). `id = [0x1e] || BLAKE3-256(ciphertext)`.
+/// Encoded as an integer-keyed canonical CBOR map (§18.1.2) — the field/key mapping is in
+/// [`Envelope::to_cv`]; serde is deliberately **not** derived (text keys are not the wire form).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
-    pub v: u8,                          // format version (0)
-    pub suite: Suite,                   // algorithm suite (§1.1)
-    pub id: ContentId,                  // content address of `ciphertext` (§2.2)
-    pub to: Vec<u8>,                    // DeliveryTag bytes (§2.2a)
-    pub epoch: Option<Vec<u8>>,         // MLS epoch / group-context ref, if group (§5)
-    pub ts: TimestampMs,                // sender timestamp (ms epoch)
-    pub kind: Kind,                     // message kind (§2.3)
-    pub keypkg: Option<ContentId>,      // present iff this initiates an MLS session (§5.3)
-    pub challenge: Option<ChallengeResponse>, // anti-abuse proof for cold senders (§2.2b)
-    pub ciphertext: Vec<u8>,            // HPKE-sealed Payload (§2.4)
-    /// Detached signature by an EPHEMERAL per-message key over `(id‖to‖ts‖kind‖challenge)`;
-    /// gates abuse, reveals no identity (§2.2).
+    pub v: u8,                          // key 1  — format version (0)
+    pub suite: Suite,                   // key 2  — algorithm suite (§1.1)
+    pub id: ContentId,                  // key 3  — content address of `ciphertext` (§2.2)
+    pub to: DeliveryTag,                // key 4  — routing target (§18.3.2)
+    pub epoch: Option<Vec<u8>>,         // key 5  — MLS epoch / group-context ref, if group (§5)
+    pub ts: TimestampMs,                // key 6  — sender timestamp (ms epoch)
+    pub kind: Kind,                     // key 7  — message kind (§2.3)
+    pub keypkg: Option<KeyPackageRef>,  // key 8  — present iff this initiates an MLS session (§5.3)
+    pub challenge: Option<ChallengeResponse>, // key 9 — anti-abuse proof for cold senders (§2.2b)
+    pub ciphertext: Vec<u8>,            // key 10 — HPKE-sealed Payload (§2.4)
+    /// Key 11 — detached signature by an EPHEMERAL per-message key over the §18.9.1 preimage.
     pub sender_sig: Option<Vec<u8>>,
-    /// The ephemeral public key that produced `sender_sig`. (Reference-explicit; see module
-    /// docs — the spec leaves this distribution implicit.)
+    /// Key 12 (`sender_key`, §18.3.1) — the ephemeral public key that verifies `sender_sig`.
     pub sender_eph: Option<Vec<u8>>,
 }
 
-/// The end-to-end-encrypted payload (spec §2.4), sealed into `Envelope.ciphertext`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Envelope {
+    /// Integer-keyed canonical map (§18.3.1). Absent optionals are omitted (§18.1.1); when
+    /// `include_sig` is false, key 11 (`sender_sig`) is dropped — but `sender_sig` is not part
+    /// of a whole-object signing preimage (its preimage is the §18.9.1 concatenation), so this
+    /// full form (with key 11 present when set) is the wire encoding.
+    fn to_cv(&self) -> Cv {
+        let mut m = vec![
+            (1u64, Cv::U64(self.v as u64)),
+            (2, Cv::U64(self.suite.as_u8() as u64)),
+            (3, Cv::Bytes(self.id.as_bytes().to_vec())),
+            (4, self.to.to_cv()),
+        ];
+        if let Some(e) = &self.epoch {
+            m.push((5, Cv::Bytes(e.clone())));
+        }
+        m.push((6, Cv::U64(self.ts)));
+        m.push((7, Cv::U64(self.kind.as_u8() as u64)));
+        if let Some(k) = &self.keypkg {
+            m.push((8, k.to_cv()));
+        }
+        if let Some(c) = &self.challenge {
+            m.push((9, c.to_cv()));
+        }
+        m.push((10, Cv::Bytes(self.ciphertext.clone())));
+        if let Some(s) = &self.sender_sig {
+            m.push((11, Cv::Bytes(s.clone())));
+        }
+        if let Some(k) = &self.sender_eph {
+            m.push((12, Cv::Bytes(k.clone())));
+        }
+        Cv::Map(m)
+    }
+
+    /// The exact wire bytes of this envelope: §18-canonical integer-keyed CBOR.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv())
+    }
+
+    /// The §18.9.1 `sender_sig` preimage **body** (the [`ENVELOPE_SENDER_DS`] tag is prepended by
+    /// `sign_domain`): `id ‖ det_cbor(to) ‖ u64be(ts) ‖ u8(kind) ‖ challenge_enc`. Exposed for
+    /// conformance vectors and independent verifiers.
+    pub fn sender_sig_body(&self) -> Vec<u8> {
+        sender_authed_bytes(self)
+    }
+
+    /// Decode an envelope from its canonical CBOR (§18.3.1), failing closed on any violation.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cbor::decode(bytes)?)?;
+        let v = as_u8(f.req(1)?)?;
+        let suite = suite_from_cv(f.req(2)?)?;
+        let id = ContentId(as_bytes(f.req(3)?)?);
+        let to = DeliveryTag::from_cv(f.req(4)?)?;
+        let epoch = f.take(5).map(as_bytes).transpose()?;
+        let ts = as_u64(f.req(6)?)?;
+        let kind = Kind::from_u8(as_u8(f.req(7)?)?).ok_or(CborError::UnknownDiscriminant(0))?;
+        let keypkg = f.take(8).map(KeyPackageRef::from_cv).transpose()?;
+        let challenge = f.take(9).map(ChallengeResponse::from_cv).transpose()?;
+        let ciphertext = as_bytes(f.req(10)?)?;
+        let sender_sig = f.take(11).map(as_bytes).transpose()?;
+        let sender_eph = f.take(12).map(as_bytes).transpose()?;
+        f.deny_unknown()?;
+        Ok(Envelope {
+            v,
+            suite,
+            id,
+            to,
+            epoch,
+            ts,
+            kind,
+            keypkg,
+            challenge,
+            ciphertext,
+            sender_sig,
+            sender_eph,
+        })
+    }
+}
+
+/// The end-to-end-encrypted payload (spec §2.4, §18.3.5), sealed into `Envelope.ciphertext`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
-    pub from: Vec<u8>, // sender IK — revealed only to the recipient (sealed sender)
-    #[serde(default)]
-    pub sig: Vec<u8>, // IK/device key over the canonical payload hash (§2.4, §5.2)
-    pub headers: Headers,
-    pub body: Vec<u8>,
-    pub refs: Vec<ContentId>,
-    pub attach: Vec<Attachment>,
-    pub expires: Option<TimestampMs>,
+    pub from: Vec<u8>,           // key 1 — sender IK (sealed sender)
+    pub sig: Vec<u8>,            // key 2 — IK/device sig over the payload hash (§18.9.2)
+    pub headers: Headers,        // key 3
+    pub body: Vec<u8>,           // key 4 — Body (encoded as a CBOR byte string, §18.3.6)
+    pub refs: Vec<ContentId>,    // key 5 — threading refs
+    pub attach: Vec<Attachment>, // key 6
+    pub expires: Option<TimestampMs>, // key 7
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl Payload {
+    /// Integer-keyed canonical map (§18.3.5). `include_sig=false` omits key 2 for the signing
+    /// preimage body of §18.9.2. `refs` (key 5) and `attach` (key 6) are always present (MAY be
+    /// empty arrays). `Body` is emitted as a CBOR byte string (the `bytes` branch of §18.3.6).
+    fn to_cv(&self, include_sig: bool) -> Cv {
+        let mut m = vec![(1u64, Cv::Bytes(self.from.clone()))];
+        if include_sig {
+            m.push((2, Cv::Bytes(self.sig.clone())));
+        }
+        m.push((3, self.headers.to_cv()));
+        m.push((4, Cv::Bytes(self.body.clone())));
+        m.push((
+            5,
+            Cv::Array(self.refs.iter().map(|r| Cv::Bytes(r.as_bytes().to_vec())).collect()),
+        ));
+        m.push((6, Cv::Array(self.attach.iter().map(Attachment::to_cv).collect())));
+        if let Some(e) = self.expires {
+            m.push((7, Cv::U64(e)));
+        }
+        Cv::Map(m)
+    }
+
+    /// The exact wire bytes of this payload: §18-canonical integer-keyed CBOR.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv(true))
+    }
+
+    /// The §18.9.2 signing body: deterministic CBOR of the payload with `sig` (key 2) omitted.
+    fn signing_body(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv(false))
+    }
+
+    /// The §18.9.2 payload hash `BLAKE3-256(det_cbor(Payload ∖ {sig}))`, over which `sig` is
+    /// signed under the [`PAYLOAD_SIG_DS`] domain. Exposed for conformance vectors.
+    pub fn signing_hash(&self) -> [u8; 32] {
+        *blake3::hash(&self.signing_body()).as_bytes()
+    }
+
+    /// Decode a payload from its canonical CBOR (§18.3.5), failing closed on any violation.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cbor::decode(bytes)?)?;
+        let from = as_bytes(f.req(1)?)?;
+        let sig = as_bytes(f.req(2)?)?;
+        let headers = Headers::from_cv(f.req(3)?)?;
+        let body = as_bytes(f.req(4)?)?;
+        let refs = as_array(f.req(5)?)?
+            .into_iter()
+            .map(|c| as_bytes(c).map(ContentId))
+            .collect::<Result<_, _>>()?;
+        let attach = as_array(f.req(6)?)?
+            .into_iter()
+            .map(Attachment::from_cv)
+            .collect::<Result<_, _>>()?;
+        let expires = f.take(7).map(as_u64).transpose()?;
+        f.deny_unknown()?;
+        Ok(Payload { from, sig, headers, body, refs, attach, expires })
+    }
+}
+
+/// Message headers (spec §2.4, §18.3.6). All fields optional except `cc` (key 4, MAY be empty).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Headers {
-    pub thread: Option<Vec<u8>>,
-    pub subject: Option<String>, // mail only
-    pub mime: Option<String>,
-    pub cc: Vec<Vec<u8>>, // fan-out is per-recipient MOTEs
+    pub thread: Option<Vec<u8>>, // key 1
+    pub subject: Option<String>, // key 2 — mail only
+    pub mime: Option<String>,    // key 3
+    pub cc: Vec<Vec<u8>>,        // key 4 — additional recipient keys
 }
 
-/// An attachment (spec §2.5). Small → inline; large → content-addressed manifest (§5.5).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Headers {
+    fn to_cv(&self) -> Cv {
+        let mut m: Vec<(u64, Cv)> = Vec::new();
+        if let Some(t) = &self.thread {
+            m.push((1, Cv::Bytes(t.clone())));
+        }
+        if let Some(s) = &self.subject {
+            m.push((2, Cv::Text(s.clone())));
+        }
+        if let Some(mm) = &self.mime {
+            m.push((3, Cv::Text(mm.clone())));
+        }
+        m.push((4, Cv::Array(self.cc.iter().map(|k| Cv::Bytes(k.clone())).collect())));
+        Cv::Map(m)
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let thread = f.take(1).map(as_bytes).transpose()?;
+        let subject = f.take(2).map(as_text).transpose()?;
+        let mime = f.take(3).map(as_text).transpose()?;
+        let cc = as_array(f.req(4)?)?
+            .into_iter()
+            .map(as_bytes)
+            .collect::<Result<_, _>>()?;
+        f.deny_unknown()?;
+        Ok(Headers { thread, subject, mime, cc })
+    }
+}
+
+/// An attachment (spec §2.5, §18.3.7). Small → inline; large → content-addressed manifest (§5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
-    pub name: String,
-    pub mime: String,
-    pub size: u64,
-    pub inline: Option<Vec<u8>>,
-    pub manifest: Option<ManifestRef>,
-    /// Per-file content key. It lives HERE, inside the sealed MOTE — never inside the
+    pub name: String,                 // key 1
+    pub mime: String,                 // key 2
+    pub size: u64,                    // key 3
+    pub inline: Option<Vec<u8>>,      // key 4 — mutually exclusive with `manifest`
+    pub manifest: Option<ManifestRef>, // key 5 — mutually exclusive with `inline`
+    /// Key 6 — per-file content key. It lives HERE, inside the sealed MOTE — never inside the
     /// swarm-distributed `Manifest` object (§5.5/§18.3.8): a manifest is a content-addressed
-    /// blob any holder may serve, so an embedded key would leak the whole file. `ManifestRef`
-    /// (below) deliberately carries only id/size/chunk-count, no key.
+    /// blob any holder may serve, so an embedded key would leak the whole file.
     pub key: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Attachment {
+    fn to_cv(&self) -> Cv {
+        let mut m = vec![
+            (1u64, Cv::Text(self.name.clone())),
+            (2, Cv::Text(self.mime.clone())),
+            (3, Cv::U64(self.size)),
+        ];
+        if let Some(i) = &self.inline {
+            m.push((4, Cv::Bytes(i.clone())));
+        }
+        if let Some(mr) = &self.manifest {
+            m.push((5, mr.to_cv()));
+        }
+        m.push((6, Cv::Bytes(self.key.clone())));
+        Cv::Map(m)
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let name = as_text(f.req(1)?)?;
+        let mime = as_text(f.req(2)?)?;
+        let size = as_u64(f.req(3)?)?;
+        let inline = f.take(4).map(as_bytes).transpose()?;
+        let manifest = f.take(5).map(ManifestRef::from_cv).transpose()?;
+        let key = as_bytes(f.req(6)?)?;
+        f.deny_unknown()?;
+        Ok(Attachment { name, mime, size, inline, manifest, key })
+    }
+}
+
+/// Reference to a file's manifest (spec §2.5, §18.3.7). `chunks` here is a *count* (u32).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestRef {
-    pub id: ContentId, // BLAKE3 Merkle-DAG root (§5.5)
-    pub size: u64,
-    pub chunks: u32,
+    pub id: ContentId, // key 1 — BLAKE3 Merkle-DAG root (§18.9.5)
+    pub size: u64,     // key 2
+    pub chunks: u32,   // key 3 — NUMBER of chunks
+}
+
+impl ManifestRef {
+    fn to_cv(&self) -> Cv {
+        Cv::Map(vec![
+            (1, Cv::Bytes(self.id.as_bytes().to_vec())),
+            (2, Cv::U64(self.size)),
+            (3, Cv::U64(self.chunks as u64)),
+        ])
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let id = ContentId(as_bytes(f.req(1)?)?);
+        let size = as_u64(f.req(2)?)?;
+        let chunks = as_u32(f.req(3)?)?;
+        f.deny_unknown()?;
+        Ok(ManifestRef { id, size, chunks })
+    }
+}
+
+/// The swarm-distributed file manifest (spec §5.5, §18.3.8). Here `chunks` is the *ordered list
+/// of chunk hashes* (⚠ distinct from `ManifestRef.chunks`, a count — §18.11 item 4). Key `5` is
+/// **forbidden**: the content key MUST NOT appear in a Manifest (§18.3.8); a Manifest carrying
+/// key 5 is rejected on decode (`ERR_MANIFEST_KEY_PRESENT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub id: ContentId,          // key 1 — Merkle root / content address
+    pub size: u64,              // key 2 — total plaintext size
+    pub chunk_sz: u32,          // key 3 — fixed chunk size
+    pub chunks: Vec<ContentId>, // key 4 — ordered chunk hashes (≥ 1)
+    pub suite: Suite,           // key 6 — chunk AEAD + hash suite
+}
+
+impl Manifest {
+    fn to_cv(&self) -> Cv {
+        Cv::Map(vec![
+            (1, Cv::Bytes(self.id.as_bytes().to_vec())),
+            (2, Cv::U64(self.size)),
+            (3, Cv::U64(self.chunk_sz as u64)),
+            (
+                4,
+                Cv::Array(self.chunks.iter().map(|c| Cv::Bytes(c.as_bytes().to_vec())).collect()),
+            ),
+            (6, Cv::U64(self.suite.as_u8() as u64)),
+        ])
+    }
+
+    /// The exact wire bytes of this manifest: §18-canonical integer-keyed CBOR.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv())
+    }
+
+    /// Decode a manifest (§18.3.8), rejecting a present key `5` as `ERR_MANIFEST_KEY_PRESENT`.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cbor::decode(bytes)?)?;
+        // The content key MUST NOT appear here (§18.3.8) — reject before anything else so a
+        // leaky manifest is detected, never silently honored.
+        if f.has(5) {
+            return Err(CborError::ManifestKeyPresent);
+        }
+        let id = ContentId(as_bytes(f.req(1)?)?);
+        let size = as_u64(f.req(2)?)?;
+        let chunk_sz = as_u32(f.req(3)?)?;
+        let chunks = as_array(f.req(4)?)?
+            .into_iter()
+            .map(|c| as_bytes(c).map(ContentId))
+            .collect::<Result<_, _>>()?;
+        let suite = suite_from_cv(f.req(6)?)?;
+        f.deny_unknown()?;
+        Ok(Manifest { id, size, chunk_sz, chunks, suite })
+    }
 }
 
 /// File-handling tier by size (spec §2.5 / §16.4). The three-tier model is normative; the
@@ -360,7 +866,7 @@ pub struct MoteDraft {
     pub attach: Vec<Attachment>,
     pub expires: Option<TimestampMs>,
     pub epoch: Option<Vec<u8>>,
-    pub keypkg: Option<ContentId>,
+    pub keypkg: Option<KeyPackageRef>,
     pub challenge: Option<ChallengeResponse>,
 }
 
@@ -383,39 +889,37 @@ impl MoteDraft {
 }
 
 /// AEAD additional-authenticated-data binding the ciphertext to its envelope header (suite,
-/// kind, ts, to). `id` is excluded because it is *derived from* the ciphertext.
-fn aad_bytes(suite: Suite, kind: Kind, ts: TimestampMs, to: &[u8]) -> Vec<u8> {
-    let mut a = Vec::with_capacity(2 + 8 + to.len());
+/// kind, ts, to). `id` is excluded because it is *derived from* the ciphertext. `to_cbor` is the
+/// deterministic CBOR of the [`DeliveryTag`] (§18.3.2), so the whole tag is bound.
+fn aad_bytes(suite: Suite, kind: Kind, ts: TimestampMs, to_cbor: &[u8]) -> Vec<u8> {
+    let mut a = Vec::with_capacity(2 + 8 + to_cbor.len());
     a.push(suite.as_u8());
     a.push(kind.as_u8());
     a.extend_from_slice(&ts.to_be_bytes());
-    a.extend_from_slice(to);
+    a.extend_from_slice(to_cbor);
     a
 }
 
-/// The bytes covered by `sender_sig`: `id ‖ to ‖ ts ‖ kind ‖ challenge` (spec §2.2, §2.7 step 3).
+/// The §18.9.1 `sender_sig` preimage **body** (the DS-tag is prepended by `sign_domain`):
+/// `id_bytes ‖ det_cbor(to) ‖ u64be(ts) ‖ u8(kind) ‖ challenge_enc`, where `challenge_enc` is
+/// `det_cbor(challenge)` when present, else the single byte `0xf6` (CBOR null — the only place a
+/// `null` appears in a preimage, §18.1.1).
 fn sender_authed_bytes(env: &Envelope) -> Vec<u8> {
     let mut m = Vec::new();
-    m.extend_from_slice(env.id.as_bytes());
-    m.extend_from_slice(&env.to);
-    m.extend_from_slice(&env.ts.to_be_bytes());
-    m.push(env.kind.as_u8());
-    // Challenge (deterministically encoded; empty when absent).
-    if let Some(c) = &env.challenge {
-        let mut cb = Vec::new();
-        ciborium::into_writer(c, &mut cb).expect("CBOR of challenge is infallible");
-        m.extend_from_slice(&cb);
+    m.extend_from_slice(env.id.as_bytes()); // field 3: raw hash bytes (no CBOR head)
+    m.extend_from_slice(&env.to.det_cbor()); // field 4: deterministic CBOR of the DeliveryTag
+    m.extend_from_slice(&env.ts.to_be_bytes()); // field 6: u64 big-endian, 8 bytes
+    m.push(env.kind.as_u8()); // field 7: 1 byte
+    match &env.challenge {
+        Some(c) => m.extend_from_slice(&c.det_cbor()), // field 9: det_cbor(ChallengeResponse)
+        None => m.push(0xf6),                          // absent ⇒ CBOR null
     }
     m
 }
 
-/// Canonical hash of a payload for signing: `BLAKE3(CBOR(payload with sig cleared))`.
+/// Canonical payload hash for signing (§18.9.2): `BLAKE3-256(det_cbor(Payload ∖ {sig}))`.
 fn payload_hash(payload: &Payload) -> [u8; 32] {
-    let mut p = payload.clone();
-    p.sig = Vec::new();
-    let mut buf = Vec::new();
-    ciborium::into_writer(&p, &mut buf).expect("CBOR of payload is infallible");
-    *blake3::hash(&buf).as_bytes()
+    *blake3::hash(&payload.signing_body()).as_bytes()
 }
 
 /// Build a MOTE (spec §2.2, §2.4): construct + sign the payload, HPKE-seal it, content-address
@@ -435,7 +939,8 @@ pub fn build_mote(
     draft: MoteDraft,
 ) -> Result<Envelope, MoteError> {
     let suite = Suite::Classical;
-    let to = recipient_ik.to_vec();
+    let to = DeliveryTag::Key(recipient_ik.to_vec());
+    let to_cbor = to.det_cbor();
 
     // 1. Build and sign the payload (identity signature lives inside the ciphertext).
     let mut payload = Payload {
@@ -448,12 +953,11 @@ pub fn build_mote(
         expires: draft.expires,
     };
     let ph = payload_hash(&payload);
-    payload.sig = sender_ik.sign_domain(PAYLOAD_SIG_DOMAIN, &ph);
+    payload.sig = sender_ik.sign_domain(PAYLOAD_SIG_DS, &ph);
 
-    // 2. Serialize + HPKE-seal the payload, binding it to the envelope header via AAD.
-    let mut pt = Vec::new();
-    ciborium::into_writer(&payload, &mut pt).expect("CBOR of payload is infallible");
-    let aad = aad_bytes(suite, draft.kind, draft.ts, &to);
+    // 2. Serialize (canonical §18 CBOR) + HPKE-seal the payload, binding it via AAD.
+    let pt = payload.det_cbor();
+    let aad = aad_bytes(suite, draft.kind, draft.ts, &to_cbor);
     let ciphertext = sealer.seal(recipient_seal_pub, &aad, &pt)?;
 
     // 3. Content-address the ciphertext.
@@ -475,7 +979,7 @@ pub fn build_mote(
         sender_eph: Some(ephemeral.public()),
     };
     let authed = sender_authed_bytes(&env);
-    env.sender_sig = Some(ephemeral.sign_domain(SENDER_SIG_DOMAIN, &authed));
+    env.sender_sig = Some(ephemeral.sign_domain(ENVELOPE_SENDER_DS, &authed));
     Ok(env)
 }
 
@@ -528,15 +1032,15 @@ pub fn validate(
         return Err(MoteError::BadContentAddress);
     }
 
-    // 3. Verify sender_sig over (id‖to‖ts‖kind‖challenge) under the ephemeral key (cheap).
+    // 3. Verify sender_sig over the §18.9.1 preimage under the ephemeral key (cheap).
     if let Some(sig) = &env.sender_sig {
         let eph = env.sender_eph.as_ref().ok_or(MoteError::MissingSenderKey)?;
         let authed = sender_authed_bytes(env);
-        verify_domain(eph, SENDER_SIG_DOMAIN, &authed, sig).map_err(|_| MoteError::BadSignature)?;
+        verify_domain(eph, ENVELOPE_SENDER_DS, &authed, sig).map_err(|_| MoteError::BadSignature)?;
     }
 
-    // 4. Resolve `to` to this node (default tag == our identity key).
-    if env.to != ctx.our_ik {
+    // 4. Resolve `to` to this node (default KeyTag == our identity key, §2.7 step 4).
+    if !env.to.resolves_to_key(ctx.our_ik) {
         return Err(MoteError::NotForUs);
     }
 
@@ -549,13 +1053,13 @@ pub fn validate(
     }
 
     // 7. Decrypt the payload (only now, after the anonymous gate).
-    let aad = aad_bytes(env.suite, env.kind, env.ts, &env.to);
+    let aad = aad_bytes(env.suite, env.kind, env.ts, &env.to.det_cbor());
     let pt = sealer.open(ctx.seal_secret, &aad, &env.ciphertext)?;
-    let payload: Payload = ciborium::from_reader(&pt[..]).map_err(|_| MoteError::DecryptFailed)?;
+    let payload = Payload::from_det_cbor(&pt)?;
 
     // 8. Verify Payload.sig under Payload.from (TOFU-pin / pinned-identity check is the caller's).
     let ph = payload_hash(&payload);
-    verify_domain(&payload.from, PAYLOAD_SIG_DOMAIN, &ph, &payload.sig)
+    verify_domain(&payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig)
         .map_err(|_| MoteError::BadSignature)?;
 
     // 9. (Caller applies expires/refs/kind semantics, stores, and acks.)
@@ -582,10 +1086,22 @@ mod tests {
     #[test]
     fn envelope_cbor_round_trip() {
         let (env, _r, _s) = round(Kind::Mail);
-        let mut buf = Vec::new();
-        ciborium::into_writer(&env, &mut buf).unwrap();
-        let back: Envelope = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(env, back, "envelope must survive a CBOR round-trip byte-for-byte");
+        let buf = env.det_cbor();
+        // First byte MUST be a CBOR map head, and the first key MUST be integer 1 (not a text key).
+        assert_eq!(buf[0] & 0xe0, 0xa0, "top-level object is a CBOR map");
+        let back = Envelope::from_det_cbor(&buf).unwrap();
+        assert_eq!(env, back, "envelope must survive a canonical CBOR round-trip byte-for-byte");
+        assert_eq!(env.det_cbor(), back.det_cbor(), "re-encode is byte-identical");
+    }
+
+    #[test]
+    fn envelope_is_integer_keyed_not_text_keyed() {
+        let (env, _r, _s) = round(Kind::Mail);
+        let buf = env.det_cbor();
+        // map head, then key 1 encoded as the single byte 0x01 (a small unsigned integer),
+        // then value = version 0 (0x00). A text-keyed encoding would start with a 0x6x string head.
+        assert_eq!(buf[1], 0x01, "first map key is integer 1 (v), not a text key");
+        assert_eq!(buf[2], 0x00, "v = 0");
     }
 
     #[test]
@@ -661,10 +1177,13 @@ mod tests {
         let recipient = IdentityKey::generate();
         let seal = SealKeypair::generate();
         let mut draft = MoteDraft::new(Kind::Mail, 1, b"cold contact".to_vec());
-        draft.challenge = Some(ChallengeResponse::ProofOfWork {
-            nonce: vec![1, 2, 3],
+        draft.challenge = Some(ChallengeResponse::Pow(PowSolution {
+            algo: "argon2id".into(),
+            params: [65536, 3, 1],
+            epoch_nonce: vec![1, 2, 3],
             solution: vec![4, 5, 6],
-        });
+            difficulty: 20,
+        }));
         let env =
             build_mote(&Hpke, &sender, &eph, &recipient.public(), seal.public(), draft).unwrap();
         let ctx = RecipientCtx {
@@ -687,5 +1206,86 @@ mod tests {
         let ss = b"shared secret from first contact";
         assert_eq!(blinded_tag(ss, 100), blinded_tag(ss, 100));
         assert_ne!(blinded_tag(ss, 100), blinded_tag(ss, 101));
+    }
+
+    #[test]
+    fn manifest_round_trips_canonically() {
+        let m = Manifest {
+            id: ContentId::of(b"manifest-root"),
+            size: 3 * 1024 * 1024,
+            chunk_sz: 1024 * 1024,
+            chunks: vec![ContentId::of(b"c0"), ContentId::of(b"c1"), ContentId::of(b"c2")],
+            suite: Suite::Classical,
+        };
+        let bytes = m.det_cbor();
+        assert_eq!(Manifest::from_det_cbor(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn manifest_with_key5_is_rejected() {
+        // Hand-build a Manifest map that (illegally) carries key 5 = a content key (§18.3.8).
+        let leaky = Cv::Map(vec![
+            (1, Cv::Bytes(ContentId::of(b"root").as_bytes().to_vec())),
+            (2, Cv::U64(1024)),
+            (3, Cv::U64(1024)),
+            (4, Cv::Array(vec![Cv::Bytes(ContentId::of(b"c0").as_bytes().to_vec())])),
+            (5, Cv::Bytes(vec![0u8; 32])), // FORBIDDEN
+            (6, Cv::U64(0x01)),
+        ]);
+        let bytes = cbor::encode(&leaky);
+        assert_eq!(
+            Manifest::from_det_cbor(&bytes),
+            Err(CborError::ManifestKeyPresent)
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unknown_key_fail_closed() {
+        let (env, _r, _s) = round(Kind::Mail);
+        let mut f = match cbor::decode(&env.det_cbor()).unwrap() {
+            Cv::Map(m) => m,
+            _ => unreachable!(),
+        };
+        f.push((63, Cv::U64(1))); // an unknown (reserved-range) key
+        let bytes = cbor::encode(&Cv::Map(f));
+        assert_eq!(Envelope::from_det_cbor(&bytes), Err(CborError::UnknownKey(63)));
+    }
+
+    #[test]
+    fn challenge_variants_round_trip() {
+        for c in [
+            ChallengeResponse::Arc(ArcToken {
+                issuer: vec![1],
+                token: vec![2, 3],
+                origin: vec![4],
+                nonce: Some(vec![5]),
+            }),
+            ChallengeResponse::Pow(PowSolution {
+                algo: "argon2id".into(),
+                params: [65536, 3, 1],
+                epoch_nonce: vec![9],
+                solution: vec![8, 7],
+                difficulty: 22,
+            }),
+            ChallengeResponse::Postage(PostageStamp {
+                issuer: vec![1],
+                serial: vec![2],
+                amount: 500,
+                currency: "USD".into(),
+                expiry: 1_700_000_000_000,
+                audience: None,
+                sig: vec![0u8; 64],
+            }),
+            ChallengeResponse::Vouch(Vouch {
+                voucher: vec![1; 32],
+                subject: vec![2; 32],
+                recipient: vec![3; 32],
+                exp: 1_700_000_000_000,
+                sig: vec![0u8; 64],
+            }),
+        ] {
+            let bytes = c.det_cbor();
+            assert_eq!(ChallengeResponse::from_cv(cbor::decode(&bytes).unwrap()).unwrap(), c);
+        }
     }
 }

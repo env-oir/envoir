@@ -12,8 +12,7 @@
 include!("../vectors_gen.rs.inc");
 
 fn vectors_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../dmtap/conformance/vectors/vectors.json")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors.json")
 }
 
 fn load_committed() -> VectorFile {
@@ -63,26 +62,28 @@ fn cbor_vectors_round_trip() {
         }
         let cbor_hex = vec.expected["cbor_hex"].as_str().unwrap();
         let bytes = unhex(cbor_hex);
+        // Decode from the committed canonical (integer-keyed §18) CBOR, then re-encode: the
+        // re-encoding MUST be byte-identical (deterministic encoding, §18.1.1).
         match vec.input["type"].as_str().unwrap() {
             "Identity" => {
-                let obj: Identity = ciborium::from_reader(&bytes[..]).unwrap();
+                let obj = Identity::from_det_cbor(&bytes).unwrap();
                 assert!(obj.verify(None).is_ok(), "decoded Identity must verify: {}", vec.name);
-                assert_eq!(hex(&cbor(&obj)), cbor_hex, "re-encode must be byte-identical: {}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "re-encode must be byte-identical: {}", vec.name);
             }
             "DeviceCert" => {
-                let obj: DeviceCert = ciborium::from_reader(&bytes[..]).unwrap();
+                let obj = DeviceCert::from_det_cbor(&bytes).unwrap();
                 assert!(obj.verify().is_ok(), "decoded DeviceCert must verify: {}", vec.name);
-                assert_eq!(hex(&cbor(&obj)), cbor_hex, "{}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
             }
             "Payload" => {
-                let obj: Payload = ciborium::from_reader(&bytes[..]).unwrap();
-                assert_eq!(hex(&cbor(&obj)), cbor_hex, "{}", vec.name);
+                let obj = Payload::from_det_cbor(&bytes).unwrap();
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
             }
             "Envelope" => {
-                let obj: Envelope = ciborium::from_reader(&bytes[..]).unwrap();
+                let obj = Envelope::from_det_cbor(&bytes).unwrap();
                 // Envelope carries its own content address — it must still verify after decode.
                 assert!(obj.id.verify(&obj.ciphertext), "Envelope id must match ciphertext: {}", vec.name);
-                assert_eq!(hex(&cbor(&obj)), cbor_hex, "{}", vec.name);
+                assert_eq!(hex(&obj.det_cbor()), cbor_hex, "{}", vec.name);
             }
             other => panic!("unknown cbor type {other}"),
         }
