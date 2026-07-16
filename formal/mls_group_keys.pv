@@ -1,0 +1,127 @@
+(* ============================================================================
+   MLS-style group key schedule  --  secrecy + forward secrecy (FS) + post-
+   compromise security (PCS), as a TRACTABLE symbolic abstraction.
+   ----------------------------------------------------------------------------
+   What is modelled (honest abstraction of RFC 9420 TreeKEM + key schedule):
+
+     - Each epoch is created by a Commit that injects a FRESH `commit_secret`
+       (`cs_n`).  In real MLS the committer distributes `cs_n` to the CURRENT
+       group members along their TreeKEM path, encrypted to member leaf keys.
+       Here that path encryption is abstracted by a public-key encryption of
+       `cs_n` to each remaining member's leaf public key (`penc(cs_n, leaf)`),
+       which is exactly what a removed member can NOT open.
+
+     - The key schedule is abstracted by two ONE-WAY functions:
+           es_n = kdfEpoch(is_{n-1}, cs_n)   (* epoch secret          *)
+           is_n = kdfInit (es_n)             (* next-epoch init secret *)
+       Both are free constructors with no inverse rule => one-way, which is the
+       only property FS/PCS actually rely on (you cannot run the schedule
+       backwards, and you cannot get `es_n` without BOTH `is_{n-1}` AND `cs_n`).
+
+     - An application message per epoch (`appMsg_n`) is sent under an AEAD keyed
+       by that epoch's secret; secrecy of `appMsg_n` <=> secrecy of `es_n`.
+
+   Timeline (a bounded, concrete 3-epoch instance):
+       epoch 1 : group {A, B, R}   -- R is a full member, learns es1
+       epoch 2 : Commit REMOVES R  -> group {A, B}, fresh cs2 to A,B only
+       epoch 3 : Commit re-keys    -> group {A, B}, fresh cs3 to A,B only
+
+   Phase-1 compromises (coexisting, the WORST case for epoch 2):
+       PCS-leak: the removed member R dumps ALL of its state
+                 (its leaf key skR + its epoch-1 group secret es1, hence is1).
+       FS -leak: a LATER epoch (3) is fully compromised at the secret level
+                 (es3 is handed out, hence is3).
+
+   Queries:
+     (headline, TRUE)  attacker(appMsg2): the epoch-2 secret survives BOTH a
+        removed member dumping its entire past state (=> PCS: the fresh Commit
+        entropy cs2 was never given to R) AND a later epoch being fully
+        compromised (=> FS: the one-way schedule cannot be run backwards).
+        A fortiori this is group-key secrecy against a passive transcript
+        observer (who has neither leaf keys nor any epoch secret).
+
+     (non-vacuity controls, deliberately FALSE) attacker(appMsg1),
+        attacker(appMsg3): a member/attacker who legitimately holds an epoch's
+        OWN secret can of course read that epoch's traffic.  These FALSE results
+        prove the leaks are effective and the model is not vacuously secret --
+        i.e. epoch 2 is protected by real cryptographic separation, not because
+        the attacker was handed nothing.
+
+   Tool: ProVerif.   Run:  proverif mls_group_keys.pv
+   ============================================================================ *)
+
+(* ---------- TreeKEM leaf key = a public-key encryption keypair ------------- *)
+type skey.
+type pkey.
+fun  pk(skey): pkey.
+fun  penc(bitstring, pkey): bitstring.
+reduc forall m: bitstring, k: skey; pdec(penc(m, pk(k)), k) = m.
+
+(* ---------- MLS key schedule, abstracted as two one-way KDFs --------------- *)
+fun  kdfEpoch(bitstring, bitstring): bitstring.  (* (init_{n-1}, commit_n) -> epoch_n *)
+fun  kdfInit (bitstring): bitstring.             (* epoch_n -> init_n (one-way)        *)
+
+(* ---------- AEAD under an epoch secret (the group's message key) ----------- *)
+fun  aead(bitstring, bitstring): bitstring.      (* key, plaintext *)
+reduc forall k: bitstring, m: bitstring; adec(k, aead(k, m)) = m.
+
+free c: channel.                                 (* public network / transcript *)
+
+(* Per-epoch application-message probes; secrecy of these = secrecy of es_n.   *)
+free appMsg1: bitstring [private].
+free appMsg2: bitstring [private].
+free appMsg3: bitstring [private].
+
+(* ===================== QUERIES ========================================== *)
+
+(* (S)+(FS)+(PCS) -- the security property.  epoch-2 secret stays secret even
+   though (a) the removed member R has dumped its complete epoch-1 state, and
+   (b) a later epoch (3) has been fully compromised. *)
+query attacker(appMsg2).
+
+(* Non-vacuity controls -- EXPECTED to be false (see header): a party holding an
+   epoch's own secret can read that epoch. Their falsity certifies the leaks are
+   real, so appMsg2's secrecy is a genuine separation, not an empty model. *)
+query attacker(appMsg1).
+query attacker(appMsg3).
+
+(* ===================== MAIN (a concrete 3-epoch run) =================== *)
+process
+  (* leaf (TreeKEM) keypairs for members A, B and the to-be-removed member R *)
+  new skA: skey;  new skB: skey;  new skR: skey;
+  out(c, (pk(skA), pk(skB), pk(skR)));            (* leaf public keys are public *)
+
+  new init0: bitstring;                            (* epoch-0 init secret (group creation) *)
+
+  (* -------- epoch 1 : group {A, B, R} -------- *)
+  new cs1: bitstring;                              (* fresh Commit entropy *)
+  (* TreeKEM distribution of cs1 to ALL of A, B, R *)
+  out(c, (penc(cs1, pk(skA)), penc(cs1, pk(skB)), penc(cs1, pk(skR))));
+  let es1 = kdfEpoch(init0, cs1) in                (* epoch-1 secret (R knows this) *)
+  let is1 = kdfInit(es1) in
+  out(c, aead(es1, appMsg1));                       (* an epoch-1 application message *)
+
+  (* -------- epoch 2 : Commit REMOVES R -> group {A, B} -------- *)
+  new cs2: bitstring;                              (* fresh entropy, NEVER given to R *)
+  out(c, (penc(cs2, pk(skA)), penc(cs2, pk(skB))));(* delivered ONLY to remaining members *)
+  let es2 = kdfEpoch(is1, cs2) in                  (* epoch-2 secret *)
+  let is2 = kdfInit(es2) in
+  out(c, aead(es2, appMsg2));
+
+  (* -------- epoch 3 : Commit re-keys among {A, B} -------- *)
+  new cs3: bitstring;
+  out(c, (penc(cs3, pk(skA)), penc(cs3, pk(skB))));
+  let es3 = kdfEpoch(is2, cs3) in                  (* epoch-3 secret *)
+  let is3 = kdfInit(es3) in
+  out(c, aead(es3, appMsg3));
+
+  (
+      (* PCS: the removed member R dumps ALL of its state.  es1 => is1 via the
+         public kdfInit; skR opens only cs1 (which was sent to R) -- crucially
+         NOT cs2, so R cannot reach es2. *)
+      ( phase 1; out(c, (skR, es1)) )
+      (* FS: a later epoch (3) is fully compromised at the secret level.  es3
+         => is3, but the schedule is one-way, so es2 is not recoverable from a
+         future epoch. *)
+    | ( phase 1; out(c, (es3, is3)) )
+  )

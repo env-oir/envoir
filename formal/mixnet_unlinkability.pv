@@ -1,0 +1,83 @@
+(* ============================================================================
+   Mixnet unlinkability (best-effort)  --  one honest hop unlinks input<->output
+   for a passive global observer, as a symbolic observational-equivalence
+   (biprocess) model.
+   ----------------------------------------------------------------------------
+   What is modelled:
+
+     - TWO honest senders each build a 2-layer onion: an inner layer addressed
+       to the NEXT hop (`penc(payload, pk(skN), r_inner)`) wrapped in an outer
+       layer addressed to the mix (`penc(inner, pk(skM), r_outer)`).
+     - ONE honest mix hop strips its outer layer and emits the two inner layers
+       in a permuted order.
+     - A PASSIVE global observer sees: both input onions (in a fixed observed
+       order) and both mix outputs.
+
+     Encryption is RANDOMIZED -- `penc(m, pk, coins)` with fresh secret `coins`.
+     This is essential: with deterministic encryption the observer could
+     re-encrypt an output under the mix's PUBLIC key and byte-match it to an
+     input, trivially linking them.  Randomized encryption (the re-encryption /
+     probabilistic-onion property real mixes require) forbids that.
+
+   Unlinkability is stated as OBSERVATIONAL EQUIVALENCE of two worlds that
+   differ ONLY in how inputs map to outputs (the mix's secret permutation):
+       choice[ x, y ] on the LEFT chooses `x`, on the RIGHT chooses `y`.
+     - output position 1 = choice[ inner-of-input-A , inner-of-input-B ]
+     - output position 2 = choice[ inner-of-input-B , inner-of-input-A ]
+   LEFT emits (innerA, innerB); RIGHT emits (innerB, innerA).  The two input
+   onions are IDENTICAL across both worlds; only the internal routing differs.
+   If LEFT ~ RIGHT, no passive observer can decide which input produced which
+   output => the honest hop UNLINKS input<->output.
+
+   The payloads `pA`, `pB` are secret and the inner layers are ciphertexts to a
+   next hop the observer cannot open; that is what makes (innerA, innerB) and
+   (innerB, innerA) indistinguishable.
+
+   Scope (honest): this is a PASSIVE global-observer unlinkability of a SINGLE
+   honest hop with exactly two concurrent inputs -- the atomic mixing step.  It
+   is NOT anonymous-channel anonymity against an ACTIVE attacker (n-1 / flooding
+   / tagging / trickle attacks, traffic-analysis over timing/volume, or
+   compromised hops) -- those are out of the symbolic Dolev-Yao scope and are
+   the reason real mixnets need cover traffic, thresholds and multiple hops.
+
+   Tool: ProVerif.   Run:  proverif mixnet_unlinkability.pv
+                     Expect: RESULT Observational equivalence is true.
+   ============================================================================ *)
+
+(* ---------- Randomized public-key encryption ------------------------------- *)
+type skey.
+type pkey.
+fun  pk(skey): pkey.
+fun  penc(bitstring, pkey, bitstring): bitstring.     (* msg, pubkey, coins *)
+reduc forall m: bitstring, k: skey, r: bitstring;
+  pdec(penc(m, pk(k), r), k) = m.
+
+free c: channel.                                       (* observed network *)
+
+(* The two senders' payloads: secret from the observer. *)
+free pA: bitstring [private].
+free pB: bitstring [private].
+
+(* ===================== MAIN (biprocess) ================================ *)
+process
+  new skM: skey;        (* the honest mix hop's key           *)
+  new skN: skey;        (* the NEXT hop's key (inner layer addressed here) *)
+  out(c, (pk(skM), pk(skN)));                          (* public keys are public *)
+
+  (* -- honest senders build randomized 2-layer onions -- *)
+  new rA_in: bitstring;  new rA_out: bitstring;
+  let innerA = penc(pA, pk(skN), rA_in) in
+  let onionA = penc(innerA, pk(skM), rA_out) in
+  new rB_in: bitstring;  new rB_out: bitstring;
+  let innerB = penc(pB, pk(skN), rB_in) in
+  let onionB = penc(innerB, pk(skM), rB_out) in
+
+  (* observer sees the two inputs in a fixed order *)
+  out(c, onionA);
+  out(c, onionB);
+
+  (* -- the honest mix hop: strip the outer layer, emit inners permuted -- *)
+  let mA = pdec(onionA, skM) in       (* = innerA *)
+  let mB = pdec(onionB, skM) in       (* = innerB *)
+  out(c, choice[mA, mB]);             (* pos 1: LEFT=innerA, RIGHT=innerB *)
+  out(c, choice[mB, mA])              (* pos 2: LEFT=innerB, RIGHT=innerA *)

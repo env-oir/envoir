@@ -1,0 +1,151 @@
+(* ============================================================================
+   Key Transparency  --  append-only integrity + split-view (equivocation)
+   detection, as a symbolic model with Merkle hashing abstracted as a
+   collision-resistant hash.
+   ----------------------------------------------------------------------------
+   What is modelled:
+
+     - The log holds a signing key `logK`.  A Signed Tree Head (STH) is
+           sign((prev, root), logK)
+       where `root = H(prev, leaf)` is the new tree head after appending `leaf`
+       onto the previous head `prev`.  Merkle hashing is abstracted by the free
+       binary function `H`, which is COLLISION-RESISTANT in the symbolic model
+       (distinct arguments give distinct, non-invertible terms): the only
+       property inclusion/consistency proofs rely on.
+
+     - "Tree size / position" is abstracted by the predecessor head `prev`:
+       two STHs sharing the same `prev` are two views of the log at the SAME
+       position.  A fork = two DIFFERENT roots at the same `prev` (the log
+       extended one committed state two different ways) -- this is exactly a
+       split view / equivocation.
+
+     - The log is offered as a SERVICE the (Dolev-Yao) attacker drives: it will
+       append any attacker-chosen `leaf` onto any attacker-chosen `prev`,
+       INCLUDING two divergent leaves on the same `prev` (a deliberate fork).
+       It cannot, however, forge its own signature (logK is secret), so every
+       STH a client or auditor ever accepts traces back to a genuine append.
+
+     - A gossip auditor cross-checks two STHs that (honest) clients relied on;
+       if they are the same position (`prev`) but different roots, it fires the
+       split-view alarm.
+
+   Properties proven (all correspondences => TRUE):
+     (I)  INCLUSION SOUNDNESS / no fake membership -- a client that verifies an
+          inclusion proof (STH signature valid AND root = H(prev, leaf)) is
+          guaranteed the log actually appended THAT leaf at THAT position.
+          Collision-resistance of H is what forbids a second (prev, leaf') with
+          the same root.
+     (X)  EXTENSION / NO ROLLBACK -- a client that accepts an extension STH
+          whose `prev` equals the old root is guaranteed the new head was built
+          by a genuine one-step append ONTO the exact old head; the log cannot
+          silently rewrite or drop history under the client.
+     (D)  DETECTION SOUNDNESS (no false alarm) -- the auditor raises the
+          equivocation alarm only when the log REALLY signed two conflicting
+          heads at the same position; every alarm is a real fork.
+
+   Reachability sanity (documented, EXPECTED reachable -- prints "... is false"):
+     (Dr) the equivocation alarm CAN fire (the attacker forks the log);
+     (Xr) a genuine extension IS accepted (liveness).
+   These certify the model is not dead/vacuous.
+
+   Tool: ProVerif.   Run:  proverif kt_append_only.pv
+   ============================================================================ *)
+
+(* ---------- Log signing key ------------------------------------------------ *)
+type skey.
+type pkey.
+fun  spk(skey): pkey.
+fun  sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksign(sign(m, k), spk(k)) = m.
+
+(* ---------- Collision-resistant Merkle combine ----------------------------- *)
+fun  H(bitstring, bitstring): bitstring.     (* (prev_head, leaf) -> new_head *)
+
+free c: channel.
+
+(* ---------- Events --------------------------------------------------------- *)
+event LogAppend(bitstring, bitstring, bitstring).    (* prev, leaf, root=H(prev,leaf) *)
+event ClientInclusion(bitstring, bitstring, bitstring).  (* prev, leaf, root : verified *)
+event ClientExtend(bitstring, bitstring, bitstring).     (* oldRoot, leaf, newRoot : accepted *)
+event Equivocation(bitstring, bitstring, bitstring).     (* prev, root1, root2 : split-view detected *)
+
+(* ===================== QUERIES ========================================== *)
+
+(* (I) inclusion soundness: a verified inclusion of `leaf` at position `prev`
+       implies the log genuinely appended exactly that leaf there. *)
+query prev: bitstring, leaf: bitstring, root: bitstring;
+  event(ClientInclusion(prev, leaf, root)) ==> event(LogAppend(prev, leaf, root)).
+
+(* (X) extension / no-rollback: an accepted one-step extension corresponds to a
+       genuine append onto the exact old head. *)
+query oldRoot: bitstring, leaf: bitstring, newRoot: bitstring;
+  event(ClientExtend(oldRoot, leaf, newRoot)) ==> event(LogAppend(oldRoot, leaf, newRoot)).
+
+(* (D) detection soundness (no false alarm): every raised split-view alarm
+       corresponds to the log REALLY signing two conflicting heads at `prev`
+       (leaf1, leaf2 are existentially quantified -- not in the premise). *)
+query prev: bitstring, r1: bitstring, r2: bitstring, leaf1: bitstring, leaf2: bitstring;
+  event(Equivocation(prev, r1, r2)) ==>
+    (event(LogAppend(prev, leaf1, r1)) && event(LogAppend(prev, leaf2, r2))).
+
+(* (Dr) reachability sanity: the split-view alarm CAN fire (attacker forks the
+       log). EXPECTED reachable => ProVerif prints "... is false". *)
+query prev: bitstring, r1: bitstring, r2: bitstring;
+  event(Equivocation(prev, r1, r2)).
+
+(* (Xr) reachability sanity: a genuine extension IS accepted (liveness).
+       EXPECTED reachable => ProVerif prints "... is false". *)
+query oldRoot: bitstring, leaf: bitstring, newRoot: bitstring;
+  event(ClientExtend(oldRoot, leaf, newRoot)).
+
+(* ===================== ROLES ============================================ *)
+
+(* The log service: appends any attacker-chosen leaf onto any attacker-chosen
+   prev (forks included), records the append, and returns a signed STH. *)
+let logService(logK: skey) =
+  in(c, (prev: bitstring, leaf: bitstring));
+  let root = H(prev, leaf) in
+  event LogAppend(prev, leaf, root);
+  out(c, sign((prev, root), logK)).
+
+(* A client verifying a Merkle inclusion proof for `leaf` as the head at `prev`:
+   the STH must be log-signed AND the head must recompute (collision-resistance
+   of H is what makes this binding). *)
+let clientInclusion(logPub: pkey) =
+  in(c, (sth: bitstring, prev: bitstring, leaf: bitstring));
+  let (=prev, root: bitstring) = checksign(sth, logPub) in
+  if root = H(prev, leaf) then
+    event ClientInclusion(prev, leaf, root).
+
+(* A client accepting a one-step consistency/extension proof: the NEW STH's
+   predecessor must equal the OLD STH's root, and the new head must recompute
+   as H(oldRoot, leaf). Both STHs must be log-signed. *)
+let clientExtend(logPub: pkey) =
+  in(c, (sthOld: bitstring, sthNew: bitstring, leaf: bitstring));
+  let (pO: bitstring, oldRoot: bitstring) = checksign(sthOld, logPub) in
+  let (=oldRoot, newRoot: bitstring) = checksign(sthNew, logPub) in
+  if newRoot = H(oldRoot, leaf) then
+    event ClientExtend(oldRoot, leaf, newRoot).
+
+(* The gossip auditor: two STHs that clients relied on are cross-checked; a
+   same-position (same prev), different-root pair is a detected split view. *)
+let auditor(logPub: pkey) =
+  in(c, sth1: bitstring);
+  in(c, sth2: bitstring);
+  let (p1: bitstring, r1: bitstring) = checksign(sth1, logPub) in
+  let (p2: bitstring, r2: bitstring) = checksign(sth2, logPub) in
+  if p1 = p2 then
+    if r1 = r2 then 0
+    else event Equivocation(p1, r1, r2).
+
+(* ===================== MAIN ============================================= *)
+process
+  new logK: skey;
+  out(c, spk(logK));
+  let logPub = spk(logK) in
+  (
+      ( ! logService(logK) )
+    | ( ! clientInclusion(logPub) )
+    | ( ! clientExtend(logPub) )
+    | ( ! auditor(logPub) )
+  )

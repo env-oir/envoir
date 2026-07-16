@@ -1,13 +1,16 @@
 # DMTAP formal (symbolic) models
 
-Machine-checkable **symbolic (Dolev-Yao) models** of DMTAP's two
-security-critical ceremonies, in the [ProVerif](https://proverif.inria.fr/)
+Machine-checkable **symbolic (Dolev-Yao) models** of DMTAP's
+security-critical ceremonies and of the group / transparency / mixing
+primitives it composes, in the [ProVerif](https://proverif.inria.fr/)
 process calculus. This is the same *class* of artifact used to audit TLS 1.3,
 MLS, and Signal: a mechanized proof (or refutation) of named security
 properties against an active network attacker, with perfect cryptography
 abstracted as an equational theory.
 
-**Status: all queries verified with ProVerif 2.05** (see [Results](#results)).
+**Status: every query obtained a definitive result under ProVerif 2.05** — all
+security queries hold; the two group/transparency non-vacuity controls are
+deliberately, and verifiably, *reachable* (see [Results](#results)).
 
 Spec sources (read-only):
 
@@ -18,6 +21,13 @@ Spec sources (read-only):
   (origin-bound challenge; `cnf = H(session_pubkey)` bound before signing;
   RP binds the session only to `cnf`; DS-tag `DMTAP-v0/auth-assertion`).
 
+The three newer models (`mls_group_keys`, `kt_append_only`,
+`mixnet_unlinkability`) are **tractable symbolic abstractions of the composed
+primitives** — an MLS-style group key schedule, a Key-Transparency log, and one
+mixnet hop — not of a specific DMTAP section; each honestly abstracts the one
+cryptographic property it depends on (a one-way key schedule, a
+collision-resistant Merkle combine, randomized onion encryption).
+
 ## Files
 
 | File | Ceremony | Analysis kind | Properties |
@@ -25,6 +35,9 @@ Spec sources (read-only):
 | `deniable_1to1.pv` | Deniable 1:1 X3DH + first ratchet msg | reachability | secrecy (S), mutual auth (A), weak forward secrecy (F) |
 | `deniable_1to1_deniability.pv` | Deniable 1:1 — repudiation | observational equivalence | deniability (D) |
 | `dmtap_auth.pv` | DMTAP-Auth login | reachability | unforgeability (U), replay-resistance (R), origin-binding (O), key-binding/DPoP (K) |
+| `mls_group_keys.pv` | MLS-style group key schedule (3 epochs) | reachability (+ phase compromise) | group-key secrecy, forward secrecy (FS), post-compromise security (PCS) |
+| `kt_append_only.pv` | Key-Transparency log + gossip auditor | reachability (correspondence) | inclusion soundness (I), no-rollback extension (X), split-view detection soundness (D) |
+| `mixnet_unlinkability.pv` | One honest mixnet hop, 2 inputs | observational equivalence | passive input↔output unlinkability |
 
 **Why deniability is a separate file.** Deniability is an
 *indistinguishability* property, not a reachability one, so it is a ProVerif
@@ -126,30 +139,131 @@ nonce freshness, and binds the session **only** to `cnf`.
   per §13.6 the bridge, sees it), a bearer without the session private key
   cannot obtain the resource ⇒ a stolen assertion alone is useless.
 
+### `mls_group_keys.pv`
+
+A **tractable abstraction of the RFC 9420 (MLS) TreeKEM + key schedule**, run as
+a concrete bounded 3-epoch instance:
+
+- epoch 1 — group `{A, B, R}`, `R` a full member (learns `es1`);
+- epoch 2 — a Commit **removes `R`** → `{A, B}`, fresh Commit entropy `cs2`
+  delivered *only* to `A, B`;
+- epoch 3 — a Commit re-keys `{A, B}` with fresh `cs3`.
+
+The **key schedule is abstracted by two one-way functions** — `es_n =
+kdfEpoch(is_{n-1}, cs_n)` and `is_n = kdfInit(es_n)` (free constructors, no
+inverse). One-wayness is the *only* property FS/PCS rely on: you cannot run the
+schedule backwards, and you cannot get `es_n` without **both** `is_{n-1}`
+**and** `cs_n`. **TreeKEM path distribution is abstracted** by public-key
+encrypting `cs_n` to each *current* member's leaf key — exactly what a removed
+member cannot open. Each epoch encrypts one application probe `appMsg_n` under
+`es_n`, so secrecy of `appMsg_n` ⇔ secrecy of `es_n`.
+
+Two phase-1 compromises are switched on **simultaneously** (the worst case for
+epoch 2): the removed member `R` dumps *all* of its state (`skR`, `es1` ⇒
+`is1`), **and** a later epoch is fully compromised (`es3` ⇒ `is3`).
+
+- **Group-key secrecy + PCS + FS** — `query attacker(appMsg2)`. The epoch-2
+  secret survives that combined leak. **PCS**: the removed `R` holds `es1`/`is1`
+  but the fresh Commit entropy `cs2` was encrypted only to `A, B`, so `R` cannot
+  form `es2`. **FS**: the later-epoch compromise (`es3`, `is3`) cannot be run
+  backwards through the one-way schedule to recover `es2`. And *a fortiori* this
+  is group-key secrecy against a **passive transcript observer**, who holds
+  neither leaf keys nor any epoch secret.
+- **Non-vacuity controls** — `query attacker(appMsg1)` and
+  `query attacker(appMsg3)` are **deliberately false**: a party that legitimately
+  holds an epoch's own secret can read that epoch (`R` reads epoch 1 it belonged
+  to; the epoch-3 compromise reveals epoch-3 traffic). These false results
+  *certify the leaks are real*, so epoch 2's secrecy is genuine cryptographic
+  separation, not an artifact of handing the attacker nothing.
+
+### `kt_append_only.pv`
+
+A **Key-Transparency log with a gossip auditor**, with **Merkle hashing
+abstracted as a collision-resistant hash** — the free binary function `H`,
+which is injective and non-invertible in the symbolic model. A Signed Tree Head
+is `sign((prev, root), logK)` with `root = H(prev, leaf)` the head after
+appending `leaf` onto `prev`. **Tree size/position is abstracted by the
+predecessor head `prev`**: two STHs sharing a `prev` are two views at the same
+position, and a **fork** = two *different* roots at the same `prev`. The log is
+offered as a service the Dolev-Yao attacker drives (it will append any leaf onto
+any `prev`, forks included), but it cannot forge its own signature, so every STH
+a client/auditor accepts traces to a genuine append.
+
+- **(I) Inclusion soundness / no fake membership** —
+  `event(ClientInclusion(prev,leaf,root)) ==> event(LogAppend(prev,leaf,root))`.
+  A client that verifies an inclusion proof (STH signature valid *and*
+  `root = H(prev,leaf)`) is guaranteed the log actually appended *that* leaf at
+  *that* position. Collision-resistance of `H` forbids a second `(prev,leaf')`
+  with the same root.
+- **(X) Extension / no rollback** —
+  `event(ClientExtend(oldRoot,leaf,newRoot)) ==> event(LogAppend(oldRoot,leaf,newRoot))`.
+  A client that accepts a one-step consistency proof whose new `prev` equals the
+  old root is guaranteed the new head was built by a genuine append **onto the
+  exact old head**; the log cannot silently rewrite or drop history under it.
+- **(D) Split-view detection soundness (no false alarm)** —
+  `event(Equivocation(prev,r1,r2)) ==> event(LogAppend(prev,leaf1,r1)) && event(LogAppend(prev,leaf2,r2))`
+  (leaves existentially quantified). The gossip auditor raises the equivocation
+  alarm **only** when the log really signed two conflicting heads at the same
+  position — every alarm is a real fork, never a false positive.
+- **Reachability sanity (documented, expected reachable)** —
+  `event(Equivocation(...))` and `event(ClientExtend(...))` are each reachable
+  (ProVerif reports `not event(...) is false`), certifying that the split-view
+  alarm *can* actually fire when the attacker forks the log, and that a genuine
+  extension *is* accepted (liveness). Without these, (I)/(X)/(D) could hold
+  vacuously.
+
+### `mixnet_unlinkability.pv`
+
+**One honest mix hop with two concurrent inputs**, as an
+observational-equivalence (biprocess) model of **input↔output unlinkability for
+a passive global observer**. Two honest senders each build a randomized 2-layer
+onion (inner layer addressed to the next hop, outer layer to the mix); the hop
+strips its outer layer and emits the two inner layers in a permuted order.
+
+**Encryption is randomized** — `penc(m, pk, coins)` with fresh secret `coins`.
+This is load-bearing: with *deterministic* encryption the observer could
+re-encrypt an output under the mix's *public* key and byte-match it to an input,
+trivially linking them; randomized encryption (the re-encryption / probabilistic
+-onion property real mixes require) forbids that.
+
+- **Unlinkability** — observational equivalence of two worlds that differ *only*
+  in the mix's secret permutation: `out(choice[mA,mB]); out(choice[mB,mA])`, so
+  LEFT emits `(innerA, innerB)` and RIGHT emits `(innerB, innerA)` while the two
+  input onions are byte-identical across both worlds. If `LEFT ~ RIGHT`, no
+  passive observer can decide which input produced which output ⇒ the honest hop
+  **unlinks** input↔output. The payloads are secret and the inner layers are
+  ciphertexts to a next hop the observer cannot open, which is what makes the two
+  outputs interchangeable.
+
 ## How to run
 
-Requires **ProVerif** (`opam install proverif`) — or Docker, via the fallback
-in `run.sh`.
+Requires **ProVerif** (`opam install proverif`) — or Docker. `run.sh` resolves,
+in order: a native `proverif` on `PATH`; else the local Docker image
+`proverif-local:2.05`; else a throwaway `ocaml/opam` container that installs
+ProVerif via opam.
 
 ```sh
-./run.sh                              # all three models
-./run.sh deniable_1to1.pv             # one model
+./run.sh                              # all six models
+./run.sh mls_group_keys.pv            # one model
 proverif deniable_1to1.pv             # or invoke ProVerif directly
 proverif deniable_1to1_deniability.pv # equivalence: expect "true"
-proverif dmtap_auth.pv
+proverif mixnet_unlinkability.pv      # equivalence: expect "true"
 ```
 
 Reading the output: for a reachability `query`, ProVerif prints
 `RESULT ... is true` when the property holds (secrecy: secret; correspondence:
-authenticated). For the equivalence model, expect
+authenticated). For the equivalence models, expect
 `RESULT Observational equivalence is true`. A `false` result comes with an
-attack derivation.
+attack derivation — which for a *deliberate non-vacuity control* (the two
+`appMsg1/appMsg3` and the two `kt` reachability queries) is the intended,
+documented outcome, not a security failure.
 
 ## Results
 
-Verified with **ProVerif 2.05** (installed via `opam`, run in the `ocaml/opam`
-Docker image; see `run.sh`). **Every query holds — no attack found.** Verbatim
-verification summaries:
+Obtained with **ProVerif 2.05** (run in the `proverif-local:2.05` Docker image;
+see `run.sh`). **Every security query holds; the deliberate non-vacuity controls
+are, as intended, reachable.** Verbatim verification summaries (copied from the
+tool output):
 
 **`deniable_1to1.pv`** (secrecy, mutual authentication, weak forward secrecy):
 
@@ -185,6 +299,57 @@ RESULT not attacker(secretResource[]) is true.
 - `not attacker(secretResource[]) is true` — **key-binding / DPoP**: a captured
   assertion without the session private key cannot unlock the session.
 
+**`mls_group_keys.pv`** (group-key secrecy, forward secrecy, post-compromise
+security):
+
+```
+Query not attacker_p1(appMsg2[]) is true.
+Query not attacker_p1(appMsg1[]) is false.
+Query not attacker_p1(appMsg3[]) is false.
+```
+- `not attacker_p1(appMsg2[]) is true` — the **epoch-2** secret stays secret in
+  phase 1 **even with the removed member `R` dumping its entire epoch-1 state
+  AND a later epoch fully compromised** ⇒ **post-compromise security** (fresh
+  Commit entropy `cs2` was never delivered to `R`) **and forward secrecy** (the
+  one-way schedule cannot be inverted from a future epoch); *a fortiori*
+  group-key secrecy against a passive observer.
+- `not attacker_p1(appMsg1[]) is false` and `... appMsg3[] ... is false` —
+  **deliberate non-vacuity controls** (see the model section): a party holding
+  an epoch's *own* secret can read that epoch. Their falsity proves the
+  compromises are effective, so epoch 2's secrecy is genuine separation.
+
+**`kt_append_only.pv`** (inclusion soundness, no-rollback extension, split-view
+detection):
+
+```
+Query event(ClientInclusion(prev_2,leaf_3,root_2)) ==> event(LogAppend(prev_2,leaf_3,root_2)) is true.
+Query event(ClientExtend(oldRoot_1,leaf_3,newRoot_1)) ==> event(LogAppend(oldRoot_1,leaf_3,newRoot_1)) is true.
+Query event(Equivocation(prev_2,r1_1,r2_1)) ==> event(LogAppend(prev_2,leaf1,r1_1)) && event(LogAppend(prev_2,leaf2,r2_1)) is true.
+Query not event(Equivocation(prev_2,r1_1,r2_1)) is false.
+Query not event(ClientExtend(oldRoot_1,leaf_3,newRoot_1)) is false.
+```
+- the three `... is true` correspondences — **(I)** a verified inclusion implies
+  a genuine append of that leaf at that position (collision-resistance of `H`);
+  **(X)** an accepted extension implies a genuine append onto the exact old head
+  (no rollback); **(D)** every raised equivocation alarm implies the log really
+  signed two conflicting heads (no false alarm).
+- the two `not event(...) is false` — **deliberate reachability sanities**: the
+  split-view alarm **can** fire (attacker forks the log) and a genuine extension
+  **is** accepted (liveness). `is false` here means *reachable*, i.e. the
+  intended outcome — it certifies the model is not vacuous.
+
+**`mixnet_unlinkability.pv`** (passive input↔output unlinkability of one hop):
+
+```
+RESULT Observational equivalence is true.
+```
+- A passive global observer that sees both input onions and both mix outputs
+  cannot decide which input produced which output ⇒ **one honest hop unlinks
+  input↔output**. (ProVerif emitted `Termination warning`s while completing the
+  disequality clauses of the biprocess, but still reached a **definitive**
+  `Observational equivalence is true` — the equivalence is proved, not left
+  open.)
+
 ## Limitations of the symbolic model (honest)
 
 - **Symbolic, not computational.** Cryptography is perfect and abstract
@@ -213,6 +378,34 @@ RESULT not attacker(secretResource[]) is true.
   exact `=origin` match. It does not model the §13.3.1 *companion-mode*
   weakening against homograph/look-alike origins (a UI/PKI TOFU property, not a
   protocol-message property), nor WebAuthn `clientDataJSON` at the byte level.
-- These are **bounded well-formed models of the ceremonies as specified**, not
-  of any particular implementation. An implementation can still be insecure
-  while the protocol is sound.
+- **MLS key schedule is abstracted to two one-way KDFs** (`kdfEpoch`,
+  `kdfInit`); the real RFC 9420 schedule (`joiner_secret`, `welcome_secret`,
+  `confirmation_key`, `PSK`s, exporter, `sender_data`) and the full TreeKEM tree
+  (path secrets, parent-hash, blanking, unmerged leaves) are *not* modelled —
+  path distribution is collapsed to a per-member public-key encryption of the
+  Commit secret. Only a **bounded 3-epoch, single-removal** instance is run
+  (`R` removed at epoch 2); PCS/FS are shown for exactly that shape, not for
+  arbitrary membership sequences. Group-agreement, Welcome/join, external
+  commits, and the transcript-hash authentication chain are out of scope.
+- **KT model abstracts a Merkle tree to a hash chain** (`root = H(prev, leaf)`),
+  and **"tree size / position" to the predecessor head `prev`** — an
+  equivocation is modelled as two divergent appends onto the *same* predecessor.
+  A fuller model would track a real leaf count and multi-level authentication
+  paths / consistency proofs over sub-tree hashes. Collision-resistance is the
+  *perfect* symbolic injectivity of `H` (no probabilistic collision); STH
+  freshness/gossip is modelled by the auditor cross-checking two log-signed STHs
+  rather than by wall-clock timestamps or a real gossip network; monitor-side
+  auditing of the *whole* tree and rate/rollback bounds are out of scope.
+- **Mixnet unlinkability is passive-observer only**, for **one honest hop with
+  exactly two concurrent inputs** — the atomic mixing step. It is **not**
+  anonymous-channel anonymity: active `n−1` / flooding / tagging / trickle
+  attacks, timing- and volume-based traffic analysis, and compromised or
+  colluding hops are all outside the Dolev-Yao symbolic model (they are the
+  reason real mixnets need cover traffic, thresholds and multiple hops).
+  Encryption is modelled as *randomized* `penc(m, pk, coins)`; without the fresh
+  `coins` the equivalence would (correctly) fail, since a deterministic onion is
+  linkable by re-encryption. ProVerif completes with `Termination warning`s on
+  the biprocess disequality clauses but still returns a definitive result.
+- These are **bounded well-formed models of the ceremonies/primitives as
+  specified**, not of any particular implementation. An implementation can still
+  be insecure while the protocol is sound.
