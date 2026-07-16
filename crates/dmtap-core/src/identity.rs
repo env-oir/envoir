@@ -818,8 +818,13 @@ fn threshold_min(t: &Threshold) -> u32 {
 fn method_at_least_as_strong(prev: &RecoveryMethod, cand: &RecoveryMethod) -> bool {
     use RecoveryMethod::*;
     match (prev, cand) {
-        (Phrase { .. }, Phrase { .. }) => true,
-        (Device { label: a, .. }, Device { label: b, .. }) => a == b,
+        // A change to a factor's **key material** is a removal of the old secret, not a
+        // like-for-like carry-over: a stolen-IK holder must not be able to swap a factor's
+        // key to their own material silently. Compare the actual material, not just the label.
+        (Phrase { recovery_key: a }, Phrase { recovery_key: b }) => a == b,
+        (Device { label: la, device_key: ka }, Device { label: lb, device_key: kb }) => {
+            la == lb && ka == kb
+        }
         (Social { guardians: pg, threshold: pt }, Social { guardians: cg, threshold: ct }) => {
             ct >= pt && pg.iter().all(|g| cg.contains(g))
         }
@@ -1195,6 +1200,63 @@ mod tests {
         // collusion bar M is unchanged — must NOT be flagged (no false positive on hardening).
         let widened = base(RecoveryMethod::Social { guardians: g[..4].to_vec(), threshold: 2 }, 4);
         assert!(!recovery_change_is_weakening(&prev, &widened), "adding a guardian is not weakening");
+    }
+
+    #[test]
+    fn swapping_factor_key_material_is_weakening() {
+        let ik = IdentityKey::generate();
+        let one = |method: RecoveryMethod, ver: u64| {
+            policy(
+                &ik,
+                vec![method],
+                Threshold { any_of: vec![MethodPredicate::Phrase] },
+                Threshold { any_of: vec![MethodPredicate::Ik] },
+                ver,
+            )
+        };
+
+        // --- Phrase: swapping the recovery_key to attacker material is a removal ⇒ weakening.
+        // A stolen-IK holder must NOT be able to re-point a Phrase factor to their own mnemonic
+        // silently (no guardian quorum, no 72 h veto). Compare the MATERIAL, not "Phrase == Phrase".
+        let prev_phrase = one(RecoveryMethod::Phrase { recovery_key: vec![0xAA; 32] }, 1);
+        let swapped_phrase = one(RecoveryMethod::Phrase { recovery_key: vec![0xBB; 32] }, 2);
+        assert!(
+            recovery_change_is_weakening(&prev_phrase, &swapped_phrase),
+            "swapping a Phrase recovery_key must be weakening"
+        );
+        // A weakening change is gated: IK alone (no guardians/approvals) is refused.
+        assert!(matches!(
+            authorize_recovery_change(&prev_phrase, &swapped_phrase, &[], &[], &[], 0, 0),
+            Err(RecoveryGuardError::WeakeningUnquorumed)
+        ));
+        // Identical key material is NOT a change ⇒ not weakening (benign re-sign / version bump).
+        let same_phrase = one(RecoveryMethod::Phrase { recovery_key: vec![0xAA; 32] }, 3);
+        assert!(!recovery_change_is_weakening(&prev_phrase, &same_phrase));
+
+        // --- Device: swapping device_key at the SAME label is a removal ⇒ weakening. The label
+        // alone must not carry a factor over a key change (attacker re-binds "phone" to their key).
+        let prev_dev = one(RecoveryMethod::Device { device_key: vec![0x11; 32], label: "phone".into() }, 4);
+        let swapped_dev = one(RecoveryMethod::Device { device_key: vec![0x22; 32], label: "phone".into() }, 5);
+        assert!(
+            recovery_change_is_weakening(&prev_dev, &swapped_dev),
+            "swapping a Device device_key at the same label must be weakening"
+        );
+        // Same label AND same key ⇒ not weakening.
+        let same_dev = one(RecoveryMethod::Device { device_key: vec![0x11; 32], label: "phone".into() }, 6);
+        assert!(!recovery_change_is_weakening(&prev_dev, &same_dev));
+
+        // Adding a second, distinct Device (keeping the original) is purely additive ⇒ not weakening.
+        let added = policy(
+            &ik,
+            vec![
+                RecoveryMethod::Device { device_key: vec![0x11; 32], label: "phone".into() },
+                RecoveryMethod::Device { device_key: vec![0x33; 32], label: "laptop".into() },
+            ],
+            Threshold { any_of: vec![MethodPredicate::Phrase] },
+            Threshold { any_of: vec![MethodPredicate::Ik] },
+            7,
+        );
+        assert!(!recovery_change_is_weakening(&prev_dev, &added));
     }
 
     #[test]

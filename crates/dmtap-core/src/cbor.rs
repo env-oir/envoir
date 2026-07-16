@@ -184,7 +184,7 @@ fn enc(v: &Cv, out: &mut Vec<u8>) {
 /// to provide. Higher layers additionally reject unknown keys in *signed* objects (§18.1.2).
 pub fn decode(bytes: &[u8]) -> Result<Cv, CborError> {
     let mut d = Decoder { b: bytes, pos: 0 };
-    let cv = d.value()?;
+    let cv = d.value(0)?;
     if d.pos != bytes.len() {
         return Err(CborError::TrailingData); // one, and only one, top-level item (§18.1.1)
     }
@@ -197,6 +197,14 @@ struct Decoder<'a> {
     b: &'a [u8],
     pos: usize,
 }
+
+/// Maximum container-nesting depth accepted by [`Decoder::value`]. Every nested array/map adds one
+/// native stack frame per level, so an unbounded decoder lets ~50 KB of `0x81` (nested one-element
+/// arrays) overflow the stack and abort — a DoS reachable from any `*::from_det_cbor` on untrusted
+/// bytes. DMTAP wire objects are shallow (a handful of levels: object → field → array/map → scalar),
+/// so 64 is comfortably above any real message yet far below the overflow threshold. Exceeding it
+/// fails closed with [`CborError::Malformed`] instead of panicking.
+const MAX_NESTING_DEPTH: u32 = 64;
 
 impl<'a> Decoder<'a> {
     fn byte(&mut self) -> Result<u8, CborError> {
@@ -253,7 +261,12 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn value(&mut self) -> Result<Cv, CborError> {
+    fn value(&mut self, depth: u32) -> Result<Cv, CborError> {
+        // Bound recursion before descending into any container: reject over-deep nesting
+        // fail-closed rather than exhausting the native stack (DoS guard).
+        if depth > MAX_NESTING_DEPTH {
+            return Err(CborError::Malformed);
+        }
         let ib = self.byte()?;
         let major = ib >> 5;
         let ai = ib & 0x1f;
@@ -278,11 +291,11 @@ impl<'a> Decoder<'a> {
                 let n = self.argument(ai)? as usize;
                 let mut out = Vec::with_capacity(n.min(1024));
                 for _ in 0..n {
-                    out.push(self.value()?);
+                    out.push(self.value(depth + 1)?);
                 }
                 Ok(Cv::Array(out))
             }
-            5 => self.map(ai),
+            5 => self.map(ai, depth),
             6 => {
                 // tag — read (and length-check) the tag number, then reject.
                 let _ = self.argument(ai)?;
@@ -292,7 +305,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn map(&mut self, ai: u8) -> Result<Cv, CborError> {
+    fn map(&mut self, ai: u8, depth: u32) -> Result<Cv, CborError> {
         let n = self.argument(ai)? as usize;
         if n == 0 {
             return Ok(Cv::Map(Vec::new())); // empty map (variant-neutral; matches encode)
@@ -309,7 +322,7 @@ impl<'a> Decoder<'a> {
         let mut text_out: Vec<(String, Cv)> = Vec::new();
         for i in 0..n {
             let key_start = self.pos;
-            let key = self.value()?;
+            let key = self.value(depth + 1)?;
             let key_bytes = self.b[key_start..self.pos].to_vec();
             if i > 0 {
                 match key_bytes.as_slice().cmp(prev_key.as_slice()) {
@@ -325,7 +338,7 @@ impl<'a> Decoder<'a> {
                 }
             }
             prev_key = key_bytes;
-            let val = self.value()?;
+            let val = self.value(depth + 1)?;
             match (&kind, key) {
                 (None, Cv::U64(k)) => {
                     kind = Some(KeyKind::Int);
@@ -641,5 +654,31 @@ mod tests {
         let bytes = encode(&v);
         assert_eq!(decode(&bytes).unwrap(), v);
         assert_eq!(encode(&decode(&bytes).unwrap()), bytes);
+    }
+
+    #[test]
+    fn rejects_over_deep_nesting_without_stack_overflow() {
+        // ~50 KB of single-element-array heads (0x81 = array(1)) would recurse per level and
+        // overflow the native stack on an unbounded decoder. It MUST fail closed instead.
+        let deep = vec![0x81u8; 50_000];
+        assert_eq!(decode(&deep), Err(CborError::Malformed));
+        // Right at the boundary: MAX_NESTING_DEPTH + 1 nested arrays around a scalar exceed the
+        // bound and are rejected — no panic, a clean error.
+        let mut too_deep = vec![0x81u8; (MAX_NESTING_DEPTH as usize) + 2];
+        too_deep.push(0x00); // innermost scalar
+        assert_eq!(decode(&too_deep), Err(CborError::Malformed));
+    }
+
+    #[test]
+    fn accepts_nesting_up_to_the_bound() {
+        // A structure nested right up to the limit still decodes (real objects are far shallower).
+        // depth 0 is the outermost value; children sit at depth 1.., so MAX_NESTING_DEPTH nested
+        // arrays around a scalar is the deepest accepted shape.
+        let n = MAX_NESTING_DEPTH as usize;
+        let mut buf = vec![0x81u8; n];
+        buf.push(0x00);
+        let decoded = decode(&buf).expect("nesting at the bound must decode");
+        // And it re-encodes byte-for-byte (idempotence holds for the deep-but-legal case).
+        assert_eq!(encode(&decoded), buf);
     }
 }

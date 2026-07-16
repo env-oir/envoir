@@ -257,11 +257,91 @@ impl MixDirectory {
 
     /// Verify the authority signature (§18.9.9). Does **not** re-verify each descriptor — the
     /// caller MUST (the authority attests membership, not descriptor content).
+    ///
+    /// Note this is a *signature* check only. It does **not** enforce the §4.4.2 `version`
+    /// monotonicity — an attacker can replay an older, validly-signed directory to freeze the
+    /// client on a small, possibly-compromised fleet view. Pair this with a
+    /// [`MixDirectoryTracker`] to reject a stale/rolled-back directory fail-closed (`0x0311`).
     pub fn verify(&self) -> Result<(), IdentityError> {
         if !self.suite.is_supported() {
             return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
         }
         verify_domain(&self.authority, MIX_DIRECTORY_DS, &self.signing_body(), &self.sig)
+    }
+}
+
+/// A [`MixDirectoryTracker::accept`] failure, each carrying its §21.5 wire error code via
+/// [`MixDirectoryError::code`].
+///
+/// A signature that does not verify under the pinned authority is `ERR_MIX_DIRECTORY_SIG_INVALID`
+/// (`0x030B`, §4.4.2 / §18.5.3). A directory whose `version` is older-than-or-equal-to the last
+/// accepted from that authority is `ERR_MIX_DIRECTORY_STALE` (`0x0311`, §4.4.2 / §16.3) — a stale,
+/// possibly-frozen fleet view an adversary replays to keep the client's anonymity set small (the
+/// mixnet analogue of the KT STH-freshness freeze defense `0x0112`).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MixDirectoryError {
+    /// The directory is not validly signed by the pinned directory authority (§4.4.2, §18.5.3).
+    #[error("mix directory signature invalid (ERR_MIX_DIRECTORY_SIG_INVALID, 0x030B)")]
+    SigInvalid,
+    /// The directory's `version` is ≤ the last accepted from this authority — a rollback/replay of
+    /// a superseded-but-validly-signed directory (freeze attack, §4.4.2, §16.3).
+    #[error("mix directory rollback — version ≤ last accepted (ERR_MIX_DIRECTORY_STALE, 0x0311)")]
+    Stale,
+}
+
+impl MixDirectoryError {
+    /// The normative DMTAP wire error code (§21.5).
+    pub fn code(&self) -> u16 {
+        match self {
+            MixDirectoryError::SigInvalid => 0x030B,
+            MixDirectoryError::Stale => 0x0311,
+        }
+    }
+}
+
+/// Per-authority mix-directory **anti-rollback** state (spec §4.4.2, §16.3). Retains the highest
+/// `MixDirectory.version` accepted from each directory authority (keyed by the authority identity
+/// key). [`accept`](MixDirectoryTracker::accept) verifies a directory's authority signature and
+/// then rejects any whose `version` is `≤` the last accepted from that authority
+/// ([`MixDirectoryError::Stale`], `0x0311`) — so a global active adversary cannot replay a stale,
+/// frozen fleet view to shrink the client's diversity/anonymity set (freeze attack).
+///
+/// This mirrors [`SuiteRatchet`](crate::suite::SuiteRatchet) and
+/// [`CapsVersionTracker`](crate::capability::CapsVersionTracker): an **additive, opt-in** helper
+/// the caller layers over [`MixDirectory::verify`], not forced into `verify()` (the core holds no
+/// state and reads no clock). The mark ratchets **up only** — a rejected rollback never mutates it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MixDirectoryTracker {
+    /// authority identity key → highest `version` accepted from that authority.
+    seen: std::collections::BTreeMap<Vec<u8>, u64>,
+}
+
+impl MixDirectoryTracker {
+    /// A tracker with no authorities seen.
+    pub fn new() -> Self {
+        MixDirectoryTracker { seen: std::collections::BTreeMap::new() }
+    }
+
+    /// The highest `version` accepted from `authority`, or `None` if none seen.
+    pub fn last_version(&self, authority: &[u8]) -> Option<u64> {
+        self.seen.get(authority).copied()
+    }
+
+    /// Verify and accept a directory, failing closed on a stale/rolled-back one. The authority
+    /// signature is checked first ([`MixDirectoryError::SigInvalid`], `0x030B`); then a `version`
+    /// `≤` the last accepted from `dir.authority` is rejected as [`MixDirectoryError::Stale`]
+    /// (`0x0311`) **without** mutating state. A strictly-newer directory is accepted and its
+    /// `version` becomes the new floor. The first directory from an authority always passes the
+    /// freshness gate (there is no prior mark to roll back from).
+    pub fn accept(&mut self, dir: &MixDirectory) -> Result<(), MixDirectoryError> {
+        dir.verify().map_err(|_| MixDirectoryError::SigInvalid)?;
+        if let Some(&last) = self.seen.get(&dir.authority) {
+            if dir.version <= last {
+                return Err(MixDirectoryError::Stale);
+            }
+        }
+        self.seen.insert(dir.authority.clone(), dir.version);
+        Ok(())
     }
 }
 
@@ -353,5 +433,75 @@ mod tests {
         d.sig.clear();
         let bytes = cbor::encode(&d.to_cv(true));
         assert_eq!(MixNodeDescriptor::from_det_cbor(&bytes), Err(CborError::TypeMismatch));
+    }
+
+    fn directory_at(authority: &IdentityKey, version: u64) -> MixDirectory {
+        MixDirectory::issue(
+            authority,
+            42,
+            version,
+            vec![descriptor(0x11, 0), descriptor(0x33, 1), descriptor(0x44, 2)],
+            ContentId::of(b"genesis-mix-directory"),
+            1_700_000_000_000,
+        )
+    }
+
+    #[test]
+    fn directory_tracker_first_accept_marks() {
+        let auth = key(0x22);
+        let mut tr = MixDirectoryTracker::new();
+        let dir = directory_at(&auth, 5);
+        assert_eq!(tr.last_version(&auth.public()), None);
+        assert_eq!(tr.accept(&dir), Ok(()));
+        assert_eq!(tr.last_version(&auth.public()), Some(5));
+    }
+
+    #[test]
+    fn directory_tracker_higher_version_ratchets() {
+        let auth = key(0x22);
+        let mut tr = MixDirectoryTracker::new();
+        assert_eq!(tr.accept(&directory_at(&auth, 5)), Ok(()));
+        assert_eq!(tr.accept(&directory_at(&auth, 6)), Ok(()));
+        assert_eq!(tr.last_version(&auth.public()), Some(6));
+    }
+
+    #[test]
+    fn directory_tracker_older_or_equal_rejected_fail_closed() {
+        let auth = key(0x22);
+        let mut tr = MixDirectoryTracker::new();
+        assert_eq!(tr.accept(&directory_at(&auth, 7)), Ok(()));
+        // Equal version — a replay of the current directory — is a rollback.
+        let eq = tr.accept(&directory_at(&auth, 7));
+        assert_eq!(eq, Err(MixDirectoryError::Stale));
+        assert_eq!(eq.unwrap_err().code(), 0x0311);
+        // Strictly-older version is a rollback.
+        assert_eq!(tr.accept(&directory_at(&auth, 3)), Err(MixDirectoryError::Stale));
+        // A rejected rollback never lowers the mark.
+        assert_eq!(tr.last_version(&auth.public()), Some(7));
+    }
+
+    #[test]
+    fn directory_tracker_rejects_bad_signature() {
+        let auth = key(0x22);
+        let mut tr = MixDirectoryTracker::new();
+        let mut dir = directory_at(&auth, 5);
+        dir.version = 6; // signed body no longer matches sig
+        let err = tr.accept(&dir);
+        assert_eq!(err, Err(MixDirectoryError::SigInvalid));
+        assert_eq!(err.unwrap_err().code(), 0x030B);
+        // A rejected directory never marks the authority.
+        assert_eq!(tr.last_version(&auth.public()), None);
+    }
+
+    #[test]
+    fn directory_tracker_is_per_authority() {
+        let a = key(0x22);
+        let b = key(0x55);
+        let mut tr = MixDirectoryTracker::new();
+        assert_eq!(tr.accept(&directory_at(&a, 9)), Ok(()));
+        // A different authority is tracked independently; its low version still passes first-contact.
+        assert_eq!(tr.accept(&directory_at(&b, 1)), Ok(()));
+        assert_eq!(tr.last_version(&a.public()), Some(9));
+        assert_eq!(tr.last_version(&b.public()), Some(1));
     }
 }
