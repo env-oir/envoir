@@ -1,0 +1,20 @@
+[package]
+name = "netsim"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Mixnet anonymity simulator — a deterministic, seeded MODEL of DMTAP's Sphinx/Loopix mixing mechanism (§4.4, §16.3) that empirically measures the sender→receiver correlation resistance and anonymity-set entropy the spec claims. Not the wire format; not the real Sphinx client."
+repository = "https://example.invalid/envoir"
+publish = false
+
+[dependencies]
+# --- Deterministic seeded RNG (already in the workspace dependency graph via dmtap-mls/openmls) ---
+rand = "0.8"
+rand_chacha = "0.3"
+# --- Poisson-process / exponential-delay sampling (Poisson mixing + Loopix cover, §4.4.5/§4.4.6) ---
+rand_distr = "0.4"
+
+[[bin]]
+name = "netsim-report"
+path = "src/main.rs"
