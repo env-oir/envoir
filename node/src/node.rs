@@ -12,11 +12,16 @@
 //!   addressing, the full §2.7 ordered validation (via [`dmtap_core::mote::validate`]), the
 //!   §20.1 sender-retry machine, dedup/idempotent ack (§2.6), and RFC 5322 projection into an
 //!   IMAP/JMAP-visible [`MemoryStore`].
+//! - **Real (groups, §5):** the node also holds **real MLS group sessions** (RFC 9420 via the
+//!   [`dmtap_mls`] crate / `openmls`) alongside the 1:1 HPKE path — found/join a group, Add/Remove
+//!   members (post-compromise security on Remove), and send/receive group application messages.
+//!   Handshakes are ordered by an in-process [`Committer`] (the §5.1 DS ordering seam); group
+//!   application messages ride the mesh as [`Frame::Group`]. See [`crate::group`].
 //! - **Stubbed / in-process:** recipient resolution is a local `directory` map (a stand-in for
 //!   naming/KeyPackage fetch, §3/§5.3); sender classification uses the transport return path
-//!   rather than blinded tags (§2.2a); the transport is [`InMemoryNetwork`], not libp2p; MLS
-//!   group sessions (§5) are not modeled (1:1 HPKE only); timers are event-driven off an
-//!   injected clock.
+//!   rather than blinded tags (§2.2a); the transport is [`InMemoryNetwork`], not libp2p; the group
+//!   committer is a single in-process ordered log (real mesh committer succession/takeover/
+//!   fork-recovery of §5.1 is out of scope); timers are event-driven off an injected clock.
 //!
 //! [`IdentityKey`]: dmtap_core::identity::IdentityKey
 //! [`SealKeypair`]: dmtap_core::mote::SealKeypair
@@ -31,7 +36,9 @@ use dmtap_core::mote::{
 };
 use dmtap_core::{ContentId, TimestampMs};
 use dmtap_mail::store::{MailStore, Mailbox, MemoryStore};
+use dmtap_mls::{Committer, Member, Session};
 
+use crate::group::{GroupAdd, GroupError, GroupMote};
 use crate::inbound::{DropReason, InboundOutcome};
 use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
@@ -90,6 +97,17 @@ pub struct Node<T: Transport> {
     directory: HashMap<Vec<u8>, [u8; 32]>,
     /// The mesh transport.
     transport: T,
+    /// This node's live MLS group sessions (spec §5), keyed by group id. Each is this node's own
+    /// leaf's view of a real RFC 9420 group; membership/handshakes are ordered by a [`Committer`].
+    groups: HashMap<Vec<u8>, Session>,
+    /// A pre-published MLS leaf ([`Member`]) awaiting a Welcome to join a group (§5.3 async join).
+    /// Provisioned by [`Node::publish_group_keypackage`], consumed by [`Node::join_group`].
+    pending_leaf: Option<Member>,
+    /// Inbound group **application** MOTEs pulled off the transport by [`Node::poll`], buffered for
+    /// [`Node::poll_group_messages`] to decrypt — kept off the 1:1 outcome path so the 1:1
+    /// pipeline is untouched. Each entry is the `(group_id, encoded GroupMote)` from a
+    /// [`Frame::Group`].
+    group_inbox: Vec<(Vec<u8>, Vec<u8>)>,
     /// Injected clock (ms). Explicit so deadline/backoff behavior is deterministic in tests.
     now: TimestampMs,
     /// Durable store for the outbound retry queue + dedup set (§19.3.3). Every mutation of that
@@ -117,6 +135,9 @@ impl<T: Transport> Node<T> {
             outbound: HashMap::new(),
             contacts: HashSet::new(),
             directory: HashMap::new(),
+            groups: HashMap::new(),
+            pending_leaf: None,
+            group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
             journal: Box::new(NullJournal),
@@ -146,6 +167,9 @@ impl<T: Transport> Node<T> {
             outbound: HashMap::new(),
             contacts: HashSet::new(),
             directory: HashMap::new(),
+            groups: HashMap::new(),
+            pending_leaf: None,
+            group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
             journal,
@@ -364,6 +388,10 @@ impl<T: Transport> Node<T> {
             match frame {
                 Frame::Mote(bytes) => outcomes.push(self.receive_mote(&from, &bytes)),
                 Frame::Ack(id) => self.receive_ack(&id),
+                // A group application MOTE (§5): buffer it for `poll_group_messages` to decrypt,
+                // keeping the 1:1 outcome list clean. (Group handshakes never arrive here — they
+                // travel the ordered committer log, not the mesh, §5.1.)
+                Frame::Group { group_id, body } => self.group_inbox.push((group_id, body)),
             }
         }
         outcomes
@@ -454,6 +482,211 @@ impl<T: Transport> Node<T> {
     /// that fails to send is absorbed by the sender's retry + our dedup (§19.3.2 failure modes).
     fn send_ack(&self, to: &[u8], id: &ContentId) {
         let _ = self.transport.send(to, Frame::Ack(id.as_bytes().to_vec()));
+    }
+
+    // --- MLS groups (spec §5) ---------------------------------------------------------------
+    //
+    // Real RFC 9420 group sessions via `dmtap_mls`/`openmls`, alongside the 1:1 HPKE path above.
+    // Each of this node's leaves is credentialed as `ik_public ‖ "#" ‖ device_label`, binding the
+    // MLS leaf to this node's DMTAP identity (§5.6). Handshakes are ordered by the caller-supplied
+    // [`Committer`] (the §5.1 DS ordering seam); application messages ride the mesh transport.
+
+    /// The label this node uses for its own MLS leaf. Single-leaf-per-node in the reference model;
+    /// the multi-device cluster (multiple leaves per owner, §5.6) is exercised in `dmtap-mls`.
+    fn group_device_label() -> &'static str {
+        "node"
+    }
+
+    /// Pre-publish a signed **KeyPackage** for this node so a group initiator can **Add** it while
+    /// offline (spec §5.3 async join). Retains the provisioned leaf ([`Member`]) so a later
+    /// [`join_group`](Self::join_group) uses the *same* key material. Returns the KeyPackage wire
+    /// bytes to hand (out of band / via naming) to the initiator.
+    pub fn publish_group_keypackage(&mut self) -> Result<Vec<u8>, GroupError> {
+        let member = Member::new(self.ik.public(), Self::group_device_label())?;
+        let kp = member.publish_key_package()?;
+        self.pending_leaf = Some(member);
+        Ok(kp)
+    }
+
+    /// Found a **new MLS group** `group_id` with this node as the initial member/committer (§5.1).
+    pub fn found_group(&mut self, group_id: &[u8]) -> Result<(), GroupError> {
+        let member = Member::new(self.ik.public(), Self::group_device_label())?;
+        let session = member.create_group(group_id)?;
+        self.groups.insert(group_id.to_vec(), session);
+        Ok(())
+    }
+
+    /// **Add** the member whose published KeyPackage is `kp_bytes` to `group_id` (spec §5.3): build
+    /// the Add **Commit** + **Welcome**, order the Commit through `committer` (the DS), and apply it
+    /// to this node's own view. Returns the [`GroupAdd`] (the `group_event` MOTE, the Welcome to
+    /// hand the joiner, and the committer sequence). Other existing members catch up via
+    /// [`apply_committed`](Self::apply_committed).
+    pub fn group_add_member(
+        &mut self,
+        group_id: &[u8],
+        kp_bytes: &[u8],
+        committer: &mut Committer,
+    ) -> Result<GroupAdd, GroupError> {
+        let session = self.groups.get_mut(group_id).ok_or(GroupError::UnknownGroup)?;
+        let hs = session.add_member(kp_bytes)?;
+        let commit = hs.commit.clone();
+        let welcome = hs.welcome.clone().ok_or(GroupError::Malformed)?;
+        let seq = committer.submit(hs);
+        session.note_authored(seq);
+        session.advance(committer)?;
+        let event = GroupMote {
+            group_id: group_id.to_vec(),
+            kind: Kind::GroupEvent,
+            epoch: session.epoch(),
+            body: commit,
+        };
+        Ok(GroupAdd { event, welcome, seq })
+    }
+
+    /// **Remove** the member at `leaf_index` from `group_id` (spec §5.8.2): build + order the Remove
+    /// **Commit** and apply it here. After every member advances, MLS's TreeKEM has re-keyed, so the
+    /// removed leaf's key opens nothing in the new epoch (post-compromise security, §5.2). Returns
+    /// the `group_event` MOTE.
+    pub fn group_remove_member(
+        &mut self,
+        group_id: &[u8],
+        leaf_index: u32,
+        committer: &mut Committer,
+    ) -> Result<GroupMote, GroupError> {
+        let session = self.groups.get_mut(group_id).ok_or(GroupError::UnknownGroup)?;
+        let hs = session.remove_member(leaf_index)?;
+        let commit = hs.commit.clone();
+        let seq = committer.submit(hs);
+        session.note_authored(seq);
+        session.advance(committer)?;
+        let _ = seq;
+        Ok(GroupMote {
+            group_id: group_id.to_vec(),
+            kind: Kind::GroupEvent,
+            epoch: session.epoch(),
+            body: commit,
+        })
+    }
+
+    /// **Advance** this node's view of `group_id` along the committer's ordered log, applying every
+    /// handshake it has not yet applied (spec §5.1). Returns the number newly applied. This is how
+    /// a member that did not author a Commit catches up to the current epoch.
+    pub fn apply_committed(
+        &mut self,
+        group_id: &[u8],
+        committer: &Committer,
+    ) -> Result<usize, GroupError> {
+        let session = self.groups.get_mut(group_id).ok_or(GroupError::UnknownGroup)?;
+        Ok(session.advance(committer)?)
+    }
+
+    /// **Join** `group_id` from a `welcome_bytes` produced by an Add (spec §5.3), consuming the leaf
+    /// pre-published by [`publish_group_keypackage`](Self::publish_group_keypackage). The new view's
+    /// committer baseline is set to the log head, so it applies only Commits ordered after it joined.
+    pub fn join_group(
+        &mut self,
+        group_id: &[u8],
+        welcome_bytes: &[u8],
+        committer: &Committer,
+    ) -> Result<(), GroupError> {
+        let member = self.pending_leaf.take().ok_or(GroupError::NoPendingLeaf)?;
+        let mut session = member.join_from_welcome(welcome_bytes)?;
+        session.note_joined_at(committer.head());
+        self.groups.insert(group_id.to_vec(), session);
+        Ok(())
+    }
+
+    /// Encrypt `plaintext` as an MLS **application message** for `group_id` (spec §5.4), returning
+    /// the `group_event`-sibling content MOTE (kind `chat`) to route over the mesh. See
+    /// [`group_broadcast`](Self::group_broadcast) to also fan it out to members over the transport.
+    pub fn group_send(
+        &mut self,
+        group_id: &[u8],
+        plaintext: &[u8],
+    ) -> Result<GroupMote, GroupError> {
+        let session = self.groups.get_mut(group_id).ok_or(GroupError::UnknownGroup)?;
+        let body = session.create_message(plaintext)?;
+        Ok(GroupMote { group_id: group_id.to_vec(), kind: Kind::Chat, epoch: session.epoch(), body })
+    }
+
+    /// Encrypt `plaintext` for `group_id` and **fan it out** to every other member over the mesh
+    /// transport as a [`Frame::Group`] (spec §5.4/§5.8.4). Members' transport addresses are their
+    /// owner identity bytes (the in-process addressing model); this node itself is skipped. Returns
+    /// how many members it was dispatched to (best-effort per §20.1; unreachable members are not
+    /// retried here).
+    pub fn group_broadcast(
+        &mut self,
+        group_id: &[u8],
+        plaintext: &[u8],
+    ) -> Result<usize, GroupError> {
+        let mote = self.group_send(group_id, plaintext)?;
+        let frame_body = mote.encode();
+        let me = self.ik.public();
+        // Collect distinct member owner addresses (a multi-device owner maps many leaves → one
+        // address here), excluding ourselves, before borrowing the transport.
+        let session = self.groups.get(group_id).ok_or(GroupError::UnknownGroup)?;
+        let mut targets: Vec<Vec<u8>> = Vec::new();
+        for (_, leaf_id) in session.roster() {
+            let owner = Member::owner_of_identity(&leaf_id).to_vec();
+            if owner != me && !targets.contains(&owner) {
+                targets.push(owner);
+            }
+        }
+        let mut sent = 0;
+        for to in &targets {
+            if self
+                .transport
+                .send(to, Frame::Group { group_id: group_id.to_vec(), body: frame_body.clone() })
+                .is_ok()
+            {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Drain group **application** MOTEs buffered by [`poll`](Self::poll) and decrypt each against
+    /// its group session (spec §5.4). Returns `(group_id, plaintext-or-error)` per message. A
+    /// decrypt error is surfaced, not swallowed — e.g. a message from an epoch this node was
+    /// removed from cannot be read (post-compromise security, §5.2).
+    #[allow(clippy::type_complexity)]
+    pub fn poll_group_messages(&mut self) -> Vec<(Vec<u8>, Result<Vec<u8>, GroupError>)> {
+        let inbox = std::mem::take(&mut self.group_inbox);
+        let mut out = Vec::with_capacity(inbox.len());
+        for (group_id, body) in inbox {
+            let result = self.decrypt_group_frame(&group_id, &body);
+            out.push((group_id, result));
+        }
+        out
+    }
+
+    /// Decode one [`Frame::Group`] body into a [`GroupMote`] and decrypt its application ciphertext
+    /// against the named group session. Fails closed on a malformed frame, an unknown group, a
+    /// non-application kind, or an MLS decrypt failure.
+    fn decrypt_group_frame(&mut self, group_id: &[u8], body: &[u8]) -> Result<Vec<u8>, GroupError> {
+        let mote = GroupMote::decode(body)?;
+        if mote.kind == Kind::GroupEvent {
+            // Handshakes are ordered via the committer, never decrypted off the mesh (§5.1).
+            return Err(GroupError::Malformed);
+        }
+        let session = self.groups.get_mut(group_id).ok_or(GroupError::UnknownGroup)?;
+        Ok(session.receive_message(&mote.body)?)
+    }
+
+    /// The current MLS **epoch** of `group_id` on this node (§5.2), or `None` if not a member.
+    pub fn group_epoch(&self, group_id: &[u8]) -> Option<u64> {
+        self.groups.get(group_id).map(|s| s.epoch())
+    }
+
+    /// This node's own leaf index in `group_id` (for addressing a Remove, §5.8.2).
+    pub fn group_leaf_index(&self, group_id: &[u8]) -> Option<u32> {
+        self.groups.get(group_id).map(|s| s.own_leaf_index())
+    }
+
+    /// The roster of `group_id` as `(leaf_index, leaf_identity)` pairs (§5.8) — `leaf_identity` is
+    /// `ik_public ‖ "#" ‖ label`; use `Member::owner_of_identity` to map a leaf to its owner.
+    pub fn group_roster(&self, group_id: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
+        self.groups.get(group_id).map(|s| s.roster())
     }
 }
 

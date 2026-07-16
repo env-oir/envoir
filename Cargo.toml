@@ -10,7 +10,7 @@ members = [
     "node",        # the whole client side; it IS the mesh
     "gateway",     # optional legacy SMTP bridge
     "integration", # cross-component end-to-end tests (test-only crate)
-    "crates/*",    # shared libraries incl. dmtap-seam (the operator seam)
+    "crates/*",    # shared libraries incl. dmtap-seam (the operator seam) + dmtap-mls (§5 groups)
 ]
 
 [workspace.metadata.dmtap]
