@@ -13,17 +13,28 @@
 
 use std::collections::BTreeMap;
 
+use dmtap_core::capability::{Capability, CapabilityError, CapabilityToken};
 use dmtap_core::cbor::{self, CborError, Cv};
+use dmtap_core::deniable::{
+    DeniableFrame, DeniableInit, DeniableMessage, DeniablePayload, DeniablePrekeyBundle,
+    DENIABLE_IDK_DS,
+};
 use dmtap_core::id::ContentId;
-use dmtap_core::identity::{Cap, DeviceCert, Identity, IdentityError, IdentityKey, KeyPackageBundleRef};
+use dmtap_core::identity::{
+    verify_domain, Cap, DeviceCert, Identity, IdentityError, IdentityKey, KeyPackageBundleRef,
+};
+use dmtap_core::kt::{
+    identity_leaf_for, verify_consistency, ConsistencyProof, InclusionProof, KtError, MerkleTree,
+    SignedTreeHead,
+};
 use dmtap_core::mixnet::{MixDirectory, MixKeyEntry, MixNodeDescriptor};
 use dmtap_core::mote::{
     self, build_mote, file_tier, DeliveryTag, Envelope, FileTier, Headers, Hpke, Kind, Manifest,
-    MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair,
+    MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair, ValidateError,
     ENVELOPE_SENDER_DS, MOTE_VERSION, PAYLOAD_SIG_DS,
 };
 use dmtap_core::sphinx::{self, SphinxCell, SphinxError};
-use dmtap_core::suite::Suite;
+use dmtap_core::suite::{Suite, SuiteRatchet, SuiteRatchetError};
 use dmtap_core::TimestampMs;
 
 use crate::{CaseOutcome, SuiteCase};
@@ -52,8 +63,16 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-VAL-06" => Some(val_cold_sender_absent_challenge_defers()),
         "DMTAP-VAL-07" => Some(val_decrypt_failure()),
         "DMTAP-VAL-08" => Some(val_bad_payload_sig()),
+        "DMTAP-VAL-10" => Some(val_suite_downgrade_rejected()),
         "DMTAP-VAL-12" => Some(val_cold_sender_absent_challenge_defers()),
         "DMTAP-VAL-13" => Some(val_kind_unknown_rejected()),
+        "DMTAP-ORG-04" => Some(cap_chain_attenuation_violation_rejected()),
+        "DMTAP-ORG-05" => Some(cap_token_revoked_rejected()),
+        "DMTAP-KTV1-01" => Some(kt_equal_size_differing_root_rejected()),
+        "DMTAP-KTV1-04" => Some(kt_leaf_hash_mismatch_rejected()),
+        "DMTAP-DENIABLE-01" => Some(deniable_payload_signature_field_rejected()),
+        "DMTAP-DENIABLE-04" => Some(deniable_prekey_bundle_invalid_sig_rejected()),
+        "DMTAP-DENIABLE-05" => Some(deniable_init_idk_cert_invalid_rejected()),
         _ => None,
     };
     match result {
@@ -76,8 +95,6 @@ fn skip_reason(id: &str, operation: &str) -> String {
         "DMTAP-VAL-09" => "TOFU-pin / pinned-identity comparison at validate() step 8 is explicitly left \
             to the caller per the function's own doc comment; mote.rs exposes no pinned-identity API to \
             exercise from this harness.",
-        "DMTAP-VAL-10" => "suite-downgrade (per-contact high-water-mark) tracking has no dmtap-core API; \
-            neither validate() nor RecipientCtx carries pinned/HWM suite state.",
         "DMTAP-VAL-11" => "duplicate-id detection (STATUS_DUPLICATE_ID / ACK_DEDUP) is a storage-layer \
             concern; mote.rs's validate() has no id-store/dedup cache to exercise.",
         "DMTAP-VAL-14" => "timestamp-skew enforcement is caller policy — validate()'s doc comment lists \
@@ -126,12 +143,27 @@ fn skip_reason(id: &str, operation: &str) -> String {
             `authority` key matches its own signature); it takes no external pinned-authority parameter \
             (unlike Identity::verify's `pinned` arg), so 'signed by a key other than the PINNED authority' \
             cannot be made to fail inside dmtap-core alone.",
-        "DMTAP-ORG-04" => "CapabilityToken::verify() is documented as NOT walking the delegation chain or \
-            checking attenuation ('the caller does') — no chain/attenuation-verification API exists to \
-            exercise.",
-        "DMTAP-ORG-05" => "CapabilityToken::verify() and CapabilityRevocation::verify() each check only \
-            their own signature; there is no combined token-vs-revocation-list rejection API in \
-            dmtap-core (cross-referencing a revocation list is caller/KT-log application logic).",
+        "DMTAP-KTV1-02" => "kt_log_quorum_check needs a *set* of independently pinned logs and a > n/2 \
+            quorum vote over which name->ik binding they attest; kt.rs models exactly one \
+            SignedTreeHead/log at a time (verify()/verify_consistency() are single-log) — no \
+            multi-log quorum type or function exists to exercise.",
+        "DMTAP-KTV1-03" => "SignedTreeHead carries a `timestamp` field but kt.rs enforces no freshness \
+            window/re-fetch-on-staleness policy over it (unlike MixDirectoryTracker's explicit \
+            version-monotonicity gate) — 'older than the freshness window is stale and refreshed' is \
+            caller-side clock/cache policy with no dmtap-core function to call.",
+        "DMTAP-PROFILE-01" | "DMTAP-PROFILE-02" => "dmtap-core has no Profile/avatar module (no \
+            profile_verify or profile_avatar_verify types) — the Profile object (§ profile) is not yet \
+            implemented in this crate.",
+        "DMTAP-PUSH-01" | "DMTAP-PUSH-02" => "dmtap-core has no push-wake module (no WakePing or \
+            PushSubscription types) — wakeping_decode/push_subscription_verify are not yet implemented \
+            in this crate.",
+        "DMTAP-DENIABLE-02" => "deniable.rs has no session-establishment/capability-gating function; \
+            CapabilityAnnouncement (capability.rs) advertises capability sets generically but nothing in \
+            this crate ties 'peer has not advertised deniable-1:1' to a deniable-session refusal — that \
+            gating is caller/client policy, not a dmtap-core API.",
+        "DMTAP-DENIABLE-03" => "deniable.rs models only the DeniableMessage/DeniableInit wire frames \
+            (CBOR shape); it implements no actual Double-Ratchet AEAD (no seal/open, no chain-key \
+            derivation) — a ratchet MAC-tag failure has no dmtap-core function to exercise.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
@@ -679,6 +711,269 @@ fn val_kind_unknown_rejected() -> Result<(), String> {
     }
 }
 
+/// DMTAP-VAL-10: "suite-ratchet: Envelope.suite below the contact's pinned high-water-mark is a
+/// downgrade" (§2.7 step 8 / §10.7.1). Pin a contact's `SuiteRatchet` floor at the higher `PqHybrid`
+/// suite epoch directly (the doc comment on `SuiteRatchet` is explicit that the ratchet observes a
+/// suite regardless of whether the reference core can *validate* it — pinning is a distinct concern
+/// from suite support, and `PqHybrid` cannot itself be built into an accepted MOTE since
+/// `build_mote` hard-codes `Suite::Classical`, the only suite `is_supported()`). Then run a REAL,
+/// fully-built-and-sealed classical MOTE through `mote::validate_pinned` against that pinned floor:
+/// the object decrypts and authenticates cleanly (steps 1-8 all pass), but the suite pin at step 8
+/// rejects it as a downgrade — the mark MUST NOT ratchet down.
+fn val_suite_downgrade_rejected() -> Result<(), String> {
+    let sender = IdentityKey::generate();
+    let ephemeral = IdentityKey::generate();
+    let recipient = IdentityKey::generate();
+    let seal = SealKeypair::generate();
+    let draft = MoteDraft::new(Kind::Mail, 1_700_000_000_000, b"suite-downgrade fixture".to_vec());
+    let env = build_mote(&Hpke, &sender, &ephemeral, &recipient.public(), seal.public(), draft)
+        .map_err(|e| format!("build_mote: {e}"))?;
+
+    let mut ratchet = SuiteRatchet::new();
+    // Establish the floor at the higher suite epoch BEFORE this (classical) MOTE ever arrives —
+    // exactly as a real peer who has already migrated to PQ would be pinned.
+    ratchet.observe(&sender.public(), Suite::PqHybrid);
+
+    let our_ik = recipient.public();
+    let ctx = RecipientCtx { our_ik: &our_ik, seal_secret: seal.secret(), sender_is_known: true };
+    match mote::validate_pinned(&Hpke, &env, &ctx, Some(&mut ratchet)) {
+        Err(ValidateError::Suite(SuiteRatchetError::SuiteDowngrade)) => {
+            if ratchet.high_water_mark(&sender.public()) != Some(Suite::PqHybrid) {
+                return Err("rejected downgrade must not ratchet the high-water-mark down".into());
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "expected Err(ValidateError::Suite(SuiteRatchetError::SuiteDowngrade)), got {other:?}"
+        )),
+    }
+}
+
+// ============================================================================================
+// ORG — delegated capability chain/revocation enforcement (§13.5.1, §18.7.3)
+// ============================================================================================
+
+fn cap(resource: &str, ability: &str) -> Capability {
+    Capability { resource: resource.into(), ability: ability.into(), caveats: None }
+}
+
+/// DMTAP-ORG-04: "a CapabilityToken whose link grants more than its parent (attenuation broken) ...
+/// is rejected". `CapabilityToken::verify_chain` walks the delegation chain to a trusted root
+/// enforcing the §18.7.3 attenuation invariant at every link; a child claiming a wider `ability`
+/// than its parent ever granted is the privilege-escalation the invariant forbids.
+fn cap_chain_attenuation_violation_rejected() -> Result<(), String> {
+    let root_k = IdentityKey::generate();
+    let mid_k = IdentityKey::generate();
+    let leaf_aud = IdentityKey::generate().public();
+    let parent = CapabilityToken::issue(
+        &root_k,
+        mid_k.public(),
+        vec![cap("mailbox:calendar", "read")], // parent grants only read
+        1_000,
+        9_000,
+        b"root-nonce".to_vec(),
+        None,
+    );
+    let child = CapabilityToken::issue(
+        &mid_k,
+        leaf_aud,
+        vec![cap("mailbox:calendar", "write")], // child tries to widen to write
+        1_000,
+        9_000,
+        b"child-nonce".to_vec(),
+        Some(parent.content_id()),
+    );
+    match child.verify_chain(&[parent]) {
+        Err(CapabilityError::AttenuationViolation) => Ok(()),
+        other => Err(format!("expected Err(AttenuationViolation), got {other:?}")),
+    }
+}
+
+/// DMTAP-ORG-05: "a validly-formed CapabilityToken covered by a published CapabilityRevocation
+/// (from its issuer/ancestor) is denied". `CapabilityToken::verify_at` checks the invocation-time
+/// validity window AND the revocation set (§18.7.3 steps 3 & 6) — a token whose own content-address
+/// appears in the caller-supplied revocation list is rejected distinctly from an expiry/not-yet-valid
+/// failure (`Revoked`, `0x050B`, vs `0x0508`).
+fn cap_token_revoked_rejected() -> Result<(), String> {
+    let iss = IdentityKey::generate();
+    let token = CapabilityToken::issue(
+        &iss,
+        IdentityKey::generate().public(),
+        vec![cap("mailbox:calendar", "read")],
+        1_000,
+        9_000,
+        b"nonce".to_vec(),
+        None,
+    );
+    // Well inside the validity window, but its own content-address is in the revocation set —
+    // exactly the "validly-formed but revoked" scenario the case describes.
+    match token.verify_at(5_000, &[token.content_id()]) {
+        Err(CapabilityError::Revoked) => Ok(()),
+        other => Err(format!("expected Err(Revoked), got {other:?}")),
+    }
+}
+
+// ============================================================================================
+// KTV1 — key-transparency v1 log properties (§3.5.2, §18.4.9/.10/.11)
+// ============================================================================================
+
+/// DMTAP-KTV1-01: "two validly-signed STHs of one log with equal tree_size but differing root_hash
+/// ... => equivocation". `verify_consistency`'s equal-size branch requires an EMPTY proof path AND
+/// matching roots; two same-log, same-size STHs signed with different roots is exactly the forked/
+/// equivocating log this rejects (`NotConsistent`, the append-only-violation evidence for §3.5.2).
+fn kt_equal_size_differing_root_rejected() -> Result<(), String> {
+    let log = IdentityKey::generate();
+    let sth_a = SignedTreeHead::issue(&log, 5, 1, ContentId::of(b"root-a"));
+    let sth_b = SignedTreeHead::issue(&log, 5, 2, ContentId::of(b"root-b"));
+    sth_a.verify().map_err(|e| format!("sanity: sth_a must self-verify: {e}"))?;
+    sth_b.verify().map_err(|e| format!("sanity: sth_b must self-verify: {e}"))?;
+    let proof = ConsistencyProof { first_size: 5, second_size: 5, proof_path: vec![] };
+    match verify_consistency(&sth_a, &sth_b, &proof) {
+        Err(KtError::NotConsistent) => Ok(()),
+        other => Err(format!("expected Err(NotConsistent) (equivocation), got {other:?}")),
+    }
+}
+
+/// DMTAP-KTV1-04: "an InclusionProof whose committed leaf != the recomputed Identity-entry
+/// leaf-hash ... is rejected". Mirrors kt.rs's own
+/// `leaf_binding_rejects_a_leaf_for_a_different_identity` unit test using only public API: put an
+/// evil identity's leaf in the tree, then check the (arithmetically-valid) inclusion proof against
+/// the REAL identity's recomputed leaf via `InclusionProof::verify_identity`.
+fn kt_leaf_hash_mismatch_rejected() -> Result<(), String> {
+    let name = "alice@abc.example";
+    let real = Identity::create_classical(
+        &IdentityKey::generate(), 0, vec![], sample_keypkg_ref("real"),
+        ContentId::of(b"recovery-real"), vec![name.into()], None, 1_700_000_000_000,
+    );
+    let evil = Identity::create_classical(
+        &IdentityKey::generate(), 0, vec![], sample_keypkg_ref("evil"),
+        ContentId::of(b"recovery-evil"), vec![name.into()], None, 1_700_000_000_000,
+    );
+    let evil_leaf = identity_leaf_for(&evil, name).ok_or("evil identity has no classical leaf")?;
+
+    let mut tree = MerkleTree::new();
+    let idx = tree.append(&evil_leaf).ok_or("evil leaf must be a well-formed BLAKE3 hash")?;
+    let root = tree.root().ok_or("tree must be non-empty")?;
+    let sth = SignedTreeHead::issue(&IdentityKey::generate(), tree.size(), 1, root);
+    let proof = InclusionProof {
+        tree_size: tree.size(),
+        leaf_index: idx,
+        leaf_hash: evil_leaf,
+        audit_path: tree.inclusion_path(idx).ok_or("audit path must exist for an included leaf")?,
+    };
+    // The inclusion path itself is arithmetically valid (the evil leaf IS in the tree) ...
+    proof.verify_against(&sth).map_err(|e| format!("sanity: proof must fold against its own tree: {e:?}"))?;
+    // ... but its committed leaf does not match the leaf recomputed for the REAL identity.
+    match proof.verify_identity(&sth, &real, name) {
+        Err(KtError::LeafHashMismatch) => Ok(()),
+        other => Err(format!("expected Err(LeafHashMismatch), got {other:?}")),
+    }
+}
+
+// ============================================================================================
+// DENIABLE — deniable 1:1 mode (§5.2.1, §18.3.9/.10, §18.4.8, §18.9.10)
+// ============================================================================================
+
+/// DMTAP-DENIABLE-01: "a DeniablePayload carrying any signature field is rejected (a signature
+/// would defeat repudiation)". Mirrors deniable.rs's own
+/// `deniable_payload_round_trips_and_rejects_smuggled_signature` unit test: smuggle an extra key
+/// into an otherwise-valid `DeniablePayload`'s canonical map and confirm the decoder's
+/// `deny_unknown()` fails closed (`ERR_DENIABLE_SIGNATURE_PRESENT` — any unrecognized key is
+/// rejected, which necessarily covers a signature-shaped one).
+fn deniable_payload_signature_field_rejected() -> Result<(), String> {
+    let p = DeniablePayload {
+        from: IdentityKey::generate().public(),
+        kind: Kind::Chat,
+        headers: Headers::default(),
+        body: b"conformance-runner deniable fixture".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+    let bytes = p.det_cbor();
+    DeniablePayload::from_det_cbor(&bytes).map_err(|e| format!("sanity: base payload must decode: {e}"))?;
+    let cv = cbor::decode(&bytes).map_err(|e| format!("decode base payload: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base payload is not a map".into()),
+    };
+    pairs.push((8, Cv::Bytes(vec![0u8; 64]))); // a stray "signature" — key 8 is unrecognized.
+    let leaky = cbor::encode(&Cv::Map(pairs));
+    match DeniablePayload::from_det_cbor(&leaky) {
+        Err(CborError::UnknownKey(8)) => Ok(()),
+        other => Err(format!("expected Err(UnknownKey(8)), got {other:?}")),
+    }
+}
+
+/// DMTAP-DENIABLE-04: "an invalid/exhausted DeniablePrekeyBundle (sig/spk_sig/idk_sig fail ...) is
+/// rejected". Exercises the sig-failure disjunct: tampering `spk` after issuance invalidates both
+/// `spk_sig` and the bundle `sig`, and `DeniablePrekeyBundle::verify()` fails closed on either
+/// (mirrors deniable.rs's own `tampered_bundle_fails_signature` unit test). The "no unspent
+/// prekey" disjunct is exhaustion/inventory bookkeeping with no dmtap-core API (`opks` is a bare
+/// `Vec<Vec<u8>>`, MAY be empty by design) — out of scope here, but the "or" in the case's own
+/// checks text means covering one enforced disjunct is a genuine, non-vacuous execution.
+fn deniable_prekey_bundle_invalid_sig_rejected() -> Result<(), String> {
+    let device = IdentityKey::generate();
+    let mut bundle = DeniablePrekeyBundle::issue(
+        &device,
+        vec![0xcd; 32], // idk
+        vec![0xab; 32], // spk
+        vec![vec![0x01; 32]],
+        1,
+        1_700_000_000_000,
+    );
+    bundle.verify().map_err(|e| format!("sanity: freshly issued bundle must verify: {e}"))?;
+    bundle.spk[0] ^= 0xff; // invalidates both spk_sig and the bundle sig
+    match bundle.verify() {
+        Err(IdentityError::BadSignature) => Ok(()),
+        other => Err(format!("expected Err(BadSignature), got {other:?}")),
+    }
+}
+
+/// DMTAP-DENIABLE-05: "a DeniableInit whose idk_a_cert does not certify idk_a under ik_a ... is
+/// rejected". The hardened §5.2.1/§18.4.8 construction replaces XEdDSA-from-IK with a dedicated
+/// `idk` DH key certified once under an IK-authorized device key; build a real
+/// `DeniableFrame::Init` wire object (round-tripped through `det_cbor`/`from_det_cbor`, which do
+/// NOT themselves check any signature — the frame is otherwise unsigned by design, §18.3.9), then
+/// perform the X3DH/PQXDH `idk_a_cert` certification check the caller MUST make: `idk_a_cert` must
+/// verify under `ik_a` for the `DMTAP-v0/deniable-idk` DS tag (the same check
+/// `DeniablePrekeyBundle::verify()` makes for a responder's `idk`). A cert signed by the WRONG key
+/// fails this exactly as a forged/mismatched certification would. (The "or whose key agreement
+/// fails" / replay disjuncts require an actual X3DH/PQXDH KEM implementation, which this crate does
+/// not provide — out of scope.)
+fn deniable_init_idk_cert_invalid_rejected() -> Result<(), String> {
+    let ik_a = IdentityKey::generate();
+    let wrong_signer = IdentityKey::generate(); // NOT ik_a
+    let idk_a = vec![0x44u8; 32];
+    let idk_a_cert = wrong_signer.sign_domain(DENIABLE_IDK_DS, &idk_a);
+    let msg = DeniableMessage { dh: vec![0x09; 32], pn: 0, n: 0, ct: vec![0xde, 0xad, 0xbe, 0xef] };
+    let init = DeniableInit {
+        suite: Suite::Classical,
+        ik_a: ik_a.public(),
+        idk_a,
+        idk_a_cert,
+        ek_a: vec![0x33; 32],
+        spk_ref: ContentId::of(b"responder-spk"),
+        opk_ref: None,
+        kem_ct: None,
+        kem_ref: None,
+        msg,
+    };
+    let frame = DeniableFrame::Init(init);
+    let bytes = frame.det_cbor();
+    let decoded = DeniableFrame::from_det_cbor(&bytes).map_err(|e| format!("decode frame: {e}"))?;
+    let init = match decoded {
+        DeniableFrame::Init(i) => i,
+        DeniableFrame::Message(_) => return Err("expected DeniableInit, decoded a DeniableMessage".into()),
+    };
+    match verify_domain(&init.ik_a, DENIABLE_IDK_DS, &init.idk_a, &init.idk_a_cert) {
+        Err(IdentityError::BadSignature) => Ok(()),
+        other => Err(format!(
+            "expected Err(BadSignature) certifying idk_a under ik_a, got {other:?}"
+        )),
+    }
+}
+
 /// Every `id` this dispatcher recognizes (used by tests to keep the executed-set and the reason
 /// table honest against each other and against `suite.json`).
 pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
@@ -686,8 +981,9 @@ pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
         "DMTAP-CBOR-11", "DMTAP-CBOR-12", "DMTAP-IDENT-01", "DMTAP-IDENT-02", "DMTAP-IDENT-03",
         "DMTAP-IDENT-05", "DMTAP-PRIV-01", "DMTAP-PRIV-02", "DMTAP-FILE-01", "DMTAP-FILE-02",
         "DMTAP-FILE-03", "DMTAP-FILE-04", "DMTAP-VAL-01", "DMTAP-VAL-02", "DMTAP-VAL-03",
-        "DMTAP-VAL-04", "DMTAP-VAL-06", "DMTAP-VAL-07", "DMTAP-VAL-08", "DMTAP-VAL-12",
-        "DMTAP-VAL-13",
+        "DMTAP-VAL-04", "DMTAP-VAL-06", "DMTAP-VAL-07", "DMTAP-VAL-08", "DMTAP-VAL-10",
+        "DMTAP-VAL-12", "DMTAP-VAL-13", "DMTAP-ORG-04", "DMTAP-ORG-05", "DMTAP-KTV1-01",
+        "DMTAP-KTV1-04", "DMTAP-DENIABLE-01", "DMTAP-DENIABLE-04", "DMTAP-DENIABLE-05",
     ]
     .into_iter()
     .map(|id| (id, ()))

@@ -188,8 +188,8 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
         "construction-todo cases FAILED their construction (not just skipped): {failed:?}"
     );
     assert!(
-        executed.len() >= 20,
-        "expected at least 20 construction-todo cases to be actually executed against dmtap-core, \
+        executed.len() >= 29,
+        "expected at least 29 construction-todo cases to be actually executed against dmtap-core, \
          got {} ({executed:?}) — did construction::run_construction_case regress?",
         executed.len()
     );
