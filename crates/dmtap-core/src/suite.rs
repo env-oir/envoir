@@ -20,11 +20,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum Suite {
     /// v0 REQUIRED: Ed25519 sign, HPKE DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305.
     Classical = 0x01,
-    /// RESERVED (PQ): Ed25519+ML-DSA-65 sign, X-Wing (X25519 + ML-KEM-768) KEM.
+    /// PQ HYBRID: Ed25519+ML-DSA-65 sign, X-Wing (X25519 + ML-KEM-768) KEM.
     ///
-    /// The signing/KEM primitives for this suite are not implemented in the reference core;
-    /// verification of a `0x02`-only object therefore fails closed (see
-    /// [`crate::identity::Identity::verify`]).
+    /// The **MOTE layer** implements this suite for real — hybrid sealing/signing live in
+    /// [`crate::pq`], and [`mote_supported`](Suite::mote_supported) returns `true`. The multi-suite
+    /// [`crate::identity::Identity`] object machinery, however, is still classical-only, so
+    /// [`is_supported`](Suite::is_supported) returns `false` and a `0x02`-only `Identity` fails
+    /// closed (see [`crate::identity::Identity::verify`]).
     PqHybrid = 0x02,
 }
 
@@ -43,10 +45,24 @@ impl Suite {
         self as u8
     }
 
-    /// Whether the reference core can actually validate signatures for this suite.
-    /// `0x02` (PQ) is reserved and unimplemented, so it returns `false` (fail closed).
+    /// Whether the reference core supports this suite for the **multi-suite [`Identity`] object**
+    /// (§18.4.1): a full per-suite key set + one signature per suite. Only `0x01` is wired at that
+    /// layer, so `0x02` returns `false` (a `0x02`-only `Identity` fails closed). This is distinct
+    /// from [`mote_supported`](Suite::mote_supported) — the MOTE envelope/payload layer implements
+    /// `0x02` for real (see [`crate::pq`]).
+    ///
+    /// [`Identity`]: crate::identity::Identity
     pub fn is_supported(self) -> bool {
         matches!(self, Suite::Classical)
+    }
+
+    /// Whether the **MOTE envelope/payload layer** (§2.2, §2.4) can seal, sign, and validate an
+    /// object under this suite. Both `0x01` (classical) and `0x02` (X-Wing + Ed25519∧ML-DSA-65
+    /// hybrid, see [`crate::pq`]) are implemented, so both return `true`. A future, still-unassigned
+    /// suite byte cannot even decode ([`from_u8`](Suite::from_u8) fails closed), so this predicate
+    /// enumerates exactly the suites the MOTE machinery can handle.
+    pub fn mote_supported(self) -> bool {
+        matches!(self, Suite::Classical | Suite::PqHybrid)
     }
 }
 
@@ -175,8 +191,16 @@ mod tests {
 
     #[test]
     fn only_classical_is_supported() {
+        // Identity-object (multi-suite) support is classical-only.
         assert!(Suite::Classical.is_supported());
         assert!(!Suite::PqHybrid.is_supported());
+    }
+
+    #[test]
+    fn both_suites_are_mote_supported() {
+        // The MOTE envelope/payload layer implements both the classical and the PQ-hybrid suite.
+        assert!(Suite::Classical.mote_supported());
+        assert!(Suite::PqHybrid.mote_supported());
     }
 
     #[test]

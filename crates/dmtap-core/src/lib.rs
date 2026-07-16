@@ -34,6 +34,8 @@
 //!   §18.9.3 (DS-tag `DMTAP-v0/profile`); avatar content-address tamper-evidence.
 //! - [`push`] — the push wake-signaling objects `PushSubscription` (signed per §18.9.15) and the
 //!   content-free `WakePing` (§18.5.5/.6, §4.9).
+//! - [`pq`] — suite `0x02` post-quantum **hybrid** crypto: X-Wing KEM sealing + Ed25519∧ML-DSA-65
+//!   AND-composed signatures with the no-strip `0x0210` invariant (§1.1, §1.3, §16.7).
 //! - [`policy`] — caller-policy predicates for the §2.6/§2.7 recipient pipeline (dedup, clock-skew,
 //!   expiry, pinned-identity re-pin), each mapped to its §21 code — additive to [`mote::validate`].
 //! - [`attestation`] — the advisory §1.2a device key-attestation evaluator (`0x0116`/`0x0118`),
@@ -43,7 +45,12 @@
 //!
 //! ## Crypto suite `0x01` (v0 REQUIRED)
 //! Ed25519 signatures, HPKE `DHKEM(X25519)/HKDF-SHA256/ChaCha20-Poly1305`, BLAKE3-256 hashing.
-//! Suite `0x02` (PQ) is reserved and **fails closed** everywhere it is offered.
+//!
+//! ## Crypto suite `0x02` (PQ hybrid)
+//! The **MOTE layer** implements suite `0x02` for real (see [`pq`]): X-Wing (X25519 ⊕ ML-KEM-768)
+//! payload sealing and Ed25519 ∧ ML-DSA-65 AND-composed signatures, with the no-strip `0x0210`
+//! invariant. The multi-suite [`identity::Identity`] object machinery is still classical-only and
+//! **fails closed** on a `0x02`-only identity (a distinct, larger surface, unchanged here).
 
 pub mod attestation;
 pub mod capability;
@@ -57,6 +64,7 @@ pub mod keyname;
 pub mod mixnet;
 pub mod mote;
 pub mod policy;
+pub mod pq;
 pub mod profile;
 pub mod push;
 pub mod safety;
