@@ -336,14 +336,25 @@ fn parse_one_address(raw: &str) -> Address {
 
 // --- Rendering a MOTE payload into RFC 5322 ------------------------------------------------
 
+/// Strip CR/LF from a value about to be embedded verbatim in an RFC 5322 header line. `subject`
+/// and `mime` on an inbound MOTE [`Payload`] are attacker-controlled (the *sender* sets them, spec
+/// §2.4) — without this, a hostile peer could smuggle a bare CR/LF to inject extra headers (e.g. a
+/// forged `Bcc:`) or a blank line to terminate the header block early and splice attacker-chosen
+/// bytes into what the client renders as the body (RFC 5322 §2.2 forbids raw CR/LF in a value).
+fn sanitize_header_value(v: &str) -> String {
+    v.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
+
 /// Render a decrypted MOTE [`Payload`] (spec §2.4) into an RFC 5322 message (spec §8.2).
 ///
 /// The sender identity key is projected to a stable, human-checkable local-part via the 8-word
 /// **key-name** (spec §3.9.1); this is the address a legacy client sees for a DMTAP peer.
 pub fn render_rfc5322(payload: &Payload, ts: TimestampMs) -> Vec<u8> {
     let from = address_for_key(&payload.from);
-    let subject = payload.headers.subject.clone().unwrap_or_default();
-    let mime = payload.headers.mime.clone().unwrap_or_else(|| "text/plain; charset=utf-8".into());
+    let subject = sanitize_header_value(payload.headers.subject.as_deref().unwrap_or(""));
+    let mime = sanitize_header_value(
+        payload.headers.mime.as_deref().unwrap_or("text/plain; charset=utf-8"),
+    );
     let date = format_rfc5322_date(ts);
     // A deterministic Message-ID from the content, so threading is stable across a re-render.
     let mid = format!("<{}@dmtap.local>", hex(&blake3_16(&payload.body)));
@@ -537,6 +548,50 @@ mod tests {
         assert_eq!(parsed.header("subject"), Some("Hello"));
         assert!(parsed.header("from").unwrap().ends_with("@dmtap.local"));
         assert!(parsed.header("date").is_some());
+    }
+
+    #[test]
+    fn renders_mote_payload_rejects_header_injection() {
+        use dmtap_core::identity::IdentityKey;
+        use dmtap_core::mote::{Headers, Payload};
+        let ik = IdentityKey::generate();
+        // A hostile sender's subject/mime carry embedded CR/LF, trying to (a) inject a forged
+        // header and (b) splice a fake blank line that would end the header block early.
+        let payload = Payload {
+            from: ik.public(),
+            sig: vec![],
+            headers: Headers {
+                subject: Some("Hi\r\nBcc: attacker@evil.example\r\n\r\nInjected body".into()),
+                mime: Some("text/plain\r\nX-Injected: yes".into()),
+                ..Default::default()
+            },
+            body: b"legit body".to_vec(),
+            refs: vec![],
+            attach: vec![],
+            expires: None,
+        };
+        let raw = render_rfc5322(&payload, 1_752_000_000_000);
+        // The header block must never contain a raw CR/LF that didn't come from the renderer's own
+        // fixed line terminators — i.e. no "\r\nBcc:" / "\r\n\r\n" smuggled in via a header value.
+        let (hdr_bytes, body) = header_and_body(&raw);
+        let hdr = String::from_utf8_lossy(&hdr_bytes);
+        assert!(!hdr.contains("\r\nBcc:"), "Subject must not inject a sibling header: {hdr:?}");
+        assert!(
+            !hdr.contains("\r\nX-Injected"),
+            "Content-Type must not inject a sibling header: {hdr:?}"
+        );
+        let parsed = ParsedMessage::parse(&raw);
+        // The smuggled header names must not parse out as real, distinct headers.
+        assert_eq!(parsed.header("bcc"), None);
+        assert_eq!(parsed.header("x-injected"), None);
+        // The legitimate body must still be exactly the payload body, not the smuggled text — the
+        // attacker's embedded blank line must not have spliced "Injected body" in as real content.
+        assert_eq!(body, b"legit body\r\n");
+        assert_eq!(parsed.body, b"legit body\r\n");
+        // The value survives (a client sees *something* for Subject) but with CR/LF stripped, so it
+        // can never be mistaken for a header/body boundary or a second header line.
+        assert!(!parsed.header("subject").unwrap().contains('\r'));
+        assert!(!parsed.header("subject").unwrap().contains('\n'));
     }
 
     #[test]
