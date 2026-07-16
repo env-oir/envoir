@@ -135,6 +135,10 @@ impl DeniableResponder {
         let ek_a = parse_pub(&init.ek_a)?;
 
         // --- replay defense (§5.2.1, last-resort init) -------------------------------------
+        // The last-resort replay tag is only COMMITTED after the init authenticates (below), so a
+        // flood of forged/garbage last-resort inits that fail AEAD can never grow the cache.
+        const MAX_LASTRESORT_REPLAY: usize = 4096;
+        let mut lastresort_tag: Option<Vec<u8>> = None;
         let opk_secret: Option<StaticSecret> = match &init.opk_ref {
             Some(opk_ref) => {
                 // Consuming path: the one-time prekey must still be unspent; reuse ⇒ reject
@@ -151,12 +155,18 @@ impl DeniableResponder {
                 if !self.opks.is_empty() {
                     return Err(DeniableError::X3dhFailed);
                 }
-                // (ii) Replay cache of consumed (ek_a ‖ idk_a): drop repeats.
+                // (ii) Replay cache of consumed (ek_a ‖ idk_a): reject a known replay up front,
+                // but defer COMMITTING the tag until the init authenticates (below), and fail
+                // closed rather than let a forged-init flood grow the cache without bound.
                 let mut tag = ek_a.to_vec();
                 tag.extend_from_slice(&idk_a);
-                if !self.consumed_lastresort.insert(tag) {
+                if self.consumed_lastresort.contains(&tag) {
                     return Err(DeniableError::ReplayRejected);
                 }
+                if self.consumed_lastresort.len() >= MAX_LASTRESORT_REPLAY {
+                    return Err(DeniableError::ReplayRejected);
+                }
+                lastresort_tag = Some(tag);
                 None
             }
         };
@@ -179,6 +189,12 @@ impl DeniableResponder {
         let header = header_from_message(&init.msg)?;
         let pt = ratchet.decrypt(&ad, header, &init.msg.ct)?;
         let payload = DeniablePayload::from_det_cbor(&pt)?;
+        // Commit the last-resort replay tag only now that the init has authenticated (AEAD +
+        // payload decode both succeeded) — an unauthenticated forgery never reaches this point,
+        // so a garbage-init flood can no longer grow `consumed_lastresort`.
+        if let Some(tag) = lastresort_tag {
+            self.consumed_lastresort.insert(tag);
+        }
 
         let session = DeniableSession { ratchet, ad };
         Ok((session, payload))

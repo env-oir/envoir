@@ -319,6 +319,33 @@ fn last_resort_replay_is_rejected() {
 }
 
 #[test]
+fn forged_last_resort_init_does_not_commit_or_poison_the_replay_cache() {
+    // A last-resort init whose ciphertext is forged fails AEAD. It MUST NOT commit its replay tag
+    // (else a flood of fresh-ek_a forgeries grows `consumed_lastresort` without bound). So the
+    // identical forgery, re-submitted, fails the SAME way — never spuriously `ReplayRejected` —
+    // and a genuine last-resort init afterwards still succeeds (the cache was not poisoned).
+    let (alice, mut bob) = setup(0);
+    let (_a, good) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "x")).unwrap();
+    assert!(good.opk_ref.is_none(), "no opk offered ⇒ last-resort init");
+
+    // Forge: flip a ciphertext byte so AEAD open fails (ek_a/idk_a, hence the replay tag, unchanged).
+    let mut ct = good.msg.ct.clone();
+    ct[0] ^= 0xff;
+    let forged = DeniableInit { msg: DeniableMessage { ct, ..good.msg.clone() }, ..good.clone() };
+
+    assert!(matches!(bob.accept(&forged), Err(e) if !matches!(e, DeniableError::ReplayRejected)),
+        "forged init fails on decrypt, not replay");
+    assert!(matches!(bob.accept(&forged), Err(e) if !matches!(e, DeniableError::ReplayRejected)),
+        "a re-submitted forgery is NOT replay-rejected — its tag was never committed on failure");
+
+    // The genuine init (same ek_a/idk_a) still authenticates and is accepted; its replay is then
+    // correctly rejected — proving replay defense for AUTHENTICATED inits is fully preserved.
+    let (_b, p) = bob.accept(&good).expect("genuine last-resort init still accepted");
+    assert_eq!(p.body, b"x");
+    assert!(matches!(bob.accept(&good), Err(DeniableError::ReplayRejected)));
+}
+
+#[test]
 fn last_resort_rejected_while_a_one_time_prekey_is_available() {
     // If Bob still has an unspent opk, a last-resort-only init MUST be rejected (prefer-OPK rule),
     // closing the replayable path when a replay-resistant one exists.
