@@ -284,6 +284,12 @@ impl DeniableSession {
     pub fn snapshot(&self) -> DeniableSession {
         DeniableSession { ratchet: self.ratchet.clone(), ad: self.ad.clone() }
     }
+
+    /// Test-only: number of out-of-order message keys the ratchet currently retains.
+    #[cfg(test)]
+    pub(crate) fn skipped_len(&self) -> usize {
+        self.ratchet.skipped_len()
+    }
 }
 
 /// Reconstruct a ratchet [`Header`] from a wire [`DeniableMessage`], validating the `dh` length.
