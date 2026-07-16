@@ -21,6 +21,7 @@
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
+<div class="scroll-progress" aria-hidden="true"><span id="scroll-progress-bar"></span></div>
 
 <header class="site-nav">
   <div class="wrap nav-inner">
@@ -40,7 +41,7 @@
       <span class="word">Envoir</span>
     </a>
 
-    <nav class="nav-links hide-mobile" aria-label="Primary">
+    <nav class="nav-links" id="primary-nav" aria-label="Primary">
       <a href="#how">How it works</a>
       <a href="#naming">Naming</a>
       <a href="#identity">One identity</a>
@@ -52,7 +53,22 @@
     <div class="nav-right">
       <button class="switch" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Toggle light/dark theme"></button>
       <a class="btn btn-ghost btn-mono nav-cta" href="https://github.com/envoir" target="_blank" rel="noopener">Get the code</a>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="mobile-menu" aria-label="Open menu">
+        <span class="nav-toggle-bars" aria-hidden="true"><span></span><span></span><span></span></span>
+      </button>
     </div>
+  </div>
+
+  <div class="mobile-menu" id="mobile-menu" hidden>
+    <nav aria-label="Mobile">
+      <a href="#how">How it works</a>
+      <a href="#naming">Naming</a>
+      <a href="#identity">One identity</a>
+      <a href="#parity">Parity</a>
+      <a href="#privacy">Privacy</a>
+      <a href="#open-source">Open source</a>
+    </nav>
+    <a class="btn btn-primary btn-mono" href="https://github.com/envoir/envoir" target="_blank" rel="noopener">Get the code →</a>
   </div>
 </header>
 
@@ -482,6 +498,5 @@ cargo run -p envoir-node -- --help
 </footer>
 
 <script src="js/mesh.js"></script>
-<script src="js/main.js"></script>
-</body>
+<script src="js/main.js"></script></body>
 </html>
