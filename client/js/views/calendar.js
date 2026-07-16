@@ -21,7 +21,7 @@ export function render(root) {
         <button class="btn" id="today">Today</button>
         <button class="icon-btn" id="prev">${icon('reply')}</button>
         <button class="icon-btn" id="next">${icon('forward')}</button>
-        <h1 id="cal-title">${esc(title())}</h1>
+        <h1 id="cal-title" class="display">${esc(title())}</h1>
       </div>
       <div class="cal-right">
         <div class="seg" id="calseg" role="group" aria-label="Calendar range">

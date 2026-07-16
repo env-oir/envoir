@@ -55,7 +55,7 @@ function drawDetail(root, g) {
       <button class="icon-btn mobile-back" id="gr-back" aria-label="Back to groups list" title="Back">${icon('reply')}</button>
       <span class="av chgroup" style="--h:250;width:56px;height:56px">${icon(g.mode === 'broadcast' ? 'bell' : 'groups')}</span>
       <div class="gr-hero-main">
-        <h1>${esc(g.name)}</h1>
+        <h1 class="display">${esc(g.name)}</h1>
         <div class="gr-hero-addr"><span class="key big">${esc(g.address)}</span> <button class="icon-btn sm" id="gcopy" title="Copy address">${icon('files')}</button></div>
         <div class="gr-hero-tags">
           <span class="pill ${g.mode === 'broadcast' ? 'warn' : 'accent'}">${g.mode === 'broadcast' ? icon('bell') + ' broadcast list' : icon('chat') + ' channel'}</span>

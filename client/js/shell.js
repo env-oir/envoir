@@ -5,7 +5,7 @@
 import { state, initStore, saveSettings } from './store.js';
 import { currentIdentity, displayAddress, displayName } from './identity.js';
 import { PEOPLE } from './seed.js';
-import { esc, icon, brandMark, openModal, closeModal, initials, hideInspector } from './ui.js';
+import { esc, icon, brandMark, openModal, closeModal, initials, hideInspector, applyStagger } from './ui.js';
 import { bus } from './bus.js';
 import { openCompose } from './compose.js';
 
@@ -43,6 +43,8 @@ export const SHORTCUTS = [
   ['s', 'Star'],
   ['u', 'Mark unread'],
   ['x', 'Select conversation'],
+  ['b / h', 'Snooze… (command menu)'],
+  ['l', 'Label… (command menu)'],
   ['?', 'This help'],
   ['Esc', 'Close overlay'],
 ];
@@ -116,11 +118,16 @@ function setView(v) {
 }
 const rerenderKeepSearch = () => rerender();
 
+let _lastStaggerView = null;
 function rerender() {
   const root = document.getElementById('view');
   const def = VIEWS.find(x => x.id === state.view) || VIEWS[0];
-  // gentle shimmer for the heavier list views on first paint feel
   def.render(root);
+  // Play the entrance stagger only when the *view* changed — never on in-place re-renders
+  // (star/read/select), which would otherwise re-flicker the whole workspace mid-interaction.
+  const entered = _lastStaggerView !== state.view;
+  _lastStaggerView = state.view;
+  applyStagger(root, entered);
 }
 
 function refreshChrome() {
@@ -231,6 +238,8 @@ function installKeys() {
       else if (k === 's') { mailKeys.star(); }
       else if (k === 'u') { mailKeys.unread(); }
       else if (k === 'x') { mailKeys.select(); }
+      else if (k === 'b' || k === 'h') { e.preventDefault(); mailKeys.snooze(); }
+      else if (k === 'l') { e.preventDefault(); mailKeys.label(); }
     }
   });
 }

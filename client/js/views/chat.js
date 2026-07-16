@@ -5,13 +5,25 @@
 
 import { state } from '../store.js';
 import { person, PEOPLE } from '../seed.js';
-import { el, esc, icon, avatar, timeAgo, fmtClock, fmtDay, emptyState, trustPill, toast, openModal, closeModal } from '../ui.js';
+import { el, esc, icon, avatar, timeAgo, fmtClock, fmtDay, emptyState, trustPill, toast, openModal, closeModal, emojiPanel } from '../ui.js';
 import { buildMote, KIND } from '../mote.js';
 import { bus } from '../bus.js';
 
-const REACTIONS = ['👍', '🔥', '💯', '✨', '👀', '🙏', '❤️', '😂', '🎉', '👏'];
 const REPLIES = ['makes sense 👍', 'on it', 'love that', 'let\'s ship it', 'agreed', 'looking now ✨'];
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+// In-conversation search state (kind=chat local search — the mailbox is never server-indexed).
+let chatSearch = { q: '', idx: 0, open: false };
+function resetSearch() { chatSearch = { q: '', idx: 0, open: false }; }
+
+// Ordered pinned messages: a stable reorderable list distinct from message order.
+function getPins(c) {
+  const pinned = c.msgs.filter(m => m.pinned);
+  if (!c._pinOrder) c._pinOrder = [];
+  c._pinOrder = c._pinOrder.filter(m => pinned.includes(m));
+  pinned.forEach(m => { if (!c._pinOrder.includes(m)) c._pinOrder.push(m); });
+  return c._pinOrder;
+}
 
 export function render(root) {
   root.className = 'view chat-view';
@@ -65,7 +77,7 @@ function convRow(c) {
     </div>
     ${c.unread ? `<i class="conv-unread">${c.unread}</i>` : ''}
   </button>`);
-  row.onclick = () => { state.ui.selChat = c.id; state.ui.chatThread = null; c.unread = 0; state.ui.mobileDetail = true; bus.rerender(); bus.refreshChrome(); };
+  row.onclick = () => { state.ui.selChat = c.id; state.ui.chatThread = null; c.unread = 0; state.ui.mobileDetail = true; resetSearch(); bus.rerender(); bus.refreshChrome(); };
   return row;
 }
 
@@ -83,7 +95,7 @@ function drawMain(root) {
   const isCh = c.type === 'channel';
   const g = isCh ? state.groups.find(x => x.id === c.group) : null;
   const p = isCh ? null : person(c.with);
-  const pinned = c.msgs.filter(m => m.pinned);
+  const pins = getPins(c);
   const members = isCh && g ? g.members.filter(m => !m.hidden).map(m => person(m.address)) : [];
 
   wrap.innerHTML = `
@@ -94,9 +106,11 @@ function drawMain(root) {
         <div class="chat-head-name">${esc(convTitle(c))} ${isCh ? '' : (p.trust === 'verified' ? trustPill('verified') : trustPill('tofu'))}</div>
         <div class="chat-head-sub mono">${isCh ? esc(g.address) + ' · ' + g.members.length + ' members · ' + g.mode : (state.settings.presence ? (c.presence === 'online' ? '<span class="pres-inline online"></span> online' : c.presence) : 'presence off') }</div>
       </div>
+      <button class="icon-btn ${chatSearch.open ? 'on' : ''}" id="chatsearchbtn" title="Search this conversation" aria-label="Search this conversation" aria-pressed="${chatSearch.open}">${icon('search')}</button>
       ${members.length ? `<div class="chat-members">${members.slice(0, 4).map(m => avatar(m, 26, { ring: false })).join('')}${g.members.length > members.length ? `<span class="chat-more-m">+${g.members.length - members.length}</span>` : ''}</div>` : ''}
     </header>
-    ${pinned.length ? `<div class="pin-bar" id="pinbar">${icon('pin')} <b>${pinned.length}</b> pinned · <span class="pin-prev">${esc(pinned[pinned.length - 1].body.slice(0, 60))}</span></div>` : ''}
+    ${chatSearch.open ? `<div class="chat-search">${icon('search')}<input id="csearch" placeholder="Search in this conversation…" value="${esc(chatSearch.q)}" autocomplete="off" spellcheck="false" aria-label="Search in this conversation"><span class="chat-search-count" id="cscount"></span><div class="chat-search-nav"><button class="icon-btn sm" id="csprev" title="Previous match (Shift+Enter)" aria-label="Previous match">${icon('chevUp')}</button><button class="icon-btn sm" id="csnext" title="Next match (Enter)" aria-label="Next match">${icon('chevDown')}</button></div><button class="icon-btn sm" id="csclose" title="Close search" aria-label="Close search">${icon('x')}</button></div>` : ''}
+    ${pins.length ? `<div class="pin-bar" id="pinbar">${icon('pin')} <b>${pins.length}</b> pinned · <span class="pin-prev">${esc(pins[0].body.slice(0, 60))}</span></div>` : ''}
     <div class="bubbles" id="bubbles"></div>
     ${c.typing ? `<div class="typing-row">${avatar(p || { name: '?', hue: 200 }, 22)}<span class="typing"><i></i><i></i><i></i></span></div>` : ''}
     <div class="chat-input">
@@ -112,8 +126,6 @@ function drawMain(root) {
     if (dayKey !== lastDay) { b.appendChild(el(`<div class="day-div"><span>${esc(dayDivLabel(m.t))}</span></div>`)); lastDay = dayKey; }
     b.appendChild(bubble(c, m, i));
   });
-  b.scrollTop = b.scrollHeight;
-
   const inp = wrap.querySelector('#ci');
   const send = async () => {
     const v = inp.value.trim(); if (!v) return;
@@ -126,14 +138,62 @@ function drawMain(root) {
   wrap.querySelector('#chat-back').onclick = () => { state.ui.mobileDetail = false; bus.rerender(); };
   wrap.querySelector('#cs').onclick = send;
   inp.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
-  wrap.querySelector('#ciemoji').onclick = (e) => { e.stopPropagation(); emojiPicker(wrap.querySelector('#ciemoji'), (emo) => { inp.value += emo; inp.focus(); }); };
+  wrap.querySelector('#ciemoji').onclick = (e) => { e.stopPropagation(); emojiPanel(wrap.querySelector('#ciemoji'), (emo) => { inp.value += emo; inp.focus(); }); };
   wrap.querySelector('#pinbar')?.addEventListener('click', () => pinnedModal(c));
+
+  // ---- in-conversation search: highlight matches in-place, ↵/⇧↵ to walk them ----
+  const runSearch = () => {
+    // clear prior marks, then re-highlight
+    b.querySelectorAll('mark.hl').forEach(m => m.replaceWith(document.createTextNode(m.textContent)));
+    b.querySelectorAll('.bubble').forEach(x => x.normalize());
+    const q = chatSearch.q.trim().toLowerCase();
+    const countEl = wrap.querySelector('#cscount');
+    if (!q) { if (countEl) countEl.textContent = ''; return; }
+    const marks = [];
+    b.querySelectorAll('.bubble').forEach(bub => {
+      const nodes = []; const w = document.createTreeWalker(bub, NodeFilter.SHOW_TEXT);
+      let n; while ((n = w.nextNode())) nodes.push(n);
+      nodes.forEach(node => {
+        const text = node.nodeValue, lower = text.toLowerCase();
+        if (!lower.includes(q)) return;
+        const frag = document.createDocumentFragment(); let i = 0, pos;
+        while ((pos = lower.indexOf(q, i)) !== -1) {
+          if (pos > i) frag.appendChild(document.createTextNode(text.slice(i, pos)));
+          const mk = document.createElement('mark'); mk.className = 'hl'; mk.textContent = text.slice(pos, pos + q.length);
+          frag.appendChild(mk); marks.push(mk); i = pos + q.length;
+        }
+        if (i < text.length) frag.appendChild(document.createTextNode(text.slice(i)));
+        node.replaceWith(frag);
+      });
+    });
+    if (!marks.length) { if (countEl) countEl.textContent = 'no matches'; return; }
+    const cur = ((chatSearch.idx % marks.length) + marks.length) % marks.length;
+    chatSearch.idx = cur;
+    marks[cur].classList.add('cur');
+    marks[cur].scrollIntoView({ block: 'center', behavior: 'auto' });
+    if (countEl) countEl.textContent = `${cur + 1} / ${marks.length}`;
+  };
+  wrap.querySelector('#chatsearchbtn').onclick = () => { chatSearch.open = !chatSearch.open; if (!chatSearch.open) chatSearch.q = ''; bus.rerender(); };
+  const searchInput = wrap.querySelector('#csearch');
+  if (searchInput) {
+    searchInput.oninput = () => { chatSearch.q = searchInput.value; chatSearch.idx = 0; runSearch(); };
+    searchInput.onkeydown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); chatSearch.idx += e.shiftKey ? -1 : 1; runSearch(); }
+      else if (e.key === 'Escape') { e.preventDefault(); chatSearch.open = false; chatSearch.q = ''; bus.rerender(); }
+    };
+    wrap.querySelector('#csnext').onclick = () => { chatSearch.idx += 1; runSearch(); searchInput.focus(); };
+    wrap.querySelector('#csprev').onclick = () => { chatSearch.idx -= 1; runSearch(); searchInput.focus(); };
+    wrap.querySelector('#csclose').onclick = () => { chatSearch.open = false; chatSearch.q = ''; bus.rerender(); };
+  }
 
   // thread side panel
   if (state.ui.chatThread && state.ui.chatThread.cid === c.id) drawThread(wrap, c, state.ui.chatThread.idx);
   else wrap.querySelector('.chat-thread')?.remove();
 
-  setTimeout(() => wrap.querySelector('#ci')?.focus(), 30);
+  // On a search, keep the current match centered; otherwise rest at the newest message.
+  if (chatSearch.open && chatSearch.q.trim()) runSearch();
+  else b.scrollTop = b.scrollHeight;
+  setTimeout(() => wrap.querySelector(chatSearch.open ? '#csearch' : '#ci')?.focus(), 30);
 }
 
 function dayDivLabel(t) {
@@ -211,23 +271,42 @@ function drawThread(wrap, c, idx) {
   setTimeout(() => thi.focus(), 30);
 }
 
-function reactPicker(anchor, m) { emojiPicker(anchor, (e) => { m.reactions = m.reactions || {}; m.reactions[e] = (m.reactions[e] || 0) + 1; bus.rerender(); }); }
+function reactPicker(anchor, m) { emojiPanel(anchor, (e) => { m.reactions = m.reactions || {}; m.reactions[e] = (m.reactions[e] || 0) + 1; bus.rerender(); }); }
 
-function emojiPicker(anchor, onPick) {
-  document.querySelector('.react-pop')?.remove();
-  const r = anchor.getBoundingClientRect();
-  const top = Math.max(8, r.top - 52);
-  const pop = el(`<div class="react-pop" style="top:${top}px;left:${Math.min(r.left, innerWidth - 320)}px">${REACTIONS.map(e => `<button data-e="${e}">${e}</button>`).join('')}</div>`);
-  document.body.appendChild(pop);
-  REACTIONS.forEach(e => pop.querySelector(`[data-e="${e}"]`).onclick = () => { pop.remove(); onPick(e); });
-  setTimeout(() => document.addEventListener('click', function h(ev) { if (!pop.contains(ev.target)) { pop.remove(); document.removeEventListener('click', h); } }), 0);
-}
-
+// Pinned messages — reorderable (drag the grip, or the ↑/↓ controls). The top pin shows in the bar.
 function pinnedModal(c) {
-  const pinned = c.msgs.filter(m => m.pinned);
   const card = openModal(`<div class="id-modal">
     <div class="ev-detail-head"><h2>${icon('pin')} Pinned messages</h2><button class="icon-btn" id="px">${icon('x')}</button></div>
-    <div class="pin-list">${pinned.map(m => `<div class="pin-item"><div class="pin-who">${esc((m.me ? 'You' : person(m.from).name))} · ${fmtClock(m.t)}</div><div class="pin-body">${mentionize(m.body)}</div></div>`).join('') || '<div class="id-empty-inline">Nothing pinned.</div>'}</div>
+    <p class="modal-note">${icon('info')} Drag the grip or use the arrows to reorder — the top pin is the one shown in the conversation's pinned bar.</p>
+    <div class="pin-list" id="pinlist"></div>
   </div>`, { wide: true });
   card.querySelector('#px').onclick = closeModal;
+  const listEl = card.querySelector('#pinlist');
+  const draw = () => {
+    const pins = getPins(c);
+    if (!pins.length) { listEl.innerHTML = '<div class="id-empty-inline">Nothing pinned. Hover a message and pin it.</div>'; return; }
+    listEl.innerHTML = pins.map((m, i) => `<div class="pin-item" draggable="true" data-i="${i}">
+      <div class="pin-grip" title="Drag to reorder">${icon('grip')}</div>
+      <div class="pin-item-main"><div class="pin-who">${esc(m.me ? 'You' : person(m.from).name)} · ${fmtClock(m.t)}</div><div class="pin-body">${mentionize(m.body)}</div></div>
+      <div class="pin-reorder">
+        <button class="icon-btn sm" data-up="${i}" title="Move up" aria-label="Move up" ${i === 0 ? 'disabled' : ''}>${icon('chevUp')}</button>
+        <button class="icon-btn sm" data-down="${i}" title="Move down" aria-label="Move down" ${i === pins.length - 1 ? 'disabled' : ''}>${icon('chevDown')}</button>
+      </div>
+      <button class="icon-btn sm pin-unpin" data-unpin="${i}" title="Unpin" aria-label="Unpin">${icon('x')}</button>
+    </div>`).join('');
+    const arr = c._pinOrder;
+    const move = (from, to) => { if (to < 0 || to >= arr.length) return; const [x] = arr.splice(from, 1); arr.splice(to, 0, x); draw(); bus.rerender(); };
+    listEl.querySelectorAll('[data-up]').forEach(b => b.onclick = () => move(+b.dataset.up, +b.dataset.up - 1));
+    listEl.querySelectorAll('[data-down]').forEach(b => b.onclick = () => move(+b.dataset.down, +b.dataset.down + 1));
+    listEl.querySelectorAll('[data-unpin]').forEach(b => b.onclick = () => { arr[+b.dataset.unpin].pinned = false; draw(); bus.rerender(); });
+    // HTML5 drag-to-reorder
+    let dragI = null;
+    listEl.querySelectorAll('.pin-item').forEach(item => {
+      item.addEventListener('dragstart', () => { dragI = +item.dataset.i; item.classList.add('dragging'); });
+      item.addEventListener('dragend', () => { dragI = null; item.classList.remove('dragging'); listEl.querySelectorAll('.drop-target').forEach(x => x.classList.remove('drop-target')); });
+      item.addEventListener('dragover', (e) => { e.preventDefault(); if (dragI === null) return; listEl.querySelectorAll('.drop-target').forEach(x => x.classList.remove('drop-target')); item.classList.add('drop-target'); });
+      item.addEventListener('drop', (e) => { e.preventDefault(); const to = +item.dataset.i; if (dragI === null || dragI === to) return; move(dragI, to); });
+    });
+  };
+  draw();
 }

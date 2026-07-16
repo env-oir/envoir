@@ -31,7 +31,7 @@ export function render(root) {
       <div class="id-hero-mark">${brandMark(56)}</div>
       <div class="id-hero-body">
         <div class="id-hero-eyebrow">${icon('shield')} Sovereign identity</div>
-        <h1>${esc(displayName(id))}</h1>
+        <h1 class="display">${esc(displayName(id))}</h1>
         <button class="id-addr-copy" id="copyaddr" title="Copy address">
           <span class="mono">${esc(displayAddress(id))}</span>${icon('copy')}
         </button>

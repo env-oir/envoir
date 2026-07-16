@@ -77,6 +77,13 @@ const P = {
   share: '<circle cx="6" cy="12" r="2.4"/><circle cx="17" cy="6" r="2.4"/><circle cx="17" cy="18" r="2.4"/><path d="M8.2 11l6.6-3.6M8.2 13l6.6 3.6"/>',
   eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/>',
   hash: '<path d="M9 4L7 20M17 4l-2 16M4 9h16M3 15h16"/>',
+  chevUp: '<path d="M6 15l6-6 6 6"/>',
+  chevDown: '<path d="M6 9l6 6 6-6"/>',
+  grip: '<path d="M9 5.5v.01M9 12v.01M9 18.5v.01M15 5.5v.01M15 12v.01M15 18.5v.01" stroke-width="2.4"/>',
+  rows2: '<rect x="4" y="4" width="16" height="3.2" rx="1.1"/><rect x="4" y="10.4" width="16" height="3.2" rx="1.1"/><rect x="4" y="16.8" width="16" height="3.2" rx="1.1"/>',
+  density: '<path d="M4 5h16M4 9h16M4 13h16M4 17h16"/>',
+  pdf: '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 13h1.2a1.3 1.3 0 010 2.6H9zm0 0v4"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2.4"/><circle cx="8.5" cy="9.5" r="1.6"/><path d="M4 18l5-5 3.5 3.5L16 12l4 4"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
@@ -284,6 +291,152 @@ export function safetyGrid(safety) {
 }
 export function safetyNumeric(safety) {
   return safety ? `<div class="safety-num mono">${esc(safety.numeric)}</div>` : '';
+}
+
+// ---- Command-menu: a keyboard-driven picker (snooze / label / actions) --------------------
+// Not a mouse-only dropdown — opens focused, type-to-filter, ↑↓ to move, ↵ to run, Esc closes.
+// items: [{ label, sub?, hue?, icon?, checked?, run }]. opts: { anchor, title, icon, filterable }.
+export function commandMenu(anchor, opts = {}) {
+  document.querySelector('.cmenu')?.remove();
+  document.querySelector('.popover')?.remove();
+  const items = opts.items || [];
+  const filterable = opts.filterable ?? items.length > 7;
+  const menu = el(`<div class="cmenu" role="menu" aria-label="${esc(opts.title || 'Menu')}">
+    ${opts.title ? `<div class="cmenu-head">${opts.icon ? icon(opts.icon) : ''}${esc(opts.title)}</div>` : ''}
+    ${filterable ? `<div class="cmenu-search"><input id="cmq" placeholder="${esc(opts.placeholder || 'Filter…')}" autocomplete="off" spellcheck="false" aria-label="Filter"></div>` : ''}
+    <div class="cmenu-list" id="cmlist"></div>
+    <div class="cmenu-foot"><span><kbd>↑↓</kbd>move</span><span><kbd>↵</kbd>select</span><span><kbd>esc</kbd>close</span></div>
+  </div>`);
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  const w = menu.offsetWidth || 260, h = menu.offsetHeight || 220;
+  let left = Math.min(r.left, innerWidth - w - 10);
+  if (opts.align === 'right') left = Math.max(10, r.right - w);
+  let top = r.bottom + 6;
+  if (top + h > innerHeight - 10) top = Math.max(10, r.top - h - 6);
+  menu.style.left = Math.max(10, left) + 'px';
+  menu.style.top = top + 'px';
+
+  const listEl = menu.querySelector('#cmlist');
+  const input = menu.querySelector('#cmq');
+  let filtered = items, cur = 0;
+  const draw = () => {
+    listEl.innerHTML = filtered.length ? filtered.map((it, i) => `<button class="cmenu-item ${i === cur ? 'on' : ''} ${it.checked ? 'checked' : ''}" data-i="${i}" role="menuitem">
+      ${it.hue != null ? `<i class="dot" style="--h:${it.hue}"></i>` : (it.icon ? icon(it.icon) : '')}
+      <span class="cmenu-label">${esc(it.label)}</span>
+      ${it.sub ? `<span class="cmenu-sub">${esc(it.sub)}</span>` : ''}
+      <span class="cmenu-tick">${icon('check')}</span>
+    </button>`).join('') : `<div class="cmenu-empty">No matches</div>`;
+    listEl.querySelectorAll('[data-i]').forEach(b => {
+      b.onmouseenter = () => { cur = Number(b.dataset.i); highlight(); };
+      b.onclick = () => run(Number(b.dataset.i));
+    });
+  };
+  const highlight = () => { listEl.querySelectorAll('.cmenu-item').forEach((b, i) => b.classList.toggle('on', i === cur)); listEl.querySelector('.on')?.scrollIntoView({ block: 'nearest' }); };
+  const run = (i) => { const it = filtered[i]; if (!it) return; if (!it.keepOpen) close(); it.run(); };
+  const applyFilter = () => { const q = (input?.value || '').trim().toLowerCase(); filtered = q ? items.filter(it => (it.label + ' ' + (it.sub || '')).toLowerCase().includes(q)) : items; cur = 0; draw(); };
+  const onKey = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); cur = Math.min(filtered.length - 1, cur + 1); highlight(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); cur = Math.max(0, cur - 1); highlight(); }
+    else if (e.key === 'Enter') { e.preventDefault(); run(cur); }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  };
+  function close() { document.removeEventListener('keydown', onKeyGlobal, true); document.removeEventListener('click', onOut, true); menu.remove(); opts.onClose?.(); }
+  const onKeyGlobal = (e) => { if (!menu.isConnected) return; onKey(e); };
+  const onOut = (e) => { if (!menu.contains(e.target) && e.target !== anchor) close(); };
+  draw();
+  if (input) { input.addEventListener('input', applyFilter); input.addEventListener('keydown', onKey); setTimeout(() => input.focus(), 20); }
+  else { menu.tabIndex = -1; setTimeout(() => menu.focus?.(), 20); }
+  document.addEventListener('keydown', onKeyGlobal, true);
+  setTimeout(() => document.addEventListener('click', onOut, true), 0);
+  return menu;
+}
+
+// ---- Emoji set with search keywords (self-contained; no external assets) -------------------
+export const EMOJI_QUICK = ['👍', '🔥', '💯', '✨', '👀', '🙏', '❤️', '😂', '🎉', '👏'];
+export const EMOJI = [
+  ['👍','thumbs up yes ok approve like'],['👎','thumbs down no dislike'],['🔥','fire lit hot flame'],['💯','hundred perfect score'],
+  ['✨','sparkles shiny nice clean'],['👀','eyes look watching see'],['🙏','pray thanks please hope'],['❤️','heart love red'],
+  ['😂','joy laugh lol funny cry'],['🎉','party tada celebrate'],['👏','clap applause bravo'],['🚀','rocket ship launch ship fast'],
+  ['✅','check done complete tick'],['❌','cross no wrong fail'],['⭐','star favorite'],['💡','idea bulb light think'],
+  ['🎯','target bullseye goal'],['⚡','bolt fast zap energy'],['🐛','bug insect issue'],['🛠️','tools build fix wrench'],
+  ['📌','pin pinned tack'],['📎','paperclip attach'],['📝','memo note write edit'],['📊','chart bar stats graph data'],
+  ['😀','grin smile happy'],['😃','smile happy joy'],['😄','laugh happy grin'],['😅','sweat smile nervous'],
+  ['😊','blush smile happy'],['🙂','slight smile'],['😉','wink'],['😍','heart eyes love adore'],
+  ['🤩','star struck wow amazed'],['😎','cool sunglasses'],['🤔','thinking hmm consider'],['🫡','salute yes sir respect'],
+  ['🙌','raised hands praise celebrate'],['🤝','handshake deal agree'],['💪','muscle strong flex'],['🫶','love hands heart'],
+  ['👋','wave hi hello bye'],['🤞','fingers crossed luck hope'],['🤙','call shaka hang loose'],['✌️','peace victory'],
+  ['😇','angel innocent halo'],['🥳','party face celebrate birthday'],['😌','relieved calm content'],['😴','sleep tired zzz'],
+  ['😭','sob cry sad tears'],['😢','cry sad tear'],['😩','weary tired frustrated'],['😤','huff angry steam'],
+  ['😡','angry mad rage red'],['🤯','mind blown explode wow'],['😱','scream shock fear'],['🥺','pleading puppy please'],
+  ['🤨','raised eyebrow skeptical'],['😬','grimace awkward yikes'],['🙄','eye roll annoyed'],['😏','smirk sly'],
+  ['🤗','hug hugging warm'],['🤫','shush quiet secret'],['🤓','nerd glasses smart'],['🧐','monocle inspect examine'],
+  ['💀','skull dead dying lol'],['👻','ghost boo spooky'],['🤖','robot bot ai'],['👾','alien game invader'],
+  ['💜','purple heart'],['💙','blue heart'],['💚','green heart'],['🧡','orange heart'],['💛','yellow heart'],
+  ['🖤','black heart'],['🤍','white heart'],['💔','broken heart sad'],['💖','sparkle heart love'],['💗','growing heart'],
+  ['🎊','confetti celebrate party'],['🥂','cheers toast drink celebrate'],['🍾','champagne pop celebrate'],['🎈','balloon party'],
+  ['☕','coffee tea break'],['🍕','pizza food'],['🍔','burger food'],['🍰','cake dessert birthday'],
+  ['🌟','glowing star'],['🌈','rainbow pride color'],['🌍','earth world globe'],['🌙','moon night'],
+  ['☀️','sun sunny day'],['⛅','cloud weather'],['❄️','snow cold winter'],['💧','drop water'],
+  ['📈','chart up growth trend'],['📉','chart down decline'],['💰','money bag cash'],['💸','money flying spend'],
+  ['🔒','lock secure private'],['🔑','key access'],['🛡️','shield protect security'],['⏰','alarm clock time'],
+  ['⌛','hourglass wait time'],['📅','calendar date'],['📬','mailbox mail'],['✉️','envelope mail message'],
+  ['💬','speech chat message'],['🗣️','speaking talk voice'],['📣','megaphone announce loud'],['🔔','bell notify alert'],
+  ['✍️','writing sign hand'],['👌','ok perfect nice'],['🤌','pinch italian chef'],['🫰','fingers snap money'],
+  ['🥇','gold medal first win'],['🏆','trophy win champion'],['🎁','gift present'],['🧠','brain smart think'],
+];
+
+// A searchable emoji panel: quick row + type-to-filter grid. Keyboard: type filters, ↵ picks
+// the first result, Esc closes. Used by chat reactions and the composer emoji button.
+export function emojiPanel(anchor, onPick, opts = {}) {
+  document.querySelector('.emoji-panel')?.remove();
+  document.querySelector('.react-pop')?.remove();
+  const panel = el(`<div class="emoji-panel" role="dialog" aria-label="Pick an emoji">
+    <div class="emoji-quick">${EMOJI_QUICK.map(e => `<button data-e="${e}" title="${e}">${e}</button>`).join('')}</div>
+    <div class="emoji-search"><input id="emq" placeholder="Search emoji…" autocomplete="off" spellcheck="false" aria-label="Search emoji"></div>
+    <div class="emoji-grid" id="emgrid"></div>
+  </div>`);
+  document.body.appendChild(panel);
+  const r = anchor.getBoundingClientRect();
+  const w = panel.offsetWidth || 306, h = panel.offsetHeight || 300;
+  let left = Math.min(r.left, innerWidth - w - 10);
+  let top = r.top - h - 8;
+  if (top < 10) top = Math.min(innerHeight - h - 10, r.bottom + 8);
+  panel.style.left = Math.max(10, left) + 'px';
+  panel.style.top = Math.max(10, top) + 'px';
+
+  const grid = panel.querySelector('#emgrid');
+  const input = panel.querySelector('#emq');
+  let list = EMOJI;
+  const draw = () => {
+    grid.innerHTML = list.length ? list.map(([e]) => `<button data-e="${e}" title="${esc(e)}">${e}</button>`).join('') : `<div class="emoji-empty">No emoji match</div>`;
+    grid.querySelectorAll('[data-e]').forEach(b => b.onclick = () => { onPick(b.dataset.e); close(); });
+  };
+  const filter = () => { const q = input.value.trim().toLowerCase(); list = q ? EMOJI.filter(([e, k]) => k.includes(q) || e === q) : EMOJI; draw(); };
+  const close = () => { document.removeEventListener('click', onOut, true); panel.remove(); };
+  const onOut = (e) => { if (!panel.contains(e.target) && e.target !== anchor) close(); };
+  panel.querySelectorAll('.emoji-quick [data-e]').forEach(b => b.onclick = () => { onPick(b.dataset.e); close(); });
+  input.addEventListener('input', filter);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); if (list[0]) { onPick(list[0][0]); close(); } }
+    else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+  });
+  draw();
+  setTimeout(() => input.focus(), 20);
+  setTimeout(() => document.addEventListener('click', onOut, true), 0);
+  return panel;
+}
+
+// ---- Page-load stagger orchestration ------------------------------------------------------
+// Applies a cohesive entrance sequence to a view's top-level panes — but ONLY when the view
+// changed (not on in-place re-renders like star/read), so nothing flickers mid-interaction.
+export function applyStagger(root, animate) {
+  root.classList.remove('stagger-in');
+  if (!animate) return;
+  [...root.children].forEach((c, i) => c.style.setProperty('--stagger-i', i));
+  // reflow so re-adding the class restarts the animation reliably
+  void root.offsetWidth;
+  root.classList.add('stagger-in');
 }
 
 export { fmtBytes };

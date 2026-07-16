@@ -2,9 +2,9 @@
 // Folders + labels rail · conversation-threaded list with multi-select + bulk actions ·
 // reading pane with per-message verified badges, legacy-origin marking, and the MOTE inspector.
 
-import { state, threadsIn, thread, unreadCount, lastTime, parseSearch, matchThread, searchIsGlobal, blockSender, allowSender, threadSender, uid } from '../store.js';
+import { state, threadsIn, thread, unreadCount, lastTime, parseSearch, matchThread, searchIsGlobal, blockSender, allowSender, threadSender, uid, saveSettings } from '../store.js';
 import { FOLDERS, LABELS, person } from '../seed.js';
-import { el, esc, icon, avatar, timeAgo, fmtLong, trustPill, emptyState, verifiedGlyph, showInspector, litHop, toast, renderBody } from '../ui.js';
+import { el, esc, icon, avatar, timeAgo, fmtLong, trustPill, emptyState, verifiedGlyph, showInspector, litHop, toast, renderBody, commandMenu } from '../ui.js';
 import { buildMote, KIND } from '../mote.js';
 import { planDelivery, animatePath } from '../mesh-sim.js';
 import { bus } from '../bus.js';
@@ -12,7 +12,7 @@ import { openCompose } from '../compose.js';
 
 export function render(root) {
   const ui = state.ui;
-  root.className = 'view mail-view';
+  root.className = 'view mail-view' + (state.settings.mailDensity === 'compact' ? ' compact' : '');
   root.innerHTML = `
     <aside class="mail-rail">
       <button class="btn primary block" id="m-compose">${icon('edit')} Compose</button>
@@ -78,6 +78,7 @@ function drawList(root) {
   // not on in-place mutations like star/read/archive — otherwise the whole list re-flickers.
   const key = state.ui.mailFolder + '|' + state.ui.mailLabel + '|' + state.ui.search;
   const fresh = key !== _listKey; _listKey = key;
+  const dense = state.settings.mailDensity === 'compact';
 
   wrap.innerHTML = `
     <div class="list-head">
@@ -89,11 +90,15 @@ function drawList(root) {
         <button class="icon-btn" data-bulk="spam" title="Spam">${icon('shield')}</button>
         <button class="icon-btn" data-bulk="trash" title="Delete (#)">${icon('trash')}</button>
         <button class="icon-btn" data-bulk="clear" title="Clear">${icon('x')}</button>
-      </div>` : `<h2>${esc(state.ui.search ? 'Search' : title)}</h2><span class="list-count">${list.length}</span>${searchChips()}`}
+      </div>` : `<h2>${esc(state.ui.search ? 'Search' : title)}</h2><span class="list-count">${list.length}</span>${searchChips()}
+        <button class="icon-btn sm density-toggle" id="densebtn" title="Density: ${dense ? 'compact' : 'comfortable'} — click for ${dense ? 'comfortable' : 'compact'}" aria-label="Toggle list density" aria-pressed="${dense}">${icon(dense ? 'rows2' : 'density')}</button>`}
     </div>
     <div class="thread-list ${fresh ? '' : 'static'}" id="threads"></div>`;
 
   if (sel.size) wrap.querySelectorAll('[data-bulk]').forEach(b => b.onclick = () => bulk(b.dataset.bulk));
+  wrap.querySelector('#densebtn')?.addEventListener('click', () => {
+    state.settings.mailDensity = dense ? 'comfortable' : 'compact'; saveSettings(); bus.rerender();
+  });
 
   const tl = wrap.querySelector('#threads');
   if (!list.length) { tl.innerHTML = emptyState('inbox', 'Nothing here', state.ui.search ? 'No messages match. Try operators: from: to: subject: label: in: is:unread has:attachment' : 'You are all caught up.'); return; }
@@ -104,7 +109,7 @@ function drawList(root) {
     const names = [...new Set(t.msgs.map(m => m.from === 'you' ? 'You' : person(m.from).name.split(' ')[0]))].join(', ');
     const row = el(`<div class="trow ${state.ui.selThread === t.id ? 'sel' : ''} ${t.read ? '' : 'unread'} ${t.legacy ? 'legacy' : ''}" data-id="${t.id}" role="button" tabindex="0" aria-label="${esc(t.subject)} — from ${esc(names)}${t.read ? '' : ', unread'}" style="animation-delay:${Math.min(i * 20, 300)}ms">
       <button class="tcheck ${sel.has(t.id) ? 'on' : ''}" data-check="${t.id}" aria-label="Select">${sel.has(t.id) ? icon('check') : ''}</button>
-      ${avatar(p, 36, { ring: true })}
+      ${avatar(p, dense ? 28 : 36, { ring: true })}
       <div class="tmain">
         <div class="trow-top">
           <span class="tfrom">${esc(names)}${t.verified ? verifiedGlyph() : ''}${t.msgs.length > 1 ? `<i class="tcount">${t.msgs.length}</i>` : ''}</span>
@@ -169,7 +174,7 @@ function drawRead(root) {
     <header class="read-head">
       <button class="icon-btn mobile-back" id="m-back" aria-label="Back to conversation list" title="Back">${icon('reply')}</button>
       <div class="read-title">
-        <h1>${esc(t.subject)}</h1>
+        <h1 class="display">${esc(t.subject)}</h1>
         <div class="read-tags">
           ${t.labels.map(id => { const l = LABELS.find(x => x.id === id); return l ? `<i class="chip-lbl" style="--h:${l.hue}">${esc(l.name)}</i>` : ''; }).join('')}
           ${t.tier === 'private' ? `<span class="pill priv">${icon('shield')} metadata-private</span>` : ''}
@@ -282,16 +287,37 @@ function nextAfterAction() {
   bus.rerender(); bus.refreshChrome();
 }
 
+// Keyboard-driven snooze picker — a command menu (type-to-nothing here, but ↑↓ + ↵ + Esc),
+// anchored to the reading-pane control or the selected row.
 function snoozeMenu(anchor, t) {
-  popover(anchor, [
-    ['Later today', 6 * 3600e3], ['Tomorrow', 24 * 3600e3], ['This weekend', 3 * 24 * 3600e3], ['Next week', 7 * 24 * 3600e3],
-  ].map(([label, ms]) => ({ label, run: () => { t.snoozeUntil = Date.now() + ms; t.folder = 'inbox'; nextAfterAction(); } })));
+  const wknd = (() => { const d = new Date(); d.setDate(d.getDate() + ((6 - d.getDay() + 7) % 7 || 7)); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); })();
+  const opts = [
+    ['Later today', 6 * 3600e3, '+6h', 'clock'],
+    ['Tomorrow', 24 * 3600e3, tomorrowLabel(), 'clock'],
+    ['This weekend', wknd, 'Sat 9am', 'clock'],
+    ['Next week', 7 * 24 * 3600e3, 'Mon', 'clock'],
+  ];
+  commandMenu(anchor, {
+    title: 'Snooze until', icon: 'snooze', align: 'right', filterable: false,
+    items: opts.map(([label, ms, sub, ic]) => ({ label, sub, icon: ic, run: () => {
+      t.snoozeUntil = Date.now() + ms; t.folder = 'inbox';
+      toast(`${icon('snooze')} Snoozed — resurfaces ${sub === '+6h' ? 'later today' : label.toLowerCase()}`);
+      nextAfterAction();
+    } })),
+  });
 }
+function tomorrowLabel() { const d = new Date(); d.setDate(d.getDate() + 1); return d.toLocaleDateString([], { weekday: 'short' }); }
+
+// Keyboard-driven label picker — type-to-filter, ↵ toggles, Esc closes.
 function labelMenu(anchor, t) {
-  popover(anchor, LABELS.map(l => ({
-    label: (t.labels.includes(l.id) ? '✓ ' : '') + l.name, hue: l.hue,
-    run: () => { t.labels.includes(l.id) ? (t.labels = t.labels.filter(x => x !== l.id)) : t.labels.push(l.id); bus.rerender(); },
-  })));
+  commandMenu(anchor, {
+    title: 'Apply label', icon: 'label', align: 'right', filterable: true, placeholder: 'Filter labels…',
+    items: LABELS.map(l => ({ label: l.name, hue: l.hue, checked: t.labels.includes(l.id), run: () => {
+      t.labels.includes(l.id) ? (t.labels = t.labels.filter(x => x !== l.id)) : t.labels.push(l.id);
+      toast(`${icon('label')} ${t.labels.includes(l.id) ? 'Labelled' : 'Removed'} ${esc(l.name)}`);
+      bus.rerender();
+    } })),
+  });
 }
 function popover(anchor, items) {
   document.querySelector('.popover')?.remove();
@@ -318,4 +344,6 @@ export const mailKeys = {
   unread() { const t = thread(state.ui.selThread); if (t) { t.read = false; bus.rerender(); bus.refreshChrome(); } },
   reply() { const t = thread(state.ui.selThread); if (t) replyTo(t); },
   select() { if (state.ui.selThread) toggleSel(state.ui.selThread); },
+  snooze() { const t = thread(state.ui.selThread); if (!t) return; const a = document.querySelector('#a-snooze') || document.querySelector('.trow.sel'); if (a) snoozeMenu(a, t); },
+  label() { const t = thread(state.ui.selThread); if (!t) return; const a = document.querySelector('#a-label') || document.querySelector('.trow.sel'); if (a) labelMenu(a, t); },
 };

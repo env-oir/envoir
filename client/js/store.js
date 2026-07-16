@@ -11,6 +11,7 @@ const LS_SETTINGS = 'envoir.settings.v2';
 
 const defaultSettings = {
   theme: 'dark',
+  mailDensity: 'comfortable',   // 'comfortable' | 'compact' (Superhuman-style density toggle)
   tierDefault: 'private',
   gateway: true,
   presence: true,               // opt-in presence (labeled metadata-sensitive)

@@ -4,10 +4,9 @@
 
 import { state, saveSettings, applyFilters, uid, unblockSender, allowSender, blockSender } from '../store.js';
 import { LABELS } from '../seed.js';
-import { currentIdentity, displayAddress, displayName, logout, addAlias, removeAlias, makePrimary, fromB64u } from '../identity.js';
-import { verifySafety } from '../safety.js';
+import { currentIdentity, displayAddress, displayName, logout, addAlias, removeAlias, makePrimary } from '../identity.js';
 import { claimHandle } from '../mesh-sim.js';
-import { el, esc, icon, toast, openModal, closeModal, safetyWords, safetyGrid, safetyNumeric } from '../ui.js';
+import { el, esc, icon, toast, openModal, closeModal } from '../ui.js';
 import { renderSignin } from '../signin.js';
 import { bus } from '../bus.js';
 import { SHORTCUTS } from '../shell.js';
@@ -17,11 +16,11 @@ export function render(root) {
   const s = state.settings;
   root.className = 'view settings-view';
   root.innerHTML = `<div class="set-scroll"><div class="set-inner">
-    <header class="set-header"><h1>Settings</h1><p>Your identity and defaults. Privacy is never a paid feature.</p></header>
+    <header class="set-header"><h1 class="display">Settings</h1><p>Your identity and defaults. Privacy is never a paid feature.</p></header>
 
     <section class="set-card">
-      <h2>${icon('key')} Identity &amp; safety number</h2>
-      <p class="set-hint">Your <b>key</b> is your identity. Your address is a pointer to it. To prove a contact is really them (not a look-alike key), compare this <b>safety number</b> out-of-band — read the words, scan the grid, or compare the digits.</p>
+      <h2>${icon('key')} Identity</h2>
+      <p class="set-hint">Your <b>key</b> is your identity; your address is just a pointer to it. Your <b>safety number</b>, device cluster, recovery anchors, key rotation and signed-in apps all live on the dedicated <b>Identity</b> page.</p>
       <div class="id-grid">
         <div class="id-facts">
           <div class="kvr"><span>Display name</span><b>${esc(displayName(id))}</b></div>
@@ -29,14 +28,9 @@ export function render(root) {
           <div class="kvr"><span>Fingerprint</span><b class="mono">${esc(id.fingerprint)}</b></div>
           <div class="kvr"><span>Algorithm</span><b class="mono">${esc(id.alg)}</b></div>
         </div>
-        <div class="id-safety">
-          ${safetyGrid(id.safety)}
+        <div class="set-id-cta">
+          <button class="btn primary" id="openidentity">${icon('fingerprint')} Open Identity</button>
         </div>
-      </div>
-      <div class="safety-full">${safetyWords(id.safety)}${safetyNumeric(id.safety)}</div>
-      <div class="set-row">
-        <button class="btn" id="verifysafety">${icon('repeat')} Recompute &amp; verify</button>
-        <span class="set-hint inline">re-derives the number from your public key, right now — proves it's deterministic, not stored or looked up.</span>
       </div>
     </section>
 
@@ -124,11 +118,8 @@ export function render(root) {
     </section>
   </div></div>`;
 
-  // Identity
-  root.querySelector('#verifysafety').onclick = async () => {
-    const { match, recomputed } = await verifySafety(fromB64u(id.ik), id.safety.full);
-    toast(match ? `${icon('check')} recomputed identical: ${esc(recomputed)}` : '✗ mismatch: ' + esc(recomputed), { ms: 5000 });
-  };
+  // Identity — the full surface (safety number, devices, recovery, rotation) lives in its own view.
+  root.querySelector('#openidentity').onclick = () => bus.setView('identity');
 
   drawAliases(root, id);
   drawSigs(root);
