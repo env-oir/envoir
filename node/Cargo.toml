@@ -54,10 +54,30 @@ serde_json = "1"
 # application messages travel over the mesh transport as `Frame::Group`.
 dmtap-mls = { path = "../crates/dmtap-mls" }
 
+# --- Naming / resolution (spec §3): name→key with RFC 6962 key-transparency ---
+# The real, fail-closed `name@domain → KT-verified pinned key` resolver. The node uses its
+# `Resolver` / `KeyPackageSource` seams (with the in-memory harnesses where no network layer is
+# wired) to KT-verify a recipient BEFORE addressing outbound mail — never a TOFU pin on unreachable
+# KT (§3.3). Replaces the node's directory stub as the *authoritative* resolution path.
+dmtap-naming = { path = "../crates/dmtap-naming" }
+
+# --- DMTAP-Auth (spec §13): the node's own sovereign login/session ---
+# The origin-bound login ceremony + DPoP-style key-bound session. The node signs an RP challenge
+# with its root IK to establish a `BoundSession` (its own login), no central identity provider.
+dmtap-auth = { path = "../crates/dmtap-auth" }
+
+# --- Deniable 1:1 mode (spec §5.2.1): X3DH + Double Ratchet, distinct from MLS groups ---
+# A pairwise deniable channel whose authentication is a shared-key MAC (no signature ⇒ repudiable),
+# used to route a 1:1 MOTE with cryptographic deniability alongside the signed HPKE + MLS paths.
+dmtap-deniable = { path = "../crates/dmtap-deniable" }
+
 # --- Mesh / transport (spec §4; libp2p) ---
-# libp2p = { version = "0.54", features = [
-#   "kad", "relay", "dcutr", "autonat", "noise", "quic", "tcp", "websocket", "mdns", "identify", "ping",
-# ] }
+# The real libp2p mesh transport lives in the SEPARATE `dmtap-p2p` crate, which depends on THIS
+# crate and implements the `crate::transport::Transport` trait (so the heavy libp2p/tokio graph
+# stays out of the node/mail/gateway build paths). It is therefore selectable through the trait
+# seam — as a `Box<dyn Transport>` or a `SelectableTransport` (see `transport.rs`) — NOT a path
+# dependency here (that would be a cycle). The in-tree in-memory + TCP transports remain the
+# default; `dmtap_p2p::Libp2pTransport` drops into the same seam.
 
 # --- Mixnet (spec §4.4, §6; Sphinx / Loopix-style) ---
 # sphinx-packet = "*"      # Sphinx packet format (evaluate nym crates vs. own)

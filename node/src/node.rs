@@ -17,9 +17,20 @@
 //!   members (post-compromise security on Remove), and send/receive group application messages.
 //!   Handshakes are ordered by an in-process [`Committer`] (the §5.1 DS ordering seam); group
 //!   application messages ride the mesh as [`Frame::Group`]. See [`crate::group`].
-//! - **Stubbed / in-process:** recipient resolution is a local `directory` map (a stand-in for
-//!   naming/KeyPackage fetch, §3/§5.3); sender classification uses the transport return path
-//!   rather than blinded tags (§2.2a); the transport is [`InMemoryNetwork`], not libp2p; the group
+//! - **Real (naming, §3):** recipient resolution is the KT-verified, fail-closed
+//!   [`dmtap_naming`] resolver ([`resolve_and_pin`](Node::resolve_and_pin) /
+//!   [`send_mail_to_name`](Node::send_mail_to_name)): DNS `_dmtap` → fetched `Identity` → RFC 6962
+//!   inclusion/STH/leaf/quorum verification before anything is pinned — never a TOFU pin on an
+//!   unreachable/sub-quorum/stale/equivocating KT (§3.3). The local `directory` is now purely the
+//!   *pin cache* that verification populates; the network fetch is the `Resolver`/`KeyPackageSource`
+//!   trait seam (in-memory harness where no socket layer is wired).
+//! - **Real (auth, §13):** the node runs its own DMTAP-Auth login ([`login`](Node::login)) — its
+//!   root `IK` signs an RP's origin-bound challenge to establish a key-bound session.
+//! - **Real (deniable, §5.2.1):** an optional repudiable 1:1 channel (X3DH + Double Ratchet, shared
+//!   -key-MAC) distinct from the MLS group path — see [`crate::deniable`].
+//! - **Stubbed / in-process:** sender classification uses the transport return path rather than
+//!   blinded tags (§2.2a); the in-tree transport is [`InMemoryNetwork`] (the real libp2p mesh lives
+//!   in the separate `dmtap-p2p` crate, selectable through the [`Transport`] seam); the group
 //!   committer is a single in-process ordered log (real mesh committer succession/takeover/
 //!   fork-recovery of §5.1 is out of scope); timers are event-driven off an injected clock.
 //!
@@ -38,11 +49,17 @@ use dmtap_core::{ContentId, TimestampMs};
 use dmtap_mail::store::{MailStore, Mailbox, MemoryStore};
 use dmtap_mls::{Committer, Member, Session};
 
+use dmtap_core::deniable::{DeniableInit, DeniableMessage, DeniablePayload, DeniablePrekeyBundle};
+
+use crate::auth::{Challenge, Login, TrustedClient};
+use crate::deniable::{DeniableRouteError, DeniableState, DEFAULT_OPKS};
 use crate::group::{GroupAdd, GroupError, GroupMote};
 use crate::inbound::{DropReason, InboundOutcome};
 use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
+use crate::naming::{self, AddressError, KeyPackageSource, Resolver};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
+use dmtap_auth::AuthError;
 
 /// The requests-area mailbox for deferred cold-sender MOTEs (§2.7a: never the inbox). Mapped onto
 /// the Junk SPECIAL-USE folder so existing IMAP/JMAP clients surface it distinctly from the inbox.
@@ -103,6 +120,9 @@ pub struct Node<T: Transport> {
     /// A pre-published MLS leaf ([`Member`]) awaiting a Welcome to join a group (§5.3 async join).
     /// Provisioned by [`Node::publish_group_keypackage`], consumed by [`Node::join_group`].
     pending_leaf: Option<Member>,
+    /// The deniable 1:1 subsystem (spec §5.2.1): a dedicated deniable identity, an optional
+    /// responder half, and live pairwise ratchet sessions — distinct from the MLS group path.
+    deniable: DeniableState,
     /// Inbound group **application** MOTEs pulled off the transport by [`Node::poll`], buffered for
     /// [`Node::poll_group_messages`] to decrypt — kept off the 1:1 outcome path so the 1:1
     /// pipeline is untouched. Each entry is the `(group_id, encoded GroupMote)` from a
@@ -137,6 +157,7 @@ impl<T: Transport> Node<T> {
             directory: HashMap::new(),
             groups: HashMap::new(),
             pending_leaf: None,
+            deniable: DeniableState::default(),
             group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
@@ -169,6 +190,7 @@ impl<T: Transport> Node<T> {
             directory: HashMap::new(),
             groups: HashMap::new(),
             pending_leaf: None,
+            deniable: DeniableState::default(),
             group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
@@ -207,6 +229,49 @@ impl<T: Transport> Node<T> {
     /// cold-sender send (the recipient will classify us as unknown until they pin us).
     pub fn learn_key(&mut self, ik: &[u8], seal_pub: [u8; 32]) {
         self.directory.insert(ik.to_vec(), seal_pub);
+    }
+
+    // --- name → key resolution (spec §3.3) --------------------------------------------------
+
+    /// Resolve `name@domain` to a **KT-verified, pinned** recipient and cache the binding, the real
+    /// §3.3 path that replaces any hardcoded/stub lookup before addressing outbound mail.
+    ///
+    /// The `resolver` runs the full fail-closed verification (DNS `_dmtap` parse → fetched
+    /// `Identity` signature/chain → DNS⇄Identity cross-check → RFC 6962 inclusion/STH/leaf-hash +
+    /// v1 quorum/freshness/equivocation gates). **Only** on a verified binding does this fetch the
+    /// recipient's content-addressed sealing KeyPackage (via `kps`) and pin `name → (ik, seal)` into
+    /// the node's contact/directory cache. An unverifiable KT (unreachable / sub-quorum / stale /
+    /// equivocating / proof-invalid) returns the typed [`ResolveError`](crate::naming::ResolveError)
+    /// and pins **nothing** — never a TOFU pin on unverifiable KT (§3.3). Returns the verified IK.
+    pub fn resolve_and_pin(
+        &mut self,
+        name: &str,
+        resolver: &dyn Resolver,
+        kps: &dyn KeyPackageSource,
+    ) -> Result<Vec<u8>, crate::naming::ResolveError> {
+        // KT-verify the binding (fail-closed) BEFORE trusting anything about the recipient (§3.3).
+        let res = resolver.resolve(name)?;
+        // Fetch + content-verify (§2.2) the sealing KeyPackage the verified identity advertises.
+        let bundle = kps.fetch_bundle(&res.keypkgs)?;
+        let seal_pub = naming::seal_key_from_bundle(&bundle)?;
+        // Pin the verified binding into the local cache (§3.4): only now is it addressable.
+        self.add_contact(&res.ik, seal_pub);
+        Ok(res.ik)
+    }
+
+    /// Resolve `name@domain` KT-verified (fail-closed, §3.3) and, only on success, send a mail MOTE
+    /// to the resolved key. The one-call name-addressed send: resolution and sealing failures are
+    /// kept distinguishable via [`AddressError`](crate::naming::AddressError).
+    pub fn send_mail_to_name(
+        &mut self,
+        name: &str,
+        resolver: &dyn Resolver,
+        kps: &dyn KeyPackageSource,
+        subject: &str,
+        body: &[u8],
+    ) -> Result<ContentId, AddressError> {
+        let to_ik = self.resolve_and_pin(name, resolver, kps)?;
+        Ok(self.send_mail(&to_ik, subject, body)?)
     }
 
     /// Advance the injected clock to `now` (ms since epoch).
@@ -687,6 +752,88 @@ impl<T: Transport> Node<T> {
     /// `ik_public ‖ "#" ‖ label`; use `Member::owner_of_identity` to map a leaf to its owner.
     pub fn group_roster(&self, group_id: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
         self.groups.get(group_id).map(|s| s.roster())
+    }
+
+    // --- DMTAP-Auth: the node's own login/session (spec §13) --------------------------------
+
+    /// Run the **client side** of the native login ceremony (§13.3): the node's root `IK` is the
+    /// identity-revealing login signer over the RP's origin-bound `challenge`. The `client` (a
+    /// WebAuthn/PRF authenticator or paired companion, [`TrustedClient`]) enforces origin binding
+    /// against the machine-observed origin and gates signing on user-verification (§13.3.1) — the
+    /// crypto core never trusts an origin handed to it by the RP. Returns the [`Login`]: the signed
+    /// assertion to transmit plus the retained per-RP session key for DPoP-style proof-of-possession
+    /// on every subsequent request (§13.4). Fails closed on an origin mismatch or declined UV.
+    pub fn login(
+        &self,
+        client: &impl TrustedClient,
+        challenge: &Challenge,
+    ) -> Result<Login, AuthError> {
+        dmtap_auth::create_login(client, challenge, &self.ik)
+    }
+
+    // --- deniable 1:1 messaging (spec §5.2.1) -----------------------------------------------
+    //
+    // A repudiable pairwise channel — X3DH over a dedicated IK-certified `idk`, then a Double
+    // Ratchet whose only authentication is the AEAD tag (shared-key MAC). Distinct from the MLS
+    // group path above: no committer, no epoch log. See [`crate::deniable`].
+
+    /// Publish this node's deniable **prekey bundle** so a peer can open a deniable 1:1 session to
+    /// it (§5.2.1): provisions the responder half (a dedicated deniable identity + one-time prekeys)
+    /// and returns the signed [`DeniablePrekeyBundle`] to advertise. Uses [`DEFAULT_OPKS`] one-time
+    /// prekeys and the node's injected clock for the bundle timestamp.
+    pub fn deniable_publish_bundle(&mut self) -> DeniablePrekeyBundle {
+        self.deniable.publish_bundle(DEFAULT_OPKS, 1, self.now)
+    }
+
+    /// **Initiator:** open a deniable 1:1 session to the peer whose signed `peer_bundle` we hold,
+    /// routing `first` (a [`DeniablePayload`] — a MOTE with its signature removed, §18.3.10) as the
+    /// embedded first ratchet message. Returns the [`DeniableInit`] to hand to the peer; the live
+    /// session is retained, keyed by the peer's deniable IK (§5.2.1(a)).
+    pub fn deniable_open(
+        &mut self,
+        peer_bundle: &DeniablePrekeyBundle,
+        first: &DeniablePayload,
+    ) -> Result<DeniableInit, DeniableRouteError> {
+        self.deniable.open(peer_bundle, first)
+    }
+
+    /// **Responder:** accept an incoming [`DeniableInit`], establishing the session and decrypting
+    /// its embedded first payload (§5.2.1(a)). Requires a prior
+    /// [`deniable_publish_bundle`](Self::deniable_publish_bundle). Fails closed on a bad `idk`
+    /// certification, a consumed/absent prekey, or a replayed last-resort init.
+    pub fn deniable_accept(
+        &mut self,
+        init: &DeniableInit,
+    ) -> Result<DeniablePayload, DeniableRouteError> {
+        self.deniable.accept(init)
+    }
+
+    /// Seal `payload` into a [`DeniableMessage`] on the live deniable session with `peer_ik`
+    /// (§5.2.1(b)). The message carries no signature — the ratchet's AEAD tag is the only
+    /// authenticator (the property that makes the transcript repudiable).
+    pub fn deniable_send(
+        &mut self,
+        peer_ik: &[u8],
+        payload: &DeniablePayload,
+    ) -> Result<DeniableMessage, DeniableRouteError> {
+        self.deniable.send(peer_ik, payload)
+    }
+
+    /// Open a [`DeniableMessage`] back into a [`DeniablePayload`] on the deniable session with
+    /// `peer_ik`. A tampered header/ciphertext, a wrong key, or a rewound (already-consumed)
+    /// message fails closed (§5.2.1).
+    pub fn deniable_recv(
+        &mut self,
+        peer_ik: &[u8],
+        msg: &DeniableMessage,
+    ) -> Result<DeniablePayload, DeniableRouteError> {
+        self.deniable.recv(peer_ik, msg)
+    }
+
+    /// This node's initiator deniable identity public key, once one has been provisioned (by opening
+    /// a session). Peers key their side of the session by this value (§5.2.1).
+    pub fn deniable_identity_public(&self) -> Option<Vec<u8>> {
+        self.deniable.identity_public()
     }
 }
 
