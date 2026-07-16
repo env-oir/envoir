@@ -19,6 +19,9 @@ use crate::AUTH_ASSERTION_DS;
 ///    origin (a look-alike site) is rejected here ([`AuthError::OriginMismatch`]).
 /// 2. `aud == expected_aud` — audience binding ([`AuthError::AudienceMismatch`]).
 /// 3. Every echoed field equals the issued challenge ([`AuthError::ChallengeMismatch`]).
+/// 3b. The echoed `scope` equals the issued challenge's scope — the scope-elevation defense
+///    ([`AuthError::ScopeMismatch`]); `scope` is inside the signed preimage (§18.9.8), so a
+///    broader granted scope also fails the signature check.
 /// 4. Not expired against the RP clock ([`AuthError::Expired`]).
 /// 5. `from` is an `IK`-authorized signer for `pinned_ik` ([`AuthError::UnauthorizedSigner`] —
 ///    the wrong-identity-key / unauthorized-device rejection).
@@ -57,6 +60,13 @@ pub fn verify_login(
         || assertion.aud != issued.aud
     {
         return Err(AuthError::ChallengeMismatch);
+    }
+    // (3b) Scope binding (§18.9.8, §18.7.2 key 9). The RP grants exactly the scope of the
+    //      challenge it issued; the assertion's echoed scope MUST equal it. A broader (elevated)
+    //      scope is rejected fail-closed — and would in any case fail the signature check below,
+    //      because `scope` is inside the signed preimage reconstructed from the ISSUED challenge.
+    if assertion.scope != issued.scope.clone().unwrap_or_default() {
+        return Err(AuthError::ScopeMismatch);
     }
     // (4) Expiry against the RP's own clock (§16.1 — never trust the assertion's timestamps for
     //     correctness; judge with local time).

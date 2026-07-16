@@ -365,6 +365,90 @@ fn tampered_cnf_breaks_signature() {
     assert_eq!(err, AuthError::BadSignature, "cnf is inside the signed preimage");
 }
 
+// ── 7b. Scope binding: an assertion cannot grant a scope broader than the user signed ────────
+
+#[test]
+fn matching_scope_verifies() {
+    // Happy path with a non-empty scope: the assertion echoes the challenge scope and verifies.
+    let fx = Fixture::new();
+    let clock = ManualClock::at(T0);
+    let mut replay = InMemoryReplayCache::new();
+    let challenge = Challenge::new(ORIGIN, AUD, clock.now_ms(), Some(vec!["mail:read".into()]));
+    let client = TrustedClientStub::new(ORIGIN);
+    let login = create_login(&client, &challenge, &fx.device).expect("login ok");
+    assert_eq!(login.assertion.scope, vec!["mail:read".to_string()], "scope echoed into assertion");
+    verify_login(
+        &fx.ik.public(),
+        ORIGIN,
+        AUD,
+        &challenge,
+        &login.assertion,
+        &fx.authorizer,
+        &mut replay,
+        &clock,
+    )
+    .expect("an assertion whose scope matches the issued challenge verifies");
+}
+
+#[test]
+fn scope_elevation_broader_echo_rejected() {
+    // The user signs a login for scope ["mail:read"]. An attacker broadens the *echoed* scope to
+    // ["mail:read","mail:write"] to elevate privilege. The RP grants only the scope of the
+    // challenge it issued, so the broadened echo is rejected fail-closed (§18.7.2 key 9).
+    let fx = Fixture::new();
+    let clock = ManualClock::at(T0);
+    let mut replay = InMemoryReplayCache::new();
+    let challenge = Challenge::new(ORIGIN, AUD, clock.now_ms(), Some(vec!["mail:read".into()]));
+    let client = TrustedClientStub::new(ORIGIN);
+    let mut login = create_login(&client, &challenge, &fx.device).expect("login ok");
+
+    login.assertion.scope = vec!["mail:read".into(), "mail:write".into()]; // broadened
+    let err = verify_login(
+        &fx.ik.public(),
+        ORIGIN,
+        AUD,
+        &challenge,
+        &login.assertion,
+        &fx.authorizer,
+        &mut replay,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err, AuthError::ScopeMismatch, "a broadened scope is scope-elevation, rejected");
+}
+
+#[test]
+fn scope_broader_grant_fails_signature() {
+    // The cryptographic half of the defense: even if the echoed scope is made to *match* what the
+    // RP will grant, a grant broader than what was actually signed still fails, because `scope` is
+    // inside the signed preimage (§18.9.8). The user signs for ["mail:read"]; the RP then attempts
+    // to reconstruct/grant ["mail:read","mail:write"] — a different preimage → the signature fails.
+    let fx = Fixture::new();
+    let clock = ManualClock::at(T0);
+    let mut replay = InMemoryReplayCache::new();
+    let signed = Challenge::new(ORIGIN, AUD, clock.now_ms(), Some(vec!["mail:read".into()]));
+    let client = TrustedClientStub::new(ORIGIN);
+    let mut login = create_login(&client, &signed, &fx.device).expect("login ok");
+
+    // The RP's issued view carries the broader scope it would grant; make the echo match it so the
+    // (3b) echo check passes and we reach the signature check reconstructed from the ISSUED scope.
+    let broader = vec!["mail:read".to_string(), "mail:write".to_string()];
+    let issued = Challenge { scope: Some(broader.clone()), ..signed };
+    login.assertion.scope = broader;
+    let err = verify_login(
+        &fx.ik.public(),
+        ORIGIN,
+        AUD,
+        &issued,
+        &login.assertion,
+        &fx.authorizer,
+        &mut replay,
+        &clock,
+    )
+    .unwrap_err();
+    assert_eq!(err, AuthError::BadSignature, "scope is inside the signed preimage — a broader grant fails to verify");
+}
+
 // ── 8. Wire round-trips (canonical §18 CBOR) ─────────────────────────────────────────────────
 
 #[test]

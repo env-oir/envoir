@@ -20,6 +20,8 @@
 //! ```
 //! DS-tag `DMTAP-v0/profile` (§18.9.3); the signing body is `det_cbor(Profile ∖ {10})`.
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use crate::cbor::{self, as_bytes, as_text, as_u64, CborError, Cv, Fields};
 use crate::id::ContentId;
 use crate::identity::{verify_domain, IdentityKey};
@@ -42,6 +44,17 @@ pub enum ProfileError {
     /// USER_WARN, §18.4.12).
     #[error("avatar bytes do not match avatar.hash (ERR_PROFILE_AVATAR_HASH_MISMATCH 0x011A)")]
     AvatarHashMismatch,
+    /// `avatar.url` is **attacker-chosen data** (any key may publish any `Profile` about itself)
+    /// whose scheme is not `https`, or whose host is an IP literal targeting a loopback / private
+    /// (RFC 1918 / RFC 4193 ULA) / link-local (`169.254.0.0/16`, cloud-metadata `169.254.169.254`)
+    /// / other non-global address, or an obvious internal host (`localhost`) — a server-side
+    /// request-forgery / internal-probe attempt via a display pointer. A fetcher MUST NOT fetch it
+    /// and MUST fall back down the §3.9.5 ladder (`ERR_PROFILE_AVATAR_URL_UNSAFE` `0x011B`,
+    /// FAIL_CLOSED_BLOCK, §18.4.12). Hostname→IP resolution (and the re-check after any redirect)
+    /// is the fetching client's job; the core validates the scheme, IP literals, and obvious
+    /// internal hostnames.
+    #[error("avatar url is unsafe: non-https or internal/SSRF target (ERR_PROFILE_AVATAR_URL_UNSAFE 0x011B)")]
+    AvatarUrlUnsafe,
     /// A `version` ≤ the last pinned version for this identity — a rollback/replay of a
     /// superseded-but-validly-signed object (`ERR_STALE_ROLLBACK` `0x0105`, §18.4.12, §3.9.5).
     #[error("profile version is a rollback of a pinned version (ERR_STALE_ROLLBACK 0x0105)")]
@@ -60,6 +73,7 @@ impl ProfileError {
         match self {
             ProfileError::ProfileSigInvalid => 0x0119,
             ProfileError::AvatarHashMismatch => 0x011A,
+            ProfileError::AvatarUrlUnsafe => 0x011B,
             ProfileError::StaleRollback => 0x0105,
             // ERR_UNKNOWN_SUITE / ERR_MALFORMED_OBJECT.
             ProfileError::UnsupportedSuite(_) => 0x0101,
@@ -68,17 +82,109 @@ impl ProfileError {
     }
 }
 
+/// Whether `ip` is a target a fetcher MUST NOT reach for an owner-supplied avatar URL (§18.4.12):
+/// loopback, private (RFC 1918 / RFC 4193 ULA), link-local (incl. the `169.254.169.254` cloud
+/// metadata endpoint), the unspecified address, or otherwise non-global. Conservative and
+/// fail-closed: any IPv4-mapped IPv6 is judged by its embedded v4 address.
+fn ip_is_internal(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4_is_internal(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return v4_is_internal(mapped);
+            }
+            let seg = v6.segments();
+            v6.is_loopback()             // ::1
+                || v6.is_unspecified()   // ::
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local (ULA)
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+fn v4_is_internal(v4: Ipv4Addr) -> bool {
+    v4.is_loopback()        // 127.0.0.0/8
+        || v4.is_private()  // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local() // 169.254.0.0/16 (incl. 169.254.169.254 cloud metadata)
+        || v4.is_unspecified() // 0.0.0.0
+        || v4.is_broadcast() // 255.255.255.255
+        || v4.octets()[0] == 0 // 0.0.0.0/8 "this network"
+}
+
+/// Validate an owner-supplied avatar URL fail-closed (§18.4.12, §3.9.5). The URL is
+/// **attacker-chosen data**: this enforces scheme `https`, and — when the host is an **IP
+/// literal** — that it is not an internal/loopback/link-local/private target (an SSRF /
+/// internal-probe guard). It also rejects the obvious internal hostname `localhost`. Full
+/// hostname→IP resolution and the re-check after any HTTP redirect are the fetching client's
+/// responsibility (this core has no resolver); a client MUST perform them before fetching.
+/// Returns [`ProfileError::AvatarUrlUnsafe`] (`0x011B`) on any violation.
+pub fn validate_avatar_url(url: &str) -> Result<(), ProfileError> {
+    // Scheme MUST be exactly `https` (case-insensitive), with an authority component.
+    let after_scheme = url
+        .split_once("://")
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("https"))
+        .map(|(_, rest)| rest)
+        .ok_or(ProfileError::AvatarUrlUnsafe)?;
+
+    // authority = up to the first '/', '?' or '#'.
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err(ProfileError::AvatarUrlUnsafe);
+    }
+    // Drop any userinfo ("user:pass@"): the host is after the last '@'.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+
+    // Extract the host, honoring IPv6 bracket literals `[..]:port`.
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']').ok_or(ProfileError::AvatarUrlUnsafe)?;
+        &rest[..end]
+    } else {
+        // Strip a trailing ":port" (a bare host has at most one ':' here; an unbracketed
+        // multi-colon token is malformed and falls through to the parse below).
+        match host_port.rsplit_once(':') {
+            Some((h, port)) if port.chars().all(|c| c.is_ascii_digit()) => h,
+            _ => host_port,
+        }
+    };
+    if host.is_empty() {
+        return Err(ProfileError::AvatarUrlUnsafe);
+    }
+
+    // If the host is an IP literal, judge it directly; otherwise it is a hostname whose
+    // resolution the client must guard — we still block the obvious internal name `localhost`.
+    match host.parse::<IpAddr>() {
+        Ok(ip) if ip_is_internal(ip) => Err(ProfileError::AvatarUrlUnsafe),
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let lower = host.to_ascii_lowercase();
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                Err(ProfileError::AvatarUrlUnsafe)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 /// An owner-set avatar pointer (§18.4.12). DMTAP does **not** host the image — `url` is a pointer
 /// the owner controls; `hash`, when present, content-addresses the exact bytes for tamper-evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Avatar {
-    /// Key 1 — owner-set public URL of the avatar image (`https` RECOMMENDED).
+    /// Key 1 — owner-set public URL of the avatar image. Attacker-chosen data: a fetcher MUST
+    /// require scheme `https` and reject internal/SSRF targets ([`Avatar::validate_url`], `0x011B`).
     pub url: String,
     /// Key 2 — OPTIONAL `0x1e ‖ BLAKE3-256` content address of the image bytes.
     pub hash: Option<ContentId>,
 }
 
 impl Avatar {
+    /// Validate `url` fail-closed before any fetch (§18.4.12): scheme `https`, and no IP-literal
+    /// internal/loopback/link-local/private target (SSRF guard). See [`validate_avatar_url`].
+    /// Returns [`ProfileError::AvatarUrlUnsafe`] (`0x011B`) on a non-https or internal target.
+    pub fn validate_url(&self) -> Result<(), ProfileError> {
+        validate_avatar_url(&self.url)
+    }
+
     fn to_cv(&self) -> Cv {
         let mut m = vec![(1u64, Cv::Text(self.url.clone()))];
         if let Some(h) = &self.hash {
@@ -244,6 +350,17 @@ impl Profile {
             .map_err(|_| ProfileError::ProfileSigInvalid)
     }
 
+    /// Validate this profile's avatar URL fail-closed **before any fetch** (§18.4.12): scheme
+    /// `https` and no IP-literal internal/SSRF target ([`Avatar::validate_url`], `0x011B`). Returns
+    /// `Ok(())` when there is no avatar (nothing to fetch). A client MUST call this — and re-check
+    /// the resolved IP and any redirect target — before fetching the owner-hosted image.
+    pub fn validate_avatar_url(&self) -> Result<(), ProfileError> {
+        match self.avatar.as_ref() {
+            Some(a) => a.validate_url(),
+            None => Ok(()),
+        }
+    }
+
     /// Verify that `image_bytes` fetched from `avatar.url` content-address to `avatar.hash`
     /// (§18.4.12). Returns `Ok(())` when there is no avatar or no `hash` (best-effort, no integrity
     /// guarantee); [`ProfileError::AvatarHashMismatch`] (`0x011A`) on mismatch — the client MUST
@@ -342,6 +459,65 @@ mod tests {
         let err = p.verify_avatar(b"swapped-image").unwrap_err();
         assert_eq!(err, ProfileError::AvatarHashMismatch);
         assert_eq!(err.code(), 0x011A);
+    }
+
+    #[test]
+    fn avatar_url_https_accepted() {
+        // A normal public https URL (hostname target) is accepted; the content-address binding is
+        // still enforced independently (verify_avatar), unchanged by the URL guard.
+        let ik = IdentityKey::generate();
+        let p = sample(&ik); // avatar url = https://example.invalid/a.png with a hash
+        assert!(p.validate_avatar_url().is_ok(), "a normal https URL is accepted");
+        assert!(p.verify_avatar(b"avatar-bytes").is_ok(), "content-address still enforced");
+        assert_eq!(
+            p.verify_avatar(b"swapped").unwrap_err(),
+            ProfileError::AvatarHashMismatch,
+            "content-address binding independent of URL validation"
+        );
+    }
+
+    #[test]
+    fn avatar_url_http_rejected() {
+        // Non-https scheme is a fail-closed reject (0x011B): no plaintext / downgrade fetch.
+        let a = Avatar { url: "http://example.com/a.png".into(), hash: None };
+        let err = a.validate_url().unwrap_err();
+        assert_eq!(err, ProfileError::AvatarUrlUnsafe);
+        assert_eq!(err.code(), 0x011B);
+    }
+
+    #[test]
+    fn avatar_url_ip_literal_private_rejected() {
+        // IP-literal internal targets — an SSRF/internal-probe attempt via the display pointer.
+        for url in [
+            "https://127.0.0.1/a.png",             // loopback
+            "https://10.0.0.5/a.png",              // RFC 1918 private
+            "https://192.168.1.1:8080/a.png",      // private + port
+            "https://169.254.169.254/latest/meta", // cloud metadata (link-local)
+            "https://[::1]/a.png",                 // IPv6 loopback
+            "https://[fd00::1]/a.png",             // IPv6 ULA
+            "https://user:pass@127.0.0.1/a.png",   // userinfo must not smuggle the host past us
+            "https://localhost/a.png",             // obvious internal hostname
+        ] {
+            let a = Avatar { url: url.into(), hash: None };
+            assert_eq!(
+                a.validate_url(),
+                Err(ProfileError::AvatarUrlUnsafe),
+                "internal/SSRF target must be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn avatar_url_public_targets_accepted() {
+        // A public IP literal and normal hostnames are fine — only internal targets are blocked.
+        for url in [
+            "https://93.184.216.34/a.png", // public IPv4 literal
+            "https://[2606:2800:220:1::1]/a.png", // public IPv6 literal
+            "https://cdn.example.com/avatars/x.png",
+        ] {
+            let a = Avatar { url: url.into(), hash: None };
+            assert!(a.validate_url().is_ok(), "public target should be accepted: {url}");
+        }
     }
 
     #[test]

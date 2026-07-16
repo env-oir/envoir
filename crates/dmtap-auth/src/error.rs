@@ -24,6 +24,15 @@ pub enum AuthError {
     #[error("challenge echo mismatch: assertion does not correspond to the issued challenge")]
     ChallengeMismatch,
 
+    /// The assertion's echoed `scope` (`Assertion` key 9) does not equal the scope of the
+    /// `Challenge` the RP issued — an OAuth-style scope-elevation attempt. `scope` is inside the
+    /// signed preimage (§18.9.8), so the granted scope is cryptographically bound to the user's
+    /// consent: the RP reconstructs the preimage **using exactly the scope it will grant** and MUST
+    /// NOT grant a scope broader than the signed value. A divergent (e.g. broadened) scope is
+    /// rejected fail-closed here (§13.3 step 6, §18.7.2 key 9).
+    #[error("scope mismatch: assertion scope is not the scope of the issued challenge (§18.9.8)")]
+    ScopeMismatch,
+
     /// `now > exp`: the challenge/assertion window has closed (§18.7.1, ≤120 s; §16.1).
     #[error("expired: the challenge validity window has closed")]
     Expired,

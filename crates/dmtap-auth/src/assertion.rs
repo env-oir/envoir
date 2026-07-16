@@ -2,7 +2,7 @@
 //! (§13.3 steps 4–5). This is the identity-revealing login signature; the fresh per-RP session
 //! keypair it commits via `cnf` lives in [`crate::session`].
 
-use dmtap_core::cbor::{self, as_bytes, as_text, as_u64, Cv, Fields};
+use dmtap_core::cbor::{self, as_array, as_bytes, as_text, as_u64, Cv, Fields};
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::TimestampMs;
@@ -14,16 +14,20 @@ use crate::session::SessionKey;
 use crate::AUTH_ASSERTION_DS;
 
 /// Compute the §18.9.8 `auth_hash`: `BLAKE3-256( det_cbor([ rp_origin, nonce, issued_at, exp,
-/// aud, cnf ]) )`. A fixed 6-element CBOR array in exactly that order — the five origin-bound
-/// `Challenge` fields followed by `cnf` — matching §13.3 step 5's
-/// `H(rp_origin ‖ nonce ‖ issued_at ‖ exp ‖ aud ‖ cnf)`. This is the 32-byte raw digest that is
-/// signed (the DS-tag is prepended by the signer), NOT a prefixed `hash` wire field.
+/// aud, scope, cnf ]) )`. A fixed **7-element** CBOR array in exactly that order — the five
+/// origin-bound `Challenge` fields, then `scope` (`Assertion` key 9; the **empty array `[]`** when
+/// the `Challenge` carries no scope), then `cnf` (`Assertion` key 8) — matching §13.3 step 5's
+/// `H(rp_origin ‖ nonce ‖ issued_at ‖ exp ‖ aud ‖ scope ‖ cnf)`. Binding `scope` into the signed
+/// preimage is what makes scope-elevation self-defeating: a broader granted scope reconstructs a
+/// different preimage and the signature fails (§18.7.2 key 9). This is the 32-byte raw digest that
+/// is signed (the DS-tag is prepended by the signer), NOT a prefixed `hash` wire field.
 fn auth_hash(
     rp_origin: &str,
     nonce: &[u8],
     issued_at: TimestampMs,
     exp: TimestampMs,
     aud: &str,
+    scope: &[String],
     cnf: &ContentId,
 ) -> [u8; 32] {
     let arr = Cv::Array(vec![
@@ -32,6 +36,8 @@ fn auth_hash(
         Cv::U64(issued_at),
         Cv::U64(exp),
         Cv::Text(aud.to_string()),
+        // scope — the empty array [] when the Challenge omits it (§18.9.8).
+        Cv::Array(scope.iter().map(|s| Cv::Text(s.clone())).collect()),
         Cv::Bytes(cnf.as_bytes().to_vec()), // cnf = 0x1e ‖ BLAKE3-256(session_pubkey), the `hash` field
     ]);
     *blake3::hash(&cbor::encode(&arr)).as_bytes()
@@ -62,6 +68,13 @@ pub struct SignedAssertion {
     /// key 8 — `cnf = H(session_pubkey)` (RFC 7800 style): commits the fresh per-RP session key
     /// the client generated **before** signing. The RP binds the session **only** to this.
     pub cnf: ContentId,
+    /// key 9 (OPTIONAL echo) — echo of `Challenge.scope`; the **empty vector** (encoded as the
+    /// empty array `[]`) when the challenge omits it. It is **inside the signed preimage**
+    /// (§18.9.8), so the granted scope is cryptographically bound to the user's consent: the RP
+    /// MUST reconstruct the preimage with exactly the scope it will grant and MUST NOT grant a
+    /// scope broader than the signed value (a broader grant fails verification). Closes the
+    /// OAuth-style scope-elevation where a scope the user never signed is granted (§18.7.2 key 9).
+    pub scope: Vec<String>,
 }
 
 impl SignedAssertion {
@@ -76,13 +89,17 @@ impl SignedAssertion {
             issued.issued_at,
             issued.exp,
             &issued.aud,
+            // Reconstruct with the scope the RP will grant — i.e. the scope of the challenge it
+            // issued (empty [] when the challenge omitted it). A broader granted scope produces a
+            // different preimage and the signature fails to verify (§18.9.8).
+            &issued.scope.clone().unwrap_or_default(),
             &self.cnf,
         )
     }
 
     /// The canonical integer-keyed CBOR map (§18.7.2) — the exact wire form.
     fn to_cv(&self) -> Cv {
-        Cv::Map(vec![
+        let mut m = vec![
             (1u64, Cv::Text(self.rp_origin.clone())),
             (2, Cv::Bytes(self.nonce.clone())),
             (3, Cv::U64(self.issued_at)),
@@ -91,7 +108,13 @@ impl SignedAssertion {
             (6, Cv::Bytes(self.from.clone())),
             (7, Cv::Bytes(self.sig.clone())),
             (8, Cv::Bytes(self.cnf.as_bytes().to_vec())),
-        ])
+        ];
+        // key 9 — OPTIONAL echo: emitted only when non-empty (absent ⇒ the empty array [], §18.7.2
+        // key 9). The signed preimage always hashes scope as `[]` when empty (§18.9.8).
+        if !self.scope.is_empty() {
+            m.push((9, Cv::Array(self.scope.iter().map(|s| Cv::Text(s.clone())).collect())));
+        }
+        Cv::Map(m)
     }
 
     /// The exact wire bytes: §18-canonical integer-keyed CBOR.
@@ -112,8 +135,17 @@ impl SignedAssertion {
         let from = as_bytes(take(6)?).map_err(|_| AuthError::Malformed("from"))?;
         let sig = as_bytes(take(7)?).map_err(|_| AuthError::Malformed("sig"))?;
         let cnf = ContentId(as_bytes(take(8)?).map_err(|_| AuthError::Malformed("cnf"))?);
+        // key 9 — OPTIONAL echoed scope; absent ⇒ the empty vector (hashed as `[]`, §18.9.8).
+        let scope = match f.take(9) {
+            Some(c) => as_array(c)
+                .map_err(|_| AuthError::Malformed("scope"))?
+                .into_iter()
+                .map(|e| as_text(e).map_err(|_| AuthError::Malformed("scope item")))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => Vec::new(),
+        };
         f.deny_unknown().map_err(|_| AuthError::Malformed("unknown assertion key"))?;
-        Ok(SignedAssertion { rp_origin, nonce, issued_at, exp, aud, from, sig, cnf })
+        Ok(SignedAssertion { rp_origin, nonce, issued_at, exp, aud, from, sig, cnf, scope })
     }
 }
 
@@ -160,13 +192,17 @@ pub fn create_login(
     let cnf = session.cnf();
 
     // (4) Sign the DS-tagged §18.9.8 preimage under the IK-authorized login signer. `sign_domain`
-    //     prepends AUTH_ASSERTION_DS (which carries its terminating 0x00) to the auth_hash.
+    //     prepends AUTH_ASSERTION_DS (which carries its terminating 0x00) to the auth_hash. The
+    //     signed scope is the challenge's scope echoed verbatim (empty ⇒ `[]`), so the user's
+    //     consent to exactly that scope is what the signature attests (§18.7.2 key 9).
+    let scope = challenge.scope.clone().unwrap_or_default();
     let hash = auth_hash(
         &challenge.rp_origin,
         &challenge.nonce,
         challenge.issued_at,
         challenge.exp,
         &challenge.aud,
+        &scope,
         &cnf,
     );
     let sig = login_key.sign_domain(AUTH_ASSERTION_DS, &hash);
@@ -181,6 +217,7 @@ pub fn create_login(
             from: login_key.public(),
             sig,
             cnf,
+            scope,
         },
         session,
     })

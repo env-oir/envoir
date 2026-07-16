@@ -23,6 +23,8 @@
 //! `PushSubscription.sig` uses DS-tag `DMTAP-v0/push-subscription` over `det_cbor(∖ {7})`
 //! (§18.9.15).
 
+use std::collections::BTreeSet;
+
 use crate::cbor::{self, as_bytes, as_text, as_u64, as_u8, CborError, Cv, Fields};
 use crate::identity::{verify_domain, IdentityKey};
 use crate::TimestampMs;
@@ -65,6 +67,13 @@ pub enum PushError {
     /// (`ERR_WAKEPING_RATE_LIMITED` `0x0315`, §4.9.4).
     #[error("wake ping rate-limited (ERR_WAKEPING_RATE_LIMITED 0x0315)")]
     WakePingRateLimited,
+    /// The wake's sealed sync nonce is already in the device's replay cache — a push relay
+    /// re-delivering a captured ciphertext to re-wake (drain the battery of) the device. The
+    /// emitting node's rate limiter cannot see it because the replay never traverses the node, so
+    /// the **receiver** dedups on the per-wake nonce (`ERR_WAKEPING_REPLAY` `0x0316`, DROP_SILENT,
+    /// §4.9.1/§18.5.6).
+    #[error("wake ping replayed: sealed nonce already seen (ERR_WAKEPING_REPLAY 0x0316)")]
+    WakePingReplay,
     /// The suite is not one this implementation validates (fail closed, §1.1).
     #[error("suite is not supported (fail closed)")]
     UnsupportedSuite,
@@ -81,6 +90,7 @@ impl PushError {
             PushError::WakePingContentPresent => 0x0313,
             PushError::WakePingAuthFailed => 0x0314,
             PushError::WakePingRateLimited => 0x0315,
+            PushError::WakePingReplay => 0x0316,
             PushError::UnsupportedSuite => 0x0101,
             PushError::BadEncoding(_) => 0x020D,
         }
@@ -204,10 +214,14 @@ impl PushSubscription {
 }
 
 /// The content-free, sender-blind wake signal (§18.5.6). Carries **only** the opaque RFC 8291
-/// sealed sync token; no DMTAP signature.
+/// sealed sync token; no DMTAP signature, and — per §18.5.6 — **no** map key beyond key `1` (adding
+/// one is `0x0313`). The sealed plaintext MUST be a **fresh, unpredictable per-wake nonce** (never
+/// fixed/reused) so the receiver can dedup a relay's replayed ciphertext (§4.9.1); that dedup is
+/// [`WakeReplayCache`] / [`WakePing::open_dedup`], keyed on the recovered nonce (`0x0316`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakePing {
-    /// Key 1 — RFC 8291 `aes128gcm` ciphertext of an opaque sync nonce.
+    /// Key 1 — RFC 8291 `aes128gcm` ciphertext whose sealed plaintext is a fresh per-wake sync
+    /// nonce (≥ 16 bytes, minted anew each wake, §18.5.6). No other map key is permitted.
     pub token: Vec<u8>,
 }
 
@@ -266,6 +280,66 @@ impl WakePing {
         let pt = opener(&self.token).ok_or(PushError::WakePingAuthFailed)?;
         Self::check_opened_plaintext(&pt)?;
         Ok(pt)
+    }
+
+    /// Open, validate, **and dedup** a wake in one fail-closed step (§4.9.1, §18.5.6). Composes
+    /// [`WakePing::open_with`] (`0x0314` auth, then `0x0313` content-free) with the receiver-side
+    /// per-wake replay check against `replay`: a sealed nonce already seen is a relay replaying a
+    /// captured ciphertext to re-wake the device and is dropped with [`PushError::WakePingReplay`]
+    /// (`0x0316`, DROP_SILENT). On success the recovered nonce is reserved and returned. The
+    /// ordering matters: an *unauthenticated* wake never reserves a nonce (it can't be opened), and
+    /// only a genuinely-authenticated, content-free wake can consume replay budget.
+    pub fn open_dedup<F>(&self, opener: F, replay: &mut WakeReplayCache) -> Result<Vec<u8>, PushError>
+    where
+        F: FnOnce(&[u8]) -> Option<Vec<u8>>,
+    {
+        let nonce = self.open_with(opener)?;
+        replay.check_and_reserve(&nonce)?;
+        Ok(nonce)
+    }
+}
+
+/// Whether `nonce` (an opened `WakePing` sync nonce) is already in the device's `seen` set — the
+/// §4.9.1 receiver-side replay test. `true` ⇒ a replayed wake (`ERR_WAKEPING_REPLAY`, `0x0316`).
+/// Deterministic and caller-owned (mirrors the [`crate::policy`] dedup predicate; no wall clock).
+pub fn wake_is_replay(seen: &BTreeSet<Vec<u8>>, nonce: &[u8]) -> bool {
+    seen.contains(nonce)
+}
+
+/// A caller-owned receiver-side replay cache of already-seen `WakePing` sync nonces (§4.9.1,
+/// §18.5.6). Persist it across wakes for a device so a push relay cannot replay a captured wake
+/// ciphertext to drain the battery; the emitting node cannot catch this because the replay never
+/// traverses it. Deterministic, no wall clock (§16.1) — the owner scopes/evicts by its own policy.
+#[derive(Debug, Default, Clone)]
+pub struct WakeReplayCache {
+    seen: BTreeSet<Vec<u8>>,
+}
+
+impl WakeReplayCache {
+    /// A fresh, empty replay cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail-closed check-and-reserve for a recovered wake `nonce`: `Ok(())` for a **fresh** nonce
+    /// (now reserved), or [`PushError::WakePingReplay`] (`0x0316`, DROP_SILENT) for one already
+    /// seen. A rejected (replayed) nonce leaves the cache unchanged.
+    pub fn check_and_reserve(&mut self, nonce: &[u8]) -> Result<(), PushError> {
+        if self.seen.contains(nonce) {
+            return Err(PushError::WakePingReplay);
+        }
+        self.seen.insert(nonce.to_vec());
+        Ok(())
+    }
+
+    /// Number of distinct nonces currently retained (for the owner's eviction policy).
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Whether the cache holds no nonces yet.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
     }
 }
 
@@ -402,6 +476,66 @@ mod tests {
             w.open_with(|_| Some(structured)),
             Err(PushError::WakePingContentPresent)
         );
+    }
+
+    #[test]
+    fn wakeping_replayed_nonce_rejected() {
+        // A relay replays a captured wake ciphertext to re-wake (drain) the device. The receiver
+        // dedups on the sealed sync nonce: the second delivery of the same nonce is 0x0316.
+        let mut cache = WakeReplayCache::new();
+        let nonce = vec![0x5au8; 16]; // opaque ≥16-byte sync nonce
+        let w = WakePing::new(vec![0xde, 0xad, 0xbe, 0xef]); // ciphertext (opener returns the nonce)
+
+        // First wake: opener authenticates and yields the fresh nonce → accepted + reserved.
+        let got = w.open_dedup(|_| Some(nonce.clone()), &mut cache).expect("fresh wake accepted");
+        assert_eq!(got, nonce);
+        assert_eq!(cache.len(), 1);
+
+        // Relay replays the SAME ciphertext → same recovered nonce → dropped as a replay (0x0316).
+        let err = w.open_dedup(|_| Some(nonce.clone()), &mut cache).unwrap_err();
+        assert_eq!(err, PushError::WakePingReplay);
+        assert_eq!(err.code(), 0x0316);
+        assert_eq!(cache.len(), 1, "a rejected replay does not grow the cache");
+    }
+
+    #[test]
+    fn wakeping_fresh_nonce_accepted() {
+        // Distinct per-wake nonces are each accepted (the honest steady state, §4.9.1).
+        let mut cache = WakeReplayCache::new();
+        assert!(cache.is_empty());
+        for i in 0..3u8 {
+            let w = WakePing::new(vec![i]);
+            let nonce = vec![i; 16];
+            assert!(
+                w.open_dedup(|_| Some(nonce), &mut cache).is_ok(),
+                "each fresh per-wake nonce is accepted"
+            );
+        }
+        assert_eq!(cache.len(), 3);
+        // The bare predicate agrees.
+        assert!(wake_is_replay(&{
+            let mut s = std::collections::BTreeSet::new();
+            s.insert(vec![7u8; 16]);
+            s
+        }, &[7u8; 16]));
+    }
+
+    #[test]
+    fn open_dedup_content_present_still_0x0313_before_replay() {
+        // Ordering: an authenticated wake whose opened plaintext carries structured content is
+        // still rejected 0x0313 (content-free rule), and never touches the replay cache.
+        let mut cache = WakeReplayCache::new();
+        let structured = cbor::encode(&Cv::Map(vec![(1, Cv::Text("sender@x".into()))]));
+        let w = WakePing::new(vec![1, 2, 3]);
+        let err = w.open_dedup(|_| Some(structured), &mut cache).unwrap_err();
+        assert_eq!(err, PushError::WakePingContentPresent);
+        assert_eq!(err.code(), 0x0313);
+        assert!(cache.is_empty(), "a content-present wake reserves no nonce");
+
+        // And an unauthenticated wake (AEAD fails) is 0x0314 and likewise reserves nothing.
+        let err = w.open_dedup(|_| None, &mut cache).unwrap_err();
+        assert_eq!(err, PushError::WakePingAuthFailed);
+        assert!(cache.is_empty());
     }
 
     #[test]
