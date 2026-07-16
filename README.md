@@ -41,5 +41,19 @@ network effects behind traits so the full flows run in-process:
   domains, plus **TLS enforcement** (MTA-STS/DANE policy hook) that refuses cleartext fallback.
 
 Abstract seams (`KeyDirectory`, `MeshDelivery`, `AntiAbuse`, `TlsPolicy`, `OutboundTransport`,
-`GwKeyResolver`) are the only things a production deployment fills in with real sockets/DNS. The
-`run` CLI subcommand is still a stub. Covered by `cargo test -p envoir-gateway`.
+`GwKeyResolver`) are the trait boundary a production deployment fills in. The reference build now
+ships real, configurable implementations of the two that were previously left unwired:
+
+- **Recipient directory** (`directory`, §3 resolve): `FileDirectory` loads a `<email> <ik-b64>
+  <seal-b64>` file (`InMemoryDirectory` is the in-code table it parses into), so an inbound message
+  for a configured local recipient is converted to a MOTE sealed to their key. Fail-closed parsing.
+- **Mesh delivery** (`mesh`, §4): `HttpMeshDelivery` POSTs the converted MOTE to a node's ingest
+  endpoint (`http://host:port/path`); a `2xx` is the durable-custody ack that permits SMTP `250`,
+  anything else is a `NoAck` → `451`. `NullMesh` is the honest unconfigured default (never a silent
+  drop). The `dmtap-p2p`/node swarm transport is the documented drop-in behind the same trait
+  (kept above the gateway to avoid the `dmtap-p2p → envoir-node` dependency cycle).
+
+The `run` subcommand is a **real long-running daemon**: it loads the directory (`GATEWAY_DIRECTORY`)
+and mesh (`GATEWAY_MESH_ENDPOINT`), binds the MX listener, and serves until `SIGINT`/`SIGTERM`, then
+shuts down gracefully (`MxListener::serve_until`). Run `envoir-gateway help` for the full env surface.
+Covered by `cargo test -p envoir-gateway`.
