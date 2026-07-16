@@ -59,7 +59,6 @@ gateway rather than pure-mesh.
 <p align="center">
   <img src="docs/img/mail-dark.png#gh-dark-mode-only" width="860" alt="Mail — dark theme">
   <img src="docs/img/mail-light.png#gh-light-mode-only" width="860" alt="Mail — light theme">
-  <img src="docs/img/mail-mobile.png" width="260" alt="Mail — responsive mobile view">
 </p>
 
 ## Chat
@@ -73,7 +72,6 @@ non-repudiable). Click the badge for the tradeoff, spelled out in full.
 <p align="center">
   <img src="docs/img/chat-dark.png#gh-dark-mode-only" width="860" alt="Chat — Deniable 1:1 badge, dark theme">
   <img src="docs/img/chat-light.png#gh-light-mode-only" width="860" alt="Chat — Deniable 1:1 badge, light theme">
-  <img src="docs/img/chat-mobile.png" width="260" alt="Chat — responsive mobile view">
 </p>
 
 ## Calendar
@@ -86,7 +84,6 @@ peer-to-peer MOTEs — free/busy is a message, not a query against a central cal
 <p align="center">
   <img src="docs/img/calendar-dark.png#gh-dark-mode-only" width="860" alt="Calendar — month view, dark theme">
   <img src="docs/img/calendar-light.png#gh-light-mode-only" width="860" alt="Calendar — month view, light theme">
-  <img src="docs/img/calendar-mobile.png" width="260" alt="Calendar — responsive mobile view">
 </p>
 
 ## Contacts
@@ -98,7 +95,6 @@ avatar, opt-in Gravatar-style picture, or key-derived identicon. See
 
 <p align="center">
   <img src="docs/img/contacts-dark.png" width="860" alt="Contacts — cards with key-verification status">
-  <img src="docs/img/contacts-mobile.png" width="260" alt="Contacts — responsive mobile view">
 </p>
 
 ## Transport-path provenance
@@ -133,7 +129,6 @@ your linked devices, your signed-in apps, and recovery. See
 
 <p align="center">
   <img src="docs/img/identity-dark.png" width="860" alt="Identity — safety number, devices, signed-in apps">
-  <img src="docs/img/identity-mobile.png" width="260" alt="Identity — responsive mobile view">
 </p>
 
 ## Installable, offline, and mobile
@@ -147,6 +142,15 @@ whole UI is responsive down to ~360px phones, with a bottom tab bar below 680px.
 residual: on iOS, Apple's own **APNs** unavoidably sits in the delivery path for *any* web app's
 push, Envoir included — the ping stays content-free through it, but its existence and timing are
 visible to Apple as the platform operator, exactly as for any other web app.
+
+<p align="center">
+  <img src="docs/img/mail-mobile.png" width="188" alt="Mail on mobile">
+  <img src="docs/img/chat-mobile.png" width="188" alt="Chat on mobile">
+  <img src="docs/img/identity-mobile.png" width="188" alt="Identity on mobile">
+  <img src="docs/img/calendar-mobile.png" width="188" alt="Calendar on mobile">
+  <img src="docs/img/contacts-mobile.png" width="188" alt="Contacts on mobile">
+</p>
+<p align="center"><sub>The same app, responsive down to ~360px — Mail · Chat · Identity · Calendar · Contacts</sub></p>
 
 ## Architecture
 
