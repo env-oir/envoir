@@ -1,0 +1,20 @@
+[package]
+name = "dmtap-mls"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0 OR MIT"
+description = "DMTAP MLS group layer (spec §5): real RFC 9420 groups via openmls, with the committer epoch-ordering seam"
+repository = "https://example.invalid/envoir"
+
+[dependencies]
+openmls = "0.8"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
+
+# BLAKE3 for the committer log's hash chain (spec §2.2 / §5.1 fork evidence) — the same hash
+# DMTAP uses for content addressing, so the ordering log matches the rest of the protocol.
+blake3 = "1"
+
+[dev-dependencies]

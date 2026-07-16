@@ -48,10 +48,11 @@ serde_json = "1"
 # x-wing  = "*"            # X-Wing hybrid KEM (ML-KEM-768 ⊕ X25519) for HPKE — preferred combiner
 
 # --- Messaging / groups (spec §5; MLS RFC 9420) ---
-# openmls = "0.6"          # MLS; suites 0x0001/0x0003 (X25519+ChaCha20+Ed25519)
-                            # NOTE: MLS handshake (Commit/Proposal/Welcome) needs an ORDERED
-                            # channel — do NOT send handshakes over the reordering mixnet.
-                            # Track draft-kohbrok-mls-dmls for leaderless operation.
+# Real MLS groups are wrapped in the workspace-shared `dmtap-mls` crate (openmls 0.8, ciphersuite
+# 0x0001 X25519/AES128GCM/SHA256/Ed25519) and re-exported here as `dmtap::groups`. Handshakes
+# (Commit/Welcome, kind 0x06 `group_event`) travel over the ordered committer log (the DS, §5.1);
+# application messages travel over the mesh transport as `Frame::Group`.
+dmtap-mls = { path = "../crates/dmtap-mls" }
 
 # --- Mesh / transport (spec §4; libp2p) ---
 # libp2p = { version = "0.54", features = [

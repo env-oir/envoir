@@ -40,6 +40,11 @@ pub enum Frame {
     Mote(Vec<u8>),
     /// An `ack(id)` (§19.3.2): the content address being acknowledged.
     Ack(Vec<u8>),
+    /// A **group** MOTE (spec §5): an MLS application message for a group session. `group_id`
+    /// names the group; `body` is the encoded [`GroupMote`](crate::group::GroupMote) carrying the
+    /// MLS ciphertext. Group **application** messages travel the mesh like any MOTE (§5.1);
+    /// group **handshakes** do NOT — they go over the ordered committer log (the DS), never here.
+    Group { group_id: Vec<u8>, body: Vec<u8> },
 }
 
 /// An inbound frame paired with its sender's return path (`from`), as yielded by
@@ -185,6 +190,9 @@ impl Transport for InMemoryTransport {
 const TCP_TAG_MOTE: u8 = 0;
 /// Frame tag for an ack on the TCP wire.
 const TCP_TAG_ACK: u8 = 1;
+/// Frame tag for a group MOTE on the TCP wire (spec §5). Its payload is `u32be group_id_len ‖
+/// group_id ‖ body`, so the single length-prefixed payload slot carries both fields.
+const TCP_TAG_GROUP: u8 = 2;
 /// Upper bound on any single length-prefixed field (16 MiB) — guards the reader's allocation.
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 /// How long a `send` waits to establish a connection before reporting the peer unreachable.
@@ -205,9 +213,20 @@ fn read_u32(stream: &mut TcpStream) -> std::io::Result<u32> {
 /// Write one framed `(from, frame)` message. Flushes so the whole message is on the wire before the
 /// connection is dropped by the caller.
 fn write_tcp_frame(stream: &mut TcpStream, from: &[u8], frame: &Frame) -> std::io::Result<()> {
+    // A group frame packs `group_id_len ‖ group_id ‖ body` into the single payload slot; the
+    // owned buffer must outlive the borrow below, so build it before matching.
+    let group_packed: Vec<u8>;
     let (tag, payload): (u8, &[u8]) = match frame {
         Frame::Mote(b) => (TCP_TAG_MOTE, b),
         Frame::Ack(b) => (TCP_TAG_ACK, b),
+        Frame::Group { group_id, body } => {
+            let mut p = Vec::with_capacity(4 + group_id.len() + body.len());
+            p.extend_from_slice(&(group_id.len() as u32).to_be_bytes());
+            p.extend_from_slice(group_id);
+            p.extend_from_slice(body);
+            group_packed = p;
+            (TCP_TAG_GROUP, &group_packed)
+        }
     };
     stream.write_all(&(from.len() as u32).to_be_bytes())?;
     stream.write_all(from)?;
@@ -239,6 +258,20 @@ fn read_tcp_frame(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, Frame)> {
     let frame = match tag[0] {
         TCP_TAG_MOTE => Frame::Mote(payload),
         TCP_TAG_ACK => Frame::Ack(payload),
+        TCP_TAG_GROUP => {
+            // Unpack `group_id_len ‖ group_id ‖ body` from the payload slot, failing closed on a
+            // length that overruns the buffer (a malformed/hostile peer).
+            if payload.len() < 4 {
+                return Err(invalid("group frame too short"));
+            }
+            let gid_len = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+            if payload.len() < 4 + gid_len {
+                return Err(invalid("group_id length overruns frame"));
+            }
+            let group_id = payload[4..4 + gid_len].to_vec();
+            let body = payload[4 + gid_len..].to_vec();
+            Frame::Group { group_id, body }
+        }
         _ => return Err(invalid("unknown frame tag")),
     };
     Ok((from, frame))
