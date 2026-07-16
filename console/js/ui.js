@@ -87,15 +87,36 @@ export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 }
 
-// ---- Envoir brand mark, tinted for the admin console (amber-violet) -----------------------
+// ---- Envoir brand mark — the leaning "e"/at-symbol on the Aurora Indigo gradient tile ------
+// Same mark as ../brand/logo-mark.svg (see ../brand/README.md); each app keeps its own inline
+// copy (no runtime cross-reference) with a size-scoped gradient id to avoid collisions.
 export function brandMark(size = 28) {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 128 128" fill="none" aria-label="Envoir Console">
-    <defs><linearGradient id="cm-${size}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#5B9DFF"/><stop offset="1" stop-color="#7C5CFF"/></linearGradient></defs>
-    <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#cm-${size})"/>
-    <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke="#fff" stroke-width="5"/>
-    <path d="M33 45 L64 68 L95 45" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-    <circle cx="33" cy="45" r="6" fill="#fff"/><circle cx="95" cy="45" r="6" fill="#fff"/><circle cx="64" cy="68" r="7" fill="#fff"/>
+  const id = 'cm-' + size;
+  return `<svg width="${size}" height="${size}" viewBox="223 52 244 244" fill="none" aria-label="Envoir Console">
+    <defs><linearGradient id="${id}" x1="223" y1="52" x2="467" y2="296" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4C4DFF"/><stop offset=".55" stop-color="#6E4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
+    <rect x="223" y="52" width="244" height="244" rx="52" fill="url(#${id})"/>
+    <g transform="translate(340 170) skewX(-10) translate(-340 -170)" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M374 170 A34 34 0 0 0 340 136 A34 34 0 0 0 306 170 A34 34 0 0 0 340 204 A52 34 0 0 0 392 170 A52 58 0 0 0 340 112 A62 58 0 0 0 278 170 A62 66 0 0 0 340 236 A72 66 0 0 0 412 170"/>
+      <path d="M306 170 L374 170"/>
+    </g>
   </svg>`;
+}
+
+// ---- sparkline (inline svg polyline trend) -------------------------------------------------
+export function sparkline(values, opts = {}) {
+  const w = opts.w || 120, h = opts.h || 30, pad = 2;
+  if (!values || !values.length) return '';
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = max - min || 1;
+  const pts = values.map((v, i) => {
+    const x = pad + (i / (values.length - 1 || 1)) * (w - 2 * pad);
+    const y = h - pad - ((v - min) / span) * (h - 2 * pad);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const cls = opts.cls || 'accent';
+  const area = `${pad},${h - pad} ${pts.join(' ')} ${w - pad},${h - pad}`;
+  return `<svg class="spark ${cls}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+    <polygon class="spark-area" points="${area}"/><polyline class="spark-line" points="${pts.join(' ')}"/></svg>`;
 }
 
 // ---- Avatars: deterministic gradient + initials -----------------------------------------

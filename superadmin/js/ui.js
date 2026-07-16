@@ -87,15 +87,18 @@ export function icon(name, cls = '') {
 }
 export const hasIcon = (n) => !!P[n];
 
-// ---- Envoir brand mark (Aurora Indigo gradient, "@" ring with inner "e") ------------------
+// ---- Envoir brand mark — the leaning "e"/at-symbol on the Aurora Indigo gradient tile ------
+// Same mark as ../brand/logo-mark.svg (see ../brand/README.md); each app keeps its own inline
+// copy (no runtime cross-reference) with a size-scoped gradient id to avoid collisions.
 export function brandMark(size = 30) {
   const id = 'sam-' + size;
-  return `<svg width="${size}" height="${size}" viewBox="0 0 128 128" fill="none" aria-label="Envoir">
-    <defs><linearGradient id="${id}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#4C4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
-    <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#${id})"/>
-    <path d="M64 30a34 34 0 1024 58" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round"/>
-    <path d="M50 66a14 14 0 1114 14" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round"/>
-    <path d="M50 66h20" stroke="#fff" stroke-width="7" stroke-linecap="round"/>
+  return `<svg width="${size}" height="${size}" viewBox="223 52 244 244" fill="none" aria-label="Envoir">
+    <defs><linearGradient id="${id}" x1="223" y1="52" x2="467" y2="296" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4C4DFF"/><stop offset=".55" stop-color="#6E4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
+    <rect x="223" y="52" width="244" height="244" rx="52" fill="url(#${id})"/>
+    <g transform="translate(340 170) skewX(-10) translate(-340 -170)" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M374 170 A34 34 0 0 0 340 136 A34 34 0 0 0 306 170 A34 34 0 0 0 340 204 A52 34 0 0 0 392 170 A52 58 0 0 0 340 112 A62 58 0 0 0 278 170 A62 66 0 0 0 340 236 A72 66 0 0 0 412 170"/>
+      <path d="M306 170 L374 170"/>
+    </g>
   </svg>`;
 }
 

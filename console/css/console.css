@@ -1,32 +1,39 @@
 /* ============================================================================================
    Envoir Management Console — the admin app for a domain owner. Shares the reference client's
-   instrument-panel aesthetic (calm near-black surfaces, blue→violet mesh accent, sans for chrome
-   and mono for anything cryptographic) so the two feel like one product. Dark theme primary; a
-   full light theme is defined. Self-contained — no external fonts or assets.
+   instrument-panel aesthetic (calm indigo-tinted near-black surfaces, sans for chrome and mono
+   for anything cryptographic) on the brand "Aurora Indigo" palette (indigo #4C4DFF → violet
+   #9A4DFF, aurora-teal #00E0C7 accent, ink #16132E, paper #FBFAFF) — the same tokens as
+   ../superadmin and ../status, so all three admin surfaces read as one product family. Dark
+   theme primary; a full light theme is defined. Self-contained — no external fonts or assets.
    ============================================================================================ */
 
 :root {
-  --bg:#0a0c10; --bg-1:#0e1117; --bg-2:#131822; --bg-3:#1a2030; --elev:#1c2432;
-  --line:#222a38; --line-2:#2f3a4c;
-  --text:#eaedf3; --text-dim:#a1abbf; --text-faint:#727e96;
-  --accent:#5b9dff; --accent-2:#7c5cff;
-  --grad: linear-gradient(135deg, #5b9dff 0%, #7c5cff 100%);
-  --grad-soft: linear-gradient(135deg, color-mix(in srgb,#5b9dff 22%,transparent), color-mix(in srgb,#7c5cff 22%,transparent));
-  --good:#3ecf8e; --warn:#ffbe5c; --bad:#ff6b6b;
+  /* brand */
+  --indigo:#4C4DFF; --violet:#9A4DFF; --teal:#00E0C7; --ink:#16132E; --paper:#FBFAFF;
+  /* dark surfaces (indigo-tinted near-black) */
+  --bg:#0a0a14; --bg-1:#101021; --bg-2:#16162c; --bg-3:#1e1e3a; --elev:#20203c;
+  --line:#262647; --line-2:#34345c;
+  --text:#ecebff; --text-dim:#a7a6d4; --text-faint:#6f6ea3;
+  --accent:#6d6eff; --accent-2:#a96bff;
+  --grad: linear-gradient(135deg, #4C4DFF 0%, #9A4DFF 100%);
+  --grad-soft: linear-gradient(135deg, color-mix(in srgb,#4C4DFF 22%,transparent), color-mix(in srgb,#9A4DFF 22%,transparent));
+  --good:#2ee6c9; --good-ink:#2ee6c9; --warn:#ffbe5c; --bad:#ff6b7d;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Roboto, system-ui, sans-serif;
   --r:10px; --r-lg:16px;
   --sh-1: 0 1px 2px rgba(0,0,0,.4);
-  --sh-2: 0 12px 32px -8px rgba(0,0,0,.55);
-  --sh-3: 0 28px 70px -12px rgba(0,0,0,.7);
-  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+  --sh-2: 0 12px 32px -8px rgba(0,0,0,.6);
+  --sh-3: 0 28px 70px -12px rgba(0,0,0,.72);
+  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 :root[data-theme="light"] {
-  --bg:#eef1f7; --bg-1:#ffffff; --bg-2:#f5f7fb; --bg-3:#e9edf5; --elev:#ffffff;
-  --line:#e2e7f0; --line-2:#cfd7e5;
-  --text:#111624; --text-dim:#4c576f; --text-faint:#77839c;
-  --sh-2: 0 12px 30px -10px rgba(30,50,90,.22);
-  --sh-3: 0 24px 60px -14px rgba(30,50,90,.28);
+  --bg:#eeecfb; --bg-1:#ffffff; --bg-2:#f6f5ff; --bg-3:#eceafd; --elev:#ffffff;
+  --line:#e5e2f7; --line-2:#d2cef0;
+  --text:#16132E; --text-dim:#514d78; --text-faint:#817da8;
+  --accent:#4C4DFF; --accent-2:#9A4DFF;
+  --good:#0aa88f; --good-ink:#0aa88f; --warn:#c9821a; --bad:#e0475c;
+  --sh-2: 0 12px 30px -10px rgba(60,40,120,.20);
+  --sh-3: 0 24px 60px -14px rgba(60,40,120,.26);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -253,6 +260,18 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .sh-line { height: 9px; border-radius: 5px; } .sh-line.w70 { width: 70%; } .sh-line.w40 { width: 40%; }
 .sh-av, .sh-line { background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%); background-size: 200% 100%; animation: shimmer 1.3s infinite; }
 @keyframes shimmer { to { background-position: -200% 0; } }
+
+/* ---------- sparkline (inline svg polyline trend) ---------- */
+.spark { width: 100%; height: 44px; display: block; }
+.spark.sm { height: 22px; }
+.spark .spark-line { fill: none; stroke: var(--accent); stroke-width: 1.8; vector-effect: non-scaling-stroke; }
+.spark .spark-area { fill: color-mix(in srgb, var(--accent) 14%, transparent); stroke: none; }
+.spark.warn .spark-line { stroke: var(--warn); } .spark.warn .spark-area { fill: color-mix(in srgb, var(--warn) 14%, transparent); }
+.spark.bad .spark-line { stroke: var(--bad); } .spark.bad .spark-area { fill: color-mix(in srgb, var(--bad) 14%, transparent); }
+.spark.good .spark-line { stroke: var(--good); } .spark.good .spark-area { fill: color-mix(in srgb, var(--good) 14%, transparent); }
+.stat-spark { margin-top: 8px; width: 100%; }
+.kt-trend { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.kt-trend small { font-size: 10.5px; color: var(--text-faint); }
 
 /* ---------- banners ---------- */
 .banner { display: flex; align-items: flex-start; gap: 10px; font-size: 12.5px; color: var(--text-dim); background: var(--bg-1); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 15px; margin-bottom: 18px; line-height: 1.55; }

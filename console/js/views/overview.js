@@ -3,10 +3,10 @@
 // sovereignty guarantee — made legible up front: a domain owner should SEE what they can and
 // cannot do to a member (spec §3.10.1–§3.10.2).
 
-import { state, republishDirectory, ktTreeSize, ktRootHash, ktIsFresh, verifyKtCheckpoint } from '../store.js';
+import { state, republishDirectory, ktTreeSize, ktRootHash, ktIsFresh, verifyKtCheckpoint, ktTreeHistory, memberGrowthHistory } from '../store.js';
 import { collectThreshold } from '../session.js';
 import { bus } from '../bus.js';
-import { esc, icon, safetyGrid, safetyWords, emptyState, toast, timeAgo, copyBtn, fmtNum } from '../ui.js';
+import { esc, icon, safetyGrid, safetyWords, emptyState, toast, timeAgo, copyBtn, fmtNum, sparkline } from '../ui.js';
 
 export function render(root) {
   root.className = 'view scroll-view';
@@ -64,7 +64,7 @@ export function render(root) {
       </div>
 
       <div class="stat-col">
-        <button class="card stat clickable" data-go="members"><span class="stat-n">${active.length}</span><span class="stat-l">${icon('members')} members</span><span class="stat-sub"><b class="good">${sovereign}</b> sovereign · <b class="warn">${managed}</b> org-managed</span></button>
+        <button class="card stat clickable" data-go="members"><span class="stat-n">${active.length}</span><span class="stat-l">${icon('members')} members</span><span class="stat-sub"><b class="good">${sovereign}</b> sovereign · <b class="warn">${managed}</b> org-managed</span><span class="stat-spark">${sparkline(memberGrowthHistory(14), { cls: 'good sm', w: 140, h: 22 })}</span></button>
         <button class="card stat clickable" data-go="groups"><span class="stat-n">${state.groups.length}</span><span class="stat-l">${icon('groups')} groups</span><span class="stat-sub">distribution lists &amp; channels</span></button>
         <button class="card stat clickable" data-go="roles"><span class="stat-n">${caps}</span><span class="stat-l">${icon('roles')} admin roles</span><span class="stat-sub">delegated capabilities</span></button>
         <button class="card stat clickable" data-go="directory"><span class="stat-n">v${d.dirVersion}</span><span class="stat-l">${icon('directory')} directory</span><span class="stat-sub">${d.membershipVisibility}</span></button>
@@ -120,6 +120,10 @@ export function render(root) {
         <div class="kvr"><span>Tree size</span><b class="mono">${fmtNum(treeSize)}</b></div>
         <div class="kvr"><span>Pinned root</span><b class="mono ellip">${esc(rootHash)}</b></div>
         <div class="kvr"><span>Last verified</span><b class="mono">${esc(timeAgo(d.ktCheckpointAt))}</b></div>
+      </div>
+      <div class="kt-trend">
+        ${sparkline(ktTreeHistory(14), { cls: 'accent', w: 320, h: 40 })}
+        <small>tree size, append-only — never shrinks</small>
       </div>
       <div class="kt-witnesses">
         ${d.ktWitnesses.map(w => {
