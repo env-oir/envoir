@@ -77,27 +77,35 @@ export function pathToggleButton(prov, key) {
   return `<button class="icon-btn sm path-btn ${pathTone(prov)}" data-pathbtn="${esc(key)}" aria-expanded="false" aria-controls="path-${esc(key)}" aria-label="Transport path — ${esc(pathSummary(prov))}" title="Transport path — ${isPureMesh(prov) ? 'pure-mesh' : 'gateway-touched'}">${icon(name)}</button>`;
 }
 
+// Every node/arrow gets a sequential --i custom property, so the whole graph can play a single
+// left-to-right reveal + a looping "flow" pulse along the connectors (CSS, app.css) — the path
+// literally animates in the direction the message travelled, tinted by its tone (violet/indigo
+// for pure-mesh, amber the moment a gateway is involved) so the graph reads at a glance.
+let seq = 0;
 function node(iconName, label, sub, cls = '') {
-  return `<div class="path-node ${cls}">
+  return `<div class="path-node ${cls}" style="--i:${seq++}">
     <div class="path-node-ic">${icon(iconName)}</div>
     <div class="path-node-txt"><b>${esc(label)}</b>${sub ? `<span class="mono">${esc(sub)}</span>` : ''}</div>
   </div>`;
 }
-const ARROW = `<div class="path-arrow">${icon('chevRight')}</div>`;
+function arrow(tone) { return `<div class="path-arrow ${tone}" style="--i:${seq++}">${icon('chevRight')}</div>`; }
 
 export function pathGraphHtml(prov, senderPerson, key) {
   if (!prov) return '';
   const pureMesh = isPureMesh(prov);
+  const tone = pathTone(prov);           // overall tone (gw wins once a gateway is touched)
+  const tierTone = prov.tier === 'private' ? 'priv' : 'fast';   // tone of the tier hop itself
   const tierNode = prov.tier === 'private'
     ? node('shield', 'private tier', `mixnet · ≥ ${prov.minHops || 3} hops (${prov.profile === 'high' ? 'high-security' : 'standard'} floor)`, 'tier priv')
     : node('bolt', 'fast tier', prov.minHops ? `direct · ${prov.minHops} hop (observed)` : 'direct', 'tier fast');
 
+  seq = 0;
   const graph = [
     node('at', senderPerson?.name || 'sender', senderPerson?.address, 'endpoint'),
-    ARROW,
+    arrow(tierTone),
     tierNode,
-    ...(pureMesh ? [] : (prov.gateways || []).flatMap(g => [ARROW, node('bridge', 'gateway · ' + g.domain, fmtClock(g.recvAt), 'gateway')])),
-    ARROW,
+    ...(pureMesh ? [] : (prov.gateways || []).flatMap(g => [arrow('gw'), node('bridge', 'gateway · ' + g.domain, fmtClock(g.recvAt), 'gateway')])),
+    arrow(tone),
     node('mail', 'you', 'this device', 'endpoint'),
   ].join('');
 

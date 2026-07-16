@@ -1,0 +1,22 @@
+<svg width="340" height="96" viewBox="0 0 340 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Envoir">
+  <title>Envoir</title>
+  <!-- mark tile (Aurora Indigo) with the leaning e/at mark, scaled into a 72px tile -->
+  <svg x="8" y="12" width="72" height="72" viewBox="223 52 244 244">
+    <defs>
+      <linearGradient id="ew-g" x1="223" y1="52" x2="467" y2="296" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#4C4DFF"/>
+        <stop offset=".55" stop-color="#6E4DFF"/>
+        <stop offset="1" stop-color="#9A4DFF"/>
+      </linearGradient>
+    </defs>
+    <rect x="223" y="52" width="244" height="244" rx="52" fill="url(#ew-g)"/>
+    <g transform="translate(340 170) skewX(-10) translate(-340 -170)"
+       fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M374 170 A34 34 0 0 0 340 136 A34 34 0 0 0 306 170 A34 34 0 0 0 340 204 A52 34 0 0 0 392 170 A52 58 0 0 0 340 112 A62 58 0 0 0 278 170 A62 66 0 0 0 340 236 A72 66 0 0 0 412 170"/>
+      <path d="M306 170 L374 170"/>
+    </g>
+  </svg>
+  <!-- wordmark: indigo reads on both light and dark backgrounds -->
+  <text x="96" y="61" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+        font-size="46" font-weight="700" letter-spacing="-1.2" fill="#4C4DFF">envoir</text>
+</svg>

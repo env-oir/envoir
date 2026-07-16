@@ -93,15 +93,21 @@ export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 }
 
-// ---- Envoir brand mark (inline SVG, from brand/logo-mark.svg) -----------------------------
-export function brandMark(size = 28) {
-  return `<svg width="${size}" height="${size}" viewBox="0 0 128 128" fill="none" aria-label="Envoir">
-    <defs><linearGradient id="em-${size}" x1="16" y1="12" x2="112" y2="116" gradientUnits="userSpaceOnUse"><stop stop-color="#4C4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
-    <rect x="8" y="8" width="112" height="112" rx="30" fill="url(#em-${size})"/>
-    <rect x="30" y="40" width="68" height="48" rx="9" fill="none" stroke="#fff" stroke-width="5"/>
-    <path d="M33 45 L64 68 L95 45" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
-    <circle cx="33" cy="45" r="6" fill="#fff"/><circle cx="95" cy="45" r="6" fill="#fff"/><circle cx="64" cy="68" r="7" fill="#fff"/>
-    <path d="M33 45 L95 45" stroke="#fff" stroke-width="2.5" stroke-opacity="0.45" stroke-dasharray="3 5"/>
+// ---- Envoir brand mark (inline SVG, matching assets/logo-mark.svg exactly) -----------------
+// A lowercase "e" whose tail sweeps once around and up the right side, forming an at-style
+// mark, slanted slightly right for momentum (brand/README.md). Pass { draw: true } for the
+// one-time "pen stroke" reveal used on first paint (onboarding); every other call renders the
+// static mark. The reveal is pure CSS (see .brand-mark.draw in app.css) and is a no-op under
+// prefers-reduced-motion (global rule in app.css zeroes all animation durations).
+export function brandMark(size = 28, opts = {}) {
+  const gid = `em-${size}${opts.draw ? 'd' : ''}`;
+  return `<svg class="brand-mark${opts.draw ? ' draw' : ''}" width="${size}" height="${size}" viewBox="223 52 244 244" fill="none" role="img" aria-label="Envoir">
+    <defs><linearGradient id="${gid}" x1="223" y1="52" x2="467" y2="296" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4C4DFF"/><stop offset=".55" stop-color="#6E4DFF"/><stop offset="1" stop-color="#9A4DFF"/></linearGradient></defs>
+    <rect class="bm-tile" x="223" y="52" width="244" height="244" rx="52" fill="url(#${gid})"/>
+    <g transform="translate(340 170) skewX(-10) translate(-340 -170)" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+      <path class="bm-arc" d="M374 170 A34 34 0 0 0 340 136 A34 34 0 0 0 306 170 A34 34 0 0 0 340 204 A52 34 0 0 0 392 170 A52 58 0 0 0 340 112 A62 58 0 0 0 278 170 A62 66 0 0 0 340 236 A72 66 0 0 0 412 170"/>
+      <path class="bm-bar" d="M306 170 L374 170"/>
+    </g>
   </svg>`;
 }
 

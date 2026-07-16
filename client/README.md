@@ -92,6 +92,8 @@ sign-in origin via WebAuthn — the UI layer stays essentially the same.
 ```
 index.html            shell mount points + overlays (modal / inspector / toast)
 css/app.css           the design system — instrument-panel dark/light theme, all components
+assets/               brand mark SVGs (copied from ../brand/) + generated favicons/og-image PNGs;
+                      assets/make-icons.mjs is the dev-time rasterizer that produced the PNGs
 
 js/app.js             boot: load-or-create identity, then mount the shell
 js/shell.js           unified shell: rail, global search, command palette, keyboard shortcuts, view dispatch

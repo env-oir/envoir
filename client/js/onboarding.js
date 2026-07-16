@@ -13,7 +13,7 @@ export function renderOnboarding(onDone) {
   const draw = () => {
     if (step === 0) {
       o.innerHTML = `<div class="ob-card">
-        <div class="ob-brand">${brandMark(48)}<span class="ob-word">Envoir</span></div>
+        <div class="ob-brand">${brandMark(48, { draw: true })}<span class="ob-word">Envoir</span></div>
         <div class="ob-dots"><i class="on"></i><i></i><i></i></div>
         <h1>Your key is your identity</h1>
         <p class="ob-sub">Envoir gives you sovereign mail, chat, calendar &amp; files on one identity. No company holds your key, so no company can read your data — and you can leave anytime with all of it. First, pick the address people will use to reach you.</p>
