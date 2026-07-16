@@ -14,6 +14,19 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 # --- HPKE payload sealing (spec §2.4; RFC 9180 DHKEM(X25519)/HKDF-SHA256/ChaCha20Poly1305) ---
 hpke = "0.12"
+# --- Suite 0x02 (PQ hybrid) crypto — spec §1.1, §1.3, §16.7, §18.1.6 ------------------------
+# X-Wing hybrid KEM (draft-connolly-cfrg-xwing-kem, draft 06): X25519 ⊕ ML-KEM-768 with the
+# IND-CCA SHA3-256 combiner, so Envelope confidentiality holds if EITHER share is unbroken.
+# `getrandom` gives the no-arg `generate_keypair()`/`encapsulate()` (the crate's rand_core is a
+# different major than ours, so we avoid crossing an RNG-version boundary by hand).
+# Maturity note: `x-wing` 0.1.0 is a young pure-Rust crate tracking the draft — real X-Wing, not a
+# placeholder, but not yet an audited 1.0; it is the closest audited-ish option to the spec's KEM.
+x-wing = { version = "0.1.0", features = ["getrandom"] }
+# ML-DSA-65 / FIPS 204 (RustCrypto) post-quantum signatures. Composed AND-wise with Ed25519 so a
+# forgery requires breaking BOTH. `Signer` here is the deterministic ML-DSA variant (no RNG arg).
+ml-dsa = "0.1.1"
+# AEAD over the hybrid KEM's derived content key — ChaCha20-Poly1305, matching suite 0x01's AEAD.
+chacha20poly1305 = "0.10"
 # --- Hashing / content addressing (spec §2.2, §3.9: BLAKE3-256 with agility prefix) ---
 blake3 = "1"
 # --- Deterministic CBOR (spec §README, RFC 8949) ---

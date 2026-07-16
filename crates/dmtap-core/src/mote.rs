@@ -33,6 +33,7 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 use crate::cbor::{self, as_array, as_bytes, as_text, as_u32, as_u64, as_u8, CborError, Cv, Fields};
 use crate::id::ContentId;
 use crate::identity::{verify_domain, IdentityKey};
+use crate::pq::{verify_hybrid_domain, HybridSigningKey};
 use crate::suite::{Suite, SuiteRatchet, SuiteRatchetError};
 use crate::TimestampMs;
 
@@ -990,6 +991,28 @@ fn payload_hash(payload: &Payload) -> [u8; 32] {
     *blake3::hash(&payload.signing_body()).as_bytes()
 }
 
+/// Verify a detached signature under the object's `suite`, mapping any failure to the existing
+/// [`MoteError::BadSignature`] (fail closed). Suite `0x01` uses the classical Ed25519
+/// [`verify_domain`]; suite `0x02` uses the hybrid [`verify_hybrid_domain`], which requires **both**
+/// the Ed25519 and the ML-DSA-65 components to verify (AND-composition, §1.3). A `0x02` object whose
+/// PQ half is missing/stripped/tampered is rejected here — the underlying hybrid check raises
+/// `ERR_HYBRID_SUITE_INCOMPLETE` (`0x0210`, exposed via [`crate::pq::HybridError`]), never accepted
+/// on the classical half. Suite `0x01`'s path is byte-for-byte the prior behavior.
+fn verify_sig_for_suite(
+    suite: Suite,
+    pk: &[u8],
+    domain: &[u8],
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), MoteError> {
+    match suite {
+        Suite::Classical => verify_domain(pk, domain, msg, sig).map_err(|_| MoteError::BadSignature),
+        Suite::PqHybrid => {
+            verify_hybrid_domain(pk, domain, msg, sig).map_err(|_| MoteError::BadSignature)
+        }
+    }
+}
+
 /// Build a MOTE (spec §2.2, §2.4): construct + sign the payload, HPKE-seal it, content-address
 /// the ciphertext, and sign the envelope with an ephemeral per-message key.
 ///
@@ -1051,6 +1074,73 @@ pub fn build_mote(
     Ok(env)
 }
 
+/// Build a **suite-`0x02` (PQ hybrid)** MOTE — the post-quantum analogue of [`build_mote`].
+///
+/// Identical shape to [`build_mote`], but every asymmetric primitive is the hybrid:
+/// - `sealer` MUST be a [`crate::pq::HybridSeal`]; `recipient_seal_pub` is the recipient's 1216-byte
+///   **X-Wing** encapsulation key ([`crate::pq::HybridKemKeypair::public`]). Confidentiality holds
+///   if either the X25519 or the ML-KEM-768 share is unbroken (§1.3).
+/// - `sender_hybrid` signs `Payload.sig` with **both** Ed25519 and ML-DSA-65 (concatenated,
+///   §18.1.6); `Payload.from` is the 1984-byte hybrid public key.
+/// - `ephemeral_hybrid` is a fresh per-message hybrid key producing the unlinkable envelope
+///   `sender_sig`, likewise AND-composed.
+///
+/// The resulting `Envelope.suite` is `0x02`; it round-trips through [`validate`] when the recipient
+/// passes the matching [`crate::pq::HybridSeal`]. Both signatures must verify at receipt — a
+/// stripped PQ half is rejected fail-closed (§1.3, `0x0210`).
+pub fn build_mote_hybrid(
+    sealer: &impl PayloadSeal,
+    sender_hybrid: &HybridSigningKey,
+    ephemeral_hybrid: &HybridSigningKey,
+    recipient_ik: &[u8],
+    recipient_seal_pub: &[u8],
+    draft: MoteDraft,
+) -> Result<Envelope, MoteError> {
+    let suite = Suite::PqHybrid;
+    let to = DeliveryTag::Key(recipient_ik.to_vec());
+    let to_cbor = to.det_cbor();
+
+    // 1. Build and hybrid-sign the payload (identity signature lives inside the ciphertext).
+    let mut payload = Payload {
+        from: sender_hybrid.public(),
+        sig: Vec::new(),
+        headers: draft.headers,
+        body: draft.body,
+        refs: draft.refs,
+        attach: draft.attach,
+        expires: draft.expires,
+    };
+    let ph = payload_hash(&payload);
+    payload.sig = sender_hybrid.sign_domain(PAYLOAD_SIG_DS, &ph);
+
+    // 2. Serialize (canonical §18 CBOR) + X-Wing-seal the payload, binding it via AAD.
+    let pt = payload.det_cbor();
+    let aad = aad_bytes(suite, draft.kind, draft.ts, &to_cbor);
+    let ciphertext = sealer.seal(recipient_seal_pub, &aad, &pt)?;
+
+    // 3. Content-address the ciphertext.
+    let id = ContentId::of(&ciphertext);
+
+    // 4. Assemble the envelope, then hybrid-sign (id‖to‖ts‖kind‖challenge) with the ephemeral key.
+    let mut env = Envelope {
+        v: MOTE_VERSION,
+        suite,
+        id,
+        to,
+        epoch: draft.epoch,
+        ts: draft.ts,
+        kind: draft.kind,
+        keypkg: draft.keypkg,
+        challenge: draft.challenge,
+        ciphertext,
+        sender_sig: None,
+        sender_eph: Some(ephemeral_hybrid.public()),
+    };
+    let authed = sender_authed_bytes(&env);
+    env.sender_sig = Some(ephemeral_hybrid.sign_domain(ENVELOPE_SENDER_DS, &authed));
+    Ok(env)
+}
+
 /// Recipient-side context for [`validate`].
 pub struct RecipientCtx<'a> {
     /// This node's identity key bytes, for resolving `to` (§2.7 step 4). Default delivery tags
@@ -1095,7 +1185,7 @@ pub fn validate(
     if env.v != MOTE_VERSION {
         return Err(MoteError::UnknownVersion(env.v));
     }
-    if !env.suite.is_supported() {
+    if !env.suite.mote_supported() {
         return Err(MoteError::UnsupportedSuite(env.suite.as_u8()));
     }
 
@@ -1108,7 +1198,7 @@ pub fn validate(
     if let Some(sig) = &env.sender_sig {
         let eph = env.sender_eph.as_ref().ok_or(MoteError::MissingSenderKey)?;
         let authed = sender_authed_bytes(env);
-        verify_domain(eph, ENVELOPE_SENDER_DS, &authed, sig).map_err(|_| MoteError::BadSignature)?;
+        verify_sig_for_suite(env.suite, eph, ENVELOPE_SENDER_DS, &authed, sig)?;
     }
 
     // 4. Resolve `to` to this node (default KeyTag == our identity key, §2.7 step 4).
@@ -1131,8 +1221,7 @@ pub fn validate(
 
     // 8. Verify Payload.sig under Payload.from — the authenticated sender identity.
     let ph = payload_hash(&payload);
-    verify_domain(&payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig)
-        .map_err(|_| MoteError::BadSignature)?;
+    verify_sig_for_suite(env.suite, &payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig)?;
 
     // 9. (Caller applies expires/refs/kind semantics + the step-8 suite pin — see
     //     `validate_pinned` — then stores and acks.)
@@ -1227,6 +1316,96 @@ mod tests {
             }
             Outcome::Deferred => panic!("a known-contact MOTE must be accepted"),
         }
+    }
+
+    // --- Suite 0x02 (PQ hybrid) envelope-level tests -------------------------------------
+
+    fn round_hybrid() -> (Envelope, Vec<u8>, crate::pq::HybridKemKeypair) {
+        use crate::pq::{HybridKemKeypair, HybridSeal, HybridSigningKey};
+        let sender = HybridSigningKey::generate();
+        let eph = HybridSigningKey::generate();
+        let recipient = HybridSigningKey::generate();
+        let recipient_ik = recipient.public();
+        let seal = HybridKemKeypair::generate();
+        let mut draft = MoteDraft::new(Kind::Mail, 1_700_000_000_000, b"pq hello".to_vec());
+        draft.headers.subject = Some("pq".into());
+        let env =
+            build_mote_hybrid(&HybridSeal, &sender, &eph, &recipient_ik, seal.public(), draft)
+                .unwrap();
+        (env, recipient_ik, seal)
+    }
+
+    #[test]
+    fn hybrid_suite_0x02_seal_validate_round_trip() {
+        use crate::pq::HybridSeal;
+        let (env, recipient_ik, seal) = round_hybrid();
+        assert_eq!(env.suite, Suite::PqHybrid, "envelope asserts suite 0x02");
+        // A 0x02 envelope survives a canonical CBOR round-trip byte-for-byte.
+        let back = Envelope::from_det_cbor(&env.det_cbor()).unwrap();
+        assert_eq!(env, back);
+        // The X-Wing-sealed payload opens and both hybrid signatures verify.
+        let ctx = RecipientCtx {
+            our_ik: &recipient_ik,
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        match validate(&HybridSeal, &env, &ctx).unwrap() {
+            Outcome::Accepted(p) => {
+                assert_eq!(p.body, b"pq hello");
+                assert_eq!(p.headers.subject.as_deref(), Some("pq"));
+                assert_eq!(p.from.len(), crate::pq::HYBRID_PK_LEN);
+                assert_eq!(p.sig.len(), crate::pq::HYBRID_SIG_LEN);
+            }
+            Outcome::Deferred => panic!("a known-contact hybrid MOTE must be accepted"),
+        }
+    }
+
+    #[test]
+    fn hybrid_envelope_rejects_stripped_pq_sender_sig() {
+        use crate::pq::HybridSeal;
+        let (mut env, recipient_ik, seal) = round_hybrid();
+        // Strip the ML-DSA half of the *envelope* sender_sig, keeping the valid Ed25519 half — the
+        // intra-suite PQ strip the AND-composition must reject (§1.3). Verification is fail-closed:
+        // the hybrid check raises 0x0210, surfaced here as BadSignature (existing variant).
+        let sig = env.sender_sig.take().unwrap();
+        env.sender_sig = Some(sig[..crate::pq::ED25519_SIG_LEN].to_vec());
+        let ctx = RecipientCtx {
+            our_ik: &recipient_ik,
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert_eq!(validate(&HybridSeal, &env, &ctx), Err(MoteError::BadSignature));
+    }
+
+    #[test]
+    fn hybrid_envelope_rejects_tampered_pq_sender_sig() {
+        use crate::pq::HybridSeal;
+        let (mut env, recipient_ik, seal) = round_hybrid();
+        // Corrupt a byte inside the ML-DSA half of sender_sig (present but invalid).
+        let mut sig = env.sender_sig.take().unwrap();
+        let idx = sig.len() - 1;
+        sig[idx] ^= 0x01;
+        env.sender_sig = Some(sig);
+        let ctx = RecipientCtx {
+            our_ik: &recipient_ik,
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert_eq!(validate(&HybridSeal, &env, &ctx), Err(MoteError::BadSignature));
+    }
+
+    #[test]
+    fn hybrid_envelope_wrong_seal_key_fails_closed() {
+        use crate::pq::{HybridKemKeypair, HybridSeal};
+        let (env, recipient_ik, _seal) = round_hybrid();
+        let wrong = HybridKemKeypair::generate();
+        let ctx = RecipientCtx {
+            our_ik: &recipient_ik,
+            seal_secret: wrong.secret(),
+            sender_is_known: true,
+        };
+        // Decapsulation yields a different shared secret ⇒ AEAD auth fails ⇒ DecryptFailed.
+        assert_eq!(validate(&HybridSeal, &env, &ctx), Err(MoteError::DecryptFailed));
     }
 
     #[test]
