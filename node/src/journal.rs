@@ -37,10 +37,20 @@ use serde::{Deserialize, Serialize};
 use dmtap_core::mote::Envelope;
 use dmtap_core::ContentId;
 
+use crate::deniable::DeniableAdmissionSnapshot;
 use crate::outbound::{OutState, OutboundEntry};
 
-/// The durable delivery state a node must survive restart with (spec §19.3.3): the outbound retry
-/// queue plus the dedup/ack set. Serializable so any [`Journal`] can round-trip it.
+/// The durable delivery + anti-rollback/anti-abuse state a node must survive restart with. Beyond
+/// the §19.3.3 outbound retry queue and the §2.6 dedup/ack set, this also carries the
+/// **security-critical high-water-marks** that would otherwise re-pin on first contact after a
+/// restart — weakening the downgrade/rollback defenses across restarts:
+/// - the per-contact **suite** high-water-mark ([`SuiteRatchet`](dmtap_core::suite::SuiteRatchet), §1.3, §2.7 step 8);
+/// - the per-authority **mix-directory** `(epoch, version)` high-water-mark (§4.4.2, §18.5.3);
+/// - the inbound deniable-init **admission** token buckets (audit #4 OPK-depletion defense, §5.2.1).
+///
+/// Serializable so any [`Journal`] can round-trip it. New fields default-in
+/// ([`serde(default)`](https://serde.rs/field-attrs.html#default)) so an older journal (queue + dedup
+/// only) still loads — an additive, backward-compatible extension.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     /// The sender-side retry queue (§20.1 / §19.3.3), one [`PersistedEntry`] per tracked MOTE.
@@ -48,6 +58,44 @@ pub struct Snapshot {
     /// The dedup/ack set (§2.6): `(id, sender-return-path)` pairs, so a MOTE whose `id` we already
     /// hold is re-acked after a restart without being reprocessed.
     pub seen: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The per-contact suite high-water-marks (§1.3, §2.7 step 8): one [`PersistedSuiteMark`] per
+    /// contact the node has pinned a suite floor for. Restored authoritatively so a post-restart
+    /// downgrade below the pinned mark is *still* rejected (never re-pinned on first contact).
+    #[serde(default)]
+    pub suite_marks: Vec<PersistedSuiteMark>,
+    /// Each directory authority's latest accepted [`MixDirectory`](dmtap_core::mixnet::MixDirectory),
+    /// stored as its canonical §18.5.3 CBOR. On restore each is re-verified + re-ingested through the
+    /// tracker (fail-closed), restoring the monotonic `(epoch, version)` high-water-mark so a
+    /// post-restart rollback is *still* rejected (§4.4.2).
+    #[serde(default)]
+    pub mix_directories: Vec<Vec<u8>>,
+    /// The inbound deniable-init admission gate's token buckets (audit #4, §5.2.1), so a restart does
+    /// not hand an attacker a fresh, full burst against the responder's one-time-prekey pool. `None`
+    /// in a legacy journal ⇒ the node keeps its freshly-seeded gate.
+    #[serde(default)]
+    pub deniable_admission: Option<DeniableAdmissionSnapshot>,
+}
+
+/// A single persisted per-contact suite high-water-mark (spec §1.3, §2.7 step 8). The `suite` byte is
+/// validated fail-closed on restore ([`into_mark`](Self::into_mark)) — an unknown suite byte is
+/// corruption, refused, never silently defaulted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSuiteMark {
+    /// The contact identity key the mark is keyed on (their `Payload.from`).
+    pub contact: Vec<u8>,
+    /// The pinned suite byte (the §1.1 suite id) — the highest accepted from this contact.
+    pub suite: u8,
+}
+
+impl PersistedSuiteMark {
+    /// Decode the persisted `(contact, suite)` pair, **failing closed** on an unknown suite byte
+    /// (corruption is refused, not defaulted to a weaker suite — that would silently drop the
+    /// downgrade floor). Returns the contact key and its validated [`Suite`](dmtap_core::Suite).
+    pub fn into_mark(self) -> Result<(Vec<u8>, dmtap_core::Suite), JournalError> {
+        let suite = dmtap_core::Suite::from_u8(self.suite)
+            .ok_or(JournalError::Corrupt("unknown suite in persisted high-water-mark"))?;
+        Ok((self.contact, suite))
+    }
 }
 
 /// A single outbound queue entry in serializable form. The sealed envelope is stored as its
@@ -279,12 +327,16 @@ mod tests {
         let snap = Snapshot {
             outbound: vec![PersistedEntry::from_entry(&sample_entry(2))],
             seen: vec![(vec![1, 2, 3], vec![4, 5, 6])],
+            suite_marks: vec![PersistedSuiteMark { contact: vec![7, 8], suite: 0x02 }],
+            ..Snapshot::default()
         };
         j.save(&snap).unwrap();
 
         let loaded = j.load().unwrap();
         assert_eq!(loaded.outbound.len(), 1);
         assert_eq!(loaded.seen, vec![(vec![1, 2, 3], vec![4, 5, 6])]);
+        assert_eq!(loaded.suite_marks.len(), 1);
+        assert_eq!(loaded.suite_marks[0].suite, 0x02);
     }
 
     #[test]
@@ -304,6 +356,8 @@ mod tests {
         let snap = Snapshot {
             outbound: vec![PersistedEntry::from_entry(&sample_entry(3))],
             seen: vec![(vec![9], vec![8, 7])],
+            mix_directories: vec![vec![0xDE, 0xAD]],
+            ..Snapshot::default()
         };
         j.save(&snap).unwrap();
 
@@ -313,6 +367,7 @@ mod tests {
         assert_eq!(loaded.outbound.len(), 1);
         assert_eq!(loaded.outbound[0].state, OutState::Retry.as_u8());
         assert_eq!(loaded.seen, vec![(vec![9], vec![8, 7])]);
+        assert_eq!(loaded.mix_directories, vec![vec![0xDE, 0xAD]], "new fields round-trip on disk");
 
         let _ = std::fs::remove_file(&path);
     }

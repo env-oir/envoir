@@ -98,6 +98,37 @@ fn hex8(bytes: &[u8]) -> String {
     bytes.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>() + "…"
 }
 
+/// Full-hex encode of a byte string.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `init`: create a new §1.2 root identity + its HPKE sealing keypair and show the resulting
+/// address material — the real key generation, with the durable-keystore write and the naming/KT
+/// publish honestly called out as the network-bound seams (this binary carries no keystore/socket
+/// layer; those live in the node runtime and the naming crate).
+fn init_identity() {
+    use dmtap::identity::IdentityKey;
+    use dmtap::mote::SealKeypair;
+
+    // A real Ed25519 root identity (spec §1.2) and the X25519 sealing keypair peers seal to (§5.3).
+    let ik = IdentityKey::generate();
+    let seal = SealKeypair::generate();
+    let ik_pub = ik.public();
+
+    println!("Envoir node — new identity (spec §1.2)\n");
+    println!("  root identity key (Ed25519, hex) : {}", hex(&ik_pub));
+    // The §3.9.1 8-word key-name: the safety-number/verbal fingerprint of the identity key.
+    println!("  key-name (§3.9.1, 8 words)        : {}", dmtap::keyname::encode(&ik_pub));
+    println!("  sealing key (X25519 HPKE, hex)    : {}", hex(seal.public()));
+    println!("  default suite                     : {:?}", Suite::Classical);
+    println!(
+        "\nGenerated in memory. Persisting this identity to a durable keystore and publishing the\n\
+         Identity + KeyPackages to naming/key-transparency (spec §1.2, §3, §5.3) are network-bound\n\
+         steps handled by the node runtime and the `dmtap-naming` crate — not this scaffold binary."
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
@@ -108,9 +139,7 @@ fn main() {
             println!("default suite: {:?}", Suite::Classical);
         }
         "init" => {
-            // TODO: generate root identity key (Ed25519), device key, recovery policy
-            // (spec §1.2, §1.4), and publish Identity + KeyPackages.
-            eprintln!("`init` not yet implemented — see spec §1 (identity lifecycle)");
+            init_identity();
         }
         "run" => {
             // The real `run` starts the libp2p mesh (Kad/Relay/DCUtR/AutoNAT/mDNS), mixnet client,

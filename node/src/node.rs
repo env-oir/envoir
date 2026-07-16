@@ -38,7 +38,7 @@
 //! [`SealKeypair`]: dmtap_core::mote::SealKeypair
 //! [`InMemoryNetwork`]: crate::transport::InMemoryNetwork
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::{
@@ -59,7 +59,9 @@ use crate::deniable::{
 };
 use crate::group::{GroupAdd, GroupError, GroupMote};
 use crate::inbound::{DropReason, InboundOutcome};
-use crate::journal::{Journal, JournalError, NullJournal, PersistedEntry, Snapshot};
+use crate::journal::{
+    Journal, JournalError, NullJournal, PersistedEntry, PersistedSuiteMark, Snapshot,
+};
 use crate::mixdir::{MixDirError, MixDirectoryTracker};
 use crate::naming::{self, AddressError, KeyPackageSource, Resolver};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
@@ -137,6 +139,11 @@ pub struct Node<T: Transport> {
     /// `Envelope.suite` accepted from each authenticated sender. [`receive_mote`](Node::receive_mote)
     /// feeds it via [`validate_pinned`], so an on-the-wire suite downgrade is rejected *at the node*.
     suite_ratchet: SuiteRatchet,
+    /// The set of contacts the [`suite_ratchet`](Self::suite_ratchet) holds a high-water-mark for
+    /// (their `Payload.from` keys). The ratchet itself exposes no iteration, so the node tracks the
+    /// keyset here to enumerate the marks when [`snapshot`](Self::snapshot)ing them for the journal;
+    /// restored alongside the marks so persistence round-trips (§1.3, §2.7 step 8).
+    suite_contacts: BTreeSet<Vec<u8>>,
     /// Per-authority mix-directory anti-rollback tracker (§4.4.2, §18.5.3): the monotonic
     /// `(epoch, version)` high-water-mark that rejects a replayed/stale mix-fleet snapshot at the node.
     mix_directory: MixDirectoryTracker,
@@ -180,6 +187,7 @@ impl<T: Transport> Node<T> {
                 1_700_000_000_000,
             ),
             suite_ratchet: SuiteRatchet::new(),
+            suite_contacts: BTreeSet::new(),
             mix_directory: MixDirectoryTracker::new(),
             group_inbox: Vec::new(),
             transport,
@@ -219,6 +227,7 @@ impl<T: Transport> Node<T> {
                 1_700_000_000_000,
             ),
             suite_ratchet: SuiteRatchet::new(),
+            suite_contacts: BTreeSet::new(),
             mix_directory: MixDirectoryTracker::new(),
             group_inbox: Vec::new(),
             transport,
@@ -231,6 +240,34 @@ impl<T: Transport> Node<T> {
         }
         for (id, from) in snapshot.seen {
             node.seen.insert(id, from);
+        }
+        // Restore the per-contact suite high-water-marks (§1.3, §2.7 step 8), fail-closed on a bad
+        // suite byte. A restored mark is authoritative: `observe` re-establishes the floor so a
+        // post-restart downgrade below it is still rejected (never re-pinned on first contact).
+        for mark in snapshot.suite_marks {
+            let (contact, suite) = mark.into_mark()?;
+            node.suite_ratchet.observe(&contact, suite);
+            node.suite_contacts.insert(contact);
+        }
+        // Restore the per-authority mix-directory high-water-marks (§4.4.2, §18.5.3) by re-verifying
+        // and re-ingesting each persisted directory into the fresh tracker. Fail-closed: a directory
+        // that no longer decodes/verifies is corruption and is refused, not silently dropped — the
+        // mark it stood for is not defaulted away.
+        for dir_cbor in snapshot.mix_directories {
+            node.mix_directory.ingest(&dir_cbor).map_err(|e| {
+                JournalError::Corrupt(match e {
+                    MixDirError::Malformed => "persisted mix directory is malformed",
+                    MixDirError::Unverified => "persisted mix directory failed authority verification",
+                    // A fresh tracker has no pinned mark, so a persisted dir cannot be Stale; treat
+                    // an unexpected rollback as corruption too rather than silently accepting.
+                    MixDirError::Stale { .. } => "persisted mix directory is internally inconsistent",
+                })
+            })?;
+        }
+        // Restore the deniable-init admission token buckets (audit #4, §5.2.1) verbatim, so a restart
+        // does not refill the anti-abuse gate to a fresh full burst against the OPK pool.
+        if let Some(gate) = snapshot.deniable_admission {
+            node.deniable_admission = DeniableAdmission::restore(gate);
         }
         Ok(node)
     }
@@ -323,11 +360,30 @@ impl<T: Transport> Node<T> {
 
     // --- durability (§19.3.3) ----------------------------------------------------------------
 
-    /// The current durable state (outbound queue + dedup set) as a serializable [`Snapshot`].
+    /// The current durable state as a serializable [`Snapshot`]: the outbound queue + dedup set
+    /// (§19.3.3) plus the security-critical high-water-marks — the per-contact suite floors (§1.3,
+    /// §2.7 step 8), the per-authority mix-directory `(epoch, version)` marks (§4.4.2, §18.5.3), and
+    /// the deniable-init admission buckets (§5.2.1). Persisting the marks keeps the downgrade/rollback
+    /// defenses authoritative across a restart instead of re-pinning on first contact.
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             outbound: self.outbound.values().map(PersistedEntry::from_entry).collect(),
             seen: self.seen.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            suite_marks: self
+                .suite_contacts
+                .iter()
+                .filter_map(|contact| {
+                    self.suite_ratchet
+                        .high_water_mark(contact)
+                        .map(|suite| PersistedSuiteMark { contact: contact.clone(), suite: suite.as_u8() })
+                })
+                .collect(),
+            mix_directories: self
+                .mix_directory
+                .latest_directories()
+                .map(|d| d.det_cbor())
+                .collect(),
+            deniable_admission: Some(self.deniable_admission.snapshot()),
         }
     }
 
@@ -574,13 +630,18 @@ impl<T: Transport> Node<T> {
         }
         // First-contact TOFU-pin (§3.4): remember the now-revealed sender identity.
         self.contacts.insert(payload.from.clone());
+        // `validate_pinned` just ratcheted this sender's suite high-water-mark up (§2.7 step 8);
+        // record the keyset entry so the mark is enumerated into the durable snapshot below.
+        self.suite_contacts.insert(payload.from.clone());
 
         let uid = self
             .store
             .deliver_mote(&payload, "INBOX", self.now)
             .expect("INBOX always exists");
         self.seen.insert(id.as_bytes().to_vec(), from.to_vec());
-        self.checkpoint(); // dedup set grew — persist so a post-restart redelivery is still re-acked.
+        // dedup set grew and the suite mark advanced — persist so a post-restart redelivery is still
+        // re-acked and a post-restart downgrade below this sender's mark is still rejected.
+        self.checkpoint();
         self.send_ack(from, id);
         InboundOutcome::Stored { id: id.clone(), uid }
     }
@@ -878,7 +939,12 @@ impl<T: Transport> Node<T> {
         // (per-source + global token bucket) BEFORE touching a prekey; a genuine init retried after
         // the bucket refills still succeeds. Keyed on the claimed root IK; the global bucket is what
         // bounds a Sybil flood of throwaway identities.
-        if !self.deniable_admission.admit(peer_root_ik, self.now) {
+        let admitted = self.deniable_admission.admit(peer_root_ik, self.now);
+        // The admission buckets mutated (a token drained on admit, refill/prune bookkeeping either
+        // way) — persist so the anti-abuse accounting survives a restart rather than refilling to a
+        // fresh full burst against the OPK pool (audit #4).
+        self.checkpoint();
+        if !admitted {
             return Err(DeniableRouteError::RateLimited);
         }
         self.deniable.accept(&certified.init)
@@ -890,6 +956,7 @@ impl<T: Transport> Node<T> {
     /// count; this is for callers/tests that want an explicit policy.
     pub fn configure_deniable_accept_gate(&mut self, limits: DeniableAcceptLimits) {
         self.deniable_admission.configure(limits, self.now);
+        self.checkpoint(); // the gate's policy + bucket state changed — persist it.
     }
 
     /// The number of unspent one-time prekeys remaining in this node's published deniable bundle, or
@@ -954,6 +1021,8 @@ impl<T: Transport> Node<T> {
     /// ([`SuiteRatchet::observe`] semantics).
     pub fn pin_suite_floor(&mut self, contact: &[u8], suite: Suite) {
         self.suite_ratchet.observe(contact, suite);
+        self.suite_contacts.insert(contact.to_vec());
+        self.checkpoint(); // the pinned floor is security-critical state — persist it immediately.
     }
 
     // --- mix-directory anti-rollback (spec §4.4.2, §18.5.3) ---------------------------------
@@ -965,7 +1034,9 @@ impl<T: Transport> Node<T> {
     /// node-layer half of the crate's monotonic-`version` contract (§4.4.2): the rollback is rejected
     /// *here*, using state held in the node, not merely rejectable in `dmtap_core`.
     pub fn ingest_mix_directory(&mut self, bytes: &[u8]) -> Result<(), MixDirError> {
-        self.mix_directory.ingest(bytes)
+        self.mix_directory.ingest(bytes)?;
+        self.checkpoint(); // the mark ratcheted up — persist so a post-restart rollback is rejected.
+        Ok(())
     }
 
     /// The latest mix-directory this node has accepted from `authority`, if any (§4.4.2).

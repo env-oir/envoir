@@ -42,7 +42,7 @@ use dmtap_core::deniable::{DeniableInit, DeniableMessage, DeniablePayload, Denia
 use dmtap_core::identity::{Cap, DeviceCert, IdentityKey};
 use dmtap_core::TimestampMs;
 
-pub use self::admission::{DeniableAdmission, DeniableAcceptLimits};
+pub use self::admission::{DeniableAcceptLimits, DeniableAdmission, DeniableAdmissionSnapshot};
 
 pub use dmtap_deniable::{DeniableError, DeniableIdentity, DeniableResponder, DeniableSession};
 
@@ -324,11 +324,12 @@ impl DeniableState {
 /// (well under the burst capacity) are never affected.
 mod admission {
     use super::TimestampMs;
+    use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
     /// A deterministic token bucket: `capacity` tokens, one refilled per `refill_ms`, clocked off an
     /// externally supplied timestamp (no wall clock, §16.1) so behavior is reproducible in tests.
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TokenBucket {
         capacity: u32,
         refill_ms: u64,
@@ -368,7 +369,7 @@ mod admission {
 
     /// Tunable capacities for [`DeniableAdmission`]. Defaults keep an unsolicited burst well under the
     /// default OPK pool while never throttling a legitimate low-rate initiator.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
     pub struct DeniableAcceptLimits {
         /// Global burst capacity — the max accepts admitted before any refill. Kept *below* the
         /// published OPK count so no single burst can drain the pool to the last-resort prekey.
@@ -457,6 +458,44 @@ mod admission {
                 b.tokens < cap
             });
         }
+
+        /// Capture the gate's live token-bucket state as a serializable snapshot, so the anti-abuse
+        /// accounting survives a restart (audit #4 — otherwise a restart hands an attacker a fresh,
+        /// full burst against the OPK pool). The per-source map is flattened to a `Vec` so it
+        /// round-trips through JSON (byte-vector keys are not JSON object keys — mirrors [`Snapshot`
+        /// ](crate::journal::Snapshot)'s `seen`).
+        pub fn snapshot(&self) -> DeniableAdmissionSnapshot {
+            DeniableAdmissionSnapshot {
+                limits: self.limits,
+                global: self.global.clone(),
+                per_source: self
+                    .per_source
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }
+        }
+
+        /// Rebuild a gate from a [`snapshot`](Self::snapshot) — the drained/partially-refilled buckets
+        /// are restored verbatim, so the rate limit picks up exactly where the pre-restart node left
+        /// off (refill then resumes off the node's clock as usual).
+        pub fn restore(snap: DeniableAdmissionSnapshot) -> Self {
+            DeniableAdmission {
+                limits: snap.limits,
+                global: snap.global,
+                per_source: snap.per_source.into_iter().collect(),
+            }
+        }
+    }
+
+    /// A serializable snapshot of a [`DeniableAdmission`] gate's token-bucket state (audit #4
+    /// persistence, §5.2.1). Opaque by design — construct it with [`DeniableAdmission::snapshot`] and
+    /// rebuild with [`DeniableAdmission::restore`].
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DeniableAdmissionSnapshot {
+        limits: DeniableAcceptLimits,
+        global: TokenBucket,
+        per_source: Vec<(Vec<u8>, TokenBucket)>,
     }
 
     impl Default for DeniableAdmission {
@@ -515,6 +554,35 @@ mod admission {
             assert!(!gate.admit(&noisy, now), "a single source is capped by its per-source bucket");
             // A different source is unaffected (global still has budget).
             assert!(gate.admit(b"someone-else", now));
+        }
+
+        #[test]
+        fn snapshot_restore_preserves_drained_buckets() {
+            // Persistence primitive (audit #4): a drained gate that round-trips through
+            // snapshot()→restore() stays drained — a restart must not refill it to a fresh burst.
+            let now = 2_000_000;
+            let mut gate = DeniableAdmission::new(
+                DeniableAcceptLimits {
+                    global_burst: 2,
+                    global_refill_ms: 1_000_000,
+                    source_burst: 100,
+                    source_refill_ms: 1_000_000,
+                },
+                now,
+            );
+            assert!(gate.admit(&[1], now));
+            assert!(gate.admit(&[2], now));
+            assert!(!gate.admit(&[3], now), "global burst spent");
+
+            // Round-trip the state (as the journal would) and confirm it resumes drained.
+            let restored = DeniableAdmission::restore(gate.snapshot());
+            let mut restored = restored;
+            assert!(
+                !restored.admit(&[4], now),
+                "restored gate is still drained — no fresh burst after restart"
+            );
+            // Once enough time passes it refills exactly as a live gate would (state, not a reset).
+            assert!(restored.admit(&[5], now + 1_000_000));
         }
 
         #[test]

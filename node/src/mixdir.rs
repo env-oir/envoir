@@ -80,6 +80,13 @@ impl MixDirectoryTracker {
         self.latest.get(authority)
     }
 
+    /// Every authority's latest accepted directory (the persistence surface). Each carries its own
+    /// `(epoch, version)` high-water-mark; serialize these (as §18.5.3 CBOR) to survive a restart,
+    /// then re-[`ingest`](Self::ingest) them into a fresh tracker to restore the marks fail-closed.
+    pub fn latest_directories(&self) -> impl Iterator<Item = &MixDirectory> {
+        self.latest.values()
+    }
+
     /// Verify `dir` (authority signature) and enforce the per-authority monotonic high-water-mark,
     /// **fail-closed** (§4.4.2, §18.5.3):
     ///
