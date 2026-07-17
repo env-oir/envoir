@@ -24,13 +24,13 @@ homepage = "https://github.com/env-oir/envoir-gateway"
 [dependencies]
 # Shared DMTAP primitives — MOTE build/seal, Identity + Ed25519, canonical §18 CBOR (spec §1, §2).
 # Pinned to a published tag of the env-oir/envoir monorepo (the split precondition — SEPARATION.md).
-dmtap-core = { git = "https://github.com/env-oir/envoir", tag = "v0.1.0" }
+dmtap-core = { git = "https://github.com/env-oir/envoir", tag = "v0.2.0" }
 # RFC 5322 parse/render + SMTP DATA→MoteDraft conversion (reused for the message translation), plus
 # the IMAP4rev2/rev1 server + MailStore projection wired into the optional legacy IMAP access server
 # (`net` feature = std-only blocking TCP helpers; no extra crates, no async runtime).
 # BOTH deps MUST share one git source (same tag) so Cargo unifies dmtap-core to a single copy —
 # distinct tag strings resolve as distinct sources and produce a type-mismatched duplicate crate.
-dmtap-mail = { git = "https://github.com/env-oir/envoir", tag = "v0.1.0", features = ["net"] }
+dmtap-mail = { git = "https://github.com/env-oir/envoir", tag = "v0.2.0", features = ["net"] }
 
 # --- DKIM delegated-selector signing (spec §7.3; RFC 8463 ed25519-sha256, RFC 6376 relaxed) ---
 ed25519-dalek = { version = "2", features = ["rand_core"] }

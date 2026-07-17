@@ -373,8 +373,8 @@ dependencies = [
 
 [[package]]
 name = "dmtap-core"
-version = "0.1.0"
-source = "git+https://github.com/env-oir/envoir?tag=v0.1.0#ee411c6d36c2056da0c782f23868886d65cfdb44"
+version = "0.2.0"
+source = "git+https://github.com/env-oir/envoir?tag=v0.2.0#1846ea550884758f6b86da27ef3c9d0d33cbc483"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -393,8 +393,8 @@ dependencies = [
 
 [[package]]
 name = "dmtap-mail"
-version = "0.1.0"
-source = "git+https://github.com/env-oir/envoir?tag=v0.1.0#ee411c6d36c2056da0c782f23868886d65cfdb44"
+version = "0.2.0"
+source = "git+https://github.com/env-oir/envoir?tag=v0.2.0#1846ea550884758f6b86da27ef3c9d0d33cbc483"
 dependencies = [
  "dmtap-core",
  "serde",
