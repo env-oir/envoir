@@ -30,8 +30,9 @@ use dmtap_core::kt::{
 };
 use dmtap_core::mixnet::{MixDirectory, MixKeyEntry, MixNodeDescriptor};
 use dmtap_core::mote::{
-    self, build_mote, file_tier, DeliveryTag, Envelope, FileTier, Headers, Hpke, Kind, Manifest,
-    MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair, ValidateError,
+    self, build_mote, check_file_available, file_tier, spool_admit, DeliveryTag, Durability,
+    DurabilityClass, Envelope, FileTier, Headers, Hpke, Kind, Manifest, ManifestRef, MoteDraft,
+    MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair, ValidateError,
     ENVELOPE_SENDER_DS, MOTE_VERSION, PAYLOAD_SIG_DS,
 };
 use dmtap_core::policy::{CallerPolicy, PolicyError};
@@ -54,12 +55,19 @@ use dmtap_deniable::{initiate, DeniableIdentity, DeniableResponder};
 use dmtap_mls::Member;
 use dmtap_naming::namechain::{InMemoryNameChain, NameChainResolver};
 use dmtap_naming::resolver::{InMemoryResolver, Resolver};
-use dmtap_naming::restype::{Chain, ResolverKind, ResolverRegistry};
+use dmtap_naming::restype::{Chain, ResolverKind, ResolverRegistry, ResolverType};
 use dmtap_naming::{
-    check_freshness, verify_quorum, DmtapTxtRecord, InMemoryKtLog, KtLog, KtProof, ResolveError,
-    UnreachableLog,
+    check_freshness, reconcile, verify_quorum, DmtapTxtRecord, InMemoryKtLog, KtLog, KtProof,
+    ResolveError, ResolverAnswer, UnreachableLog,
+};
+use dmtap_clustersync::wire::AddTag;
+use dmtap_clustersync::{
+    validate_op, verify_range, verify_segment, Cluster, ClusterOp, ClusterSyncFrame, ClusterState,
+    Hlc, JournalEntry, RangeFingerprint, SyncError, HLC_SKEW_MS, OP_LWW_SET, OP_SET_ADD,
+    OP_SET_REMOVE,
 };
 use envoir_gateway::attestation::{AttestationError as GwAttestationError, AttestationKey};
+use envoir_gateway::forwarded_addr::{self, ForwardedAddrError};
 use envoir_gateway::outbound::{
     AlwaysRequireTls, GovernedSend, OutboundError, OutboundGateway, OutboundTransport,
     TransportResult,
@@ -131,6 +139,20 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-ALIAS-03" => Some(alias_multiple_names_same_identity()),
         "DMTAP-RESOLVE-01" => Some(resolve_namechain_binding_disagreement_rejected()),
         "DMTAP-RESOLVE-02" => Some(resolve_unsupported_type_rejected()),
+        "DMTAP-RESOLVE-03" => Some(resolve_cross_resolver_disagreement_rejected()),
+        "DMTAP-ALIAS-01" => Some(alias_forward_unverified_rejected()),
+        "DMTAP-ALIAS-02" => Some(alias_revoked_rejected()),
+        "DMTAP-GWALIAS-01" => Some(gwalias_encoding_invalid_rejected()),
+        "DMTAP-GWALIAS-03" => Some(gwalias_encode_decode_roundtrips()),
+        "DMTAP-FILE-06" => Some(file_manifest_durability_invalid_rejected()),
+        "DMTAP-FILE-07" => Some(file_spool_overflow_rejected()),
+        "DMTAP-FILE-08" => Some(file_retention_expired_rejected()),
+        "DMTAP-FILE-09" => Some(file_unavailable_rejected()),
+        "DMTAP-SYNC-01" => Some(sync_device_unauthorized_rejected()),
+        "DMTAP-SYNC-02" => Some(sync_recon_summary_invalid_rejected()),
+        "DMTAP-SYNC-03" => Some(sync_journal_chain_broken_rejected()),
+        "DMTAP-SYNC-04" => Some(sync_crdt_op_invalid_rejected()),
+        "DMTAP-SYNC-05" => Some(sync_crdt_two_order_convergence()),
         _ => None,
     };
     match result {
@@ -208,64 +230,18 @@ fn skip_reason(id: &str, operation: &str) -> String {
             advertised deniable-1:1' to a deniable-session refusal — a caller simply has no \
             `DeniablePrekeyBundle` to call `initiate()` with in that case, which is a structural absence \
             of input, not an executable 'refuse and notify' decision this crate makes.",
-        "DMTAP-FILE-06" | "DMTAP-FILE-08" | "DMTAP-FILE-09" => "mote.rs's `ManifestRef` (the wire \
-            attachment reference) is only `{id, size, chunks: u32}` (a chunk COUNT) and `Manifest` \
-            itself carries no durability metadata at all — neither crate anywhere in this workspace \
-            models a `Durability` type with a `class`/replica-count/retention-window/origin-hold \
-            concept (grepped for `Durability`/`retention`/`spool` across dmtap-core and envoir-gateway; \
-            none exists). There is no constructor or validator to call for 'a Referenced ManifestRef \
-            missing Durability' (FILE-06), 'a pinned(term) fetch past its retention' (FILE-08), or 'an \
-            origin-hold file with no reachable holder' (FILE-09) — this is a real, unimplemented spec \
-            surface, not a caller-policy gap like the mote-validate VAL-05/PRIV-04 family.",
-        "DMTAP-FILE-07" => "push.rs (`PushSubscription`/`WakePing`) is the device wake-signaling \
-            object only — there is no inbound-spool / per-sender storage-quota admission function \
-            anywhere in dmtap-core (grepped for `spool`/`Admission`; none exists) to refuse an \
-            over-cap Attached push against. A genuinely different concern from `file_tier`/ \
-            `size_tier_mismatch_detected` (FILE-03, already executed), which classifies a size, not \
-            admits a push against a spool cap.",
-        "DMTAP-SYNC-01" | "DMTAP-SYNC-02" | "DMTAP-SYNC-03" | "DMTAP-SYNC-04" | "DMTAP-SYNC-05" =>
-            "no `ClusterSyncFrame`/`ClusterOp`/OR-Set/HLC/CRDT-merge module exists anywhere in this \
-             workspace (grepped dmtap-core, dmtap-mls, dmtap-naming, dmtap-auth, dmtap-deniable, and \
-             envoir-gateway for `ClusterSyncFrame`/`ClusterOp`/`RangeFingerprint`/`HLC`/`OrSet`; zero \
-             hits). §5.6 multi-device cluster replication/reconciliation/CRDT-merge is unimplemented \
-             reference surface, distinct from the (implemented, already-executed) MLS group layer \
-             `DMTAP-GRP-*` cases exercise via dmtap-mls.",
-        "DMTAP-ALIAS-01" | "DMTAP-ALIAS-02" => "dmtap-naming's DNS+KT resolver (`resolver.rs`, \
-            `kt::check_dns_matches_identity`) DOES reject a name whose forward binding disagrees with \
-            the resolved Identity, or that the CURRENT Identity no longer lists in `names` — but it \
-            folds both into the single generic `ResolveError::DnsIdentityMismatch`/`NameResolution` \
-            bucket (wire code `0x0109`, by `error.rs`'s own explicit doc comment), not the distinct, \
-            more granular `ERR_ALIAS_FORWARD_UNVERIFIED` (`0x011C`) / `ERR_ALIAS_REVOKED` (`0x011D`) \
-            this case's `expect.error_code` names. (dmtap-naming DOES implement two adjacent, \
-            similarly-worded 0x011x codes newly — `ResolveError::NameChainBindingUnverified` `0x011E` \
-            in `namechain.rs` and `ResolverTypeUnsupported` `0x011F` in `restype.rs` — but those are the \
-            `name-chain` (`.eth`/`.sol`) resolver type specifically, §3.12.5, a materially different \
-            resolver path than this case's plain `local@domain` DNS+KT alias, so they are not an honest \
-            stand-in either.) Executing this against the real DNS+KT path and asserting only 'reject' \
-            while silently ignoring the documented code would misreport conformance with the committed \
-            `§21` code this case names — an honest run must skip rather than launder a different code \
-            as a match. (The un-coded semantic scenario itself is already proven distinctly by \
-            `DMTAP-ORG-02`/`DMTAP-IDENT-04`, which this harness DOES execute.)",
-        "DMTAP-RESOLVE-03" => "no cross-resolver reconciliation function exists anywhere in this \
-            workspace (grepped dmtap-naming's `resolver.rs`/`namechain.rs`/`restype.rs` and the rest \
-            of the workspace for anything comparing two independent resolvers'/resolver-types' \
-            outputs for one name); each of `InMemoryResolver::resolve` (dns), `NameChainResolver::\
-            resolve` (name-chain), and `SelfResolver`/`PetnameBook` (self/petname) is a single, \
-            independent lookup path with no caller-facing 'query N of them and compare' orchestrator, \
-            alert, or KT-quorum/OOB fallback trigger to call — §3.12.3's cross-resolver-disagreement \
-            defense is unimplemented reference surface, not a caller-policy gap this crate models \
-            elsewhere (distinct from the single-resolver-type quorum `verify_quorum`/`KTV1-02` this \
-            harness DOES execute, which is > n/2 agreement WITHIN one resolver type's pinned log set, \
-            not agreement ACROSS resolver types).",
-        "DMTAP-GWALIAS-01" | "DMTAP-GWALIAS-02" | "DMTAP-GWALIAS-03" => "no legacy-gateway alias \
-            encode/decode module exists anywhere in this workspace for the \
-            `localpart.nativedomain@gateway.domain` escaping scheme these cases describe (escape \
-            `-`->`--`, `.`->`-.`, join with a top-level `.`) or a `GatewayAliasMap` row store \
-            (grepped envoir-gateway and the `node` crate for `GatewayAliasMap`/`nativedomain`; the only \
-            hit is `gateway/src/authz.rs`'s `AliasAllocator`, which is the DMTAP-native mesh's \
-            vanity/key-derived LOCAL-part allocator — a different concern entirely from mapping a \
-            legacy SMTP local-part to a native `(localpart, nativedomain)` pair). §7.10's gateway-alias \
-            addressing scheme is unimplemented reference surface, not a caller-policy gap.",
+        "DMTAP-GWALIAS-02" => "the SRS-style `envoir_gateway::forwarded_addr` module (now driven by \
+            DMTAP-GWALIAS-01/03) is a *stateless, deterministic* codec — it maps a legacy \
+            `(localpart, native_domain)` pair to/from the reversible `local.native_domain@gateway` \
+            form. GWALIAS-02 is a different concern: a *random-mode* alias (an opaque token with no \
+            recoverable native address) resolved through a stateful `GatewayAliasMap` row store whose \
+            row may be missing/expired/burned, answered `ERR_GATEWAY_ALIAS_UNMAPPED` (`0x0605`, \
+            RETURN_SENDER_SMTP). No such map-row store exists anywhere in this workspace (grepped \
+            envoir-gateway and `node` for `GatewayAliasMap`/random-mode alias state; the only hit is \
+            `authz.rs`'s `AliasAllocator`, the DMTAP-native vanity/key-derived LOCAL-part allocator, a \
+            different concern). `forwarded_addr` never returns `0x0605` and has no row lifecycle to \
+            drive, so this stays an honest skip rather than laundering the deterministic codec's \
+            `None`/`0x0606` refusal as the stateful-lookup `0x0605` the case names.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
@@ -1659,6 +1635,749 @@ fn resolve_unsupported_type_rejected() -> Result<(), String> {
     Ok(())
 }
 
+/// DMTAP-RESOLVE-03: "two independent resolvers returning different `ik` for the same name is
+/// surfaced as a potential attack, never silently reconciled" (§3.12.3, §3.5.2(b)). Drives the REAL
+/// `dmtap_naming::reconcile` cross-resolver check: a `dns` `_dmtap` pointer and a `name-chain`
+/// record for ONE name return two DIFFERENT keys. The reconciler MUST NOT pin either — it fails
+/// closed with `ERR_RESOLVER_DISAGREEMENT` (`0x0120`, HALT_ALERT: the caller must alert and fall
+/// back to KT-quorum/OOB). A positive control (both resolvers agreeing) confirms the disagreement is
+/// what triggers the refusal, not a blanket rejection. Mirrors `reconcile.rs`'s own unit test
+/// `two_resolvers_disagree_is_0x0120`.
+fn resolve_cross_resolver_disagreement_rejected() -> Result<(), String> {
+    let name = "victim@example.com";
+    // Two independent, genuine-looking bindings for the SAME name that name DIFFERENT keys — the
+    // §3.12.3 equivocation an attacker who controls one resolver would produce.
+    let key_dns = IdentityKey::from_seed(&[0xA1; 32]).public();
+    let key_chain = IdentityKey::from_seed(&[0xB2; 32]).public();
+
+    let disagreeing = [
+        ResolverAnswer::found(ResolverType::Dns, key_dns.clone()),
+        ResolverAnswer::found(ResolverType::NameChain(Chain::Ens), key_chain),
+    ];
+    match reconcile(name, &disagreeing) {
+        Err(e @ ResolveError::ResolverDisagreement(_)) => {
+            let code = e.code();
+            if code != 0x0120 {
+                return Err(format!(
+                    "ERR_RESOLVER_DISAGREEMENT code mismatch: got {code:#06x}, want 0x0120"
+                ));
+            }
+        }
+        Ok(res) => {
+            return Err(format!(
+                "cross-resolver disagreement was SILENTLY RECONCILED to a pin ({:?}) — the client \
+                 MUST NOT pin; expected Err(ResolverDisagreement 0x0120)",
+                res.ik
+            ))
+        }
+        other => {
+            return Err(format!(
+                "expected Err(ResolverDisagreement) (never silently reconciled), got {other:?}"
+            ))
+        }
+    }
+
+    // Positive control: the SAME two resolver types AGREEING on one key reconciles to a pin — so the
+    // refusal above is specifically the disagreement, not a resolver-count artefact.
+    let agreeing = [
+        ResolverAnswer::found(ResolverType::Dns, key_dns.clone()),
+        ResolverAnswer::found(ResolverType::NameChain(Chain::Ens), key_dns.clone()),
+    ];
+    match reconcile(name, &agreeing) {
+        Ok(res) if res.ik == key_dns => Ok(()),
+        other => Err(format!(
+            "sanity: two resolvers agreeing on one key must reconcile to that key, got {other:?}"
+        )),
+    }
+}
+
+/// DMTAP-ALIAS-01: "a name in the identity's own `Identity.names` whose forward `name->ik` binding
+/// (DNS+KT) resolves to a different key is rendered UNVERIFIED and MUST NOT be displayed as
+/// authenticated nor used to address mail" (§3.9.4, §3.11.3). Drives the REAL DNS+KT resolver
+/// (`InMemoryResolver::resolve`): DNS points `mallory@example.com` at an identity whose `ik`/`id`
+/// genuinely match (so this is NOT the plain pointer mismatch `0x0109`), but that identity only
+/// claims `alice@example.com` — the forward name is not one it lists, so the alias is unverified.
+/// dmtap-naming now surfaces this with the distinct `ERR_ALIAS_FORWARD_UNVERIFIED` (`0x011C`,
+/// FAIL_CLOSED_BLOCK) — asserted exactly, not the generic `0x0109`. Mirrors `resolver.rs`'s own unit
+/// test `alias_not_claimed_is_forward_unverified_0x011c`.
+fn alias_forward_unverified_rejected() -> Result<(), String> {
+    let seed = 0x1Cu8;
+    let ik = IdentityKey::from_seed(&[seed; 32]);
+    // The resolved identity claims only `alice@…`, NOT the `mallory@…` DNS points at it.
+    let id = Identity::create_classical(
+        &ik,
+        0,
+        vec![],
+        sample_keypkg_ref("alias-01"),
+        ContentId::of(b"recovery-alias-01"),
+        vec!["alice@example.com".to_owned()],
+        None,
+        1_700_000_000_000,
+    );
+    let mut r = InMemoryResolver::new(1_700_000_000_000);
+    let dn = dmtap_naming::resolver::DmtapName::parse("mallory@example.com")
+        .map_err(|e| format!("parse mallory: {e}"))?;
+    // TXT carries the identity's OWN ik/id, so `check_dns_matches_identity` passes and the failure is
+    // alias-specific (0x011C), not the pointer mismatch (0x0109).
+    r.set_txt(dn.txt_qname(), naming_txt(seed, &id));
+    r.publish_identity(id);
+
+    match r.resolve("mallory@example.com") {
+        Err(e @ ResolveError::AliasForwardUnverified(_)) => {
+            let code = e.code();
+            if code != 0x011C {
+                return Err(format!(
+                    "ERR_ALIAS_FORWARD_UNVERIFIED code mismatch: got {code:#06x}, want 0x011C"
+                ));
+            }
+            Ok(())
+        }
+        Ok(res) => Err(format!(
+            "an unverified self-asserted alias was RESOLVED as authenticated ({:?}) — it MUST NOT be \
+             used to address mail; expected Err(AliasForwardUnverified 0x011C)",
+            res.ik
+        )),
+        other => Err(format!(
+            "expected Err(AliasForwardUnverified 0x011C), not the generic pointer-mismatch bucket, \
+             got {other:?}"
+        )),
+    }
+}
+
+/// DMTAP-ALIAS-02: "a revoked alias (dropped in a newer signed `Identity`, its binding retired) used
+/// off a stale cache to address the identity is refused; the key and the identity's other aliases
+/// are unaffected" (§3.9.4, §3.11.5). Drives the REAL DNS+KT resolver: `v0` lists
+/// `oldbob@example.com`; `v1` (same IK, `prev`->`v0`) drops it, keeping `bob@example.com`. Resolving
+/// the retired alias against the current `v1` walks the signed `prev` chain, PROVES the alias once
+/// existed, and surfaces `ERR_ALIAS_REVOKED` (`0x011D`, REJECT_NOTIFY) — the distinct, softer code,
+/// not the never-claimed `0x011C`. A positive control resolves a still-live alias (`bob@…`) to prove
+/// the key and other aliases are unaffected. Mirrors `resolver.rs`'s own `revoked_alias_is_0x011d`.
+fn alias_revoked_rejected() -> Result<(), String> {
+    let seed = 0x1Du8;
+    let ik = IdentityKey::from_seed(&[seed; 32]);
+    let v0 = Identity::create_classical(
+        &ik,
+        0,
+        vec![],
+        sample_keypkg_ref("alias-02-v0"),
+        ContentId::of(b"recovery-alias-02"),
+        vec!["bob@example.com".to_owned(), "oldbob@example.com".to_owned()],
+        None,
+        1_700_000_000_000,
+    );
+    let v1 = Identity::create_classical(
+        &ik,
+        1,
+        vec![],
+        sample_keypkg_ref("alias-02-v1"),
+        ContentId::of(b"recovery-alias-02"),
+        vec!["bob@example.com".to_owned()],
+        Some(v0.content_id()),
+        1_700_000_000_001,
+    );
+
+    let mut r = InMemoryResolver::new(1_700_000_000_002);
+    for name in ["oldbob@example.com", "bob@example.com"] {
+        let dn = dmtap_naming::resolver::DmtapName::parse(name)
+            .map_err(|e| format!("parse {name}: {e}"))?;
+        r.set_txt(dn.txt_qname(), naming_txt(seed, &v1));
+    }
+    r.publish_identity(v0);
+    r.publish_identity(v1);
+
+    match r.resolve("oldbob@example.com") {
+        Err(e @ ResolveError::AliasRevoked(_)) => {
+            let code = e.code();
+            if code != 0x011D {
+                return Err(format!(
+                    "ERR_ALIAS_REVOKED code mismatch: got {code:#06x}, want 0x011D"
+                ));
+            }
+        }
+        Ok(res) => {
+            return Err(format!(
+                "a revoked alias off a stale cache was RESOLVED ({:?}) — it MUST be refused; \
+                 expected Err(AliasRevoked 0x011D)",
+                res.ik
+            ))
+        }
+        other => {
+            return Err(format!(
+                "expected Err(AliasRevoked 0x011D) (proven by walking the signed prev chain), got \
+                 {other:?}"
+            ))
+        }
+    }
+
+    // The identity's still-listed alias (and thus the key itself) is unaffected: `bob@…` still needs
+    // its KT attestation to resolve, so a KtUnreachable here (no KT log pinned) is the expected
+    // *non-alias* outcome — crucially NOT AliasRevoked, proving the revocation was scoped to `oldbob`.
+    match r.resolve("bob@example.com") {
+        Err(ResolveError::AliasRevoked(_)) | Err(ResolveError::AliasForwardUnverified(_)) => Err(
+            "the identity's STILL-LISTED alias `bob@…` was wrongly treated as revoked/unverified — \
+             revocation must be scoped to the dropped alias only"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// DMTAP-GWALIAS-01: "an encoded gateway alias `localpart.nativedomain@gateway.domain` that does not
+/// reversibly decode to exactly one `(localpart, nativedomain)` (ambiguous escaping) or exceeds RFC
+/// 5321 limits is rejected — the gateway MUST NOT guess a native address" (§7.10.2, §18.3.12). Drives
+/// the REAL SRS-style `envoir_gateway::forwarded_addr` codec. It surfaces the fail-closed refusal the
+/// case's §21 code `ERR_GATEWAY_ALIAS_ENCODING_INVALID` (`0x0606`) names as a typed `None`/
+/// `ForwardedAddrError` (a pure, stateless codec carries no §21 registry code — exactly as
+/// dmtap-core's `cbor::decode` surfaces the §18.1.1 `0x020D` reject family as a `CborError`), so we
+/// assert the refusal itself across each disjunct the case lists: a dangling/ambiguous escape decodes
+/// to nothing (no guess), and an over-64-octet encoding is refused `TooLong`.
+fn gwalias_encoding_invalid_rejected() -> Result<(), String> {
+    // (a) A dangling escape (`-` with no following `-`/`.`) — the gateway MUST NOT guess a native
+    // address; decode fails closed to `None` rather than inventing a split.
+    if let Some(pair) = forwarded_addr::decode("imran-x.mydomain-.com") {
+        return Err(format!(
+            "an ambiguous/dangling-escape local-part was decoded to {pair:?} — the gateway MUST NOT \
+             guess a native address; expected None (fail-closed)"
+        ));
+    }
+    // (b) A bare dot inside the domain component (a second, spurious separator) is not reversible.
+    if let Some(pair) = forwarded_addr::decode("imran.my.domain.com") {
+        return Err(format!(
+            "a non-canonical local-part with an ambiguous split was decoded to {pair:?}; expected \
+             None (only the canonical single-separator form round-trips)"
+        ));
+    }
+    // (c) An encoding whose escaped join would exceed the RFC 5321 §4.5.3.1.1 64-octet local-part
+    // limit is refused `TooLong` — it cannot be a legal `<localpart>@gateway.domain`. Each label
+    // stays within the 63-octet DNS limit (so the domain itself is valid), but the escaped join
+    // `user` + `.` + escape(domain) runs well past 64 octets.
+    let long_domain = format!("{}.{}", "a".repeat(50), "a".repeat(50));
+    match forwarded_addr::encode("user", &long_domain) {
+        Err(ForwardedAddrError::TooLong(_)) => {}
+        other => {
+            return Err(format!(
+                "expected ForwardedAddrError::TooLong for an over-64-octet encoded local-part, got \
+                 {other:?}"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// DMTAP-GWALIAS-03: "the encoded local-part round-trips: `encode(localpart, nativedomain)` (escape
+/// `-`->`--`, `.`->`-.`, join with a top-level `.`) then `decode` yields the original
+/// `(localpart, nativedomain)` — deterministic KAT, e.g. `imran + mydomain.com` ->
+/// `imran.mydomain-.com` -> back" (§7.10.2). Drives the REAL `forwarded_addr::{encode,decode}` on the
+/// case's own worked example and asserts BOTH the exact escaped wire form AND the exact inverse.
+fn gwalias_encode_decode_roundtrips() -> Result<(), String> {
+    let (local, native) = ("imran", "mydomain.com");
+    let encoded = forwarded_addr::encode(local, native)
+        .map_err(|e| format!("encode({local:?},{native:?}) failed: {e}"))?;
+    // The spec's worked example: `imran` stays verbatim, `mydomain.com`'s dot escapes to `-.`, and
+    // the two are joined by the single top-level `.`.
+    if encoded != "imran.mydomain-.com" {
+        return Err(format!(
+            "encoded form mismatch: got {encoded:?}, want \"imran.mydomain-.com\" (the §7.10.2 KAT)"
+        ));
+    }
+    match forwarded_addr::decode(&encoded) {
+        Some((l, d)) if l == local && d == native => Ok(()),
+        other => Err(format!(
+            "round-trip failed: decode({encoded:?}) = {other:?}, want ({local:?}, {native:?})"
+        )),
+    }
+}
+
+/// DMTAP-FILE-06: "a Referenced (> 25 MiB) `ManifestRef` missing durability, or with an unknown class
+/// / cluster-replicated `replicas < 1` / pinned without retention, is rejected fail-closed" (§5.5.2,
+/// §18.3.7). Drives the REAL `ManifestRef::validate_durability` / `Durability::validate` across every
+/// variant the case names, each expecting `ERR_FILE_MANIFEST_INVALID` (`0x080A`, FAIL_CLOSED_BLOCK),
+/// plus a positive control (a well-formed Referenced contract validates).
+fn file_manifest_durability_invalid_rejected() -> Result<(), String> {
+    // A Referenced-tier size (> 25 MiB) so durability is REQUIRED.
+    let referenced_size: u64 = 64 * 1024 * 1024;
+    let mref = |durability: Option<Durability>| ManifestRef {
+        id: ContentId::of(b"file-06-referenced"),
+        size: referenced_size,
+        chunks: 4096,
+        durability,
+    };
+    let expect_invalid = |label: &str, d: Option<Durability>| -> Result<(), String> {
+        match mref(d).validate_durability() {
+            Err(MoteError::FileManifestInvalid) => Ok(()),
+            other => Err(format!(
+                "{label}: expected Err(FileManifestInvalid 0x080A) fail-closed, got {other:?}"
+            )),
+        }
+    };
+
+    // Variant 1: a Referenced file with NO durability contract at all.
+    expect_invalid("missing durability", None)?;
+    // Variant 2: class=99 (unknown) — preserved through decode, fails closed at validate.
+    expect_invalid(
+        "unknown class",
+        Some(Durability {
+            class: DurabilityClass::Unknown(99),
+            retention: None,
+            replicas: None,
+            holder_hint: None,
+        }),
+    )?;
+    // Variant 3: class=2 (ClusterReplicated) with replicas=0 (< 1).
+    expect_invalid(
+        "cluster-replicated replicas=0",
+        Some(Durability {
+            class: DurabilityClass::ClusterReplicated,
+            retention: None,
+            replicas: Some(0),
+            holder_hint: None,
+        }),
+    )?;
+    // Variant 4: class=3 (Pinned) with no retention term.
+    expect_invalid(
+        "pinned without retention",
+        Some(Durability {
+            class: DurabilityClass::Pinned,
+            retention: None,
+            replicas: None,
+            holder_hint: None,
+        }),
+    )?;
+
+    // Positive control: a well-formed cluster-replicated contract on the same Referenced file
+    // validates — proving the refusals above are about the invalid contracts, not the tier itself.
+    match mref(Some(Durability::cluster_replicated(3))).validate_durability() {
+        Ok(()) => {}
+        other => {
+            return Err(format!(
+                "sanity: a well-formed Referenced durability contract must validate, got {other:?}"
+            ))
+        }
+    }
+    // And a code-registry cross-check on the reject.
+    let code = MoteError::FileManifestInvalid.code();
+    if code != Some(0x080A) {
+        return Err(format!("FileManifestInvalid code mismatch: got {code:?}, want Some(0x080A)"));
+    }
+    Ok(())
+}
+
+/// DMTAP-FILE-07: "a pushed Inline/Attached file exceeding the recipient's inbound spool cap for that
+/// sender is refused fail-closed (spool-fill storage DoS), never silently accepted or dropped"
+/// (§5.5.5, §16.4). Drives the REAL `spool_admit` (pure form): an Attached push whose size takes the
+/// per-sender running total over the cap is `ERR_SPOOL_OVERFLOW` (`0x080C`, DENY_POLICY). A positive
+/// control (a push that fits) confirms it is the over-cap size that is refused, not all pushes.
+fn file_spool_overflow_rejected() -> Result<(), String> {
+    let cap: u64 = 10 * 1024 * 1024; // 10 MiB per-sender inbound cap
+    let already_used: u64 = 9 * 1024 * 1024; // 9 MiB already spooled from this sender
+    let attached_push: u64 = 5 * 1024 * 1024; // a 5 MiB Attached push would total 14 MiB > 10 MiB cap
+
+    match spool_admit(already_used, attached_push, cap) {
+        Err(MoteError::SpoolOverflow) => {}
+        other => {
+            return Err(format!(
+                "an over-cap Attached push was not refused fail-closed: expected \
+                 Err(SpoolOverflow 0x080C), got {other:?}"
+            ))
+        }
+    }
+    // Positive control: a push that still fits under the cap is admitted (not silently dropped).
+    match spool_admit(already_used, 512 * 1024, cap) {
+        Ok(()) => {}
+        other => return Err(format!("sanity: an in-cap push must be admitted, got {other:?}")),
+    }
+    let code = MoteError::SpoolOverflow.code();
+    if code != Some(0x080C) {
+        return Err(format!("SpoolOverflow code mismatch: got {code:?}, want Some(0x080C)"));
+    }
+    Ok(())
+}
+
+/// DMTAP-FILE-08: "a pinned(term) (class=3) fetch past its elapsed retention is rejected (the host
+/// MAY have GC'd)" (§5.5.4, §5.5.2). Drives the REAL `Durability::check_retention`: a `Pinned`
+/// contract with a retention term in the past, fetched at `now >= term`, is
+/// `ERR_FILE_RETENTION_EXPIRED` (`0x080B`). Positive controls: the same contract fetched BEFORE
+/// expiry, and a non-`Pinned` class, never expire — so the refusal is specifically the elapsed term.
+fn file_retention_expired_rejected() -> Result<(), String> {
+    let term: u64 = 1_700_000_000; // retention term (Unix seconds)
+    let pinned = Durability::pinned(term);
+
+    // Fetch AT/PAST the term ⇒ expired.
+    match pinned.check_retention(term) {
+        Err(MoteError::FileRetentionExpired) => {}
+        other => {
+            return Err(format!(
+                "a fetch at the elapsed retention term was not rejected: expected \
+                 Err(FileRetentionExpired 0x080B), got {other:?}"
+            ))
+        }
+    }
+    match pinned.check_retention(term + 86_400) {
+        Err(MoteError::FileRetentionExpired) => {}
+        other => return Err(format!("a fetch past expiry must reject, got {other:?}")),
+    }
+    // Positive control 1: fetch BEFORE the term is still durable.
+    if let Err(e) = pinned.check_retention(term - 1) {
+        return Err(format!("sanity: a fetch before expiry must succeed, got Err({e:?})"));
+    }
+    // Positive control 2: a non-Pinned class never expires on this check.
+    if let Err(e) = Durability::recipient_pinned().check_retention(term + 999_999) {
+        return Err(format!("sanity: a non-Pinned class must not expire, got Err({e:?})"));
+    }
+    let code = MoteError::FileRetentionExpired.code();
+    if code != Some(0x080B) {
+        return Err(format!("FileRetentionExpired code mismatch: got {code:?}, want Some(0x080B)"));
+    }
+    Ok(())
+}
+
+/// DMTAP-FILE-09: "a Referenced origin-hold file with no reachable holder and no satisfiable
+/// durability contract fails at the file level, distinct from a single missing chunk (0x0803)"
+/// (§5.5.2, §5.5.3, §6.6). Drives the REAL `check_file_available`: with no holder reachable it is
+/// `ERR_FILE_UNAVAILABLE` (`0x0809`) — the disclosed origin-hold residual realized. A positive
+/// control (a reachable holder) confirms availability, so the refusal is specifically unreachability.
+fn file_unavailable_rejected() -> Result<(), String> {
+    // Origin and all swarm holders unreachable ⇒ whole-file unavailable (not a per-chunk 0x0803).
+    match check_file_available(false) {
+        Err(MoteError::FileUnavailable) => {}
+        other => {
+            return Err(format!(
+                "an origin-hold file with no reachable holder was not failed at the file level: \
+                 expected Err(FileUnavailable 0x0809), got {other:?}"
+            ))
+        }
+    }
+    // Positive control: a reachable holder means the file is available.
+    if let Err(e) = check_file_available(true) {
+        return Err(format!("sanity: a reachable holder must yield availability, got Err({e:?})"));
+    }
+    let code = MoteError::FileUnavailable.code();
+    if code != Some(0x0809) {
+        return Err(format!("FileUnavailable code mismatch: got {code:?}, want Some(0x0809)"));
+    }
+    Ok(())
+}
+
+// ── §5.6 device-cluster sync (dmtap-clustersync) ─────────────────────────────────────────────
+
+/// A signed `Identity` carrying `n` device certs all chaining to one `IK`, plus that `IK` and the
+/// device public keys — the cluster-membership fixture the SYNC cases authenticate against. Mirrors
+/// dmtap-clustersync's own `cluster.rs` test helper, using only the public API.
+fn sync_cluster_identity(n: usize) -> (Identity, Vec<Vec<u8>>) {
+    let ik = IdentityKey::from_seed(&[0x5C; 32]);
+    let mut certs = Vec::new();
+    let mut device_keys = Vec::new();
+    for i in 0..n {
+        let dk = IdentityKey::from_seed(&[0xD0 + i as u8; 32]);
+        let cert = DeviceCert::issue(&ik, dk.public(), format!("device-{i}"), 1_000, None, vec![]);
+        device_keys.push(dk.public());
+        certs.push(cert);
+    }
+    let id = Identity::create_classical(
+        &ik,
+        0,
+        certs,
+        sample_keypkg_ref("sync-cluster"),
+        ContentId::of(b"recovery-sync"),
+        vec!["alice@example.com".to_owned()],
+        None,
+        1_000,
+    );
+    (id, device_keys)
+}
+
+fn sync_hlc(wall: u64, counter: u32, device: u8) -> Hlc {
+    Hlc { wall, counter, device: vec![device] }
+}
+
+/// DMTAP-SYNC-01: "a `ClusterSyncFrame`/`ClusterOp` from a device whose `DeviceCert` is absent/invalid
+/// or revoked under the owner's IK is refused — replication is mutually authenticated" (§5.6.1,
+/// §18.6.3). Drives the REAL `Cluster::authorize_frame`: a frame whose origin device is NOT a
+/// certified member of the identity's cluster is `ERR_CLUSTER_DEVICE_UNAUTHORIZED` (`0x0410`,
+/// FAIL_CLOSED_BLOCK). A positive control (a genuine member) authorizes, proving the refusal is about
+/// membership. Mirrors `cluster.rs`'s own `frame_from_non_member_is_refused_0x0410`.
+fn sync_device_unauthorized_rejected() -> Result<(), String> {
+    let (identity, member_keys) = sync_cluster_identity(2);
+    let cluster = Cluster::from_identity(&identity)
+        .map_err(|e| format!("cluster from a verified identity must build, got {e}"))?;
+
+    // A device never certified by this identity (a stranger, or a revoked device an honest Identity
+    // no longer lists).
+    let stranger = IdentityKey::from_seed(&[0xEE; 32]).public();
+    if cluster.is_member(&stranger) {
+        return Err("test setup: the stranger device must not be a member".into());
+    }
+    let frame = ClusterSyncFrame::announce(stranger, vec![vec![0x1e; 33]]);
+    match cluster.authorize_frame(&frame) {
+        Err(e @ SyncError::DeviceUnauthorized) => {
+            if e.code() != 0x0410 {
+                return Err(format!(
+                    "ERR_CLUSTER_DEVICE_UNAUTHORIZED code mismatch: got {:#06x}, want 0x0410",
+                    e.code()
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "a frame from a non-member device was not refused: expected \
+                 Err(DeviceUnauthorized 0x0410), got {other:?}"
+            ))
+        }
+    }
+    // Positive control: a genuine member is authorized.
+    let member_frame = ClusterSyncFrame::announce(member_keys[0].clone(), vec![vec![0x1e; 33]]);
+    if let Err(e) = cluster.authorize_frame(&member_frame) {
+        return Err(format!("sanity: a certified member must be authorized, got Err({e:?})"));
+    }
+    Ok(())
+}
+
+/// DMTAP-SYNC-02: "a recon summary whose `RangeFingerprint.fp` does not recompute over the receiver's
+/// ids in `[lo, hi)` (forged Merkle fingerprint) is rejected and reconciliation re-driven" (§5.6.3(a),
+/// §18.6.3). Drives the REAL `verify_range`: a `RangeFingerprint` whose `fp` is a forged hash that
+/// does not equal the fingerprint of the receiver's ids in the range is
+/// `ERR_CLUSTER_RECON_SUMMARY_INVALID` (`0x0411`). A positive control with the honestly-recomputed
+/// fingerprint verifies. Mirrors `recon.rs`'s own `forged_fingerprint_is_rejected_fail_closed`.
+fn sync_recon_summary_invalid_rejected() -> Result<(), String> {
+    // The receiver's ids in a full-space range (32-byte content addresses).
+    let own_sorted: Vec<Vec<u8>> = vec![vec![0x11; 32], vec![0x22; 32], vec![0x33; 32]];
+    let lo = vec![0u8; 16];
+    let hi = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128.to_be_bytes().to_vec();
+
+    let forged = RangeFingerprint {
+        lo: lo.clone(),
+        hi: hi.clone(),
+        count: own_sorted.len() as u64,
+        fp: vec![0xAB; 33], // a fabricated fingerprint that cannot equal the real range hash
+    };
+    match verify_range(&forged, &own_sorted) {
+        Err(e @ SyncError::ReconSummaryInvalid) => {
+            if e.code() != 0x0411 {
+                return Err(format!(
+                    "ERR_CLUSTER_RECON_SUMMARY_INVALID code mismatch: got {:#06x}, want 0x0411",
+                    e.code()
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "a forged range fingerprint was not rejected: expected \
+                 Err(ReconSummaryInvalid 0x0411), got {other:?}"
+            ))
+        }
+    }
+    // Positive control: the honestly-recomputed fingerprint over the same ids self-verifies.
+    let honest = RangeFingerprint {
+        lo,
+        hi,
+        count: own_sorted.len() as u64,
+        fp: dmtap_clustersync::range_fingerprint(&own_sorted),
+    };
+    if let Err(e) = verify_range(&honest, &own_sorted) {
+        return Err(format!("sanity: an honest range fingerprint must verify, got Err({e:?})"));
+    }
+    Ok(())
+}
+
+/// DMTAP-SYNC-03: "a journal-replay segment whose `prev` hash-chain does not verify (a fork/rewrite of
+/// the owner's own log) is halted on, analogous to a committer fork" (§5.6.3(b), §18.6.3). Drives the
+/// REAL `verify_segment`: a segment whose first entry's `prev` does not equal the expected prior hash
+/// (a rewritten back-link) is `ERR_CLUSTER_JOURNAL_CHAIN_BROKEN` (`0x0412`, HALT_ALERT). A positive
+/// control (a well-linked segment) verifies. Mirrors `journal.rs`'s own
+/// `broken_prev_link_is_rejected_fail_closed`.
+fn sync_journal_chain_broken_rejected() -> Result<(), String> {
+    let genesis = dmtap_clustersync::genesis_prev();
+    // A well-linked two-entry segment from genesis (the honest chain).
+    let e0 = JournalEntry { seq: 0, prev: genesis.clone(), reference: vec![0x1e; 33] };
+    let e1 = JournalEntry { seq: 1, prev: e0.entry_hash(), reference: vec![0x1e; 33] };
+
+    // Forge a fork: e1's `prev` is rewritten to something other than the hash of e0.
+    let forked_e1 = JournalEntry { seq: 1, prev: vec![0xFF; 33], reference: e1.reference.clone() };
+    match verify_segment(&[e0.clone(), forked_e1], &genesis, Some(0)) {
+        Err(e @ SyncError::JournalChainBroken) => {
+            if e.code() != 0x0412 {
+                return Err(format!(
+                    "ERR_CLUSTER_JOURNAL_CHAIN_BROKEN code mismatch: got {:#06x}, want 0x0412",
+                    e.code()
+                ));
+            }
+            // The §21 disposition for an own-log fork is HALT_ALERT (not the FailClosedBlock of the
+            // other three device-cluster codes).
+            if e.action() != Some(dmtap_clustersync::Action::HaltAlert) {
+                return Err(format!(
+                    "journal-chain-broken disposition mismatch: got {:?}, want Some(HaltAlert)",
+                    e.action()
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "a forked journal back-link was not halted on: expected \
+                 Err(JournalChainBroken 0x0412), got {other:?}"
+            ))
+        }
+    }
+    // Positive control: the honest segment verifies.
+    if let Err(e) = verify_segment(&[e0, e1], &genesis, Some(0)) {
+        return Err(format!("sanity: a well-linked journal segment must verify, got Err({e:?})"));
+    }
+    Ok(())
+}
+
+/// DMTAP-SYNC-04: "a `ClusterOp` with an unknown kind, an OR-Set remove citing an unknown add-tag, an
+/// HLC wall beyond the skew bound, or embedding a `DeniablePayload`/its plaintext is rejected"
+/// (§5.6.4, §16.10, §18.6.3). Drives the REAL `validate_op` on the OR-Set unknown-add-tag rule: a
+/// remove citing an add-tag whose HLC POST-DATES the remove's own HLC is causally impossible (you
+/// cannot have observed an add from the future), so it is `ERR_CLUSTER_CRDT_OP_INVALID` (`0x0413`,
+/// FAIL_CLOSED_BLOCK). Also covers the sibling disjuncts (unknown kind, out-of-skew HLC) and a
+/// positive control. Mirrors `crdt.rs`'s own `validate_rejects_remove_observing_a_future_add_tag`.
+fn sync_crdt_op_invalid_rejected() -> Result<(), String> {
+    let now_ms: u64 = 10_000_000;
+
+    let expect_invalid = |label: &str, op: &ClusterOp| -> Result<(), String> {
+        match validate_op(op, now_ms) {
+            Err(e @ SyncError::CrdtOpInvalid) => {
+                if e.code() != 0x0413 {
+                    return Err(format!(
+                        "{label}: ERR_CLUSTER_CRDT_OP_INVALID code mismatch: got {:#06x}, want 0x0413",
+                        e.code()
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(format!("{label}: expected Err(CrdtOpInvalid 0x0413), got {other:?}")),
+        }
+    };
+
+    // Primary: an OR-Set remove citing an add-tag from the FUTURE (unknown/forged add-tag) — the
+    // §5.6.4 unknown-add-tag rule.
+    let future_tag = AddTag { device: vec![0xA], hlc: sync_hlc(500, 0, 0xA) };
+    let remove_citing_future = ClusterOp {
+        kind: OP_SET_REMOVE,
+        target: "m".into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(100, 0, 0xA), // the remove's own HLC predates the cited add-tag
+        observed: Some(vec![future_tag]),
+    };
+    expect_invalid("remove citing a future/unknown add-tag", &remove_citing_future)?;
+
+    // Sibling disjunct: an unknown op kind.
+    let unknown_kind = ClusterOp {
+        kind: 99,
+        target: "m".into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(100, 0, 0xA),
+        observed: None,
+    };
+    expect_invalid("unknown kind", &unknown_kind)?;
+
+    // Sibling disjunct: an HLC wall beyond the skew bound ahead of the receiver.
+    let far_future = ClusterOp {
+        kind: OP_SET_ADD,
+        target: "m".into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(now_ms + HLC_SKEW_MS + 1, 0, 0xA),
+        observed: None,
+    };
+    expect_invalid("out-of-skew HLC", &far_future)?;
+
+    // Positive control: an honest add well within skew validates.
+    let honest_add = ClusterOp {
+        kind: OP_SET_ADD,
+        target: "m".into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(100, 0, 0xA),
+        observed: None,
+    };
+    if let Err(e) = validate_op(&honest_add, now_ms) {
+        return Err(format!("sanity: an honest add op must validate, got Err({e:?})"));
+    }
+    Ok(())
+}
+
+/// DMTAP-SYNC-05: "convergence (strong eventual consistency): two replicas applying concurrent OR-Set
+/// add/remove + per-field LWW ops in ANY order reach the identical state — add-wins-over-unseen-remove;
+/// greater HLC `(wall, counter, device)` wins each field deterministically" (§5.6.4). Drives the REAL
+/// `ClusterState::ingest` (validate-then-apply) over one concurrent op history applied in TWO
+/// different orders, asserting the two `snapshot()`s are byte-identical AND that the semantics hold
+/// (the add-wins element is present; the greater-HLC LWW value won). Mirrors dmtap-clustersync's own
+/// `two_replicas_converge_under_any_order`.
+fn sync_crdt_two_order_convergence() -> Result<(), String> {
+    let add = |target: &str, w: u64, d: u8| ClusterOp {
+        kind: OP_SET_ADD,
+        target: target.into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(w, 0, d),
+        observed: None,
+    };
+    let remove = |target: &str, w: u64, d: u8, observed: Vec<AddTag>| ClusterOp {
+        kind: OP_SET_REMOVE,
+        target: target.into(),
+        field: None,
+        value: None,
+        hlc: sync_hlc(w, 0, d),
+        observed: Some(observed),
+    };
+    let lww = |target: &str, field: &str, w: u64, d: u8, v: Cv| ClusterOp {
+        kind: OP_LWW_SET,
+        target: target.into(),
+        field: Some(field.into()),
+        value: Some(v),
+        hlc: sync_hlc(w, 0, d),
+        observed: None,
+    };
+
+    // A realistic concurrent history: device A adds `m`@(10,A); device B concurrently adds the SAME
+    // element under a DIFFERENT tag @(11,B); A removes citing ONLY its own tag (unseen B-add must
+    // win); both write the `folder` field, the greater HLC (20,B) beating (10,A).
+    let a_tag = AddTag { device: vec![0xA], hlc: sync_hlc(10, 0, 0xA) };
+    let history = vec![
+        add("m", 10, 0xA),
+        add("m", 11, 0xB),
+        remove("m", 12, 0xA, vec![a_tag]),
+        lww("m", "folder", 10, 0xA, Cv::Text("inbox".into())),
+        lww("m", "folder", 20, 0xB, Cv::Text("archive".into())),
+    ];
+    let reversed: Vec<ClusterOp> = history.iter().rev().cloned().collect();
+
+    let apply_all = |ops: &[ClusterOp]| -> Result<ClusterState, String> {
+        let mut s = ClusterState::new();
+        for op in ops {
+            s.ingest(op, 10_000_000).map_err(|e| format!("op must validate before apply: {e}"))?;
+        }
+        Ok(s)
+    };
+    let s1 = apply_all(&history)?;
+    let s2 = apply_all(&reversed)?;
+
+    // Strong eventual consistency: the two apply orders produce byte-identical state.
+    if s1.snapshot() != s2.snapshot() {
+        return Err(
+            "two replicas applying the same concurrent ops in different orders did NOT converge — \
+             snapshots differ (strong-eventual-consistency violation)"
+                .into(),
+        );
+    }
+    // And the semantics the case names: add-wins (element present despite the remove) and the
+    // greater-HLC LWW value won.
+    if !s1.set.contains("m") {
+        return Err("convergence: the concurrent unseen add must win over the remove (add-wins), but \
+                    the element is absent"
+            .into());
+    }
+    match s1.lww.get("m", "folder") {
+        Some(v) if *v == Cv::Text("archive".into()) => Ok(()),
+        other => Err(format!(
+            "convergence: the greater-HLC (20,B) LWW value must win the `folder` field, got {other:?}"
+        )),
+    }
+}
+
 /// DMTAP-KTV1-02: "a name -> ik binding not attested by a > n/2 quorum of the pinned log set fails
 /// closed -> OOB". Pin three logs but make only one reachable (the other two model
 /// partitioned/censored logs, each `prove`-ing `None`) — a strict sub-quorum (1 of 3) — and assert
@@ -2199,6 +2918,9 @@ pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
         "DMTAP-KTV1-02", "DMTAP-KTV1-03", "DMTAP-AUTH-01", "DMTAP-AUTH-02", "DMTAP-AUTH-03",
         "DMTAP-AUTH-04", "DMTAP-AUTH-05", "DMTAP-DENIABLE-03", "DMTAP-GRP-01", "DMTAP-GRP-03",
         "DMTAP-LEG-01", "DMTAP-LEG-02", "DMTAP-LEG-03", "DMTAP-RESOLVE-01", "DMTAP-RESOLVE-02",
+        "DMTAP-RESOLVE-03", "DMTAP-ALIAS-01", "DMTAP-ALIAS-02", "DMTAP-GWALIAS-01",
+        "DMTAP-GWALIAS-03", "DMTAP-FILE-06", "DMTAP-FILE-07", "DMTAP-FILE-08", "DMTAP-FILE-09",
+        "DMTAP-SYNC-01", "DMTAP-SYNC-02", "DMTAP-SYNC-03", "DMTAP-SYNC-04", "DMTAP-SYNC-05",
     ]
     .into_iter()
     .map(|id| (id, ()))

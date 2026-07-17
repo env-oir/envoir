@@ -99,9 +99,11 @@ fn suite_json_cross_reference_matches_known_state() {
     );
 
     // Sanity: the catalog has grown past its original shape (124 cases as of writing, up from 104;
-    // see SUITE.md/README) and this crate now executes the large majority of them — 97/124 (up from
-    // 92/104), with only 27 honestly left `Skipped` for behavior no crate in this workspace can
-    // exercise yet (see the `skip_reason` table in `construction.rs`). Rather than pin an exact
+    // see SUITE.md/README) and this crate now executes the large majority of them — 111/124 (up from
+    // 97/124 after the durability / device-cluster-sync / cross-resolver / alias-code / legacy-
+    // gateway-alias reference surfaces landed and were wired here), with only 13 honestly left
+    // `Skipped` for behavior no crate in this workspace can exercise yet (see the `skip_reason`
+    // table in `construction.rs`). Rather than pin an exact
     // total (which would break on every new spec case), just sanity-check the three buckets sum
     // correctly and that both "some cases pass" and "some cases are honestly skipped" hold.
     assert_eq!(pass + skip + fails.len(), outcomes.len());
@@ -190,11 +192,12 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
         "construction-todo cases FAILED their construction (not just skipped): {failed:?}"
     );
     assert!(
-        executed.len() >= 58,
-        "expected at least 58 construction-todo cases to be actually executed (40 against \
-         dmtap-core directly, plus 18 more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/ \
-         envoir-gateway — see the Cargo.toml comment), got {} ({executed:?}) — did \
-         construction::run_construction_case regress?",
+        executed.len() >= 72,
+        "expected at least 72 construction-todo cases to be actually executed (against dmtap-core \
+         directly, plus more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/dmtap-clustersync/ \
+         envoir-gateway — see the Cargo.toml comment; this floor rose from 58 when the durability, \
+         device-cluster-sync, cross-resolver, alias-code and legacy-gateway-alias cases were wired), \
+         got {} ({executed:?}) — did construction::run_construction_case regress?",
         executed.len()
     );
 }

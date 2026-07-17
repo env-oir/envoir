@@ -411,6 +411,7 @@ version = "0.0.1"
 dependencies = [
  "ciborium",
  "dmtap-auth",
+ "dmtap-clustersync",
  "dmtap-core",
  "dmtap-deniable",
  "dmtap-mls",

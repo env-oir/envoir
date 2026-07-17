@@ -18,6 +18,10 @@ dmtap-auth = { path = "../dmtap-auth" }
 dmtap-naming = { path = "../dmtap-naming" }
 dmtap-deniable = { path = "../dmtap-deniable" }
 dmtap-mls = { path = "../dmtap-mls" }
+# The §5.6 device-cluster sync reference (ClusterSyncFrame/ClusterOp validation + the OR-Set/LWW
+# CRDT merge) — drives the DMTAP-SYNC-01..05 construction-todo cases. A regular (not dev-only)
+# dependency because `construction.rs` is a module of this crate's LIBRARY, not a test file.
+dmtap-clustersync = { path = "../dmtap-clustersync" }
 envoir-gateway = { path = "../../gateway" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
