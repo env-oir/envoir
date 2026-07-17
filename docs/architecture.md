@@ -108,8 +108,12 @@ stratified path (entry → middle → exit), mixed with Poisson delays and cover
 
 A human address (`you@envoir.org`) is a discovery pointer, never proof — the key is always the
 identity and the sole root of trust. Resolution: DNS TXT/SVCB record → key-transparency check →
-pin on first use (TOFU) → route by key over the mesh from then on. See
-[features/identity.md](features/identity.md) and
+pin on first use (TOFU) → route by key over the mesh from then on. `name@domain` is the default,
+but naming itself is **pluggable**: a zero-authority key-name and a local petname need no network
+at all, and an OPTIONAL `name-chain` resolver (ENS `.eth` / SNS `.sol`, off by default) adds a
+third, guarded alternative below the same fixed point — every rung still resolves to, and is
+pinned as, a key. See [naming.md](naming.md) for the full ladder,
+[features/identity.md](features/identity.md), and
 [protocol.md](protocol.md#naming--key-transparency).
 
 ## Message flow

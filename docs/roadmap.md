@@ -40,8 +40,16 @@ the spec's own roadmap markers, it doesn't belong here.
   are left as operator-supplied seams — until wired to real infrastructure, inbound refuses (`550`)
   and outbound never durably acks (`451`), which are the safe defaults for an unconfigured gateway.
 - **Cryptographic primitives** (`crates/dmtap-core`) — real Ed25519 signing, BLAKE3 content
-  addressing, deterministic canonical CBOR, the 8-word key-name checksum, and safety-number
-  derivation, all backed by byte-exact known-answer vectors.
+  addressing, deterministic canonical CBOR (now enforcing shortest-form integers, no
+  indefinite-length items, and strictly-ascending map keys at decode time — see
+  [security.md](security.md#fuzzing)), the key-name checksum, delegated/attenuable capability
+  tokens, and safety-number derivation, all backed by byte-exact known-answer vectors.
+- **The pluggable naming/resolver framework** (`crates/dmtap-naming`) — real DNS `_dmtap`
+  TXT/SVCB parsing, RFC 6962 key-transparency verification (inclusion proofs, STH signatures,
+  v1 multi-log quorum, split-view/equivocation detection, freshness), form-based resolver-type
+  dispatch (`self`/`petname`/`dns`/`name-chain`), and the OPTIONAL `name-chain` (ENS/SNS)
+  resolver's bidirectional key↔name binding enforcement — all real, tested code behind a network
+  I/O seam. See [naming.md](naming.md).
 - **The deniable 1:1 mode** (`crates/dmtap-deniable`) and **MLS groups** (`crates/dmtap-mls`) —
   implemented with dedicated crates; see [security.md](security.md#formal-proverif-models) for
   the formal proofs covering the deniable handshake specifically.
@@ -76,14 +84,15 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v1 key-transparency hardening** (federated multi-log gossip, quorum-audited bindings,
   equivocation halt) — v0's single-log, TOFU+pinning model is what's implemented; see
   [privacy.md](privacy.md#what-this-project-does-not-claim).
-- **36 of 104 conformance cases** carry an exact construction recipe and expected error code but
-  aren't yet executed (mostly mixnet, MLS/group, gateway, and auth subsystems not yet reduced to a
-  fixed-input known-answer test in `dmtap-core`) — every skip ships with its own documented reason,
-  and the runner reports 0 failures across the 68 cases that do execute. See
-  [security.md](security.md#conformance-suite).
-- **Canonical-CBOR enforcement at decode time** — the low-level decoder doesn't yet reject
-  non-shortest-form integers or out-of-order map keys, a real and tracked gap surfaced by fuzzing
-  (see [security.md](security.md#fuzzing)).
+- **29 of 121 conformance cases** carry an exact construction recipe and expected error code but
+  aren't yet executed (mostly mixnet, MLS/group, gateway, auth, and device-sync subsystems not yet
+  reduced to a fixed-input known-answer test in `dmtap-core`/`dmtap-naming`) — every skip ships
+  with its own documented reason, and the runner reports 0 failures across the 92 cases that do
+  execute. See [security.md](security.md#conformance-suite).
+- **Envoir Send** — a Resend-style programmatic mail-sending API built on the delegated
+  capability-token primitive (`crates/dmtap-core/src/capability.rs`, real and tested today) is the
+  natural next application, but the dedicated send-service crate is not yet part of this
+  workspace. See [protocol.md](protocol.md#delegated-capabilities-and-envoir-send).
 - **Real TLS, JMAP push transport, and DEFLATE compression** in the mail-protocol layer —
   explicitly out of scope for the std-only protocol core, deferred to the node binary's transport
   layer.
@@ -93,8 +102,9 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v0** — Core + Private (minimal, TOFU-pinned key transparency) + Groups & Files + the legacy
   gateway. This is the version this repository targets.
 - **v1 hardening** — federated, gossiped key transparency with equivocation detection;
-  onion-routed bulk file transfer; anonymous tokens at scale; the post-quantum suite migration; an
-  optional self-sovereign naming backend.
+  onion-routed bulk file transfer; anonymous tokens at scale; the post-quantum suite migration. (The
+  optional `name-chain` resolver — ENS/SNS, off by default — is already implemented; see
+  [naming.md](naming.md).)
 - **Later research** — stronger private contact discovery, scalable private retrieval for
   hostile-buffer scenarios, deniable-group properties, and metadata privacy for very large files.
 

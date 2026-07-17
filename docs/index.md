@@ -16,12 +16,14 @@ protocol end to end, not a production mail service. See [Security](security.md) 
 has (and hasn't) been verified, and read the honesty notes throughout — this project deliberately
 avoids overclaiming.
 
-**No cryptocurrency, no blockchain, anywhere in this project.** The one place DMTAP admits
-anything chain-like at all is an optional, off-by-default self-sovereign naming backend (see
-[protocol.md](protocol.md#naming--key-transparency)) — nothing else depends on it. Anti-abuse for
-cold contact instead uses anonymous Privacy-Pass-style rate-limit tokens, proof-of-work, and an
-optional real-money postage stamp — never a coin. See
-[FAQ](faq.md).
+**No cryptocurrency, no blockchain, anywhere in this project.** Naming is pluggable — a key-name,
+a local petname, and the default `name@domain` (DNS + key transparency) are the core ladder — and
+the *only* place DMTAP admits anything chain-like at all is an OPTIONAL, off-by-default
+`name-chain` resolver (ENS `.eth` / SNS `.sol`) bound by four guardrails: optional, key-is-identity
+(a bidirectional binding, never a trust root), free to resolve, and no DMTAP token of its own. See
+[naming.md](naming.md) for the full ladder. Anti-abuse for cold contact instead uses anonymous
+Privacy-Pass-style rate-limit tokens, proof-of-work, and an optional real-money postage stamp —
+never a coin. See [FAQ](faq.md).
 
 ## What you get
 
@@ -47,6 +49,7 @@ JMAP, with CalDAV/CardDAV compatibility) — see [protocol.md](protocol.md#messa
 - [Architecture](architecture.md) — client ↔ node ↔ mesh/mixnet ↔ gateway, and where an operator's billing seam sits.
 - [Privacy & threat model](privacy.md) — the honest guarantee, stated as a falsifiable claim with its residual.
 - [Protocol](protocol.md) — DMTAP itself: MOTE, naming, MLS, mixnet, DMTAP-Auth, the gateway.
+- [Naming](naming.md) — the naming ladder (key-name, petname, `name@domain`, optional name-chains), the pluggable resolver framework, and operation without DNS.
 - [Security](security.md) — 6 formal ProVerif models, fuzzing, conformance suite, downgrade tests, the audit gate.
 - [PWA & push](pwa-and-push.md) — installable/offline app shell, content-free Web Push, the honest iOS/APNs residual.
 - Features: [Mail](features/mail.md) · [Chat](features/chat.md) · [Calendar](features/calendar.md) · [Contacts](features/contacts.md) · [Files](features/files.md) · [Identity](features/identity.md) · [Transport provenance](features/transport-traceability.md) · [Self-hosting](features/self-hosting.md)

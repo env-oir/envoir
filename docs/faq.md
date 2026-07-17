@@ -6,11 +6,16 @@ protocol, not a production mail service. See [security.md](security.md#the-audit
 audit gate that has to happen first.
 
 **Is there a token or cryptocurrency?**
-No. There is no cryptocurrency and no blockchain anywhere in this project. The *only* place DMTAP
-admits anything chain-like is an optional, off-by-default self-sovereign naming backend for
-un-loseable addresses — nothing else depends on it, and most deployments will just use ordinary
-DNS. Anti-abuse for cold contact (stopping spam without a central filter, without deanonymizing
-the sender) uses three separate things, none of which are a coin: anonymous **Privacy-Pass-style
+No. There is no cryptocurrency and no blockchain anywhere in this project. Naming is **pluggable**
+(see [naming.md](naming.md)): the core ladder is a derived key-name, a local petname, and the
+default `name@domain` (DNS + key transparency) — none of which touch a chain at all. The *only*
+place DMTAP admits anything chain-like is an OPTIONAL, off-by-default `name-chain` resolver
+(ENS `.eth` / SNS `.sol`) for a bare, human-chosen username, bound by four guardrails: it's
+optional, the key is still the identity (a bidirectional binding, never a trust root), resolving
+is free (only the registrant ever pays, once, to claim a name), and DMTAP defines no token of its
+own — ENS/SNS are used exactly as they exist today. Most deployments will just use ordinary DNS.
+Anti-abuse for cold contact (stopping spam without a central filter, without deanonymizing the
+sender) uses three separate things, none of which are a coin: anonymous **Privacy-Pass-style
 rate-limit tokens** (ARC), a memory-hard **proof-of-work** fallback, and an optional **real-money
 postage** stamp (a signed, prepaid credit voucher, not a cryptocurrency) that can also fund
 gateway operators. See spec §9 and [protocol.md](protocol.md#anti-abuse-honestly).
@@ -47,8 +52,9 @@ quantified version of this answer; don't trust a shorter one, including this one
 **Is this audited?**
 Not yet. Six machine-checked ProVerif models cover the deniable-1:1 handshake, DMTAP-Auth
 sign-in, MLS group keys, key-transparency append-only logs, and mixnet unlinkability; every wire
-decoder is fuzzed; a 104-case conformance suite exists (68 executing and passing today); and
-`cargo test --workspace` runs 585 passing tests — but none of that substitutes for the independent
+decoder is fuzzed; a 121-case conformance suite exists (drawn against the spec's own catalog of
+132 registered error codes), with 92 cases executing and passing today; and
+`cargo test --workspace` runs 761 passing tests — but none of that substitutes for the independent
 external audit the project treats as a hard gate before any production deployment. See
 [security.md](security.md).
 

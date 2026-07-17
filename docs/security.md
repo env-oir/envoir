@@ -3,7 +3,7 @@
 This page collects everything in the repository that lets you check Envoir's security claims
 yourself, rather than take them on faith: machine-checked formal proofs, fuzzing of every wire
 decoder, a byte-exact conformance suite, and a dedicated downgrade/fail-closed regression suite —
-backed by `cargo test --workspace`, which currently runs **585 passing tests** (0 failing) across
+backed by `cargo test --workspace`, which currently runs **761 passing tests** (0 failing) across
 every crate, the node, and the gateway. It closes with the honest gate that stands between this
 code and any production deployment.
 
@@ -67,13 +67,13 @@ cargo +nightly fuzz run envelope -- -max_total_time=5   # smoke run
 cargo +nightly fuzz build                               # just prove it all builds
 ```
 
-**Known, disclosed finding:** running any target with `DMTAP_FUZZ_STRICT_CANONICAL=1` set
-currently finds that non-shortest-form integers and out-of-order map keys are accepted at decode
-time and still produce a semantically valid object, even though the canonical re-encoding then
-differs from the input bytes. This is a real, systemic gap in the low-level CBOR decoder
-(`dmtap-core::cbor`), tracked and reported — not swallowed — by the fuzz harness and by three
-matching conformance cases (`DMTAP-CBOR-05/06/07`), which currently `FAIL`. See
-[`fuzz/README.md`](../fuzz/README.md) for the exact fix location.
+**Previously-disclosed finding, now closed:** this fuzz harness's `DMTAP_FUZZ_STRICT_CANONICAL=1`
+mode exists specifically because canonical-form enforcement (shortest-form integers, no
+indefinite-length items, strictly-ascending map keys — §18.1.1) used to be missing at decode time
+in the low-level CBOR primitive (`dmtap-core::cbor`). That enforcement is now real: the decoder
+rejects all three forms explicitly, the three matching conformance cases (`DMTAP-CBOR-05/06/07`)
+pass, and re-running the fuzz target with the strict flag set finds nothing over 235k+ executions.
+See [`fuzz/README.md`](../fuzz/README.md) for the harness details and history.
 
 ## Conformance suite
 
@@ -84,19 +84,23 @@ ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the sam
 machine-readable data (`suite.json`), and byte-exact known-answer vectors
 (`vectors/vectors.json`).
 
-- **104 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
-  Clients, Auth).
-- **68 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
-  the 8-word key-name checksum, safety numbers, Ed25519 sign/verify with two RFC 8032
-  cross-checks, canonical CBOR of the four core signed objects, suite fail-closed behavior, and
-  the MOTE content-address + signature validation order) plus one more exercised directly against
-  `dmtap-core`'s public API. Zero failures.
-- **36 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
+- **121 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
+  Clients, Auth) — mirrored against the spec's own catalog of **132 registered error codes**
+  (§21.3–§21.11).
+- **92 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
+  the key-name checksum, safety numbers, Ed25519 sign/verify with two RFC 8032 cross-checks,
+  canonical CBOR of the four core signed objects, suite fail-closed behavior, and the MOTE
+  content-address + signature validation order) plus 25 more exercised directly against
+  `dmtap-core`'s (and `dmtap-naming`'s) public API — including the pluggable resolver-type
+  dispatch, the `name-chain` bidirectional-binding guardrail, and canonical-CBOR's rejection of
+  non-shortest integers, indefinite-length items, and out-of-order map keys. Zero failures.
+- **29 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
   "no Profile/avatar module in `dmtap-core`," "TOFU-pin comparison is caller policy," "no
   auth-assertion module yet") rather than a silent gap — covering mixnet freshness/replay,
   MLS/group handshake bytes, key-transparency quorum, device attestation, gateway/DKIM-delegation,
-  auth-assertion, and push-subscription cases not yet reduced to a fixed-input known-answer test
-  in this crate. `cargo run -p conformance-runner` prints every skip and its reason verbatim.
+  auth-assertion, alias/gateway-alias/device-sync construction recipes not yet wired into the
+  runner, and push-subscription cases not yet reduced to a fixed-input known-answer test in this
+  crate. `cargo run -p conformance-runner` prints every skip and its reason verbatim.
 
 [`crates/conformance-runner`](../crates/conformance-runner) is the reference runner: it drives the
 vector-dispatch loop plus a **drift guard** that fails the build if the committed vectors and what
