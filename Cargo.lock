@@ -739,6 +739,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmtap-clustersync"
+version = "0.0.1"
+dependencies = [
+ "dmtap-core",
+]
+
+[[package]]
 name = "dmtap-core"
 version = "0.0.1"
 dependencies = [
