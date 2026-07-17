@@ -269,6 +269,20 @@ impl DeniableInit {
         let idk_a_cert = as_bytes(f.req(10)?)?;
         Ok(DeniableInit { suite, ik_a, idk_a, idk_a_cert, ek_a, spk_ref, opk_ref, kem_ct, kem_ref, msg })
     }
+
+    /// Verify the initiator's dedicated deniable-identity DH key `idk_a` is certified by its Ed25519
+    /// `ik_a` under the `DMTAP-v0/deniable-idk` DS (§18.9.10) — the mirror of the responder-side
+    /// [`DeniablePrekeyBundle::verify`], which certifies `idk` the same way. Without this the
+    /// initiator half of the handshake ships an *unchecked* `idk_a`/`idk_a_cert`: a responder could
+    /// be steered onto an attacker-substituted deniable-identity key. Fails closed on an unsupported
+    /// suite or a bad certification. (The X3DH/PQXDH transcript carries no signature; this authorizes
+    /// only the identity-key binding, preserving deniability.)
+    pub fn verify(&self) -> Result<(), IdentityError> {
+        if !self.suite.is_supported() {
+            return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
+        }
+        verify_domain(&self.ik_a, DENIABLE_IDK_DS, &self.idk_a, &self.idk_a_cert)
+    }
 }
 
 /// The deniable transport frame (§18.3.9) — a tagged choice on key `0`.
@@ -444,6 +458,33 @@ mod tests {
         assert_eq!(bytes[1], 0x00, "first key is the discriminator 0");
         assert_eq!(bytes[2], 0x01, "DeniableInit discriminator = 1");
         assert_eq!(DeniableFrame::from_det_cbor(&bytes).unwrap(), frame);
+    }
+
+    #[test]
+    fn deniable_init_idk_certification_verifies_and_fails_closed() {
+        let ika = key(0x11);
+        let idk_a = vec![0x44; 32];
+        let good = DeniableInit {
+            suite: Suite::Classical,
+            ik_a: ika.public(),
+            idk_a: idk_a.clone(),
+            idk_a_cert: ika.sign_domain(DENIABLE_IDK_DS, &idk_a),
+            ek_a: vec![0x33; 32],
+            spk_ref: ContentId::of(b"responder-spk"),
+            opk_ref: None,
+            kem_ct: None,
+            kem_ref: None,
+            msg: sample_message(),
+        };
+        assert!(good.verify().is_ok());
+        // A substituted idk_a (attacker key) no longer matches the certification → rejected.
+        let mut forged = good.clone();
+        forged.idk_a[0] ^= 0xff;
+        assert_eq!(forged.verify(), Err(IdentityError::BadSignature));
+        // A cert by a different key than ik_a is also rejected.
+        let mut wrong_signer = good.clone();
+        wrong_signer.idk_a_cert = key(0x22).sign_domain(DENIABLE_IDK_DS, &wrong_signer.idk_a);
+        assert_eq!(wrong_signer.verify(), Err(IdentityError::BadSignature));
     }
 
     #[test]

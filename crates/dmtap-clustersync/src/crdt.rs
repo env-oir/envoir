@@ -171,6 +171,58 @@ impl OrSet {
             }
         }
     }
+
+    /// **Stability-cut garbage collection (§5.6.5).** Drop every locally-dead add-tag (present in
+    /// *both* `adds` and `tombstones`) whose HLC is `≤ cut`, where `cut` is the minimum per-device
+    /// max-applied-HLC across all cluster members. Once a tombstone is stable — every member has
+    /// applied at least up to it, and since add-tags are the globally-unique pair `{device, HLC}`
+    /// no member can ever originate that tag again — the collapsed add+tombstone pair can never
+    /// affect presence, so it is pure metadata bloat and is removed.
+    ///
+    /// This changes the *stored* representation but never the *observable* state
+    /// ([`contains`](Self::contains) / [`elements`](Self::elements)): a dead tag contributes to
+    /// presence neither before nor after. Because every replica derives the same `cut` from the same
+    /// stability marks and drops the same tags, strong eventual consistency (byte-identical
+    /// snapshots) is preserved. A tombstone whose matching add has not yet arrived locally is
+    /// **kept** (it is still needed the instant the add lands) — only genuinely-collapsed pairs are
+    /// reclaimed. Returns the number of tags reclaimed.
+    pub fn prune_stable(&mut self, cut: &Hlc) -> usize {
+        let mut pruned = 0usize;
+        let elems: Vec<String> = self.tombstones.keys().cloned().collect();
+        for elem in elems {
+            // A tag is reclaimable iff it is tombstoned, its matching add is present locally, and
+            // it is at/below the stability cut (so it can never again influence presence).
+            let reclaim: Vec<AddTag> = {
+                let dead = &self.tombstones[&elem];
+                let adds = self.adds.get(&elem);
+                dead.iter()
+                    .filter(|t| t.hlc <= *cut && adds.is_some_and(|a| a.contains(*t)))
+                    .cloned()
+                    .collect()
+            };
+            if reclaim.is_empty() {
+                continue;
+            }
+            if let Some(dead) = self.tombstones.get_mut(&elem) {
+                for t in &reclaim {
+                    dead.remove(t);
+                }
+                if dead.is_empty() {
+                    self.tombstones.remove(&elem);
+                }
+            }
+            if let Some(adds) = self.adds.get_mut(&elem) {
+                for t in &reclaim {
+                    adds.remove(t);
+                }
+                if adds.is_empty() {
+                    self.adds.remove(&elem);
+                }
+            }
+            pruned += reclaim.len();
+        }
+        pruned
+    }
 }
 
 /// A per-field Last-Writer-Wins register map (§5.6.4), keyed by `(target, field)`. Each cell keeps
@@ -277,6 +329,28 @@ impl ClusterState {
     pub fn merge(&mut self, other: &ClusterState) {
         self.set.merge(&other.set);
         self.lww.merge(&other.lww);
+    }
+
+    /// Run the §5.6.5 stability-cut GC over the OR-Set half (see [`OrSet::prune_stable`]): reclaim
+    /// collapsed add+tombstone pairs at/below `cut` without changing observable state. The LWW half
+    /// is already bounded (one register per `(target, field)`), so it needs no tombstone GC. Returns
+    /// the number of OR-Set tags reclaimed.
+    pub fn prune_stable(&mut self, cut: &Hlc) -> usize {
+        self.set.prune_stable(cut)
+    }
+
+    /// The maximum HLC this state has applied across every OR-Set add-tag / tombstone tag and every
+    /// LWW register key — this replica's own §5.6.5 stability watermark (the mark it would advertise
+    /// in a [`StabilityMark`](crate::wire::StabilityMark)). `None` if no op has been applied.
+    pub fn max_hlc(&self) -> Option<Hlc> {
+        let set_tags = self
+            .set
+            .adds
+            .values()
+            .chain(self.set.tombstones.values())
+            .flat_map(|tags| tags.iter().map(|t| t.hlc.clone()));
+        let lww_keys = self.lww.regs.values().map(|(h, _)| h.clone());
+        set_tags.chain(lww_keys).max()
     }
 
     /// A canonical, order-independent snapshot of the *observable* state — present set elements and
@@ -418,6 +492,45 @@ mod tests {
         yx.merge(&x);
         right.merge(&yx);
         assert_eq!(left.snapshot(), right.snapshot(), "merge must be commutative + associative");
+    }
+
+    #[test]
+    fn stability_cut_prunes_stable_tombstones_without_changing_state() {
+        // A delete: add "m"@(10,A), then remove it citing that add — a collapsed add+tombstone pair.
+        let a_tag = AddTag { device: vec![0xA], hlc: hlc(10, 0, 0xA) };
+        let mut s = state_of(&[add("m", 10, 0xA), remove("m", 11, 0xA, vec![a_tag.clone()])]);
+        // A live element that must survive GC: add "keep"@(50,B), never removed.
+        s.apply(&add("keep", 50, 0xB));
+
+        assert!(!s.set.contains("m"), "the deleted element is absent");
+        assert!(s.set.contains("keep"));
+        let before = s.snapshot();
+        // Metadata is present: "m" carries an add-tag and a tombstone.
+        assert_eq!(s.set.adds.get("m").map(|t| t.len()), Some(1));
+        assert_eq!(s.set.tombstones.get("m").map(|t| t.len()), Some(1));
+
+        // Stability cut at (40,*) is above the delete's tags (≤ 11) but below "keep"'s live add (50).
+        let cut = hlc(40, 0, 0);
+        let reclaimed = s.prune_stable(&cut);
+        assert_eq!(reclaimed, 1, "the one stable dead tag is reclaimed");
+        // The dead element's metadata is gone entirely; the live element is untouched.
+        assert!(s.set.adds.get("m").is_none() && s.set.tombstones.get("m").is_none());
+        assert_eq!(s.set.adds.get("keep").map(|t| t.len()), Some(1));
+
+        // Observable state is byte-identical before and after GC (SEC preserved).
+        assert_eq!(s.snapshot(), before, "GC must not change observable state");
+        assert!(!s.set.contains("m") && s.set.contains("keep"));
+
+        // Merging an un-GC'd replica (still holding the dead pair) does not resurrect anything.
+        let peer = state_of(&[add("m", 10, 0xA), remove("m", 11, 0xA, vec![a_tag])]);
+        s.merge(&peer);
+        assert!(!s.set.contains("m"), "a re-merged stable delete stays deleted");
+        assert_eq!(s.snapshot(), before, "merge after GC leaves observable state unchanged");
+
+        // A cut BELOW the tags reclaims nothing (fail-safe: nothing GC'd until proven stable).
+        let mut s2 = state_of(&[add("x", 100, 1), remove("x", 101, 1, vec![AddTag { device: vec![1], hlc: hlc(100, 0, 1) }])]);
+        assert_eq!(s2.prune_stable(&hlc(50, 0, 0)), 0);
+        assert_eq!(s2.set.tombstones.get("x").map(|t| t.len()), Some(1));
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -105,7 +105,9 @@ pub fn verify_domain(pk: &[u8], domain: &[u8], msg: &[u8], sig: &[u8]) -> Result
     let mut m = Vec::with_capacity(domain.len() + msg.len());
     m.extend_from_slice(domain);
     m.extend_from_slice(msg);
-    vk.verify(&m, &sig).map_err(|_| IdentityError::BadSignature)
+    // `verify_strict` (RFC 8032 §5.1.7 cofactorless verification, rejecting non-canonical /
+    // small-order `A`) — defense-in-depth against Ed25519 signature malleability. Fail closed.
+    vk.verify_strict(&m, &sig).map_err(|_| IdentityError::BadSignature)
 }
 
 /// Decode a `suite` field (a `u8`), failing closed on any unknown byte (§18.1.4).
@@ -468,6 +470,20 @@ impl Identity {
                 .get(&suite.as_u8())
                 .ok_or(IdentityError::Malformed("missing key for a declared suite"))?;
             verify_domain(key, IDENTITY_DS, &signing_body, &self.sig[i])?;
+        }
+        // Transitive device validity: each embedded `DeviceCert` must (a) carry a valid IK
+        // signature over its own body and (b) be bound to THIS identity's IK for its suite — a
+        // cert whose `ik` is some other identity's key must not ride along as if authorized here.
+        // Fail closed so callers of `Identity::verify` get transitive device validity for free.
+        for cert in &self.devices {
+            let expected_ik = self
+                .iks
+                .get(&cert.suite.as_u8())
+                .ok_or(IdentityError::Malformed("device cert for a suite this identity lacks"))?;
+            if cert.ik.as_slice() != expected_ik.as_slice() {
+                return Err(IdentityError::Malformed("device cert IK != identity IK"));
+            }
+            cert.verify()?;
         }
         // Hash-chain sanity.
         match (self.version, &self.prev) {
@@ -889,9 +905,16 @@ pub fn authorize_recovery_change(
     }
     let n = guardians.len();
     let preimage = next.content_id();
-    // Rule 3: weakening needs the rotate_threshold quorum (> n/2), even signed by IK.
-    let approve_q = count_quorum(guardians, approvals, RECOVERY_APPROVAL_DS, preimage.as_bytes());
-    if approve_q * 2 <= n {
+    // Rule 3: weakening needs the rotate_threshold quorum, even signed by IK. The bar is the
+    // STRONGER of (a) a strict `> n/2` majority and (b) the user's own configured
+    // `prev.rotate_threshold` minimum — a user who set a higher M-of-N must have that M enforced,
+    // not silently downgraded to a bare majority. Fail closed on the max of the two.
+    let approve_q =
+        count_quorum(guardians, approvals, RECOVERY_APPROVAL_DS, preimage.as_bytes()) as u32;
+    let majority_min = (n as u32) / 2 + 1; // strict `> n/2`
+    let policy_min = threshold_min(&prev.rotate_threshold);
+    let required = majority_min.max(policy_min);
+    if approve_q < required {
         return Err(RecoveryGuardError::WeakeningUnquorumed);
     }
     // Rule 4: a rotate_threshold-backed veto aborts the change (asymmetric — a single factor cannot).
@@ -1027,6 +1050,57 @@ mod tests {
         let back = Identity::from_det_cbor(&bytes).unwrap();
         assert_eq!(id, back);
         assert_eq!(bytes, back.det_cbor());
+    }
+
+    /// LOW: `Identity::verify` must transitively validate embedded device certs — each cert's own
+    /// IK signature AND that its `ik` binds to THIS identity's IK. A cert for another identity's
+    /// key, or one with a broken signature, must fail closed.
+    #[test]
+    fn identity_verify_validates_device_certs() {
+        let ik = IdentityKey::generate();
+        let device = IdentityKey::generate();
+        let good_cert = DeviceCert::issue(&ik, device.public(), "phone", 1, None, vec![Cap::Send]);
+        let id = Identity::create_classical(
+            &ik,
+            0,
+            vec![good_cert.clone()],
+            bundle(b"kp"),
+            cid(b"rec"),
+            vec!["a@b.com".into()],
+            None,
+            1,
+        );
+        assert!(id.verify(None).is_ok(), "identity with a valid device cert verifies");
+
+        // (a) A device cert bound to a DIFFERENT identity's IK must be rejected.
+        let attacker = IdentityKey::generate();
+        let foreign_cert = DeviceCert::issue(&attacker, device.public(), "phone", 1, None, vec![Cap::Send]);
+        let id_foreign = Identity::create_classical(
+            &ik,
+            0,
+            vec![foreign_cert],
+            bundle(b"kp"),
+            cid(b"rec"),
+            vec!["a@b.com".into()],
+            None,
+            1,
+        );
+        assert!(id_foreign.verify(None).is_err(), "device cert bound to another IK must fail");
+
+        // (b) A device cert whose own signature is corrupted must be rejected.
+        let mut bad_cert = good_cert;
+        bad_cert.sig[0] ^= 0xff;
+        let id_badcert = Identity::create_classical(
+            &ik,
+            0,
+            vec![bad_cert],
+            bundle(b"kp"),
+            cid(b"rec"),
+            vec!["a@b.com".into()],
+            None,
+            1,
+        );
+        assert_eq!(id_badcert.verify(None), Err(IdentityError::BadSignature));
     }
 
     #[test]
@@ -1323,5 +1397,55 @@ mod tests {
             authorize_recovery_change(&prev, &next, &guardians, &outsiders, &[], announced, after_window),
             Err(RecoveryGuardError::WeakeningUnquorumed)
         );
+    }
+
+    /// M3: when the owner configured a `rotate_threshold` STRONGER than a bare majority
+    /// (`Guardians(4)` of 5), a weakening change must require that M-of-N — a bare majority (3 of 5)
+    /// must NOT satisfy it. Before the fix the guard hardcoded `approve_q*2 > n` and ignored
+    /// `prev.rotate_threshold`, under-enforcing the user's own policy.
+    #[test]
+    fn weakening_respects_configured_rotate_threshold_above_majority() {
+        let ik = IdentityKey::generate();
+        let guardian_keys: Vec<IdentityKey> = (0..5).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+        let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+
+        // rotate_threshold = Guardians(4): a deliberately-higher-than-majority bar.
+        let strong = Threshold { any_of: vec![MethodPredicate::Guardians(4)] };
+        let prev = policy(
+            &ik,
+            vec![
+                RecoveryMethod::Phrase { recovery_key: vec![1] },
+                RecoveryMethod::Device { device_key: vec![9; 32], label: "phone".into() },
+            ],
+            Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+            strong.clone(),
+            1,
+        );
+        // Weakening (drops the device method), thresholds unchanged so the bar stays Guardians(4).
+        let next = policy(
+            &ik,
+            vec![RecoveryMethod::Phrase { recovery_key: vec![1] }],
+            Threshold { any_of: vec![MethodPredicate::Guardians(1)] },
+            strong,
+            2,
+        );
+        assert!(recovery_change_is_weakening(&prev, &next));
+
+        let announced = 1_000_000u64;
+        let after_window = announced + RECOVERY_VETO_WINDOW_MS;
+
+        // A bare majority (3 of 5) is a strict majority but BELOW the configured Guardians(4) bar —
+        // must be rejected as un-quorumed.
+        let three: Vec<GuardianApproval> =
+            guardian_keys[..3].iter().map(|g| sign_recovery_approval(g, &next)).collect();
+        assert_eq!(
+            authorize_recovery_change(&prev, &next, &guardians, &three, &[], announced, after_window),
+            Err(RecoveryGuardError::WeakeningUnquorumed)
+        );
+
+        // Meeting the configured M-of-N (4 of 5), no veto, past the window — authorized.
+        let four: Vec<GuardianApproval> =
+            guardian_keys[..4].iter().map(|g| sign_recovery_approval(g, &next)).collect();
+        assert!(authorize_recovery_change(&prev, &next, &guardians, &four, &[], announced, after_window).is_ok());
     }
 }

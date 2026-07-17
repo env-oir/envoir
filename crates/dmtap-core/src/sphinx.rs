@@ -96,6 +96,12 @@ impl RoutingCommand {
         let delay_ms = u32::from_be_bytes([b[2], b[3], b[4], b[5]]);
         let mut next_hop = [0u8; 32];
         next_hop.copy_from_slice(&b[6..38]);
+        // `cmd = 0x01` (deliver-to-recipient / exit) has no next node: `next_hop` MUST be all-zero
+        // (§18.5.4). A non-zero next_hop here is a canonical-encoding gap — reject it fail-closed so
+        // there is exactly one valid on-wire encoding of an exit command.
+        if cmd == 0x01 && next_hop.iter().any(|&x| x != 0) {
+            return Err(SphinxError::ReservedNonZero);
+        }
         if b[38..48].iter().any(|&x| x != 0) {
             return Err(SphinxError::ReservedNonZero);
         }
@@ -247,6 +253,19 @@ mod tests {
         let mut bytes3 = RoutingCommand { cmd: 0x00, flags: 0, delay_ms: 0, next_hop: [0; 32] }.to_bytes();
         bytes3[1] = 0x02; // reserved flag bit set
         assert_eq!(RoutingCommand::from_bytes(&bytes3), Err(SphinxError::ReservedNonZero));
+    }
+
+    #[test]
+    fn deliver_command_requires_zero_next_hop() {
+        // A `cmd = 0x01` (exit) command has no next node — a non-zero next_hop is a canonical
+        // encoding gap and must be rejected fail-closed. Build a wire form directly (the
+        // constructor path would honor whatever bytes we hand it), then flip a next_hop byte.
+        let mut bytes = RoutingCommand { cmd: 0x01, flags: 0x01, delay_ms: 0, next_hop: [0; 32] }.to_bytes();
+        bytes[6] = 0x01; // first next_hop byte non-zero
+        assert_eq!(RoutingCommand::from_bytes(&bytes), Err(SphinxError::ReservedNonZero));
+        // The all-zero next_hop exit command still round-trips.
+        let ok = RoutingCommand { cmd: 0x01, flags: 0x01, delay_ms: 0, next_hop: [0; 32] };
+        assert_eq!(RoutingCommand::from_bytes(&ok.to_bytes()).unwrap(), ok);
     }
 
     #[test]

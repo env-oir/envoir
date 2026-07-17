@@ -90,8 +90,12 @@ fn ip_is_internal(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4_is_internal(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return v4_is_internal(mapped);
+            // Judge ANY IPv4-in-IPv6 form by its embedded v4 address: both the v4-**mapped**
+            // `::ffff:a.b.c.d` and the deprecated v4-**compatible** `::a.b.c.d` (e.g.
+            // `[::127.0.0.1]`). `to_ipv4()` covers both (top-96-bits-zero or ::ffff:), where
+            // `to_ipv4_mapped()` covered only the former — the compatible form was bypassing.
+            if let Some(embedded) = v6.to_ipv4() {
+                return v4_is_internal(embedded);
             }
             let seg = v6.segments();
             v6.is_loopback()             // ::1
@@ -109,6 +113,28 @@ fn v4_is_internal(v4: Ipv4Addr) -> bool {
         || v4.is_unspecified() // 0.0.0.0
         || v4.is_broadcast() // 255.255.255.255
         || v4.octets()[0] == 0 // 0.0.0.0/8 "this network"
+}
+
+/// Whether a single host label could be read as a numeric IPv4 octet/word by a permissive
+/// resolver / libc `inet_aton`: `0x`/`0X`-prefixed hex, or an all-ASCII-digit decimal/octal run.
+fn is_numeric_label(l: &str) -> bool {
+    if l.is_empty() {
+        return false;
+    }
+    if let Some(hex) = l.strip_prefix("0x").or_else(|| l.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    // decimal or leading-zero octal — all ASCII digits.
+    l.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `host` (a host that did NOT parse as a canonical [`IpAddr`]) could still be re-parsed
+/// as a numeric IPv4 by a permissive resolver — decimal `2130706433`, hex `0x7f000001`, octal
+/// `0177.0.0.1`, or any dotted mix. Rust's `IpAddr` parser rejects these alternate encodings, so
+/// without this guard they masquerade as hostnames and slip past the SSRF check entirely. Fail
+/// closed: treat any host whose every dotted label is numeric (with ≥ 1 digit) as an IP literal.
+fn is_numeric_ip_host(host: &str) -> bool {
+    host.split('.').all(is_numeric_label) && host.bytes().any(|b| b.is_ascii_digit())
 }
 
 /// Validate an owner-supplied avatar URL fail-closed (§18.4.12, §3.9.5). The URL is
@@ -156,6 +182,11 @@ pub fn validate_avatar_url(url: &str) -> Result<(), ProfileError> {
         Ok(ip) if ip_is_internal(ip) => Err(ProfileError::AvatarUrlUnsafe),
         Ok(_) => Ok(()),
         Err(_) => {
+            // Reject alternate-base numeric hosts (decimal/hex/octal) that a permissive resolver
+            // would treat as an IPv4 literal but Rust's parser does not — an SSRF bypass.
+            if is_numeric_ip_host(host) {
+                return Err(ProfileError::AvatarUrlUnsafe);
+            }
             let lower = host.to_ascii_lowercase();
             if lower == "localhost" || lower.ends_with(".localhost") {
                 Err(ProfileError::AvatarUrlUnsafe)
@@ -503,6 +534,29 @@ mod tests {
                 a.validate_url(),
                 Err(ProfileError::AvatarUrlUnsafe),
                 "internal/SSRF target must be rejected: {url}"
+            );
+        }
+    }
+
+    /// M4: alternate-base numeric encodings of an internal IPv4 (and the v4-compatible IPv6 form)
+    /// that Rust's `IpAddr` parser rejects — so before the fix they masqueraded as hostnames and
+    /// sailed past the SSRF guard. Each MUST be rejected.
+    #[test]
+    fn avatar_url_numeric_ssrf_encodings_rejected() {
+        for url in [
+            "https://2130706433/a.png",       // decimal 127.0.0.1
+            "https://0x7f000001/a.png",        // hex 127.0.0.1
+            "https://0177.0.0.1/a.png",        // octal 127.0.0.1
+            "https://0x7f.0.0.1/a.png",        // dotted-hex mix
+            "https://[::127.0.0.1]/a.png",     // v4-compatible IPv6 → 127.0.0.1
+            "https://[::ffff:127.0.0.1]/a.png", // v4-mapped IPv6 → 127.0.0.1
+            "https://017700000001/a.png",      // octal 32-bit form
+        ] {
+            let a = Avatar { url: url.into(), hash: None };
+            assert_eq!(
+                a.validate_url(),
+                Err(ProfileError::AvatarUrlUnsafe),
+                "numeric SSRF encoding must be rejected: {url}"
             );
         }
     }

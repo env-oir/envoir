@@ -72,6 +72,26 @@ impl Journal {
         self.verify()?;
         Ok(self.entries.iter().map(|e| e.reference.clone()).collect())
     }
+
+    /// **Bounded prune (§5.6.5).** Drop journal entries before `keep_from_seq`, retaining the
+    /// suffix (the internal `prev` back-links of the retained entries are untouched, so the suffix
+    /// still verifies as a segment from its predecessor's hash via [`verify_segment`]). A rejoining
+    /// device that already holds everything up to `keep_from_seq - 1` replays the retained suffix
+    /// from that anchor.
+    ///
+    /// Truncation is only safe once **every** cluster member has durably replayed past
+    /// `keep_from_seq` (the §5.6.5 stability condition). RESIDUAL / caller obligation: mapping a
+    /// per-device stability HLC (`StabilityMark.hlc`, §18.6.3) to a journal `seq` requires a
+    /// seq↔HLC index the reference core does not maintain (journal entries record object-id/op
+    /// *hashes*, not HLCs), so the stable `seq` is supplied by the caller — this is the residual the
+    /// OR-Set stability GC ([`crate::crdt::OrSet::prune_stable`], the primary metadata-growth fix)
+    /// does close directly. Returns the number of entries dropped. After truncation, use
+    /// [`verify_segment`] (not the genesis-anchored [`verify`](Self::verify)) to check the chain.
+    pub fn truncate_before(&mut self, keep_from_seq: u64) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.seq >= keep_from_seq);
+        before - self.entries.len()
+    }
 }
 
 /// Verify a journal **segment** (a contiguous run a rejoining device replays, §5.6.3(b)) fail-closed:
@@ -162,6 +182,25 @@ mod tests {
             verify_segment(&tampered, &genesis_prev(), Some(0)),
             Err(SyncError::JournalChainBroken)
         );
+    }
+
+    #[test]
+    fn truncate_before_drops_prefix_and_suffix_still_verifies_as_segment() {
+        let mut j = Journal::new();
+        for n in 0..6 {
+            j.append(oid(n));
+        }
+        let prior_hash = j.entries()[2].entry_hash(); // predecessor of the retained suffix
+        let dropped = j.truncate_before(3);
+        assert_eq!(dropped, 3, "entries 0..3 are pruned");
+        assert_eq!(j.entries().len(), 3);
+        assert_eq!(j.entries()[0].seq, 3, "the retained suffix starts at seq 3");
+        // The retained suffix still verifies as a segment anchored at its predecessor's hash.
+        verify_segment(j.entries(), &prior_hash, Some(3)).expect("retained suffix verifies");
+        // Appending continues the chain seamlessly from the retained head.
+        let next = j.append(oid(6));
+        assert_eq!(next.seq, 6);
+        assert_eq!(next.prev, j.entries()[j.entries().len() - 2].entry_hash());
     }
 
     #[test]
