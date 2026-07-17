@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::SealKeypair;
@@ -308,12 +308,17 @@ struct KeystoreFile {
     secret_ciphertext: Option<String>,
 }
 
-/// Derive a 32-byte AEAD key from `passphrase` + `salt` with Argon2id (default params).
-fn derive_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], KeystoreError> {
+/// Derive a 32-byte AEAD key from `passphrase` + `salt` with Argon2id.
+///
+/// Returned in a [`Zeroizing`] wrapper so the KEK is wiped when it drops — a bare `[u8; 32]` would
+/// otherwise linger on the stack after `aead_seal`/`aead_open`, recoverable from a core dump. (The
+/// Argon2 default params are kept deliberately: raising them would change the derived key and break
+/// decryption of already-written keystores; a params bump needs a versioned re-encrypt migration.)
+fn derive_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, KeystoreError> {
     use argon2::Argon2;
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .map_err(|_| KeystoreError::Corrupt("argon2 key derivation failed"))?;
     Ok(key)
 }
