@@ -78,6 +78,15 @@ impl Session {
         self.group.own_leaf_index().u32()
     }
 
+    /// The group's **MLS ciphersuite** as its RFC 9420 `u16` code point (spec §5.1). This is the axis
+    /// that gates **message** confidentiality PQ — a *separate* `u16` from `Envelope.suite` — so it
+    /// feeds the [`MlsCiphersuiteRatchet`](crate::MlsCiphersuiteRatchet) that polices
+    /// `ERR_MLS_CIPHERSUITE_DOWNGRADE` (`0x0414`) independently of the §1.3 `Envelope.suite`
+    /// high-water-mark.
+    pub fn ciphersuite(&self) -> u16 {
+        u16::from(self.group.ciphersuite())
+    }
+
     /// How far this view has advanced along the committer's ordered log (§5.1).
     pub fn applied_seq(&self) -> u64 {
         self.applied_seq
