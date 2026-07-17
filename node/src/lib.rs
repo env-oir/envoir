@@ -4,8 +4,9 @@
 //! truth is the specification in the DMTAP spec repo (`../dmtap/`). Where this code and the
 //! spec disagree, the spec governs (spec §10.4).
 //!
-//! One substrate carries mail, chat, and files over a P2P mesh + mixnet, with an optional
-//! legacy SMTP gateway (a separate crate). See `../dmtap/00-overview.md`.
+//! One substrate carries mail, chat, and files over a P2P mesh + mixnet. The node is native-only
+//! (spec §8.5): its client surface is JMAP (§8.1); the legacy IMAP/POP/SMTP protocols live only on
+//! the separate gateway crate. See `../dmtap/00-overview.md`.
 //!
 //! ## Layering
 //! The protocol **core** — crypto suites, content addressing, the identity lifecycle, the
@@ -17,9 +18,10 @@
 // `dmtap::mote`, …) keep working after the move into `dmtap-core`.
 pub use dmtap_core::{self, id, identity, keyname, mote, ContentId, Suite, TimestampMs};
 
-// The client-access surface (spec §8): IMAP/POP/SMTP-submission + JMAP + autodiscovery, all
-// projecting the one MOTE store. Implemented in the workspace-shared `dmtap-mail` crate and
-// re-exported here as `dmtap::clients`.
+// The node's native client-access surface is JMAP (spec §8.1) — the node is native-only (§8.5),
+// so it projects the one MOTE store to JMAP and does NOT serve the legacy IMAP/POP/SMTP-submission
+// protocols (those live only on the separate gateway, spec §7). The MOTE store + JMAP + the shared
+// mail types are implemented in the workspace `dmtap-mail` crate, re-exported here as `dmtap::clients`.
 pub use dmtap_mail as clients;
 
 // --- Node delivery engine -------------------------------------------------------------------

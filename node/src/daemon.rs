@@ -1,17 +1,21 @@
 //! The long-running node daemon (spec §0.2).
 //!
+//! The node is **native-only** (spec §8.5): it serves the libp2p mesh, JMAP (§8.1 — the node's
+//! native and only client surface), and the optional Envoir Send API (§13.5.1). The legacy
+//! IMAP/POP3/SMTP-submission surfaces live **only on the separate gateway** and are no longer
+//! started here.
+//!
 //! This turns the reference node from a one-shot in-process demo into a **persistent process**: it
 //! loads the identity from the durable [`Keystore`] and the outbound retry queue from the
-//! [`FileJournal`] (spec §19.3.3 — the queue MUST survive restart), binds its mesh transport +
-//! the §8 client servers on **configurable** interfaces (the `127.0.0.1` hardcode that made the
-//! servers unreachable through a container port-map is gone), then stays up — draining inbound
-//! MOTEs, firing retries, and expiring deadlines on a fixed tick — until SIGINT/SIGTERM, on which it
-//! flushes a final durable checkpoint and exits cleanly.
+//! [`FileJournal`] (spec §19.3.3 — the queue MUST survive restart), binds its mesh transport on a
+//! **configurable** interface (defaulting to `0.0.0.0` so a container port-map reaches it), then
+//! stays up — draining inbound MOTEs, firing retries, and expiring deadlines on a fixed tick —
+//! until SIGINT/SIGTERM, on which it flushes a final durable checkpoint and exits cleanly.
 //!
 //! ## What is real vs. an honest seam
 //! - **Real:** identity + sealing-key reload from disk; journal resume; the [`TcpTransport`] mesh
 //!   ingress (a background accept loop feeding [`Node::poll`]); the retry/deadline engine; graceful
-//!   shutdown; the §8 IMAP/POP3/SMTP-submission servers on a configurable bind.
+//!   shutdown.
 //! - **Seam (name resolution, §3):** a running node resolves + delivers **by name** through the real
 //!   [`dmtap_naming::Resolver`] / [`KeyPackageSource`](dmtap_naming::KeyPackageSource) seams already
 //!   wired into [`Node::send_mail_to_name`]. The *networked* DNS `_dmtap` + KT-log clients behind
@@ -19,24 +23,16 @@
 //!   that live DNS is not yet wired, rather than silently pretending to resolve. The
 //!   `daemon_resolves_and_delivers_by_name` integration test drives the whole path against a live,
 //!   running node.
-//! - **Seam (mail store):** the §8 servers currently project a per-connection demo store; sharing the
-//!   node's *live* delivered-mail store into those sessions (an `Arc`-shared [`MailStore`]) is a
-//!   follow-up — [`dmtap_mail::store::MemoryStore`] is `Clone`-by-copy, not shared-backing.
+//! - **Gap (JMAP, §8.1):** the node's live store already renders JMAP views via
+//!   [`dmtap_mail::jmap`], but a bound node-native JMAP listener is not yet served here — a
+//!   follow-up (the mesh + Send API are the node's wired network surfaces today).
 
 use std::future::Future;
-use std::net::TcpListener;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use dmtap_core::identity::{Identity, IdentityKey, KeyPackageBundleRef};
 use dmtap_core::id::ContentId;
 use dmtap_core::TimestampMs;
-use dmtap_mail::auth::StaticAuthenticator;
-use dmtap_mail::imap::Session as ImapSession;
-use dmtap_mail::net::{serve_imap, serve_pop3, serve_smtp};
-use dmtap_mail::pop3::Pop3Session;
-use dmtap_mail::smtp::SmtpSession;
-use dmtap_mail::store::MemoryStore;
 
 use crate::config::NodeConfig;
 use crate::journal::{FileJournal, JournalError};
@@ -57,7 +53,7 @@ pub enum DaemonError {
     NoKeystore(std::path::PathBuf),
     /// Loading/decrypting the keystore failed.
     Keystore(KeystoreError),
-    /// Binding a listener (mesh transport or a §8 server) failed.
+    /// Binding a listener (mesh transport or the Send API) failed.
     Bind(std::io::Error),
     /// Resuming the durable journal failed.
     Journal(JournalError),
@@ -85,15 +81,6 @@ impl From<JournalError> for DaemonError {
     fn from(e: JournalError) -> Self {
         DaemonError::Journal(e)
     }
-}
-
-/// The §8 client servers' lifetime: their listener threads. Dropped when the daemon exits; the
-/// threads are detached (the accept loops block on `incoming()`), so process exit reaps them.
-pub struct MailServers {
-    _threads: Vec<JoinHandle<()>>,
-    pub imap_addr: std::net::SocketAddr,
-    pub pop3_addr: std::net::SocketAddr,
-    pub smtp_addr: std::net::SocketAddr,
 }
 
 /// What one run of the daemon loop did (for logging/tests).
@@ -124,46 +111,6 @@ pub fn load_node(config: &NodeConfig) -> Result<Node<TcpTransport>, DaemonError>
     let journal = Box::new(FileJournal::new(config.journal_path()));
     let node = Node::with_journal_bytes(ik, ks.seal_secret(), ks.seal_public, transport, journal)?;
     Ok(node)
-}
-
-/// Bind + start the §8 client servers on `config.mail_host` (default `0.0.0.0`, container-reachable).
-/// Returns their bound addresses (ephemeral ports resolved). Each listener runs a blocking
-/// thread-per-connection accept loop (spec §8.2 semantics; TLS terminated upstream).
-pub fn start_mail_servers(config: &NodeConfig) -> Result<MailServers, DaemonError> {
-    let user = config.names.first().cloned().unwrap_or_else(|| "owner@dmtap.local".to_string());
-    let app_password =
-        std::env::var("ENVOIR_APP_PASSWORD").unwrap_or_else(|_| "app-password".to_string());
-
-    let make_auth = move || {
-        let mut a = StaticAuthenticator::new();
-        a.issue(user.clone(), app_password.clone(), vec![0u8; 32], "daemon");
-        a
-    };
-
-    let bind = |port: u16| -> Result<TcpListener, DaemonError> {
-        TcpListener::bind((config.mail_host.as_str(), port)).map_err(DaemonError::Bind)
-    };
-    let imap = bind(config.imap_port)?;
-    let pop3 = bind(config.pop3_port)?;
-    let smtp = bind(config.smtp_port)?;
-    let imap_addr = imap.local_addr().map_err(DaemonError::Bind)?;
-    let pop3_addr = pop3.local_addr().map_err(DaemonError::Bind)?;
-    let smtp_addr = smtp.local_addr().map_err(DaemonError::Bind)?;
-
-    let (a1, a2, a3) = (make_auth.clone(), make_auth.clone(), make_auth);
-    let mut threads = Vec::new();
-    threads.push(std::thread::spawn(move || {
-        let _ = serve_imap(imap, move || ImapSession::new(MemoryStore::new(), a1(), true));
-    }));
-    // (POP3 + SMTP-submission started below.)
-    threads.push(std::thread::spawn(move || {
-        let _ = serve_pop3(pop3, move || Pop3Session::new(MemoryStore::new(), a2(), true));
-    }));
-    threads.push(std::thread::spawn(move || {
-        let _ = serve_smtp(smtp, move || SmtpSession::new(a3(), true));
-    }));
-
-    Ok(MailServers { _threads: threads, imap_addr, pop3_addr, smtp_addr })
 }
 
 /// The daemon's steady-state loop: on every `tick`, drain inbound MOTEs (§20.2), fire due retries
@@ -223,8 +170,9 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Start and run the daemon to completion: load the node, start the §8 servers, and run the steady
-/// -state loop until a shutdown signal. The one call `main`'s `run`/`serve` wraps in a runtime.
+/// Start and run the daemon to completion: load the node and run the steady-state loop (mesh +
+/// optional Send API) until a shutdown signal. The one call `main`'s `run`/`serve` wraps in a
+/// runtime. The node is native-only (spec §8.5) — no legacy §8 servers are started here.
 pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
     let mut node = load_node(&config)?;
     let addr = node.ik_public();
@@ -236,17 +184,6 @@ pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
         node.outbound_len(),
         config.journal_path().display()
     );
-
-    let _mail = if config.mail_enabled {
-        let m = start_mail_servers(&config)?;
-        eprintln!(
-            "envoir-node: §8 servers — IMAP {} POP3 {} SMTP-submission {}",
-            m.imap_addr, m.pop3_addr, m.smtp_addr
-        );
-        Some(m)
-    } else {
-        None
-    };
 
     eprintln!(
         "envoir-node: name resolution seam — live DNS `_dmtap` + KT clients not wired; \

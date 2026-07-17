@@ -75,7 +75,7 @@ fn two_nodes_exchange_a_real_encrypted_mote_and_ack() {
         other => panic!("expected Stored, got {other:?}"),
     }
 
-    // The decrypted plaintext is exactly what Alice sent, visible in Bob's IMAP/JMAP store view.
+    // The decrypted plaintext is exactly what Alice sent, visible in Bob's JMAP store view.
     assert_eq!(bob.inbox().exists(), 1, "delivered MOTE is retrievable in Bob's INBOX");
     let raw = &bob.inbox().messages[0].raw;
     assert!(

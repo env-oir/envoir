@@ -35,7 +35,6 @@ fn test_config(data_dir: PathBuf) -> NodeConfig {
     NodeConfig {
         data_dir,
         node_bind: "127.0.0.1:0".to_string(), // ephemeral port — no fixed-port collisions in CI
-        mail_enabled: false,
         passphrase: None,
         tick: Duration::from_millis(5),
         ..NodeConfig::default()

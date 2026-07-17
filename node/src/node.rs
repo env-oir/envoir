@@ -10,8 +10,8 @@
 //! ## What is real vs. stubbed
 //! - **Real:** Ed25519 identities, HPKE payload sealing/opening (suite `0x01`), content
 //!   addressing, the full §2.7 ordered validation (via [`dmtap_core::mote::validate`]), the
-//!   §20.1 sender-retry machine, dedup/idempotent ack (§2.6), and RFC 5322 projection into an
-//!   IMAP/JMAP-visible [`MemoryStore`].
+//!   §20.1 sender-retry machine, dedup/idempotent ack (§2.6), and RFC 5322 projection into a
+//!   JMAP-visible [`MemoryStore`] (JMAP is the node's native client surface, §8.1).
 //! - **Real (groups, §5):** the node also holds **real MLS group sessions** (RFC 9420 via the
 //!   [`dmtap_mls`] crate / `openmls`) alongside the 1:1 HPKE path — found/join a group, Add/Remove
 //!   members (post-compromise security on Remove), and send/receive group application messages.
@@ -529,13 +529,13 @@ impl<T: Transport> Node<T> {
 
     // --- store views ------------------------------------------------------------------------
 
-    /// The mail-store projection (IMAP/JMAP view of delivered MOTEs).
+    /// The mail-store projection (JMAP view of delivered MOTEs — the node's native surface, §8.1).
     pub fn store(&self) -> &MemoryStore {
         &self.store
     }
 
     /// Mutable access to the mail-store projection — lets a JMAP handler
-    /// ([`dmtap_mail::jmap::process`]) or IMAP session run directly against the node's live store.
+    /// ([`dmtap_mail::jmap::process`]) run directly against the node's live store.
     pub fn store_mut(&mut self) -> &mut MemoryStore {
         &mut self.store
     }

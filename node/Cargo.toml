@@ -26,10 +26,11 @@ dmtap-core = { path = "../crates/dmtap-core" }
 # MOTE into its real §20.1 outbound retry queue + mesh dispatch — the delivery path `send_mail` drives.
 dmtap-send = { path = "../crates/dmtap-send" }
 
-# --- Client protocol servers (spec §8): IMAP/POP/SMTP-submission + JMAP + autodiscovery, ---
-# projecting the MOTE store for legacy and modern mail clients. The `net` feature adds the
-# blocking TCP listeners the `run` command wires up (a real node terminates TLS first, §8.2).
-dmtap-mail = { path = "../crates/dmtap-mail", features = ["net"] }
+# --- The MOTE store + the node's native JMAP surface (spec §8.1). ---
+# The node is native-only (§8.5): it projects the one MOTE store to JMAP and does NOT serve the
+# legacy IMAP/POP/SMTP protocols, so the `net` feature (the crate's blocking legacy TCP listeners,
+# used only by the separate gateway) is intentionally NOT enabled here.
+dmtap-mail = { path = "../crates/dmtap-mail" }
 
 # --- Durable outbound-queue journal (spec §19.3.3, §0.5, §4.7) ---
 # The sender-side retry queue is the sole durability mechanism and MUST survive restart. The
@@ -41,8 +42,7 @@ serde_json = "1"
 # --- Daemon runtime (spec §0.2 "the node is the running whole-client side") ---
 # A real node is a long-running process, not a one-shot demo: it loads its persisted identity +
 # durable journal, serves its interfaces, and stays up until SIGINT/SIGTERM. A current-thread tokio
-# runtime drives the retry/poll loop and the async graceful-shutdown signal handling. The §8 client
-# servers (dmtap-mail `net`) remain blocking thread-per-connection, spawned alongside.
+# runtime drives the retry/poll loop and the async graceful-shutdown signal handling.
 # `net` + `io-util` add the async `TcpListener` and `AsyncRead/WriteExt` the Envoir Send HTTP
 # listener (`node::send_api`) is built on — it runs inside the daemon's current-thread runtime,
 # on the same task as the delivery loop, so the sealed MOTE enters the node's real outbound path.

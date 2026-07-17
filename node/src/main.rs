@@ -95,24 +95,6 @@ fn run_daemon(config: NodeConfig) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `serve-mail`: start only the §8 client servers on the configured interface (default `0.0.0.0`,
-/// so a container port-map reaches them — the old demo hardcoded `127.0.0.1`) and park. A no-keystore
-/// run still works (the servers use a demo store); `run` is the full node.
-fn serve_mail(config: &NodeConfig) -> Result<(), Box<dyn Error>> {
-    let servers = daemon::start_mail_servers(config)?;
-    println!("Envoir §8 client servers (spec §8) — user {}", config.names.first().map(String::as_str).unwrap_or("owner@dmtap.local"));
-    println!(
-        "  IMAP {}  POP3 {}  SMTP-submission {}",
-        servers.imap_addr, servers.pop3_addr, servers.smtp_addr
-    );
-    println!("Press Ctrl-C to stop.");
-    // Park on the listener threads; they run until the process is signalled.
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(daemon::shutdown_signal());
-    println!("envoir-node: serve-mail stopping.");
-    Ok(())
-}
-
 /// Demo: two in-process nodes exchange a real end-to-end-encrypted MOTE (spec §2, §19.3, §20).
 /// The former `run` behavior, kept as `demo` for a zero-setup end-to-end sanity check.
 fn run_delivery_demo() {
@@ -142,7 +124,7 @@ fn run_delivery_demo() {
     for outcome in bob.poll() {
         println!("B: {outcome:?}");
     }
-    println!("B: INBOX now holds {} message(s) (IMAP/JMAP-visible)", bob.inbox().exists());
+    println!("B: INBOX now holds {} message(s) (JMAP-visible)", bob.inbox().exists());
 
     alice.poll();
     println!("A: outbound state = {:?} (delivered)", alice.outbound_state(&id).unwrap());
@@ -172,7 +154,6 @@ fn main() {
         "init" => init_identity(&config),
         "record" => print_record(&config),
         "run" | "serve" => run_daemon(config),
-        "serve-mail" => serve_mail(&config),
         "demo" => {
             run_delivery_demo();
             Ok(())
@@ -190,15 +171,16 @@ fn main() {
                  \n\
                  COMMANDS:\n\
                  \x20 init         generate + persist a new identity keystore; print the _dmtap record\n\
-                 \x20 run          run the node daemon (mesh + delivery + §8 clients), until SIGINT/SIGTERM\n\
+                 \x20 run          run the native node daemon (mesh + delivery + Send API), until SIGINT/SIGTERM\n\
                  \x20 record       print this identity's _dmtap DNS TXT record\n\
-                 \x20 serve-mail   run only the §8 client servers (IMAP/POP/SMTP) on the configured bind\n\
                  \x20 demo         two in-process nodes exchange a real E2E-encrypted MOTE\n\
                  \x20 version      print version and default suite\n\
                  \x20 help         show this help\n\
                  \n\
-                 CONFIG (env): ENVOIR_DATA_DIR, ENVOIR_NODE_BIND, ENVOIR_MAIL_HOST, ENVOIR_IMAP_PORT,\n\
-                 \x20 ENVOIR_POP3_PORT, ENVOIR_SMTP_PORT, ENVOIR_PASSPHRASE, ENVOIR_NAMES,\n\
+                 The node is native-only (spec §8.5): mesh + JMAP (§8.1) + Send API. The legacy\n\
+                 IMAP/POP/SMTP surfaces live only on the separate `envoir-gateway` binary (spec §7).\n\
+                 \n\
+                 CONFIG (env): ENVOIR_DATA_DIR, ENVOIR_NODE_BIND, ENVOIR_PASSPHRASE, ENVOIR_NAMES,\n\
                  \x20 ENVOIR_KT_ANCHORS, ENVOIR_KEYPKGS_LOC, ENVOIR_TICK_SECS,\n\
                  \x20 ENVOIR_SEND_API, ENVOIR_SEND_API_BIND, ENVOIR_SEND_ADMIN_TOKEN (Envoir Send §13.5.1).\n\
                  \x20 See `dmtap::config`.\n\
