@@ -70,6 +70,9 @@ use crate::naming::{
 use dmtap_core::identity::Identity;
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
+use crate::usage::{
+    NodeUsageMeter, NullUsageMeter, QuotaDecision, StorageQuota, UnlimitedStorage, UsageEvent,
+};
 use dmtap_auth::AuthError;
 use dmtap_core::mixnet::MixDirectory;
 
@@ -179,6 +182,15 @@ pub struct Node<T: Transport> {
     /// state is checkpointed here so a restarted node resumes its pending sends; the default
     /// [`NullJournal`] persists nothing (ephemeral node).
     journal: Box<dyn Journal>,
+    /// The hosted-mailbox **storage Policy** seam (spec §12.2, §12.3). Consulted before a stored MOTE
+    /// is durably filed to the inbox: a `Deny` is enforced fail-closed (not stored, not acked). The
+    /// default [`UnlimitedStorage`] never denies, so self-host is unaffected. This gates a storage
+    /// *operation* only — never crypto, access to keys, or access to already-stored mail (§12.3).
+    storage_quota: Box<dyn StorageQuota>,
+    /// The append-only **node-usage meter** seam (spec §12.2, §12.4): the node emits a
+    /// [`UsageEvent::Stored`] on each durable inbox accept for the operator's billing (a separate
+    /// repo) to consume. The default [`NullUsageMeter`] is a no-op, so self-host bills no one.
+    usage_meter: Box<dyn NodeUsageMeter>,
 }
 
 impl<T: Transport> Node<T> {
@@ -230,6 +242,10 @@ impl<T: Transport> Node<T> {
             transport,
             now: 1_700_000_000_000,
             journal,
+            // Self-host defaults: unlimited storage, no-op meter (§12.2). A hosted deployment injects
+            // a cloud impl via `set_storage_quota` / `set_usage_meter`.
+            storage_quota: Box::new(UnlimitedStorage),
+            usage_meter: Box::new(NullUsageMeter),
         }
     }
 
@@ -486,6 +502,29 @@ impl<T: Transport> Node<T> {
     /// Advance the injected clock to `now` (ms since epoch).
     pub fn set_now(&mut self, now: TimestampMs) {
         self.now = now;
+    }
+
+    /// Inject the hosted-mailbox **storage Policy** seam (spec §12.2). By default a node uses
+    /// [`UnlimitedStorage`] (never denies); a hosted deployment drops in a cloud impl here so
+    /// [`receive_mote`](Self::receive_mote) consults it before durably filing a MOTE to the inbox. The
+    /// node links no billing crate — this takes any `dyn StorageQuota`. Purely a storage-operation
+    /// gate: it never affects crypto, keys, or already-stored mail (§12.3).
+    pub fn set_storage_quota(&mut self, quota: Box<dyn StorageQuota>) {
+        self.storage_quota = quota;
+    }
+
+    /// Inject the append-only **node-usage meter** seam (spec §12.2, §12.4). By default a node uses
+    /// [`NullUsageMeter`] (no-op); a hosted deployment drops in a cloud sink here to receive a
+    /// [`UsageEvent::Stored`] on each durable inbox accept. The node links no billing crate.
+    pub fn set_usage_meter(&mut self, meter: Box<dyn NodeUsageMeter>) {
+        self.usage_meter = meter;
+    }
+
+    /// The account a storage decision / usage event is attributed to: this node's root identity public
+    /// bytes (§1.2). One node hosts one mailbox in the reference model; a hosted deployment maps this
+    /// identity to its billing account.
+    fn storage_account(&self) -> Vec<u8> {
+        self.ik.public()
     }
 
     // --- store views ------------------------------------------------------------------------
@@ -783,7 +822,25 @@ impl<T: Transport> Node<T> {
         let outcome = validate_pinned(&Hpke, &env, &ctx, Some(&mut self.suite_ratchet));
 
         match outcome {
-            Ok(Outcome::Accepted(payload)) => self.accept(from, &env.id, *payload),
+            Ok(Outcome::Accepted(payload)) => {
+                // §12.2 Policy: consult the hosted-mailbox storage quota BEFORE durably filing this
+                // MOTE. The delta is the MOTE's durable wire size (the bytes the node commits to
+                // hold). Fail-closed: a `Deny` is neither stored nor acked, so the sender's own retry
+                // holds it and EXPIREs — the mailbox is never partially/over-written past its cap.
+                // This gates a storage *operation* only; the crypto pipeline above already ran and
+                // nothing already stored is touched (§12.3). Self-host uses `UnlimitedStorage`, which
+                // always admits, so this is a pure no-op there.
+                let account = self.storage_account();
+                let delta = bytes.len() as u64;
+                match self.storage_quota.admit(&account, delta) {
+                    QuotaDecision::Deny { reason, .. } => {
+                        // Not added to `seen`, so a later redelivery (e.g. after the cap is raised)
+                        // is re-evaluated rather than hitting the dedup-ack fast path.
+                        InboundOutcome::StorageDenied { id: env.id.clone(), reason }
+                    }
+                    QuotaDecision::Allow { .. } => self.accept(from, &env.id, *payload, delta),
+                }
+            }
             Ok(Outcome::Deferred) => {
                 // §2.7a / §19.3.1 step 9 / §20.2: hold in the requests area (never the inbox) but
                 // do NOT ack — an unproven cold sender is not owed a receipt (acking would confirm
@@ -808,8 +865,16 @@ impl<T: Transport> Node<T> {
 
     /// §2.7 step 8 (node-level) + step 9: for a pinned contact, the decrypted `Payload.from` MUST
     /// match the pin, else the message is a forgery/relay and is dropped, not acked (§19.3.1). On
-    /// success, file to the inbox, record dedup, and ack.
-    fn accept(&mut self, from: &[u8], id: &ContentId, payload: Payload) -> InboundOutcome {
+    /// success, file to the inbox, record dedup, ack, and meter the durable storage. `stored_bytes`
+    /// is the MOTE's durable wire size — the quota already admitted it in [`receive_mote`], and the
+    /// emitted [`UsageEvent::Stored`] bills the very same amount (§12.2, §12.4).
+    fn accept(
+        &mut self,
+        from: &[u8],
+        id: &ContentId,
+        payload: Payload,
+        stored_bytes: u64,
+    ) -> InboundOutcome {
         if self.contacts.contains(from) && payload.from != from {
             // A pinned contact's envelope whose sealed identity does not match the pin.
             return InboundOutcome::Dropped(DropReason::BadPayloadSig);
@@ -828,6 +893,15 @@ impl<T: Transport> Node<T> {
         // dedup set grew and the suite mark advanced — persist so a post-restart redelivery is still
         // re-acked and a post-restart downgrade below this sender's mark is still rejected.
         self.checkpoint();
+        // §12.2 Metering: emit the append-only node-usage event for the durable storage just
+        // committed. Best-effort (the no-op default records nothing); it runs only on a real accept,
+        // so a self-hoster with `NullUsageMeter` is unaffected and a dropped/deferred MOTE is never
+        // billed.
+        self.usage_meter.record(&UsageEvent::Stored {
+            account: self.storage_account(),
+            delta_bytes: stored_bytes,
+            at: self.now,
+        });
         self.send_ack(from, id);
         InboundOutcome::Stored { id: id.clone(), uid }
     }

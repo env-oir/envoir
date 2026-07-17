@@ -40,6 +40,7 @@ pub mod node;
 pub mod outbound;
 pub mod send_api;
 pub mod transport;
+pub mod usage;
 
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, NullJournal, Snapshot};
 pub use node::{Node, SendError};
@@ -81,6 +82,15 @@ pub use dmtap_deniable;
 // Node-layer mix-directory anti-rollback (spec §4.4.2, §18.5.3): the per-authority monotonic
 // high-water-mark that rejects a replayed/stale mix-fleet snapshot at the node.
 pub use mixdir::{MixDirError, MixDirectoryTracker};
+
+// The hosted-node **storage** seam (spec §12.2, §12.3, §12.4): the OSS half of the "node usage"
+// (hosted-mailbox storage) meter. Two traits — a `StorageQuota` Policy decision and an append-only
+// `NodeUsageMeter` — with unlimited/no-op self-host defaults, so the node runs identically with the
+// cloud off and links no billing crate. A cloud impl drops into these from the outside.
+pub use usage::{
+    CountingUsageMeter, NodeUsageMeter, NullUsageMeter, QuotaDecision, StorageQuota, UnlimitedStorage,
+    UsageEvent,
+};
 
 // Node-only planned modules (see README): the rest of the client side that *is* the mesh.
 // pub mod privacy;     // §6 — sealed sender, cover traffic, padding, tiers

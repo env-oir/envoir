@@ -52,6 +52,12 @@ pub enum InboundOutcome {
     Deferred { id: ContentId },
     /// `id` already held — acked immediately without reprocessing (dedup, §2.6).
     Duplicate { id: ContentId },
+    /// Cryptographically **valid** but refused durable storage: the mailbox owner's operator storage
+    /// quota (§12.2 Policy) would be exceeded. Fail-closed — the MOTE is neither stored nor acked, so
+    /// the sender's own retry holds it and ultimately EXPIREs (like [`Self::Deferred`], but the cause
+    /// is a storage-**operation** cap, never a crypto/access gate — §12.3). Self-host never reaches
+    /// this: the default [`crate::UnlimitedStorage`] quota admits every write.
+    StorageDenied { id: ContentId, reason: String },
     /// Cryptographically invalid/forged — discarded silently, **no** ack (§2.7a).
     Dropped(DropReason),
 }
