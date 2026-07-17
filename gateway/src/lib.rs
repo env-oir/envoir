@@ -76,6 +76,7 @@ pub mod net;
 pub mod outbound;
 pub mod outbound_guard;
 pub mod outbound_tcp;
+pub mod personal;
 pub mod provenance;
 pub mod spf;
 
@@ -114,6 +115,7 @@ pub use outbound::{
     OutboundTransport, TlsPolicy, TlsRequirement, TransportResult,
 };
 pub use outbound_guard::{OutboundSenderGuard, SenderVerdict};
+pub use personal::{ConfigError, DirectorySource, PersonalConfig};
 pub use provenance::{
     chain_append, msg_digest, AuthzDecision, Bridge, BridgeDirection, BridgeError, CountingMeter,
     GatewayAttestation, GatewayAuthz, GatewayMeter, MeterEvent, NullMeter, Origin, Profile,

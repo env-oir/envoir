@@ -1,0 +1,35 @@
+# envoir-gateway — personal single-operator gateway.
+#
+#   cd gateway && docker compose up --build
+#
+# The build context is `..` (the repo root) because the gateway depends on the sibling
+# dmtap-core / dmtap-mail crates by path while it lives in the monorepo (see Dockerfile).
+#
+# Put your config next to this file in ./config/:
+#   ./config/personal.toml        (copy from examples/personal.toml, set your domain)
+#   ./config/recipients.directory (copy from examples/recipients.directory, add your keys)
+# TLS certs, if used, go under ./config/ too and are referenced by path in personal.toml.
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    image: envoir-gateway
+    restart: unless-stopped
+    # Map the privileged host MX port 25 onto the container's unprivileged 2525 so the
+    # container process never needs root / CAP_NET_BIND_SERVICE. Set `listen = "0.0.0.0:2525"`
+    # in personal.toml to match. For a public MX you need port 25 reachable from the internet
+    # (many home ISPs block inbound 25 — see README "Be honest about port 25").
+    ports:
+      - "25:2525"
+    volumes:
+      # Your personal.toml + recipients.directory (+ any TLS certs) live here, read-only.
+      - ./config:/gateway/config:ro
+    command: ["personal", "/gateway/config/personal.toml"]
+    # The gateway is stateless (no queue, no mailbox): a crash/restart loses nothing.
+    healthcheck:
+      test: ["CMD", "envoir-gateway", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
