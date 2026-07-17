@@ -26,7 +26,11 @@ Envoir is the open-source reference implementation of **[DMTAP](https://github.c
 (the Decentralized Message Transfer & Access Protocol): one sovereign **keypair identity** for mail,
 chat, calendar, contacts, files, and groups, delivered over a peer-to-peer mesh and mixnet so that
 not even a global observer sees who talks to whom. A human address like `you@envoir.org` is only a
-*pointer* to your key — lose the provider, keep the identity. An optional gateway bridges DMTAP to
+*pointer* to your key — lose the provider, keep the identity. Naming itself is **pluggable**: a
+zero-authority key-name and a local petname need no DNS at all, `name@domain` (DNS + key
+transparency) is the default, and an OPTIONAL crypto name-chain resolver (ENS `.eth` / SNS `.sol`,
+off by default, bound by four guardrails) is a third alternative — every rung still resolves to,
+and pins, the same key. See [docs/naming.md](docs/naming.md). An optional gateway bridges DMTAP to
 legacy SMTP so it's useful on day one, and fades as the network grows. Envoir is to DMTAP what
 Element is to Matrix: the branded, MIT-licensed apps for an open protocol. There is **no
 cryptocurrency and no blockchain** anywhere in this project — anti-abuse for cold contact uses
@@ -131,6 +135,19 @@ your linked devices, your signed-in apps, and recovery. See
   <img src="docs/img/identity-dark.png" width="860" alt="Identity — safety number, devices, signed-in apps">
 </p>
 
+## Capabilities, and Envoir Send
+
+Every fine-grained permission in DMTAP — reading one mailbox folder, posting to one channel,
+sending mail programmatically — is a signed, offline-verifiable **delegated capability token**
+(a UCAN profile, [`crates/dmtap-core/src/capability.rs`](crates/dmtap-core/src/capability.rs)):
+attenuable (a child grant can only narrow its parent, never widen it) and independently
+**revocable**, so rotating one scoped credential never touches the root identity key. The natural
+application built on that primitive is **Envoir Send** — a Resend-style programmatic mail-sending
+API where every API key is a narrowly-scoped, rotatable send-only capability: a sovereign,
+self-hostable alternative to a hosted transactional-email service. The capability primitive itself
+is real and tested today; the dedicated send-service surface is a roadmap item, not yet part of
+this workspace. See [docs/protocol.md](docs/protocol.md#delegated-capabilities-and-envoir-send).
+
 ## Installable, offline, and mobile
 
 The client is a real **Progressive Web App**: `manifest.webmanifest` + a service worker that
@@ -203,13 +220,13 @@ functional standalone — the operator seam and any hosted operator are optional
 | Path | What it is |
 |---|---|
 | [`node/`](node) | **envoir-node** — the whole client side: identity, mailbox, mesh, messaging, files, and the IMAP/POP3/SMTP-submission/JMAP client servers |
-| [`gateway/`](gateway) | **envoir-gateway** — the optional legacy SMTP bridge; the only component that isn't content-blind |
-| [`crates/dmtap-core`](crates/dmtap-core) | Identity, MOTE, content addressing, canonical CBOR — the shared primitives |
+| [`gateway/`](gateway) | **envoir-gateway** — the optional legacy SMTP bridge; the only component that isn't content-blind; lives here by design, kept loosely coupled for a future split into its own repo (see [`gateway/SEPARATION.md`](gateway/SEPARATION.md)) |
+| [`crates/dmtap-core`](crates/dmtap-core) | Identity, MOTE, content addressing, canonical CBOR, delegated capability tokens — the shared primitives |
 | [`crates/dmtap-auth`](crates/dmtap-auth) | DMTAP-Auth — decentralized, key-based sign-in |
 | [`crates/dmtap-deniable`](crates/dmtap-deniable) | Deniable 1:1 messaging (X3DH + Double Ratchet) |
 | [`crates/dmtap-mls`](crates/dmtap-mls) | MLS group messaging |
 | [`crates/dmtap-mail`](crates/dmtap-mail) | Client protocol servers: IMAP/POP3/SMTP-submission, JMAP, autodiscovery |
-| [`crates/dmtap-naming`](crates/dmtap-naming) | Naming/addressing + key-transparency |
+| [`crates/dmtap-naming`](crates/dmtap-naming) | The pluggable naming/addressing resolver framework (key-name, petname, DNS + key-transparency, optional name-chains) — see [docs/naming.md](docs/naming.md) |
 | [`crates/dmtap-p2p`](crates/dmtap-p2p) | The real libp2p mesh transport (TCP/QUIC+Noise+Yamux, Kademlia, Circuit Relay v2 + DCUtR), proven on loopback — not yet the node binary's default |
 | [`crates/dmtap-seam`](crates/dmtap-seam) | The **operator seam**: the contract a hosted operator implements |
 | [`crates/conformance-runner`](crates/conformance-runner) | Runs the implementation against the spec's conformance catalog |
@@ -265,10 +282,11 @@ repo's root for it, and see its own `README.md` once merged for the exact steps.
 
 The normative specification is **not** in this repository — it lives in the sibling
 **[env-oir/dmtap](https://github.com/env-oir/dmtap)** repo: 22 markdown sections (identity, MOTE,
-naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance, and more), grounded
-against current standards, plus a compiled **`dmtap.pdf`**. This repo is one implementation of that
-spec; conformance is checked mechanically by [`crates/conformance-runner`](crates/conformance-runner)
-against the spec's own conformance catalog.
+naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance, and more), a
+registry of **132 error codes** (§21.3–§21.11), grounded against current standards, plus a
+compiled **`dmtap.pdf`**. This repo is one implementation of that spec; conformance is checked
+mechanically by [`crates/conformance-runner`](crates/conformance-runner) against the spec's own
+**121-case conformance catalog** — see [Security & honesty](#security--honesty).
 
 ## Security & honesty
 
@@ -282,12 +300,12 @@ machine-checked **ProVerif symbolic models** in [`formal/`](formal) (secrecy, mu
 authentication, forward secrecy, deniability, replay/origin-binding, post-compromise security,
 inclusion/no-rollback/split-view soundness — see its README for exact property statements and
 honest limitations); the wire-format
-decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **104-case conformance
-suite** runs 68 cases to a pass today (0 failures, the other 36 each skipped with a documented
+decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **121-case conformance
+suite** runs 92 cases to a pass today (0 failures, the other 29 each skipped with a documented
 reason) via [`crates/conformance-runner`](crates/conformance-runner); the gateway fails closed
 against **SSRF** on its outbound DNS/MX resolution; the node's anti-rollback/anti-abuse state
 survives a restart instead of resetting to a weaker baseline; and `cargo test --workspace` runs
-**585 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None
+**761 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None
 of this substitutes for an **independent external security audit**, which has not yet happened and
 is the gate before any production deployment. Treat everything here as pre-alpha.
 

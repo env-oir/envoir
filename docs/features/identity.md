@@ -26,7 +26,11 @@ switching to Envoir doesn't mean abandoning an old inbox), an optional `@handle`
 plus-addressing (`you+tag@domain`) — all resolving to the same key. If you lose the domain, you
 lose the *name*, not the identity: a signed move record rebinds the same key to a new name, and
 existing contacts (who route by key, not by name, once you've made first contact) follow you
-automatically. See [protocol.md](../protocol.md#naming--key-transparency).
+automatically. `name@domain` is only the headline form — a zero-authority key-name and a local
+petname need no domain or DNS at all, and an optional crypto name-chain (`.eth`/`.sol`) is a
+third, guarded alternative. See [../naming.md](../naming.md) for the full ladder and
+[protocol.md](../protocol.md#naming--key-transparency) for naming in the context of the whole
+protocol.
 
 ## Safety numbers
 

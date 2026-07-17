@@ -38,14 +38,19 @@ recipients, threading, and content are all hidden from the network.
 
 ## Naming & key transparency
 
-A `name@domain` address resolves through DNS (or an optional self-sovereign name backend — the
-*only* place DMTAP admits anything blockchain-like, and it's off by default) to a public key,
-checked against a **key-transparency log** for tamper-evidence, and **pinned on first use
-(TOFU)**. After that, correspondents route by key over the mesh, and DNS is never consulted again
-for that relationship unless a signed rotation says to. See spec §3.
+A name is never the identity — it's a discovery pointer the protocol resolves down to a key, then
+verifies. DMTAP fixes that one invariant (§3, §1.2: **identity ≠ name**) and leaves the naming
+system itself **pluggable** (§3.12): a **key-name** (derived straight from the key, zero
+authority, no DNS, no `@`), a local **petname**, the default **`name@domain`** (DNS discovery +
+key-transparency proof), and an OPTIONAL crypto **name-chain** (`.eth`/`.sol`, four guardrails —
+optional, key-is-identity via a bidirectional binding, free to resolve, no DMTAP token) all
+terminate at the same KT-verified, pinned key. See [naming.md](naming.md) for the full ladder,
+the resolver-type framework, and what "operation without DNS" actually means.
 
 - **`name@domain` is the headline address form** — provider-issued (`you@envoir.org`, zero DNS
-  work) or your own domain, both resolving through the same mechanism.
+  work) or your own domain, both resolving through DNS discovery + KT proof, **pinned on first use
+  (TOFU)**: correspondents route by key over the mesh from then on, and DNS is never consulted
+  again for that relationship unless a signed rotation record says to.
 - **Safety numbers** (spec §3.4.1) let two people verify each other's key out-of-band — words,
   digits, or a scannable grid — closing the one gap TOFU leaves open (a first-contact MITM before
   verification).
@@ -90,10 +95,16 @@ when both parties are online. See [privacy.md](privacy.md) and spec §4.
 
 The gateway (spec §7) is the **only** component that speaks SMTP, and the only one that isn't
 content-blind — the legacy leg is unavoidably plaintext. It's optional: a user with only DMTAP
-correspondents never invokes one, and it MAY be self-hosted for $0. See
-[features/self-hosting.md](features/self-hosting.md) and
+correspondents never invokes one, and it MAY be self-hosted for $0. It bridges addressing too: any
+key can present a stable, **key-derived alias** at any gateway with zero registration, so a
+legacy sender can already reach you before you've registered anywhere, and both directions of the
+bridge (inbound legacy → DMTAP, outbound DMTAP → legacy) run their own anti-spam gate rather than
+sharing one. See [features/self-hosting.md](features/self-hosting.md#the-gateway-address-mapping)
+for the full model and
 [features/transport-traceability.md](features/transport-traceability.md) for how a recipient can
-verify a message actually crossed a gateway (and thus why it's billed).
+verify a message actually crossed a gateway (and thus why it's billed). The gateway lives in this
+monorepo today by design, with the boundary discipline kept clean for a future split into its own
+`envoir-gateway` repository — see [`gateway/SEPARATION.md`](../gateway/SEPARATION.md).
 
 ## Client access
 
@@ -101,6 +112,24 @@ Every client protocol is a *view* of one MOTE store on the node (spec §8): **JM
 plus **IMAP/POP3/SMTP-submission** and **CalDAV/CardDAV** compatibility surfaces so existing
 mail/calendar clients work unchanged, authenticated with app-passwords rather than the identity
 keypair itself.
+
+## Delegated capabilities, and Envoir Send
+
+A [`CapabilityToken`](../crates/dmtap-core/src/capability.rs) is a signed, offline-verifiable,
+UCAN-profile grant of one narrow `(resource, ability, caveats)` right from an issuer key to an
+audience key — chainable, and each link in the chain may only *narrow* what its parent granted,
+never widen it. A grant is revoked by publishing a separate, KT-logged revocation, which reaches
+its whole delegated subtree at once. This primitive is real and tested in `dmtap-core` today
+(fuzzed as a wire object, exercised by `cargo test -p dmtap-core`), independent of any particular
+application built on it.
+
+The natural application is **Envoir Send** — a Resend-style programmatic mail-sending API built
+entirely on rotating a narrowly-scoped, send-only capability per API key: issuing, attenuating,
+and revoking a key never touches the account's root identity, and a compromised or retired key is
+one revocation away from being worthless. Framed plainly, it's a sovereign, self-hostable
+alternative to a hosted transactional-email API. This is a roadmap item grounded in the
+capability primitive already shipped here, not a product surface in this repository yet — see
+[roadmap.md](roadmap.md).
 
 ## Anti-abuse, honestly
 
