@@ -1,11 +1,14 @@
 [package]
 name = "dmtap-mail"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
 description = "DMTAP mail-protocol server layer — IMAP4rev2/rev1, SMTP submission, POP3, JMAP, and autodiscovery servers that project the MOTE store as folders/messages for legacy and modern mail clients (spec §8)"
-repository = "https://example.invalid/envoir"
+repository = "https://github.com/env-oir/envoir"
+homepage = "https://github.com/env-oir/envoir"
+keywords = ["dmtap", "email", "imap", "smtp", "jmap"]
+categories = ["email", "network-programming"]
 
 # The protocol *core* (parsers, response encoders, state machines, the MailStore projection of
 # the MOTE store) is synchronous and std-only, so it always builds and is fully unit/integration
