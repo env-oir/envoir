@@ -20,6 +20,15 @@
 //!   unit-testable offline; a real DNS/mesh/KT network layer is a thin later swap.
 //! - [`keypackage`] — the §5.3 async-join KeyPackage bundle fetch seam + in-memory impl,
 //!   content-address-checked.
+//! - [`restype`] — the §3.12 **pluggable resolver-type framework**: form-based dispatch
+//!   ([`classify`](restype::classify) / [`ResolverRegistry`](restype::ResolverRegistry)) routing a
+//!   name to `self` / `petname` / `dns` / `name-chain`, the derived key-name
+//!   [`SelfResolver`](restype::SelfResolver) and local [`PetnameBook`](restype::PetnameBook), and the
+//!   fail-closed `ERR_RESOLVER_TYPE_UNSUPPORTED` (`0x011F`) "unknown ⇒ reject, never guess" rule.
+//! - [`namechain`] — the OPTIONAL `name-chain` resolver (ENS `.eth` / SNS `.sol`, §3.12.5): a
+//!   [`NameChainClient`](namechain::NameChainClient) RPC seam (mock-backed here) plus the
+//!   §3.12.5(b) bidirectional key↔name binding enforcement (`ERR_NAMECHAIN_BINDING_UNVERIFIED`,
+//!   `0x011E`).
 //!
 //! ## What is real vs. seam
 //! DNS **parsing**, KT **verification** (RFC 6962 folding, STH signatures, leaf binding, quorum,
@@ -37,7 +46,9 @@ pub mod error;
 pub mod keypackage;
 pub mod kt;
 pub mod merkle;
+pub mod namechain;
 pub mod resolver;
+pub mod restype;
 
 pub use dns::{DmtapSvcbRecord, DmtapTxtRecord};
 pub use error::ResolveError;
@@ -47,4 +58,9 @@ pub use kt::{
     verify_sth_consistency, InMemoryKtLog, KtLog, KtProof, UnreachableLog,
 };
 pub use merkle::{verify_inclusion, MerkleTree};
+pub use namechain::{InMemoryNameChain, NameChainClient, NameChainResolver};
 pub use resolver::{DmtapName, InMemoryResolver, KtMode, PinnedResolution, Resolver};
+pub use restype::{
+    classify, Chain, PetnameBook, ResolvedBinding, ResolverKind, ResolverRegistry, ResolverType,
+    SelfResolver, Verification,
+};

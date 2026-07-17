@@ -77,6 +77,30 @@ pub enum ResolveError {
     /// A KeyPackage bundle could not be fetched or failed its content-address check (§5.3, §18.4.3).
     #[error("keypackage fetch failed: {0}")]
     KeyPackage(&'static str),
+
+    /// A name is written in a resolver type (§3.12.2, §21.18) this node does not implement, or one
+    /// that is unregistered — the "unknown ⇒ reject, never guess" discipline (as for an unknown
+    /// suite §1.1 or transport substrate §4.1). The name is unresolvable; the identity is
+    /// unaffected (its other resolvers, and always the key-name floor §3.9.6, still resolve it).
+    /// `ERR_RESOLVER_TYPE_UNSUPPORTED` (`0x011F`), FAIL_CLOSED_BLOCK — MUST NOT guess a binding.
+    #[error("resolver type unsupported — unresolvable, never guessed (0x011F): {0}")]
+    ResolverTypeUnsupported(&'static str),
+
+    /// A crypto name-chain (`.eth`/`.sol`, resolver-type `name-chain`, §3.12.5, §21.18) resolution
+    /// whose two binding directions **disagree** (§3.12.5(b)): the on-chain `name → ik` record names
+    /// a key that does not claim the name in its signed `Identity.names`, or a claimed name whose
+    /// chain record names a different key. The chain is a discovery pointer KT audits (§3.3–§3.5),
+    /// never a trust root. `ERR_NAMECHAIN_BINDING_UNVERIFIED` (`0x011E`), FAIL_CLOSED_BLOCK — render
+    /// the name **unverified**; MUST NOT display it as authenticated nor use it to address mail.
+    #[error("name-chain binding unverified — bidirectional key↔name check failed (0x011E): {0}")]
+    NameChainBindingUnverified(&'static str),
+
+    /// A key-name (resolver-type `self`, §3.9.6) failed to verify against the candidate key: its
+    /// internal checksum did not hold (a typo/mishear) or it does not derive from the key. The `self`
+    /// resolver derives, it never guesses — a bad key-name **fails closed** rather than resolving to a
+    /// *different* key. Rendered at the resolution layer as `ERR_NAME_RESOLUTION_FAILED` (`0x0109`).
+    #[error("key-name unverified — checksum/derivation mismatch, fail closed (0x0109): {0}")]
+    KeyNameUnverified(&'static str),
 }
 
 impl ResolveError {
@@ -94,6 +118,9 @@ impl ResolveError {
             ResolveError::KtEquivocation => 0x0107,
             ResolveError::KtSthInconsistent => 0x0110,
             ResolveError::KtSthStale => 0x0112,
+            ResolveError::ResolverTypeUnsupported(_) => 0x011F,
+            ResolveError::NameChainBindingUnverified(_) => 0x011E,
+            ResolveError::KeyNameUnverified(_) => 0x0109,
             ResolveError::KeyPackage(_) => 0x0109,
             ResolveError::Identity(e) => match e {
                 IdentityError::BadSignature => 0x0103,
