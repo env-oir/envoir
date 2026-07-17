@@ -33,6 +33,7 @@ use crate::abi::{
     encode_text, keccak256,
 };
 use crate::rpc::{decode_hex_0x, eth_call, CallResult};
+use crate::ssrf::GatewayAllowlist;
 use crate::transport::HttpTransport;
 use crate::NamechainError;
 
@@ -50,21 +51,37 @@ pub struct EnsClient<T: HttpTransport> {
     transport: T,
     endpoint: String,
     registry: [u8; 20],
+    /// Optional operator allowlist of CCIP-Read gateway hosts (§ defense-in-depth). `None` preserves
+    /// the prior behavior: any public, SSRF-guarded gateway host is dialable. When `Some`, a gateway
+    /// host must additionally be on the allowlist or the CCIP fetch is refused (fail closed).
+    gateway_allowlist: Option<GatewayAllowlist>,
 }
 
 impl<T: HttpTransport> EnsClient<T> {
-    /// Build a client against the Ethereum JSON-RPC `endpoint`, using the mainnet ENS registry.
+    /// Build a client against the Ethereum JSON-RPC `endpoint`, using the mainnet ENS registry and
+    /// **no** CCIP gateway allowlist (any public, SSRF-guarded gateway is dialable — opt in with
+    /// [`with_gateway_allowlist`](Self::with_gateway_allowlist)).
     pub fn new(transport: T, endpoint: impl Into<String>) -> Self {
         EnsClient {
             transport,
             endpoint: endpoint.into(),
             registry: MAINNET_REGISTRY,
+            gateway_allowlist: None,
         }
     }
 
     /// Override the ENS registry address (for a testnet / alternate deployment).
     pub fn with_registry(mut self, registry: [u8; 20]) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// Constrain CCIP-Read (EIP-3668) gateway fetches to an operator-configured [`GatewayAllowlist`].
+    /// With an allowlist set, a gateway whose host is neither an allowlisted entry nor a subdomain of
+    /// one is refused **in addition to** the SSRF range checks. Without this (the default) any public,
+    /// SSRF-guarded host is allowed, so existing callers are unaffected.
+    pub fn with_gateway_allowlist(mut self, allowlist: GatewayAllowlist) -> Self {
+        self.gateway_allowlist = Some(allowlist);
         self
     }
 
@@ -117,12 +134,12 @@ impl<T: HttpTransport> EnsClient<T> {
                 .replace("{sender}", &sender_hex)
                 .replace("{data}", &data_hex);
             // The gateway URL is attacker-controlled (anyone can point a name at their resolver) — guard
-            // it against SSRF before any socket is opened.
-            crate::ssrf::guard_gateway_url(&expanded)?;
+            // it against SSRF (and the operator allowlist, if set) before any socket is opened.
+            crate::ssrf::guard_gateway_url(&expanded, self.gateway_allowlist.as_ref())?;
             self.transport.get(&expanded)?
         } else {
             let expanded = url.replace("{sender}", &sender_hex);
-            crate::ssrf::guard_gateway_url(&expanded)?;
+            crate::ssrf::guard_gateway_url(&expanded, self.gateway_allowlist.as_ref())?;
             let payload = serde_json::json!({ "sender": sender_hex, "data": data_hex });
             self.transport
                 .post_json(&expanded, payload.to_string().as_bytes())?
@@ -374,6 +391,56 @@ mod tests {
         let client = EnsClient::new(mock, "https://rpc");
         let got = client.resolve_result("offchain@.eth").unwrap();
         assert_eq!(got, ik.to_vec());
+    }
+
+    #[test]
+    fn ccip_read_allowlist_permits_matching_gateway_host() {
+        // Same happy CCIP path, but with an allowlist that DOES cover the gateway host.
+        let ik = [0xceu8; 32];
+        let text = format!("0x{}", hex::encode(ik));
+        let resolver = [0x55u8; 20];
+        let url = "https://gw.example.com/{sender}/{data}";
+        let revert =
+            build_offchain_lookup_revert(resolver, url, &[0x01], [0xaa, 0xbb, 0xcc, 0xdd], &[0x77]);
+        let mock = MockTransport::new(vec![
+            Ok(addr_word(resolver)),
+            Ok(format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":3,\"message\":\"revert\",\"data\":\"0x{}\"}}}}",
+                hex::encode(&revert)
+            )
+            .into_bytes()),
+            Ok(br#"{"data":"0xaabb"}"#.to_vec()),
+            Ok(string_result(&text)),
+        ]);
+        let client = EnsClient::new(mock, "https://rpc")
+            .with_gateway_allowlist(GatewayAllowlist::new(["example.com"]));
+        assert_eq!(client.resolve_result("offchain@.eth").unwrap(), ik.to_vec());
+    }
+
+    #[test]
+    fn ccip_read_allowlist_refuses_off_allowlist_gateway_host() {
+        // The gateway host is public and SSRF-clean, but not on the allowlist → the CCIP fetch is
+        // refused before any gateway socket is opened, and the resolution fails closed.
+        let resolver = [0x66u8; 20];
+        let url = "https://gw.other-domain.example/{sender}/{data}";
+        let revert =
+            build_offchain_lookup_revert(resolver, url, &[0x01], [0xaa, 0xbb, 0xcc, 0xdd], &[0x77]);
+        // Only two responses scripted: the gateway GET must never be reached.
+        let mock = MockTransport::new(vec![
+            Ok(addr_word(resolver)),
+            Ok(format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{{\"code\":3,\"message\":\"revert\",\"data\":\"0x{}\"}}}}",
+                hex::encode(&revert)
+            )
+            .into_bytes()),
+        ]);
+        let client = EnsClient::new(mock, "https://rpc")
+            .with_gateway_allowlist(GatewayAllowlist::new(["example.com"]));
+        assert!(matches!(
+            client.resolve_result("offchain@.eth"),
+            Err(NamechainError::BlockedGatewayUrl(_))
+        ));
+        assert_eq!(client.resolve("offchain@.eth"), None);
     }
 
     /// Assemble a full `OffchainLookup(...)` revert (selector + ABI body) for the CCIP test.
