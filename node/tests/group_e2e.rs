@@ -109,3 +109,66 @@ fn removed_node_cannot_read_future_group_messages_pcs() {
     assert_eq!(charlie_msgs.len(), 1, "Charlie received the frame off the mesh...");
     assert!(charlie_msgs[0].1.is_err(), "...but cannot decrypt it (PCS)");
 }
+
+// --- H-B: the real daemon serve loop drains + delivers group messages ------------------------
+
+/// Before the fix, `Node::poll_group_messages` was called only in tests — never by the daemon serve
+/// loop — so group application messages a running node received were buffered forever (dead feature)
+/// and an unbounded buffer besides. The loop now drains + delivers them each tick.
+#[tokio::test]
+async fn daemon_run_loop_delivers_a_received_group_message() {
+    use dmtap::daemon::run_loop;
+    use std::time::Duration;
+
+    let net = InMemoryNetwork::new();
+    let mut committer = Committer::new();
+    let (mut alice, _a) = make_node(&net);
+    let (mut bob, _b) = make_node(&net);
+
+    // Form a 2-member group: Alice founds, adds Bob, Bob joins from the Welcome.
+    let bob_kp = bob.publish_group_keypackage().unwrap();
+    alice.found_group(GID).unwrap();
+    let add = alice.group_add_member(GID, &bob_kp, &mut committer).unwrap();
+    bob.join_group(GID, &add.welcome, &committer).unwrap();
+
+    // Alice broadcasts an application message over the mesh; it lands on Bob's transport.
+    let secret = b"delivered by the real daemon loop";
+    assert_eq!(alice.group_broadcast(GID, secret).unwrap(), 1, "fanned out to Bob");
+    assert_eq!(bob.inbox().exists(), 0, "nothing delivered yet");
+
+    // Run Bob's real serve loop for a few ticks: it must drain the buffered group MOTE and DELIVER it.
+    let shutdown = tokio::time::sleep(Duration::from_millis(40));
+    let _ = run_loop(&mut bob, Duration::from_millis(5), shutdown).await;
+
+    assert_eq!(bob.inbox().exists(), 1, "the daemon loop drained + delivered the group message");
+    let raw = &bob.inbox().messages[0].raw;
+    assert!(
+        raw.windows(secret.len()).any(|w| w == secret),
+        "the decrypted group plaintext was filed to the store"
+    );
+}
+
+// --- H-B: the group inbox is bounded (a Frame::Group flood cannot OOM the node) --------------
+
+/// A peer streaming `Frame::Group` faster than the node drains must not grow `group_inbox` without
+/// bound. Past the cap the frames are dropped (fail-safe backpressure), mirroring the transport inbox.
+#[test]
+fn group_inbox_is_bounded_under_a_flood() {
+    // MAX_GROUP_INBOX (node.rs) — kept in step with the internal cap.
+    const CAP: usize = 1024;
+    let net = InMemoryNetwork::new();
+    let (mut bob, bob_addr) = make_node(&net);
+    let flooder = net.endpoint(b"flooder".to_vec());
+
+    let pushed = CAP + 300;
+    for _ in 0..pushed {
+        flooder
+            .send(&bob_addr, Frame::Group { group_id: b"g".to_vec(), body: vec![0xAB] })
+            .unwrap();
+    }
+
+    bob.poll(); // drains the transport into the (bounded) group_inbox
+    let drained = bob.poll_group_messages().len();
+    assert!(drained < pushed, "the flood was NOT buffered wholesale ({drained} of {pushed})");
+    assert!(drained <= CAP, "group_inbox stayed within its cap: {drained} > {CAP}");
+}

@@ -173,13 +173,13 @@ impl InMemoryNetwork {
     /// Register `addr` on the fabric and return a transport bound to it.
     pub fn endpoint(&self, addr: impl Into<Vec<u8>>) -> InMemoryTransport {
         let addr = addr.into();
-        self.inner.lock().unwrap().queues.entry(addr.clone()).or_default();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).queues.entry(addr.clone()).or_default();
         InMemoryTransport { addr, net: self.clone() }
     }
 
     /// Simulate a peer going offline: subsequent `send`s to it fail `Unreachable`.
     pub fn set_down(&self, addr: &[u8], down: bool) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if down {
             g.down.insert(addr.to_vec());
         } else {
@@ -189,7 +189,7 @@ impl InMemoryNetwork {
 
     /// Total frames buffered across all peers (test/inspection aid).
     pub fn in_flight(&self) -> usize {
-        self.inner.lock().unwrap().queues.values().map(|q| q.len()).sum()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).queues.values().map(|q| q.len()).sum()
     }
 }
 
@@ -205,7 +205,7 @@ impl Transport for InMemoryTransport {
     }
 
     fn send(&self, to: &[u8], frame: Frame) -> Result<(), TransportError> {
-        let mut g = self.net.inner.lock().unwrap();
+        let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
         // A peer is unreachable if it was never registered or is simulated down.
         if g.down.contains(to) || !g.queues.contains_key(to) {
             return Err(TransportError::Unreachable);
@@ -215,7 +215,7 @@ impl Transport for InMemoryTransport {
     }
 
     fn drain(&self) -> Vec<(Vec<u8>, Frame)> {
-        let mut g = self.net.inner.lock().unwrap();
+        let mut g = self.net.inner.lock().unwrap_or_else(|e| e.into_inner());
         match g.queues.get_mut(&self.addr) {
             Some(q) => q.drain(..).collect(),
             None => Vec::new(),
@@ -369,7 +369,7 @@ fn tcp_accept_loop(
                 // A connection carries one message (connect-per-send); read until EOF/timeout.
                 // On a clean EOF, timeout, or malformed frame we are simply done with this conn.
                 while let Ok(msg) = read_tcp_frame(&mut stream) {
-                    let mut q = inbox.lock().unwrap();
+                    let mut q = inbox.lock().unwrap_or_else(|e| e.into_inner());
                     if q.len() >= MAX_INBOX_FRAMES {
                         // Backlog full: refuse further frames and stop reading this connection so
                         // the inbox cannot grow past the cap (memory-exhaustion backpressure). The
@@ -440,7 +440,7 @@ impl TcpTransport {
     /// Register how to reach a peer: its logical DMTAP `addr` maps to a TCP `socket` to dial
     /// (a stand-in for signed `LocationRecord` discovery, §4.2).
     pub fn add_peer(&self, addr: impl Into<Vec<u8>>, socket: SocketAddr) {
-        self.peers.lock().unwrap().insert(addr.into(), socket);
+        self.peers.lock().unwrap_or_else(|e| e.into_inner()).insert(addr.into(), socket);
     }
 }
 
@@ -476,7 +476,7 @@ impl Transport for TcpTransport {
     }
 
     fn drain(&self) -> Vec<(Vec<u8>, Frame)> {
-        self.inbox.lock().unwrap().drain(..).collect()
+        self.inbox.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()
     }
 }
 
@@ -498,6 +498,29 @@ mod tests {
         assert_eq!(got, vec![(b"alice".to_vec(), Frame::Mote(vec![1, 2, 3]))]);
         // Drained; the fabric is empty again.
         assert_eq!(net.in_flight(), 0);
+    }
+
+    #[test]
+    fn poisoned_fabric_mutex_is_recovered_not_wedged() {
+        // A thread that panics while holding the fabric lock POISONS the mutex. With `.lock().unwrap()`
+        // every subsequent send/drain would panic — one panic anywhere silently wedges the whole
+        // transport (accept loop + all sends). With poison recovery the fabric keeps working.
+        let net = InMemoryNetwork::new();
+        let a = net.endpoint(b"alice".to_vec());
+        let b = net.endpoint(b"bob".to_vec());
+
+        let net2 = net.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _g = net2.inner.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("holder panics while holding the lock → poisons the mutex");
+        })
+        .join();
+        assert!(poisoned.is_err(), "the holder thread panicked (poisoning the mutex)");
+
+        // Despite the poisoned mutex, the transport is not wedged: send + drain still succeed.
+        a.send(b"bob", Frame::Mote(vec![1, 2, 3])).expect("send survives a poisoned lock");
+        let got = b.drain();
+        assert_eq!(got, vec![(b"alice".to_vec(), Frame::Mote(vec![1, 2, 3]))]);
     }
 
     #[test]
@@ -617,12 +640,12 @@ mod tests {
         // Wait until the backlog fills to the cap (proves the flood reached the inbox), never
         // draining. The depth must never exceed the cap no matter how much more the peer streams.
         assert!(
-            wait_until(|| b.inbox.lock().unwrap().len() >= MAX_INBOX_FRAMES),
+            wait_until(|| b.inbox.lock().unwrap_or_else(|e| e.into_inner()).len() >= MAX_INBOX_FRAMES),
             "the flood should fill the inbox up to its cap"
         );
         // Give the sender extra time to keep pushing; the cap must still hold.
         for _ in 0..50 {
-            let depth = b.inbox.lock().unwrap().len();
+            let depth = b.inbox.lock().unwrap_or_else(|e| e.into_inner()).len();
             assert!(
                 depth <= MAX_INBOX_FRAMES,
                 "inbox depth {depth} exceeded the cap {MAX_INBOX_FRAMES} — backlog grew unbounded"

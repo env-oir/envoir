@@ -306,8 +306,13 @@ pub async fn run_loop_with_send_api<T: Transport>(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stats = LoopStats::default();
     loop {
+        // NOT `biased`: a biased select ranks `accept` above the delivery `tick`, and because a
+        // `Node` is `!Send` the connection is handled INLINE — so under a stream of connections the
+        // delivery/retry/deadline tick would starve (queued MOTEs never retried, deadlines never
+        // fired). Unbiased select polls the arms fairly, so the tick makes progress even under
+        // continuous connection load. (`READ_TIMEOUT`/`WRITE_TIMEOUT` still bound each connection so
+        // one slow client cannot pin the task.)
         tokio::select! {
-            biased;
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
                 if let Ok((stream, _peer)) = accepted {
@@ -318,6 +323,7 @@ pub async fn run_loop_with_send_api<T: Transport>(
                 node.set_now(now_ms());
                 let inbound = node.poll();
                 stats.inbound += inbound.len() as u64;
+                node.pump_group_inbox();
                 stats.retried += node.retry_pending() as u64;
                 node.tick_deadlines();
                 stats.ticks += 1;
