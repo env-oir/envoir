@@ -43,6 +43,7 @@ pub mod transport;
 
 pub use ens::EnsClient;
 pub use sns::SnsClient;
+pub use ssrf::GatewayAllowlist;
 pub use transport::{HttpTransport, TransportError};
 
 #[cfg(feature = "net")]
@@ -76,8 +77,9 @@ pub enum NamechainError {
     NotFound,
 
     /// A CCIP-Read (EIP-3668) gateway URL from an attacker-controlled `OffchainLookup` revert failed
-    /// the SSRF guard (non-HTTPS scheme, or a host that resolves into a loopback/private/link-local/
-    /// metadata address). Refused before any socket is opened — fail closed (§3.12.5(c)).
+    /// the gateway guard: a non-HTTPS scheme, a host that resolves into a loopback/private/link-local/
+    /// metadata address, or — when the operator configured a [`GatewayAllowlist`] — a host not on that
+    /// allowlist. Refused before any socket is opened — fail closed (§3.12.5(c)).
     #[error("ccip gateway url refused: {0}")]
     BlockedGatewayUrl(&'static str),
 }
