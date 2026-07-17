@@ -69,8 +69,11 @@ pub struct OutboundSenderGuard {
     backoff_base_ms: u64,
     /// Max doublings of the backoff (so it cannot grow without bound).
     backoff_max_shift: u32,
-    /// When `Some`, only these accounts are authenticated senders (anyone else is refused). When
-    /// `None`, any non-empty account is accepted (the caller vouched for authentication upstream).
+    /// The authenticated-senders allowlist. When `Some`, only these accounts are authenticated
+    /// senders (anyone else is refused). When `None` the allowlist is **unset**, which is
+    /// **fail-closed by default**: no account is authenticated until the operator configures the
+    /// allowlist via [`Self::require_registered`]. An unset allowlist must never silently become an
+    /// open outbound relay.
     registered: Option<Vec<String>>,
     clock: Box<dyn Clock>,
     state: Mutex<HashMap<String, SenderState>>,
@@ -120,7 +123,8 @@ impl OutboundSenderGuard {
     }
 
     /// Restrict outbound relay to this explicit set of authenticated accounts (the
-    /// authenticated-senders-only allowlist). Without this, any non-empty account is accepted.
+    /// authenticated-senders-only allowlist). Until this is set the guard is fail-closed and
+    /// authenticates **no** account, so the gateway is never an open outbound relay by default.
     pub fn require_registered(mut self, accounts: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.registered = Some(accounts.into_iter().map(Into::into).collect());
         self
@@ -132,7 +136,8 @@ impl OutboundSenderGuard {
         }
         match &self.registered {
             Some(set) => set.iter().any(|a| a == account),
-            None => true,
+            // Fail-closed: an unset allowlist authenticates NO account (no open outbound relay).
+            None => false,
         }
     }
 
@@ -200,7 +205,11 @@ impl OutboundSenderGuard {
         } else {
             st.strikes = st.strikes.saturating_add(1);
             let shift = (st.strikes - 1).min(self.backoff_max_shift);
-            let backoff = self.backoff_base_ms.saturating_mul(1u64 << shift);
+            // `backoff_max_shift` is operator-set and unbounded; `1u64 << shift` panics (debug) or
+            // wraps (release) once `shift >= 64`. `checked_shl` clamps to a saturated factor instead,
+            // so an absurd config produces a very large but finite backoff, never a panic.
+            let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+            let backoff = self.backoff_base_ms.saturating_mul(factor);
             st.backoff_until = now.saturating_add(backoff);
         }
     }
@@ -245,6 +254,40 @@ mod tests {
         assert!(matches!(guard.authorize_send(""), SenderVerdict::Refuse { .. }));
         assert!(matches!(guard.authorize_send("acct-stranger"), SenderVerdict::Refuse { .. }));
         assert_eq!(guard.authorize_send("acct-alice"), SenderVerdict::Allow);
+    }
+
+    #[test]
+    fn unset_allowlist_denies_by_default_not_open_relay() {
+        // A guard with NO allowlist configured must DENY every account — an unset allowlist is
+        // fail-closed, not an open outbound relay. (Old behavior authenticated any non-empty account.)
+        let guard = OutboundSenderGuard::new();
+        assert!(matches!(guard.authorize_send("anyone"), SenderVerdict::Refuse { .. }));
+        assert!(matches!(guard.authorize_send("acct-whoever"), SenderVerdict::Refuse { .. }));
+
+        // Only after the operator sets an allowlist is a listed account authenticated; others are
+        // still refused (not merely rate-limited).
+        let guard = OutboundSenderGuard::new().require_registered(["acct-alice"]);
+        assert_eq!(guard.authorize_send("acct-alice"), SenderVerdict::Allow);
+        assert!(matches!(guard.authorize_send("acct-bob"), SenderVerdict::Refuse { .. }));
+    }
+
+    #[test]
+    fn oversized_backoff_max_shift_saturates_without_panicking() {
+        // `backoff_max_shift` is operator-set and unbounded. With the old `1u64 << shift`, a shift
+        // >= 64 panics in debug (overflow) / wraps in release. It must saturate sanely instead.
+        let clock = ManualClock::new(0);
+        let guard = OutboundSenderGuard::with_clock(Box::new(clock.clone()))
+            .require_registered(["risky"])
+            .with_backoff(1_000_000, u32::MAX);
+        // Accrue enough strikes that the shift exceeds 64.
+        for _ in 0..70 {
+            guard.report_outcome("risky", false);
+        }
+        // No panic; the sender is throttled with a finite (saturated) backoff.
+        match guard.authorize_send("risky") {
+            SenderVerdict::Throttle { retry_after_ms, .. } => assert!(retry_after_ms > 0),
+            other => panic!("expected throttle, got {other:?}"),
+        }
     }
 
     #[test]

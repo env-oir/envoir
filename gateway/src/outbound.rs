@@ -88,8 +88,9 @@ pub struct OutboundGateway {
     transport: Box<dyn OutboundTransport>,
     mx_resolver: Box<dyn MxResolver>,
     /// Optional outbound anti-spam governor (§7.3, §9): authenticated-senders-only + per-sender
-    /// rate-limit / volume cap / reputation backoff. `None` ⇒ the operator authenticated and
-    /// rate-governed the sender upstream (e.g. at the mesh ingress) — [`Self::send`] is unguarded.
+    /// rate-limit / volume cap / reputation backoff. When `None`, the governed egress entry point
+    /// [`Self::send_authenticated`] **fails closed** (refuses) rather than relaying ungoverned — so
+    /// the gateway can never become an open outbound relay by forgetting to attach a guard.
     sender_guard: Option<OutboundSenderGuard>,
 }
 
@@ -279,8 +280,11 @@ impl OutboundGateway {
     /// reputation backoff is blocked without ever touching the destination MX. On an allowed send the
     /// destination outcome is fed back into the sender's reputation (a permanent reject / TLS abort is
     /// a bad signal that arms backoff; a delivery decays it), so a sender that keeps producing
-    /// blacklisting outcomes is progressively throttled. With no guard configured this is exactly
-    /// [`Self::send`] wrapped in [`GovernedSend::Sent`] (the operator governed the sender upstream).
+    /// blacklisting outcomes is progressively throttled. With **no** guard configured this path
+    /// **fails closed** — it refuses rather than relaying ungoverned — so an operator who forgets to
+    /// attach a guard does not silently run an open outbound relay. (The raw, ungoverned
+    /// [`Self::send`] remains available for callers that governed the sender upstream and opt in
+    /// explicitly.)
     pub fn send_authenticated(
         &self,
         payload: &Payload,
@@ -289,14 +293,17 @@ impl OutboundGateway {
         account: &str,
         now: TimestampMs,
     ) -> GovernedSend {
-        if let Some(guard) = &self.sender_guard {
-            match guard.authorize_send(account) {
-                SenderVerdict::Allow => {}
-                blocked => return GovernedSend::Blocked(blocked),
-            }
+        let Some(guard) = &self.sender_guard else {
+            return GovernedSend::Blocked(SenderVerdict::Refuse {
+                reason: "5.7.1 outbound relay denied: no sender guard configured (fail-closed)".into(),
+            });
+        };
+        match guard.authorize_send(account) {
+            SenderVerdict::Allow => {}
+            blocked => return GovernedSend::Blocked(blocked),
         }
         let report = self.send(payload, from_addr, to_addr, now);
-        if let Some(guard) = &self.sender_guard {
+        {
             // A permanent destination reject or a TLS-enforcement abort is the kind of outcome that
             // gets a relay blacklisted; feed it into reputation. Transient defers are not penalized.
             let bad = matches!(report, OutboundReport::Failed(_));

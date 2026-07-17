@@ -26,7 +26,7 @@
 //! the whole flow is exercised without a wall clock.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dmtap_core::identity::verify_domain;
 use dmtap_core::{ContentId, TimestampMs};
@@ -139,6 +139,12 @@ pub enum AdmissionError {
     /// Key-registered mode: the presented key is not on the operator's registry.
     #[error("presented key is not registered with this gateway")]
     UnknownKey,
+    /// The presented challenge nonce was never issued by this gateway, or has already been consumed
+    /// by a prior admission. Admission challenges are **single-use** (§9): a captured
+    /// `(nonce, issued_at, key, sig)` tuple cannot be replayed, because the nonce is gone after the
+    /// first admission and an un-issued nonce was never admissible to begin with.
+    #[error("admission challenge was not issued by this gateway or has already been consumed")]
+    UnknownOrConsumedChallenge,
 }
 
 /// The registry of admitted identities and the operator's [`AuthzMode`] (§7.9). It performs the
@@ -150,19 +156,35 @@ pub struct IdentityRegistry {
     mode: AuthzMode,
     challenge_ttl_ms: u64,
     entries: Vec<RegisteredIdentity>,
+    /// The ledger of challenge nonces this gateway has **issued and not yet consumed** (nonce →
+    /// issue time). [`Self::admit`] consumes-and-removes the presented nonce, so a challenge admits
+    /// exactly once (§9, single-use): a replayed or never-issued nonce fails closed. Wrapped in an
+    /// `Arc<Mutex<…>>` so the authoritative consumed-nonce set is shared across clones and updatable
+    /// through the `&self` issue/admit calls.
+    issued_nonces: Arc<Mutex<HashMap<[u8; 32], TimestampMs>>>,
 }
 
 impl IdentityRegistry {
     /// A key-registered registry (the safe default) with a 5-minute challenge validity window.
     pub fn key_registered() -> Self {
-        IdentityRegistry { mode: AuthzMode::KeyRegistered, challenge_ttl_ms: 300_000, entries: Vec::new() }
+        IdentityRegistry {
+            mode: AuthzMode::KeyRegistered,
+            challenge_ttl_ms: 300_000,
+            entries: Vec::new(),
+            issued_nonces: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// An **open-public** relay registry (documented spam risk — see [`AuthzMode`]). Still runs the
     /// challenge–response (so an admitted account is bound to a proven key), but does not require the
     /// key to be pre-registered.
     pub fn open_public() -> Self {
-        IdentityRegistry { mode: AuthzMode::OpenPublic, challenge_ttl_ms: 300_000, entries: Vec::new() }
+        IdentityRegistry {
+            mode: AuthzMode::OpenPublic,
+            challenge_ttl_ms: 300_000,
+            entries: Vec::new(),
+            issued_nonces: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The operator's admission mode.
@@ -195,8 +217,27 @@ impl IdentityRegistry {
     }
 
     /// Issue a challenge for a connecting sender (deterministic: nonce + issue time are parameters).
+    /// The gateway **records** the issued nonce so [`Self::admit`] can verify it is one we minted and
+    /// consume it single-use. Expired issued nonces (older than the freshness window at this issuance)
+    /// are pruned so the ledger cannot grow without bound.
     pub fn issue_challenge(&self, nonce: [u8; 32], issued_at: TimestampMs) -> Challenge {
+        let mut issued = self.issued_nonces.lock().expect("gateway nonce ledger poisoned");
+        let cutoff = issued_at.saturating_sub(self.challenge_ttl_ms);
+        issued.retain(|_, &mut t| t >= cutoff);
+        issued.insert(nonce, issued_at);
         Challenge::new(nonce, issued_at)
+    }
+
+    /// Consume a single-use admission nonce: remove it from the issued ledger, returning
+    /// [`AdmissionError::UnknownOrConsumedChallenge`] fail-closed if it was never issued or was
+    /// already spent. This is the anti-replay gate.
+    fn consume_nonce(&self, nonce: &[u8; 32]) -> Result<(), AdmissionError> {
+        let mut issued = self.issued_nonces.lock().expect("gateway nonce ledger poisoned");
+        if issued.remove(nonce).is_some() {
+            Ok(())
+        } else {
+            Err(AdmissionError::UnknownOrConsumedChallenge)
+        }
     }
 
     /// Admit a sender that answered `challenge` by signing it with the private half of `presented_key`
@@ -205,10 +246,16 @@ impl IdentityRegistry {
     /// - a stale or future-dated challenge → [`AdmissionError::ChallengeExpired`],
     /// - a signature that does not verify under the presented key → [`AdmissionError::BadSignature`]
     ///   (this is the forged-key rejection),
+    /// - a nonce this gateway never issued, or one already spent by a prior admission →
+    ///   [`AdmissionError::UnknownOrConsumedChallenge`] (single-use anti-replay),
     /// - key-registered mode with an unregistered key → [`AdmissionError::UnknownKey`].
     ///
     /// In open-public mode an unregistered but key-controlling sender is admitted with a
     /// key-derived account label and an empty domain.
+    ///
+    /// The single-use nonce is consumed **only on the success path** — after freshness, signature,
+    /// and mode policy have all passed — so a forged-signature or unknown-key attempt cannot burn a
+    /// legitimate sender's live challenge.
     pub fn admit(
         &self,
         challenge: &Challenge,
@@ -216,7 +263,7 @@ impl IdentityRegistry {
         sig: &[u8],
         now: TimestampMs,
     ) -> Result<Admission, AdmissionError> {
-        // Freshness first (cheap, and bounds replay) — reject stale and clock-skew-future challenges.
+        // Freshness first (cheap, secondary replay bound) — reject stale and clock-skew-future challenges.
         if now < challenge.issued_at || now.saturating_sub(challenge.issued_at) > self.challenge_ttl_ms {
             return Err(AdmissionError::ChallengeExpired);
         }
@@ -225,16 +272,17 @@ impl IdentityRegistry {
         verify_domain(presented_key, ADMISSION_DS, &challenge.signing_body(), sig)
             .map_err(|_| AdmissionError::BadSignature)?;
 
-        match self.mode {
+        // Resolve who this proven key is admitted as (mode policy) BEFORE spending the nonce.
+        let admission = match self.mode {
             AuthzMode::KeyRegistered => match self.identity_for_key(presented_key) {
-                Some(id) => Ok(Admission {
+                Some(id) => Admission {
                     account: id.account.clone(),
                     domain: id.domain.clone(),
                     public_key: presented_key.to_vec(),
-                }),
-                None => Err(AdmissionError::UnknownKey),
+                },
+                None => return Err(AdmissionError::UnknownKey),
             },
-            AuthzMode::OpenPublic => Ok(match self.identity_for_key(presented_key) {
+            AuthzMode::OpenPublic => match self.identity_for_key(presented_key) {
                 Some(id) => Admission {
                     account: id.account.clone(),
                     domain: id.domain.clone(),
@@ -245,8 +293,13 @@ impl IdentityRegistry {
                     domain: String::new(),
                     public_key: presented_key.to_vec(),
                 },
-            }),
-        }
+            },
+        };
+
+        // Anti-replay gate: the presented nonce must be one this gateway issued and has not already
+        // consumed. Removing it makes the challenge single-use — a captured tuple fails the second time.
+        self.consume_nonce(&challenge.nonce)?;
+        Ok(admission)
     }
 }
 
@@ -439,10 +492,12 @@ fn base32_lower(input: &[u8]) -> String {
     out
 }
 
-/// A short, stable fingerprint of a public key (first 6 bytes of its content address, base32) — used
-/// for open-public account labels and internal identification.
+/// A short, stable fingerprint of a public key (first **10** bytes of its content address, 80 bits,
+/// base32) — used for open-public `anon:<fp>` account labels and internal identification. 80 bits
+/// (matching [`key_derived_localpart`]) keeps birthday collisions negligible, so two distinct keys
+/// cannot share a quota / reputation bucket; a 48-bit label would not.
 fn key_fingerprint(public_key: &[u8]) -> String {
-    base32_lower(&ContentId::of(public_key).digest()[..6])
+    base32_lower(&ContentId::of(public_key).digest()[..10])
 }
 
 /// The **stable, key-derived** local-part for a DMTAP key (§7.10): `k` + base32 of the first 10 bytes
@@ -622,6 +677,87 @@ mod tests {
             reg.admit(&ch, &alice.public(), &sig, 999_999),
             Err(AdmissionError::ChallengeExpired)
         );
+    }
+
+    #[test]
+    fn admission_nonce_is_single_use_replay_and_forged_nonce_rejected() {
+        let alice = IdentityKey::generate();
+        let reg = IdentityRegistry::key_registered().register(RegisteredIdentity {
+            public_key: alice.public(),
+            account: "acct-alice".into(),
+            domain: "alice.net".into(),
+            quota: Quota::messages(10, 10),
+        });
+
+        // A gateway-issued nonce admits exactly once.
+        let ch = reg.issue_challenge([42u8; 32], 1_000_000);
+        let sig = signed_answer(&alice, &ch);
+        assert!(
+            reg.admit(&ch, &alice.public(), &sig, 1_000_100).is_ok(),
+            "a fresh issued nonce is admitted once",
+        );
+
+        // Replaying the exact captured (nonce, issued_at, key, sig) tuple within the TTL is REJECTED:
+        // the nonce was consumed, so it is no longer a live challenge. (Old behavior re-admitted it.)
+        assert_eq!(
+            reg.admit(&ch, &alice.public(), &sig, 1_000_200),
+            Err(AdmissionError::UnknownOrConsumedChallenge),
+            "a captured admission tuple cannot be replayed",
+        );
+
+        // A challenge whose nonce the gateway never issued is refused even with a valid signature —
+        // only gateway-minted nonces admit. (Old behavior admitted any well-signed self-made challenge.)
+        let never_issued = Challenge::new([99u8; 32], 1_000_000);
+        let ni_sig = signed_answer(&alice, &never_issued);
+        assert_eq!(
+            reg.admit(&never_issued, &alice.public(), &ni_sig, 1_000_100),
+            Err(AdmissionError::UnknownOrConsumedChallenge),
+            "a never-issued nonce is not admissible",
+        );
+
+        // Single-use, not one-shot-ever: a freshly issued nonce for the same key admits again.
+        let ch2 = reg.issue_challenge([43u8; 32], 1_000_300);
+        let sig2 = signed_answer(&alice, &ch2);
+        assert!(
+            reg.admit(&ch2, &alice.public(), &sig2, 1_000_400).is_ok(),
+            "a newly issued nonce admits",
+        );
+    }
+
+    #[test]
+    fn a_forged_signature_does_not_consume_a_live_nonce() {
+        // The nonce is spent only on the success path, so a bad-signature attempt cannot burn a
+        // legitimate sender's live challenge (denial-of-service guard).
+        let alice = IdentityKey::generate();
+        let reg = IdentityRegistry::key_registered().register(RegisteredIdentity {
+            public_key: alice.public(),
+            account: "acct-alice".into(),
+            domain: "alice.net".into(),
+            quota: Quota::messages(10, 10),
+        });
+        let ch = reg.issue_challenge([7u8; 32], 1_000_000);
+        let mallory = IdentityKey::generate();
+        let forged = signed_answer(&mallory, &ch);
+        assert_eq!(
+            reg.admit(&ch, &alice.public(), &forged, 1_000_100),
+            Err(AdmissionError::BadSignature),
+        );
+        // The nonce survived the forged attempt: alice can still admit with it.
+        let sig = signed_answer(&alice, &ch);
+        assert!(reg.admit(&ch, &alice.public(), &sig, 1_000_100).is_ok());
+    }
+
+    #[test]
+    fn anon_fingerprint_is_at_least_80_bits_wide() {
+        // The open-public `anon:<fp>` label must be wide enough that birthday collisions don't share
+        // a quota / reputation bucket: >=10 bytes (80 bits), matching the key-derived local-part.
+        let a = IdentityKey::generate();
+        let b = IdentityKey::generate();
+        let fa = key_fingerprint(&a.public());
+        let fb = key_fingerprint(&b.public());
+        // base32 of 10 bytes = 16 chars (no padding). The old 6-byte fingerprint was only 10 chars.
+        assert_eq!(fa.len(), 16, "fingerprint encodes >=10 bytes (80 bits), not 48");
+        assert_ne!(fa, fb, "distinct keys get distinct anon labels");
     }
 
     #[test]
