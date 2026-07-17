@@ -38,6 +38,7 @@ pub mod mixdir;
 pub mod naming;
 pub mod node;
 pub mod outbound;
+pub mod send_api;
 pub mod transport;
 
 pub use journal::{FileJournal, Journal, JournalError, MemoryJournal, NullJournal, Snapshot};
@@ -48,6 +49,10 @@ pub use node::{Node, SendError};
 pub use config::NodeConfig;
 pub use daemon::{dmtap_txt_record, run_loop, serve, DaemonError, LoopStats};
 pub use keystore::{Keystore, KeystoreError};
+
+// The Envoir Send HTTP API (spec §13.5.1): the capability-token send service exposed over a bound
+// HTTP listener, routing capability-authorized sends into the node's real §20.1 outbound path.
+pub use send_api::{run_loop_with_send_api, SendApi};
 
 // Real MLS group messaging (spec §5): the node wraps the workspace-shared `dmtap-mls` crate
 // (openmls / RFC 9420) and re-exports its group types here as `dmtap::groups` for callers.

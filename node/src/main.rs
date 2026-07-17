@@ -199,7 +199,9 @@ fn main() {
                  \n\
                  CONFIG (env): ENVOIR_DATA_DIR, ENVOIR_NODE_BIND, ENVOIR_MAIL_HOST, ENVOIR_IMAP_PORT,\n\
                  \x20 ENVOIR_POP3_PORT, ENVOIR_SMTP_PORT, ENVOIR_PASSPHRASE, ENVOIR_NAMES,\n\
-                 \x20 ENVOIR_KT_ANCHORS, ENVOIR_KEYPKGS_LOC, ENVOIR_TICK_SECS. See `dmtap::config`.\n\
+                 \x20 ENVOIR_KT_ANCHORS, ENVOIR_KEYPKGS_LOC, ENVOIR_TICK_SECS,\n\
+                 \x20 ENVOIR_SEND_API, ENVOIR_SEND_API_BIND, ENVOIR_SEND_ADMIN_TOKEN (Envoir Send §13.5.1).\n\
+                 \x20 See `dmtap::config`.\n\
                  \n\
                  Spec: ../dmtap/  (the DMTAP spec repo is normative; this binary is a reference)."
             );

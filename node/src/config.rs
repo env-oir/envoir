@@ -20,6 +20,9 @@
 //! | `ENVOIR_KT_ANCHORS`    | `kt_anchors`    | `https://kt.invalid/log` (placeholder) |
 //! | `ENVOIR_KEYPKGS_LOC`   | `keypkgs_loc`   | `/mesh/kp/self`    |
 //! | `ENVOIR_TICK_SECS`     | `tick_secs`     | `15`               |
+//! | `ENVOIR_SEND_API`      | `send_api_enabled` | `false` (opt-in) |
+//! | `ENVOIR_SEND_API_BIND` | `send_api_bind` | `0.0.0.0:4610`     |
+//! | `ENVOIR_SEND_ADMIN_TOKEN` | `send_admin_token` | *(none ⇒ key-management disabled)* |
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +34,8 @@ const DEFAULT_MAIL_HOST: &str = "0.0.0.0";
 /// A clearly-invalid placeholder KT anchor: a parseable `_dmtap` record needs a non-empty `kt=`, but
 /// the real log URL is operator config — this default makes the shape valid while flagging "replace me".
 const PLACEHOLDER_KT: &str = "https://kt.invalid/log";
+/// The default bind for the Envoir Send HTTP API (`ENVOIR_SEND_API_BIND`) — off unless enabled.
+const DEFAULT_SEND_API_BIND: &str = "0.0.0.0:4610";
 
 /// Fully-resolved daemon configuration.
 #[derive(Debug, Clone)]
@@ -56,6 +61,15 @@ pub struct NodeConfig {
     pub keypkgs_loc: String,
     /// How often the daemon fires its retry/poll/deadline tick.
     pub tick: Duration,
+    /// Whether to expose the Envoir Send HTTP API (spec §13.5.1). **Off by default** — it is a
+    /// privileged programmatic send surface, opt-in via `ENVOIR_SEND_API`.
+    pub send_api_enabled: bool,
+    /// `host:port` the Envoir Send HTTP listener binds when [`send_api_enabled`](Self::send_api_enabled).
+    pub send_api_bind: String,
+    /// The admin bearer token guarding the key-management routes (`/v1/keys*`). `None` ⇒ key
+    /// management is **disabled** (fail-closed): only `/v1/send` is served, so a misconfigured
+    /// deployment can never mint/rotate/revoke keys without an explicitly-set secret.
+    pub send_admin_token: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -73,6 +87,9 @@ impl Default for NodeConfig {
             kt_anchors: vec![PLACEHOLDER_KT.to_string()],
             keypkgs_loc: "/mesh/kp/self".to_string(),
             tick: Duration::from_secs(15),
+            send_api_enabled: false,
+            send_api_bind: DEFAULT_SEND_API_BIND.to_string(),
+            send_admin_token: None,
         }
     }
 }
@@ -122,6 +139,15 @@ impl NodeConfig {
         {
             c.tick = Duration::from_secs(secs.max(1));
         }
+        if let Ok(v) = std::env::var("ENVOIR_SEND_API") {
+            c.send_api_enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("ENVOIR_SEND_API_BIND") {
+            if !v.is_empty() {
+                c.send_api_bind = v;
+            }
+        }
+        c.send_admin_token = std::env::var("ENVOIR_SEND_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
         c
     }
 
@@ -156,6 +182,16 @@ mod tests {
         assert_eq!(c.mail_host, "0.0.0.0");
         assert_eq!(c.keystore_path(), PathBuf::from("./envoir-data/keystore.json"));
         assert_eq!(c.journal_path(), PathBuf::from("./envoir-data/journal.json"));
+    }
+
+    #[test]
+    fn send_api_is_off_by_default_and_management_disabled() {
+        let c = NodeConfig::default();
+        // The Envoir Send API is a privileged programmatic surface — opt-in only.
+        assert!(!c.send_api_enabled);
+        // With no admin token, key management is fail-closed (disabled).
+        assert!(c.send_admin_token.is_none());
+        assert_eq!(c.send_api_bind, "0.0.0.0:4610");
     }
 
     #[test]

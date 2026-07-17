@@ -591,6 +591,43 @@ impl<T: Transport> Node<T> {
         self.enqueue_and_dispatch(to_ik, draft)
     }
 
+    /// Admit an **already-sealed** MOTE into this node's real §20.1 outbound retry queue and dispatch
+    /// it over the mesh transport — the exact delivery machinery [`send_mail`](Self::send_mail) drives
+    /// (`QUEUED → SEALED → IN_FLIGHT`, or `→ RETRY` if the transport is unreachable), for a MOTE that
+    /// was built + HPKE-sealed upstream (the Envoir Send capability pipeline, [`crate::send_api`]).
+    ///
+    /// The envelope's own content address (§2.2) is authoritative and this **never re-seals** — the
+    /// sealed object is retained verbatim so a retry re-dispatches the same immutable `id` (idempotent
+    /// against recipient dedup, §2.6). The queued MOTE is checkpointed durably before returning
+    /// (§19.3.3). Returns the tracked content id.
+    pub fn dispatch_sealed(&mut self, to_ik: &[u8], env: Envelope) -> ContentId {
+        let id = env.id.clone();
+        // The wire [`Envelope`] (§18.3.1) carries no `expires` field — the requested expiry lives in
+        // the sealed [`Payload`] (§2.4), opaque to us here — so the queue uses the 72 h default (§16.1).
+        let mut entry = OutboundEntry::enqueue(id.clone(), to_ik.to_vec(), self.now, None);
+        entry.apply(OutEvent::SealOk).expect("QUEUED→SEALED");
+        entry.sealed = Some(env);
+        self.dispatch(&mut entry); // SEALED → IN_FLIGHT (or → RETRY if unreachable)
+        self.outbound.insert(id.as_bytes().to_vec(), entry);
+        self.checkpoint(); // §19.3.3: the queued MOTE is durable before we return.
+        id
+    }
+
+    /// The sealed [`Envelope`] of a tracked outbound MOTE (a clone), by `id`, if it has reached
+    /// `SEALED` — for inspecting/verifying a queued MOTE (e.g. proving an Envoir-Send output is a
+    /// real, decryptable MOTE without draining the transport).
+    pub fn outbound_sealed(&self, id: &ContentId) -> Option<Envelope> {
+        self.outbound.get(id.as_bytes()).and_then(|e| e.sealed.clone())
+    }
+
+    /// A snapshot of this node's learned recipient sealing keys (identity key → X25519 seal public,
+    /// §5.3). The Envoir Send resolver ([`crate::send_api`]) reads this to seal to peers this node
+    /// already knows (`add_contact`/`learn_key`), taking an owned copy so it holds no borrow on the
+    /// node across a send.
+    pub fn directory_snapshot(&self) -> HashMap<Vec<u8>, [u8; 32]> {
+        self.directory.clone()
+    }
+
     fn enqueue_and_dispatch(
         &mut self,
         to_ik: &[u8],

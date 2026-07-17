@@ -966,6 +966,7 @@ dependencies = [
  "dmtap-mail",
  "dmtap-mls",
  "dmtap-naming",
+ "dmtap-send",
  "getrandom 0.2.17",
  "serde",
  "serde_json",

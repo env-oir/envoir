@@ -254,7 +254,39 @@ pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
     );
     eprintln!("envoir-node: running — SIGINT/SIGTERM to stop");
 
-    let stats = run_loop(&mut node, config.tick, shutdown_signal()).await;
+    let stats = if config.send_api_enabled {
+        // The Envoir Send HTTP API (spec §13.5.1). Owner identity = this node's identity (reloaded
+        // from the same keystore), so a capability-authorized send seals a MOTE authenticated as from
+        // this node and enters the node's real §20.1 outbound path. Runs on this same task (a `Node`
+        // is not `Send`), interleaved with the delivery/retry tick.
+        let owner_ik = {
+            let ks = Keystore::load(&config.keystore_path(), config.passphrase.as_deref())?;
+            ks.identity_key()
+        };
+        let mut api = crate::send_api::SendApi::new(owner_ik, config.send_admin_token.clone());
+        let listener =
+            tokio::net::TcpListener::bind(&config.send_api_bind).await.map_err(DaemonError::Bind)?;
+        eprintln!(
+            "envoir-node: Envoir Send HTTP API on {} — POST /v1/send (capability Bearer); \
+             key-management {}",
+            config.send_api_bind,
+            if config.send_admin_token.is_some() {
+                "enabled (ENVOIR_SEND_ADMIN_TOKEN set)"
+            } else {
+                "DISABLED (no ENVOIR_SEND_ADMIN_TOKEN)"
+            }
+        );
+        crate::send_api::run_loop_with_send_api(
+            &mut node,
+            &mut api,
+            listener,
+            config.tick,
+            shutdown_signal(),
+        )
+        .await
+    } else {
+        run_loop(&mut node, config.tick, shutdown_signal()).await
+    };
     eprintln!(
         "envoir-node: shutdown after {} tick(s); final checkpoint {}",
         stats.ticks,

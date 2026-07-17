@@ -19,6 +19,13 @@ repository = "https://example.invalid/envoir"
 # Moved out of this crate into the workspace-shared library; the node re-exports it (spec §1, §2, §3.9).
 dmtap-core = { path = "../crates/dmtap-core" }
 
+# --- Envoir Send (spec §13.5.1): the capability-token send service the node exposes over HTTP ---
+# The reusable core of the "sovereign/private Resend": an API key IS a scoped, rotatable, revocable
+# capability token (`SendService::verify_key`, fail-closed), and a send builds + HPKE-seals a real
+# MOTE. The node wraps this behind a bound HTTP listener (`node::send_api`) and routes the sealed
+# MOTE into its real §20.1 outbound retry queue + mesh dispatch — the delivery path `send_mail` drives.
+dmtap-send = { path = "../crates/dmtap-send" }
+
 # --- Client protocol servers (spec §8): IMAP/POP/SMTP-submission + JMAP + autodiscovery, ---
 # projecting the MOTE store for legacy and modern mail clients. The `net` feature adds the
 # blocking TCP listeners the `run` command wires up (a real node terminates TLS first, §8.2).
@@ -36,7 +43,10 @@ serde_json = "1"
 # durable journal, serves its interfaces, and stays up until SIGINT/SIGTERM. A current-thread tokio
 # runtime drives the retry/poll loop and the async graceful-shutdown signal handling. The §8 client
 # servers (dmtap-mail `net`) remain blocking thread-per-connection, spawned alongside.
-tokio = { version = "1", features = ["rt", "macros", "signal", "time"] }
+# `net` + `io-util` add the async `TcpListener` and `AsyncRead/WriteExt` the Envoir Send HTTP
+# listener (`node::send_api`) is built on — it runs inside the daemon's current-thread runtime,
+# on the same task as the delivery loop, so the sealed MOTE enters the node's real outbound path.
+tokio = { version = "1", features = ["rt", "macros", "signal", "time", "net", "io-util"] }
 
 # --- Durable keystore encryption-at-rest (spec §1.2, §1.4) ---
 # `init` writes the root identity seed + X25519 sealing secret to a keystore on disk. With a
