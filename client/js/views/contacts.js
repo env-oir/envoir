@@ -11,6 +11,7 @@ import { state, uid } from '../store.js';
 import { PEOPLE, person, addPerson, removePerson, contactTags } from '../seed.js';
 import { el, esc, icon, avatar, trustPill, toast, emptyState, openModal, closeModal, safetyWords, safetyGrid, safetyNumeric, shimmerRows } from '../ui.js';
 import { deriveSafetyFromString } from '../safety.js';
+import { classifyName, resolverChip, resolverDetail } from '../resolver.js';
 import { bus } from '../bus.js';
 import { openCompose } from '../compose.js';
 import { newEventModal } from './calendar.js';
@@ -106,6 +107,7 @@ async function drawDetail(root) {
   }
   const safety = await deriveSafetyFromString(p.address + p.name);
   if (selId !== p.id) return; // selection changed while awaiting — abandon this stale render
+  const addrInfo = classifyName(p.address);
 
   wrap.innerHTML = `
     <div class="ct-card">
@@ -124,8 +126,8 @@ async function drawDetail(root) {
         ${(p.tags || []).length ? `<div class="ct-card-tags">${p.tags.map(t => `<i class="chip-lbl" style="--h:200">${esc(t)}</i>`).join('')}</div>` : ''}
       </div>
       <div class="ct-card-body">
-        <div class="ct-field"><span class="k">${icon('mail')} Address</span><span class="v mono">${esc(p.address)}</span></div>
-        ${(p.addresses || []).length ? `<div class="ct-field"><span class="k">${icon('at')} Also</span><span class="v">${p.addresses.map(a => `<span class="chip-lbl" style="--h:210">${esc(a)}</span>`).join(' ')}</span></div>` : ''}
+        <div class="ct-field"><span class="k">${icon('mail')} Address</span><span class="v mono">${esc(p.address)} ${resolverChip(addrInfo)}</span></div>
+        ${(p.addresses || []).length ? `<div class="ct-field"><span class="k">${icon('at')} Also</span><span class="v">${p.addresses.map(a => `<span class="chip-lbl" style="--h:210">${esc(a)}</span> ${resolverChip(classifyName(a))}`).join(' ')}</span></div>` : ''}
         ${p.phone ? `<div class="ct-field"><span class="k">${icon('bell')} Phone</span><span class="v mono">${esc(p.phone)}</span></div>` : ''}
         ${p.note ? `<div class="ct-field"><span class="k">${icon('edit')} Note</span><span class="v">${esc(p.note)}</span></div>` : ''}
         ${groups.length ? `<div class="ct-field"><span class="k">${icon('groups')} Groups</span><span class="v">${groups.map(g => `<i class="chip-lbl" style="--h:250">${esc(g.name)}</i>`).join(' ')}</span></div>` : ''}
@@ -134,6 +136,8 @@ async function drawDetail(root) {
           <div class="verify-head">
             ${p.trust === 'verified' ? `${icon('verified')} <b>Key verified</b>` : p.trust === 'legacy' ? `${icon('shield')} <b>Legacy contact — no DMTAP key</b>` : `${icon('lock')} <b>Pinned on first contact (TOFU)</b>`}
           </div>
+          ${addrInfo.kind === 'namechain' || addrInfo.kind === 'self'
+            ? `<div class="verify-note resolver-context">${resolverChip(addrInfo)} ${esc(resolverDetail(addrInfo, p.trust))}</div>` : ''}
           ${p.trust === 'legacy'
             ? `<div class="verify-note">Reaches you through the gateway. No end-to-end key to verify — messages are marked legacy-origin.</div>`
             : `<div class="verify-note">${p.trust === 'verified'
@@ -195,7 +199,8 @@ function contactEditor(existing) {
         <label class="cfield"><span>Name</span><input id="pgiven" value="${esc(givenVal)}" placeholder="Ada" autofocus></label>
         <label class="cfield"><span>Surname</span><input id="pfamily" value="${esc(familyVal)}" placeholder="Okonkwo"></label>
       </div>
-      <label class="cfield"><span>Primary address</span><input id="pa" value="${esc(p.address)}" placeholder="ada@envoir.org or @handle"></label>
+      <label class="cfield"><span>Primary address</span><input id="pa" value="${esc(p.address)}" placeholder="ada@envoir.org, a key-name, alice.eth/.sol, or @handle"></label>
+      <div class="resolver-hint" id="paresolver"></div>
       <label class="cfield"><span>Additional addresses (comma-separated)</span><input id="paddrs" value="${esc((p.addresses || []).join(', '))}" placeholder="alias@envoir.org, old@legacy.example"></label>
       <div class="ev-new-row" style="grid-template-columns:1fr 1fr">
         <label class="cfield"><span>Title</span><input id="pt" value="${esc(p.title || '')}" placeholder="Protocol lead"></label>
@@ -223,6 +228,15 @@ function contactEditor(existing) {
     $('#ctavprev').innerHTML = avatar({ name: nm, hue: p.hue, trust: p.trust, avatarUrl: $('#pav').value.trim() || null }, 64, { ring: true });
   };
   drawAvPrev();
+  // Live resolver-type feedback (spec §3.12) as the address is typed — accepts a key-name, a
+  // name@domain, an alice.eth/.sol name-chain address, or an @handle, and shows honestly which
+  // resolver it would use rather than assuming DNS.
+  const drawAddrResolver = () => {
+    const info = classifyName($('#pa').value);
+    $('#paresolver').innerHTML = $('#pa').value.trim() ? resolverChip(info) + `<span class="resolver-note">${esc(resolverDetail(info))}</span>` : '';
+  };
+  drawAddrResolver();
+  $('#pa').addEventListener('input', drawAddrResolver);
   $('#pav').addEventListener('input', drawAvPrev);
   $('#pgiven').addEventListener('input', drawAvPrev);
   $('#pfamily').addEventListener('input', drawAvPrev);

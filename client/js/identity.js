@@ -11,7 +11,7 @@
 // addressing; the recovery phrase uses a small demo word list (real = SLIP-0039). Persistence
 // is localStorage (a real node holds keys in an OS keystore).
 
-import { deriveSafety } from './safety.js';
+import { deriveSafety, deriveKeyName } from './safety.js';
 import { resolveIdentityAvatar } from './avatar.js';
 
 const LS_KEY = 'envoir.identity.v2';
@@ -59,7 +59,7 @@ function persist() {
   localStorage.setItem(LS_KEY, JSON.stringify({
     ...base,
     name: _identity.name, primary: _identity.primary, addresses: _identity.addresses,
-    alg: _identity.alg, ik: _identity.ik, fingerprint: _identity.fingerprint,
+    alg: _identity.alg, ik: _identity.ik, fingerprint: _identity.fingerprint, keyName: _identity.keyName,
     phrase: _identity.phrase, safety: _identity.safety, created: _identity.created,
     displayName: _identity.displayName, givenName: _identity.givenName, familyName: _identity.familyName,
     avatarUrl: _identity.avatarUrl, gravatarEnabled: _identity.gravatarEnabled,
@@ -73,6 +73,7 @@ export async function createIdentity(primary, displayName) {
   const ik = toB64u(raw);
   const fingerprint = hex(await sha256(raw), 16);
   const safety = await deriveSafety(raw);
+  const keyName = await deriveKeyName(raw);
   const rnd = crypto.getRandomValues(new Uint8Array(12));
   const phrase = [...rnd].map(b => WORDS[b % WORDS.length]);
 
@@ -80,7 +81,7 @@ export async function createIdentity(primary, displayName) {
     name: primary, primary, displayName: displayName || primary.split('@')[0],
     givenName: '', familyName: '', avatarUrl: null, gravatarEnabled: false,
     addresses: [alias(primary, 'primary')],
-    alg, ik, fingerprint, phrase, safety, created: Date.now(),
+    alg, ik, fingerprint, keyName, phrase, safety, created: Date.now(),
     _kp: kp,
   };
   const pk8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', kp.privateKey));
@@ -104,6 +105,7 @@ export async function loadIdentity() {
   } catch { /* key unavailable — signing disabled, UI still works */ }
   _identity = { ...s, _kp: kp };
   if (!_identity.safety) _identity.safety = await deriveSafety(fromB64u(s.pub || s.ik));
+  if (!_identity.keyName) _identity.keyName = await deriveKeyName(fromB64u(s.pub || s.ik));
   if (!_identity.addresses) _identity.addresses = [alias(_identity.primary || _identity.name, 'primary')];
   if (_identity.givenName == null) _identity.givenName = '';
   if (_identity.familyName == null) _identity.familyName = '';
@@ -149,14 +151,20 @@ export function currentIdentity() { return _identity; }
 export function logout() { localStorage.removeItem(LS_KEY); _identity = null; }
 
 // --- Aliases (spec §3.9.4): one identity, many name@domain addresses, all → same key. ---
+// Also accepts the `name-chain` resolver form (§3.12.4/§3.12.5, e.g. `alice.eth`/`alice.sol`) —
+// bare, no "@", the everyday ENS/SNS-style spelling — auto-classified to kind 'namechain' so the
+// naming-ladder UI (identity view, §3.13.2) can show its bidirectional on-chain binding honestly.
 export function addAlias(address, kind = 'alias') {
   if (!_identity) return { ok: false, reason: 'No identity.' };
   const a = (address || '').trim().toLowerCase();
   if (!a) return { ok: false, reason: 'Enter an address.' };
   const isHandle = a.startsWith('@');
-  if (!isHandle && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(a)) return { ok: false, reason: 'Use name@domain (or @handle).' };
+  const isNameChain = !isHandle && !a.includes('@') && /\.(eth|sol)$/.test(a);
+  const isDnsShaped = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(a);
+  if (!isHandle && !isNameChain && !isDnsShaped) return { ok: false, reason: 'Use name@domain, alice.eth/.sol, or @handle.' };
   if (_identity.addresses.some(x => x.address === a)) return { ok: false, reason: 'Already an address on this identity.' };
-  _identity.addresses.push(alias(a, isHandle ? 'handle' : kind));
+  const finalKind = isHandle ? 'handle' : isNameChain ? 'namechain' : kind;
+  _identity.addresses.push(alias(a, finalKind));
   persist();
   return { ok: true };
 }
@@ -200,6 +208,20 @@ export function displayName(id) {
   const composed = [id.givenName, id.familyName].filter(Boolean).join(' ').trim();
   if (composed) return composed;
   return (id.primary || id.name || '').split('@')[0];
+}
+
+// A stable, KEY-DERIVED legacy/gateway fallback address — the client's simplified presentation
+// of the spec §7.10 gateway alias. The spec's "Encoded" form (§7.10.2) packs `localpart +
+// nativedomain` so it is a pure, near-stateless function of the pair — but that needs a native
+// *domain*, which a Tier A key-only identity (§3.8) doesn't have. Deriving instead from the
+// identity's own fingerprint keeps the same self-describing, near-stateless property (no
+// per-gateway registration, no state table) while working for every identity, domain or not: the
+// result is the SAME at every dmtap1-compatible gateway. It is still, honestly, a *separate,
+// rotatable* pointer (§7.10.4) — burn or regenerate it and every other name on the key is
+// unaffected.
+export function gatewayAlias(id = _identity, gatewayDomain = 'gw.envoir.org') {
+  if (!id?.fingerprint) return '';
+  return `dmtap1-${id.fingerprint.slice(0, 12)}@${gatewayDomain}`;
 }
 
 // Split a plus-addressed local part (spec §3.9.4): you+tag@domain → { base, tag }.

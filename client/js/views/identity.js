@@ -6,11 +6,12 @@
 // cluster / sessions are the simulated store, honestly labelled.
 
 import { state } from '../store.js';
-import { currentIdentity, displayAddress, displayName, logout, fromB64u } from '../identity.js';
+import { currentIdentity, displayAddress, displayName, logout, fromB64u, gatewayAlias } from '../identity.js';
 import { verifySafety } from '../safety.js';
 import { PEOPLE, person } from '../seed.js';
 import { el, esc, icon, avatar, initials, brandMark, toast, openModal, closeModal,
   safetyWords, safetyGrid, safetyNumeric, timeAgo, fmtLong } from '../ui.js';
+import { classifyName, resolverChip, resolverDetail } from '../resolver.js';
 import { bus } from '../bus.js';
 import { openEditProfile } from '../profileModal.js';
 
@@ -24,6 +25,7 @@ export function render(root) {
   const verified = PEOPLE.filter(p => p.trust === 'verified').length;
   const pinned = PEOPLE.filter(p => p.trust === 'tofu').length;
   const legacy = PEOPLE.filter(p => p.trust === 'legacy').length;
+  const gwAlias = gatewayAlias(id);
 
   root.innerHTML = `<div class="id-scroll"><div class="id-inner">
 
@@ -54,6 +56,44 @@ export function render(root) {
     </section>
 
     <div class="id-sections">
+
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('ladder')}</div>
+          <h2>Naming ladder</h2>
+          <p>Every rung below points at the <b>same key</b> — a ladder from zero-authority floor to human convenience (spec §3.13), never a set of equals. Change any rung any time; you can change these, the key is you.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-ladder">
+            <div class="id-rung floor">
+              <div class="id-rung-badge">${resolverChip({ kind: 'self', label: 'Key-name', icon: 'key', note: 'the zero-authority floor' })}</div>
+              <div class="id-rung-main">
+                <div class="id-rung-h"><span class="mono">${esc(id.keyName || '—')}</span><span class="pill accent sm">floor</span></div>
+                <small>Derived from your key alone — no DNS, no chain, no registration, no <span class="mono">@</span>. Always yours; changes only on the rare full key rotation.</small>
+              </div>
+              <button class="icon-btn sm" id="copykeyname" title="Copy key-name">${icon('copy')}</button>
+            </div>
+            ${(id.addresses || []).map(a => ladderRung(a)).join('')}
+          </div>
+          <div class="id-ladder-note">${icon('shield')} <b>Zero-authority floor:</b> if every domain and every chain you use vanished tomorrow, your key-name above still reaches you — no company, registrar, or chain can take it away. Everything else here is convenience layered over it.</div>
+          <div class="id-row-body-head" style="margin-top:14px"><button class="btn ghost sm" id="managealiases">${icon('mail')} Manage addresses in Settings ${icon('forward')}</button></div>
+        </div>
+      </section>
+
+      <section class="id-row">
+        <div class="id-row-label">
+          <div class="id-row-ic">${icon('bridge')}</div>
+          <h2>Legacy gateway alias</h2>
+          <p>Your fallback address for the old email world (Gmail/Outlook) — the same at every dmtap1-compatible gateway, because it's derived from your key rather than registered anywhere.</p>
+        </div>
+        <div class="id-row-body">
+          <div class="id-gwalias">
+            <span class="mono">${esc(gwAlias)}</span>
+            <button class="icon-btn sm" id="copygw" title="Copy gateway alias">${icon('copy')}</button>
+          </div>
+          <p class="modal-note" style="margin-top:12px">${icon('info')} Legacy mail can't route a reply to a domain with no MX record, so the gateway rewrites the reply-path to this alias (spec §7.10.1) — your friendly address still displays to the human. It's <b>rotatable and separate from your identity</b>: burn it and your key, your name, and every other address above keep working unchanged.</p>
+        </div>
+      </section>
 
       <section class="id-row">
         <div class="id-row-label">
@@ -173,6 +213,9 @@ export function render(root) {
   // ---- wire ----
   root.querySelector('#copyaddr').onclick = () => { navigator.clipboard?.writeText(displayAddress(id)); toast(`${icon('check')} Copied ${displayAddress(id)}`); };
   root.querySelector('#editprofile').onclick = () => openEditProfile();
+  root.querySelector('#copykeyname').onclick = () => { navigator.clipboard?.writeText(id.keyName || ''); toast(`${icon('check')} Copied key-name`); };
+  root.querySelector('#managealiases').onclick = () => bus.setView('settings');
+  root.querySelector('#copygw').onclick = () => { navigator.clipboard?.writeText(gwAlias); toast(`${icon('check')} Copied gateway alias`); };
   root.querySelector('#recompute').onclick = async () => {
     const { match, recomputed } = await verifySafety(fromB64u(id.ik), id.safety.full);
     toast(match ? `${icon('check')} Recomputed identical — ${esc(recomputed)}` : '✗ mismatch: ' + esc(recomputed), { ms: 5000 });
@@ -188,6 +231,20 @@ export function render(root) {
   root.querySelector('#goverify').onclick = () => bus.setView('contacts');
   root.querySelectorAll('.id-vbar').forEach(b => b.onclick = () => bus.setView('contacts'));
   root.querySelector('#signout').onclick = () => { if (confirm('Sign out and clear this identity from this browser?')) { logout(); location.reload(); } };
+}
+
+// One rung of the naming ladder for a published address (spec §3.9.4/§3.13.2). Reuses the same
+// resolver classifier compose/contacts use, so "which resolver" reads identically everywhere.
+function ladderRung(a) {
+  const info = classifyName(a.address);
+  const kindLabel = { primary: 'primary', alias: 'alias', legacy: 'kept legacy', handle: 'handle', namechain: 'on-chain' }[a.kind] || a.kind;
+  return `<div class="id-rung">
+    <div class="id-rung-badge">${resolverChip(info)}</div>
+    <div class="id-rung-main">
+      <div class="id-rung-h"><span class="mono">${esc(a.address)}</span><span class="pill ${a.kind === 'primary' ? 'accent' : 'dim'} sm">${esc(kindLabel)}</span></div>
+      <small>${esc(resolverDetail(info))}</small>
+    </div>
+  </div>`;
 }
 
 function drawDevices(root) {

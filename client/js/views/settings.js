@@ -46,10 +46,10 @@ export function render(root) {
 
     <section class="set-card">
       <h2>${icon('mail')} Addresses &amp; aliases</h2>
-      <p class="set-hint">One identity, many addresses — all resolving to the same key (spec §3.9.4). Keep a legacy address, add a work alias, or claim an @handle. Plus-addressing (you+tag@…) routes to the same key automatically.</p>
+      <p class="set-hint">One identity, many addresses — all resolving to the same key (spec §3.9.4). Keep a legacy address, add a work alias, claim an @handle, or link an on-chain <span class="mono">.eth</span>/<span class="mono">.sol</span> name. Plus-addressing (you+tag@…) routes to the same key automatically.</p>
       <div class="alias-list" id="aliases"></div>
       <div class="alias-add">
-        <input id="newalias" placeholder="add name@domain, a kept legacy address, or @handle">
+        <input id="newalias" placeholder="add name@domain, alice.eth / alice.sol, a kept legacy address, or @handle">
         <button class="btn" id="addalias">${icon('plus')} Add</button>
       </div>
     </section>
@@ -243,11 +243,12 @@ function wireNotifications(root) {
 function drawAliases(root, id) {
   const wrap = root.querySelector('#aliases');
   wrap.innerHTML = id.addresses.map(a => {
-    const label = { primary: 'primary', alias: 'alias', legacy: 'kept legacy', handle: 'handle' }[a.kind];
+    const label = { primary: 'primary', alias: 'alias', legacy: 'kept legacy', handle: 'handle', namechain: 'on-chain' }[a.kind] || a.kind;
     return `<div class="alias-row">
       <span class="mono alias-addr">${esc(a.address)}</span>
-      <span class="pill ${a.kind === 'primary' ? 'accent' : a.kind === 'legacy' ? 'legacy' : 'dim'} sm">${label}</span>
+      <span class="pill ${a.kind === 'primary' ? 'accent' : a.kind === 'legacy' ? 'legacy' : a.kind === 'namechain' ? 'chain' : 'dim'} sm">${label}</span>
       ${a.kind === 'legacy' ? `<span class="set-hint inline">inbound marked legacy-origin</span>` : ''}
+      ${a.kind === 'namechain' ? `<span class="set-hint inline">${icon('link')} bidirectional binding — key claims name + chain record points back, KT-audited</span>` : ''}
       <div class="spacer"></div>
       ${a.kind !== 'primary' && a.kind !== 'handle' ? `<button class="btn ghost sm" data-primary="${esc(a.address)}">Make primary</button>` : ''}
       ${a.kind !== 'primary' ? `<button class="icon-btn sm" data-del="${esc(a.address)}" title="Remove">${icon('trash')}</button>` : ''}
@@ -263,12 +264,17 @@ function drawAliases(root, id) {
       if (!r.ok) return toast(r.reason);
       addAlias('@' + r.handle, 'handle');
       toast(`${icon('check')} @${r.handle} claimed · ${r.kt} (simulated key-transparency entry)`, { ms: 4500 });
+    } else if (!v.includes('@') && /\.(eth|sol)$/i.test(v)) {
+      const r = addAlias(v, 'namechain');
+      if (!r.ok) return toast(r.reason);
+      toast(`${icon('link')} ${v} linked — bidirectional binding required: your key claims the name, and the chain record must point back to your key (spec §3.12.5b)`, { ms: 5000 });
     } else {
       const kind = /@(gmail|outlook|yahoo|proton|oldprovider)\./.test(v) ? 'legacy' : 'alias';
       const r = addAlias(v, kind);
       if (!r.ok) return toast(r.reason);
       toast(`${icon('check')} ${v} added — resolves to your key`);
     }
+    root.querySelector('#newalias').value = '';
     bus.rerender();
   };
 }
