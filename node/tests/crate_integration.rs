@@ -209,10 +209,11 @@ fn tampered_dns_pointer_fails_closed() {
 
 #[test]
 fn non_dns_name_forms_dispatch_and_fail_closed_at_the_node() {
-    // The node routes a recipient name by its FORM (§3.9). The DNS resolver here has NOTHING
-    // published, so if a non-DNS form leaked into the DNS path it would fail with a DNS/KT error;
-    // instead it must be intercepted by the form dispatch and fail closed as an *unwired seam*,
-    // pinning nothing — proving the dispatch runs before the DNS resolver is even consulted.
+    // The node delegates form dispatch to `dmtap-naming`'s resolver-type registry (§3.12): a name is
+    // routed by FORM and gated against the types this node implements *before* the DNS resolver is
+    // consulted. The DNS resolver here has NOTHING published, so if a non-DNS form leaked into the
+    // DNS path it would surface a DNS/KT error; instead each fails closed on the registry/dispatch,
+    // pinning nothing — proving the crate's dispatch runs first.
     let net = InMemoryNetwork::new();
     let empty = InMemoryResolver::new(NOW);
     let kps = InMemoryKeyPackages::new();
@@ -222,24 +223,150 @@ fn non_dns_name_forms_dispatch_and_fail_closed_at_the_node() {
     let mut alice =
         Node::with_identity(alice_ik, SealKeypair::generate(), net.endpoint(alice_ik_pub));
 
-    // A self-authenticating key-name (§3.9.1) → the derive seam (unwired ⇒ fail closed).
+    // A self-authenticating key-name (§3.9.6) routes to the crate's real `SelfResolver`; with no such
+    // key known to this node it is a fail-closed NameResolution miss (never a guess), not a DNS error.
     let key_name = dmtap::keyname::encode(&IdentityKey::from_seed(&[21u8; 32]).public());
     let err = alice.resolve_and_pin(&key_name, &empty, &kps).unwrap_err();
     assert!(
         matches!(err, ResolveError::NameResolution(m) if m.contains("key-name")),
-        "key-name routes to the derive seam and fails closed, got {err:?}"
+        "an unknown key-name fails closed via SelfResolver, got {err:?}"
     );
 
-    // A name-chain name → the on-chain seam (unwired ⇒ fail closed).
+    // A name-chain name is the OPTIONAL `name-chain` type — off by default (§3.12.5(a)), so the
+    // registry rejects it as unsupported (`0x011F`), never guessing an on-chain binding.
     let err = alice.resolve_and_pin("vitalik.eth", &empty, &kps).unwrap_err();
     assert!(
-        matches!(err, ResolveError::NameResolution(m) if m.contains("name-chain")),
-        "a .eth name routes to the name-chain seam and fails closed, got {err:?}"
+        matches!(err, ResolveError::ResolverTypeUnsupported(_)),
+        "an .eth name is unsupported until name-chain is enabled, got {err:?}"
+    );
+    assert_eq!(err.code(), 0x011F, "the normative ERR_RESOLVER_TYPE_UNSUPPORTED code");
+
+    // A bare label that is neither a key-name nor a chain name classifies as a local petname; the
+    // by-name send path carries no petname book, so it fails closed (pins nothing, not coerced to DNS).
+    let err = alice.resolve_and_pin("not-a-known-name", &empty, &kps).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::NameResolution(_)),
+        "an unresolvable petname fails closed, got {err:?}"
+    );
+}
+
+#[test]
+fn key_name_really_resolves_end_to_end_at_the_node() {
+    // A key-name (§3.9.6) is a one-way derivation of an identity key. Once the node has learned a
+    // recipient's key, resolving that recipient's key-name really binds — via the crate's real
+    // `SelfResolver` (checksum + full derivation) — and the resolved key is then addressable.
+    let net = InMemoryNetwork::new();
+    let empty = InMemoryResolver::new(NOW);
+    let kps = InMemoryKeyPackages::new();
+
+    let bob = Recipient::new("bob@example.com", 22);
+    let bob_ik = bob.ik_public();
+    let bob_node = Node::with_identity(
+        IdentityKey::from_seed(&bob.seed),
+        bob.node_seal,
+        net.endpoint(bob_ik.clone()),
     );
 
-    // Garbage that matches no form is rejected outright (fail closed, not coerced into DNS).
-    let err = alice.resolve_and_pin("not a name", &empty, &kps).unwrap_err();
-    assert!(matches!(err, ResolveError::MalformedName(_)), "unrecognized form is rejected");
+    let alice_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let alice_seal = SealKeypair::generate();
+    let alice_seal_pub = *alice_seal.public();
+    let mut alice = Node::with_identity(alice_ik, alice_seal, net.endpoint(alice_ik_pub.clone()));
+    // Alice has learned Bob's sealing key out of band (e.g. an earlier exchange / mesh discovery).
+    alice.learn_key(&bob_ik, bob.seal_pub);
+
+    // Bob's key-name is the derivation of his identity key; resolving it returns exactly that key.
+    let bobs_key_name = dmtap::naming::SelfResolver::derive(&bob_ik);
+    let resolved = alice
+        .resolve_and_pin(&bobs_key_name, &empty, &kps)
+        .expect("a known key-name really resolves via SelfResolver");
+    assert_eq!(resolved, bob_ik, "key-name resolves to the exact derived identity key");
+
+    // And it is now a pinned, addressable contact — a real by-key-name send round-trips + acks.
+    let mut bob_node = bob_node;
+    bob_node.add_contact(&alice_ik_pub, alice_seal_pub); // Bob knows Alice (so she is not cold)
+    let id = alice.send_mail(&bob_ik, "hi", b"reached you by key-name").expect("send to pinned key");
+    assert!(matches!(bob_node.poll()[0], InboundOutcome::Stored { .. }), "delivered to the key-name'd key");
+    alice.poll();
+    assert_eq!(alice.outbound_state(&id), Some(OutState::Acked));
+
+    // A well-formed key-name for a key this node does NOT know fails closed — never a guess.
+    let stranger = dmtap::naming::SelfResolver::derive(&IdentityKey::from_seed(&[99u8; 32]).public());
+    assert!(
+        matches!(alice.resolve_and_pin(&stranger, &empty, &kps), Err(ResolveError::NameResolution(_))),
+        "an unknown key-name is a fail-closed miss"
+    );
+}
+
+#[test]
+fn name_chain_resolves_via_injected_client_and_enforces_binding() {
+    // The OPTIONAL `name-chain` type (§3.12.5): a test injects an in-memory chain client, and the
+    // node enforces the crate's §3.12.5(b) bidirectional key↔name binding against the owner's signed
+    // Identity — accepting an agreeing binding and failing closed (`0x011E`) on a mismatch.
+    let net = InMemoryNetwork::new();
+    let chain_name = "vitalik@.eth";
+
+    // Bob claims the chain name in his signed Identity, and the chain record points back at his key.
+    let bob_key = IdentityKey::from_seed(&[42u8; 32]);
+    let bob_ik = bob_key.public();
+    let bob_seal = SealKeypair::generate();
+    let bob_seal_pub = *bob_seal.public();
+    let mut bob_kps = InMemoryKeyPackages::new();
+    let bref = bob_kps.publish("/mesh/kp/vitalik", seal_key_bundle(&bob_seal_pub));
+    let bob_identity = Identity::create_classical(
+        &bob_key,
+        0,
+        vec![],
+        bref,
+        ContentId::of(b"recovery"),
+        vec![chain_name.to_owned()],
+        None,
+        NOW,
+    );
+
+    let alice_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let alice_seal = SealKeypair::generate();
+    let alice_seal_pub = *alice_seal.public();
+    let mut alice = Node::with_identity(alice_ik, alice_seal, net.endpoint(alice_ik_pub.clone()));
+
+    // Off by default: even with the owner's Identity in hand, a chain name is unsupported (`0x011F`).
+    let err = alice.resolve_name_chain(chain_name, &bob_identity, bob_seal_pub).unwrap_err();
+    assert_eq!(err.code(), 0x011F, "name-chain is OPTIONAL and off until enabled");
+
+    // Inject the chain client (the registrant's one on-chain claim), opting into name-chain.
+    let mut chain = dmtap::naming::InMemoryNameChain::new(dmtap::naming::Chain::Ens);
+    chain.register(chain_name, bob_ik.clone());
+    alice.enable_name_chain(chain);
+
+    // Both directions agree ⇒ the binding verifies and the classical IK is pinned + returned.
+    let resolved = alice
+        .resolve_name_chain(chain_name, &bob_identity, bob_seal_pub)
+        .expect("agreeing bidirectional binding resolves");
+    assert_eq!(resolved, bob_ik, "name-chain resolves to the classical identity key");
+
+    // The pinned key is addressable — a real send to the name-chain'd key round-trips + acks.
+    let mut bob_node = Node::with_identity(bob_key, bob_seal, net.endpoint(bob_ik.clone()));
+    bob_node.add_contact(&alice_ik_pub, alice_seal_pub); // Bob knows Alice (so she is not cold)
+    let id = alice.send_mail(&bob_ik, "hi", b"reached you by name-chain").expect("send to pinned key");
+    assert!(matches!(bob_node.poll()[0], InboundOutcome::Stored { .. }));
+    alice.poll();
+    assert_eq!(alice.outbound_state(&id), Some(OutState::Acked));
+
+    // A captured registrar points the chain record at an ATTACKER key the identity never claims —
+    // the two directions disagree ⇒ fail closed with ERR_NAMECHAIN_BINDING_UNVERIFIED (`0x011E`).
+    let attacker_ik = IdentityKey::from_seed(&[0xee; 32]).public();
+    let mut evil_chain = dmtap::naming::InMemoryNameChain::new(dmtap::naming::Chain::Ens);
+    evil_chain.register(chain_name, attacker_ik);
+    let mut mallory = Node::with_identity(
+        IdentityKey::generate(),
+        SealKeypair::generate(),
+        net.endpoint(b"mallory".to_vec()),
+    );
+    mallory.enable_name_chain(evil_chain);
+    let err = mallory.resolve_name_chain(chain_name, &bob_identity, bob_seal_pub).unwrap_err();
+    assert!(matches!(err, ResolveError::NameChainBindingUnverified(_)));
+    assert_eq!(err.code(), 0x011E, "a chain/identity binding mismatch fails closed");
 }
 
 #[test]

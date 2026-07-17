@@ -13,6 +13,14 @@
 //!   signature/chain check, the DNS⇄Identity cross-check, RFC 6962 inclusion-proof folding, STH
 //!   signatures, leaf-hash binding, the v1 `> n/2` quorum, split-view/freshness gates — all via the
 //!   [`Resolver`] seam. Its verdict flows straight into the node's pin cache.
+//! - **Real (form dispatch, §3.12):** the node no longer carries its own name-form classifier. It
+//!   **delegates** to `dmtap-naming`'s pluggable resolver-type framework — [`classify`] /
+//!   [`ResolverRegistry`] route a recipient name by form (§3.12.4) and gate it against the types the
+//!   node implements (§3.12.2), and the real per-type resolvers do the work: [`SelfResolver`] for the
+//!   `self` key-name floor (§3.9.6, derive/verify — no longer a fail-closed stub) and
+//!   [`NameChainResolver`] over a [`NameChainClient`] for the OPTIONAL `.eth`/`.sol` `name-chain`
+//!   type (§3.12.5, off by default → `ERR_RESOLVER_TYPE_UNSUPPORTED`). One source of truth, no
+//!   duplicate dispatch.
 //! - **Seam (network I/O):** the actual DNS queries / mesh fetches / HTTP KT clients are the
 //!   [`Resolver`] + [`KeyPackageSource`] trait boundaries; the node drives them through the trait, so
 //!   the in-memory harnesses ([`dmtap_naming::InMemoryResolver`] / [`InMemoryKeyPackages`]) exercise
@@ -24,117 +32,16 @@
 //!   narrowing of the bundle, not a silent stub — [`seal_key_from_bundle`] fails closed on any other
 //!   shape.
 
-use dmtap_core::keyname;
-
 use crate::node::SendError;
 
+// The name-form dispatch lives entirely in `dmtap-naming` now (spec §3.12): the node re-exports the
+// crate's framework rather than duplicating a weaker classifier. [`Node::resolve_and_pin`] routes by
+// [`ResolverRegistry`] and resolves each form via the crate's real resolvers.
 pub use dmtap_naming::{
-    InMemoryKeyPackages, InMemoryResolver, KeyPackageSource, PinnedResolution, ResolveError,
-    Resolver,
+    classify, Chain, InMemoryKeyPackages, InMemoryNameChain, InMemoryResolver, KeyPackageSource,
+    NameChainClient, NameChainResolver, PinnedResolution, ResolvedBinding, ResolveError,
+    Resolver, ResolverKind, ResolverRegistry, ResolverType, SelfResolver, Verification,
 };
-
-// --- name-FORM dispatch (spec §3.9) --------------------------------------------------------------
-
-/// A blockchain **name-chain** namespace (§3.9): the DNS-alternative registries a name can live in.
-/// These resolve through a chain RPC + on-chain KT, not the `_dmtap` DNS path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Chain {
-    /// Ethereum Name Service — `name.eth`.
-    Eth,
-    /// Solana Name Service — `name.sol`.
-    Sol,
-}
-
-impl Chain {
-    /// The human label for the chain (for diagnostics / the seam's fail-closed message).
-    pub fn label(self) -> &'static str {
-        match self {
-            Chain::Eth => "eth",
-            Chain::Sol => "sol",
-        }
-    }
-}
-
-/// The syntactic **form** of a DMTAP recipient name (§3.9), which selects the resolver:
-///
-/// | form | example | resolver |
-/// |------|---------|----------|
-/// | [`Dns`](NameForm::Dns) | `alice@example.com` | the wired `_dmtap` DNS + RFC 6962 KT [`Resolver`] |
-/// | [`KeyName`](NameForm::KeyName) | `bafu-dize-…-teka` | **derive** (self-authenticating key-name, §3.9.1) |
-/// | [`NameChain`](NameForm::NameChain) | `alice.eth` / `alice.sol` | on-chain name registry |
-///
-/// [`classify`] buckets a name by form so [`Node::resolve_and_pin`](crate::node::Node::resolve_and_pin)
-/// can route it. Only the DNS form has a wired resolver today; the other two are documented seams
-/// ([`KeyNameResolver`] / [`NameChainResolver`]) that fail closed until a resolver is attached.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NameForm {
-    /// `local@domain` — resolved via the real `_dmtap` DNS + KT [`Resolver`].
-    Dns,
-    /// A zero-authority 8-word (+checksum) **key-name** (§3.9.1): self-authenticating, derived
-    /// directly from the identity key, needing no directory/registration.
-    KeyName,
-    /// A blockchain name-chain name (`name.eth` / `name.sol`).
-    NameChain(Chain),
-}
-
-/// Classify `name` into its resolution [`NameForm`] (§3.9), **fail-closed** on an unrecognized
-/// shape — an ambiguous/garbage name resolves to nothing rather than being coerced into a form.
-///
-/// Precedence (a name matches at most one form): an `@` ⇒ DNS; a `.eth`/`.sol` suffix ⇒ the
-/// matching name-chain; otherwise a checksum-valid key-name ⇒ key-name; else
-/// [`ResolveError::MalformedName`].
-pub fn classify(name: &str) -> Result<NameForm, ResolveError> {
-    if name.is_empty() {
-        return Err(ResolveError::MalformedName("empty name"));
-    }
-    if name.contains('@') {
-        return Ok(NameForm::Dns);
-    }
-    let lower = name.to_ascii_lowercase();
-    if let Some(stem) = lower.strip_suffix(".eth") {
-        if stem.is_empty() {
-            return Err(ResolveError::MalformedName("empty .eth label"));
-        }
-        return Ok(NameForm::NameChain(Chain::Eth));
-    }
-    if let Some(stem) = lower.strip_suffix(".sol") {
-        if stem.is_empty() {
-            return Err(ResolveError::MalformedName("empty .sol label"));
-        }
-        return Ok(NameForm::NameChain(Chain::Sol));
-    }
-    // A checksum-valid key-name is self-describing (§3.9.1) — accept it only if it verifies, so a
-    // mistyped/foreign token falls through to the fail-closed error rather than a wrong form.
-    if keyname::verify(name) {
-        return Ok(NameForm::KeyName);
-    }
-    Err(ResolveError::MalformedName("unrecognized name form"))
-}
-
-/// Resolve a self-authenticating **key-name** (§3.9.1) to a KT-verified, pinned binding.
-///
-/// SEAM: a key-name carries no locator, so resolving one to a *new* key needs a mesh reverse-lookup
-/// (key-name → published `Identity`) plus the same KT gate the DNS path runs. That network layer is
-/// being added in `dmtap-naming`; until a resolver is attached the node routes this form to a
-/// fail-closed stub ([`resolve_key_name` unwired](KeyNameResolver::resolve_key_name)) so it is
-/// **never** silently accepted. Mirrors the [`Resolver`] trait shape so it drops into the same
-/// dispatch once wired.
-pub trait KeyNameResolver {
-    /// Resolve + KT-verify a key-name, or fail closed.
-    fn resolve_key_name(&self, key_name: &str) -> Result<PinnedResolution, ResolveError>;
-}
-
-/// Resolve a blockchain **name-chain** name (`name.eth` / `name.sol`, §3.9) to a KT-verified,
-/// pinned binding.
-///
-/// SEAM: name-chain resolution needs a chain RPC client (ENS/SNS registry read) plus KT
-/// verification of the pointed-to `Identity`. That client is out of the current `dmtap-naming`
-/// surface; the node routes this form to a fail-closed stub until one is attached, so an on-chain
-/// name is **never** trusted without KT. Mirrors the [`Resolver`] trait shape.
-pub trait NameChainResolver {
-    /// Resolve + KT-verify a name-chain name on `chain`, or fail closed.
-    fn resolve_chain(&self, chain: Chain, name: &str) -> Result<PinnedResolution, ResolveError>;
-}
 
 // --- key-derived legacy gateway alias (spec §3.9, §7) --------------------------------------------
 
@@ -199,7 +106,7 @@ fn base32_decode(s: &str) -> Option<Vec<u8>> {
 /// The node's **key-derived legacy gateway alias** local-part (§3.9, §7): a stable, stateless
 /// address any SMTP↔DMTAP gateway can bridge with **no registration**.
 ///
-/// Unlike the memorable [`keyname`] (an 80-bit *hash* of the key — not reversible), this alias
+/// Unlike the memorable [`keyname`](dmtap_core::keyname) (an 80-bit *hash* of the key — not reversible), this alias
 /// carries the **whole** identity public key, base32-encoded under [`GATEWAY_ALIAS_PREFIX`], so it
 /// is:
 /// - **deterministic** — a pure function of the key, identical at every gateway (no shared state);
@@ -278,29 +185,6 @@ impl std::error::Error for AddressError {}
 mod tests {
     use super::*;
     use dmtap_core::identity::IdentityKey;
-
-    #[test]
-    fn classify_routes_each_form() {
-        assert_eq!(classify("alice@example.com").unwrap(), NameForm::Dns);
-        assert_eq!(classify("alice.eth").unwrap(), NameForm::NameChain(Chain::Eth));
-        assert_eq!(classify("alice.SOL").unwrap(), NameForm::NameChain(Chain::Sol));
-
-        // A real, checksum-valid key-name classifies as the derive form.
-        let kn = keyname::encode(&IdentityKey::from_seed(&[3u8; 32]).public());
-        assert_eq!(classify(&kn).unwrap(), NameForm::KeyName);
-    }
-
-    #[test]
-    fn classify_fails_closed_on_garbage() {
-        // Neither an address, a name-chain, nor a checksum-valid key-name.
-        assert!(matches!(classify("just-a-token"), Err(ResolveError::MalformedName(_))));
-        assert!(matches!(classify(""), Err(ResolveError::MalformedName(_))));
-        assert!(matches!(classify(".eth"), Err(ResolveError::MalformedName(_))));
-        // A key-name shape with a busted checksum must NOT be coerced into the key-name form.
-        let mut kn = keyname::encode(&IdentityKey::from_seed(&[4u8; 32]).public());
-        kn.push_str("-zzzz");
-        assert!(matches!(classify(&kn), Err(ResolveError::MalformedName(_))));
-    }
 
     #[test]
     fn base32_round_trips_arbitrary_lengths() {

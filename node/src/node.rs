@@ -63,7 +63,11 @@ use crate::journal::{
     Journal, JournalError, NullJournal, PersistedEntry, PersistedSuiteMark, Snapshot,
 };
 use crate::mixdir::{MixDirError, MixDirectoryTracker};
-use crate::naming::{self, classify, AddressError, KeyPackageSource, NameForm, Resolver};
+use crate::naming::{
+    self, AddressError, KeyPackageSource, NameChainClient, NameChainResolver, ResolveError,
+    Resolver, ResolverKind, ResolverRegistry, ResolverType, SelfResolver,
+};
+use dmtap_core::identity::Identity;
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
 use dmtap_auth::AuthError;
@@ -127,6 +131,16 @@ pub struct Node<T: Transport> {
     contacts: HashSet<Vec<u8>>,
     /// Naming/KeyPackage resolution stand-in: recipient IK → their sealing (X25519) public key.
     directory: HashMap<Vec<u8>, [u8; 32]>,
+    /// The pluggable **resolver-type registry** (spec §3.12): routes a recipient name by form
+    /// (§3.12.4) and gates it against the types this node implements (§3.12.2). Owned by the node so
+    /// [`resolve_and_pin`](Self::resolve_and_pin) delegates form dispatch to `dmtap-naming`'s one
+    /// source of truth instead of a duplicate classifier. `self`/`petname`/`dns` are on by default;
+    /// the OPTIONAL `name-chain` type (§3.12.5(a)) stays off until [`enable_name_chain`](Self::enable_name_chain).
+    resolvers: ResolverRegistry,
+    /// The OPTIONAL `name-chain` (ENS `.eth` / SNS `.sol`) client seam (§3.12.5): `None` ⇒ the node
+    /// does not implement name-chain and every chain name fails closed (`0x011F`); a test/deployment
+    /// injects one via [`enable_name_chain`](Self::enable_name_chain) to opt in.
+    name_chain: Option<Box<dyn NameChainClient>>,
     /// The mesh transport.
     transport: T,
     /// This node's live MLS group sessions (spec §5), keyed by group id. Each is this node's own
@@ -200,6 +214,8 @@ impl<T: Transport> Node<T> {
             outbound: HashMap::new(),
             contacts: HashSet::new(),
             directory: HashMap::new(),
+            resolvers: ResolverRegistry::with_defaults(),
+            name_chain: None,
             groups: HashMap::new(),
             pending_leaf: None,
             deniable: DeniableState::default(),
@@ -331,41 +347,125 @@ impl<T: Transport> Node<T> {
     /// v1 quorum/freshness/equivocation gates). **Only** on a verified binding does this fetch the
     /// recipient's content-addressed sealing KeyPackage (via `kps`) and pin `name → (ik, seal)` into
     /// the node's contact/directory cache. An unverifiable KT (unreachable / sub-quorum / stale /
-    /// equivocating / proof-invalid) returns the typed [`ResolveError`](crate::naming::ResolveError)
+    /// equivocating / proof-invalid) returns the typed [`ResolveError`]
     /// and pins **nothing** — never a TOFU pin on unverifiable KT (§3.3). Returns the verified IK.
     pub fn resolve_and_pin(
         &mut self,
         name: &str,
         resolver: &dyn Resolver,
         kps: &dyn KeyPackageSource,
-    ) -> Result<Vec<u8>, crate::naming::ResolveError> {
-        // Route the name by its FORM (§3.9): `local@domain` → the wired DNS+KT resolver; a
-        // self-authenticating key-name (§3.9.1) → the *derive* resolver; `name.eth`/`name.sol` →
-        // the on-chain name registry. Only the DNS form has a networked resolver wired today, so the
-        // other two are routed to their documented seams and **fail closed** (never a silent accept)
-        // — the per-form resolvers ([`KeyNameResolver`]/[`NameChainResolver`]) drop into this match
-        // once `dmtap-naming` exposes them.
-        match classify(name)? {
-            NameForm::Dns => {}
-            NameForm::KeyName => {
-                return Err(crate::naming::ResolveError::NameResolution(
-                    "key-name (derive) resolver not wired — fail closed (§3.9.1 seam)",
-                ));
+    ) -> Result<Vec<u8>, ResolveError> {
+        // Route the name by its FORM through `dmtap-naming`'s pluggable resolver-type registry
+        // (§3.12.4) and gate it against the types this node implements (§3.12.2) — one source of
+        // truth, no duplicate classifier. An unimplemented/unregistered type fails closed here with
+        // `ERR_RESOLVER_TYPE_UNSUPPORTED` (`0x011F`) before any resolver is consulted (never guessed).
+        match self.resolvers.route(name)? {
+            // `local@domain` → the wired DNS `_dmtap` + KT [`Resolver`] path (§3.3), unchanged.
+            ResolverType::Dns => {
+                // KT-verify the binding (fail-closed) BEFORE trusting anything about the recipient.
+                let res = resolver.resolve(name)?;
+                // Fetch + content-verify (§2.2) the sealing KeyPackage the verified identity advertises.
+                let bundle = kps.fetch_bundle(&res.keypkgs)?;
+                let seal_pub = naming::seal_key_from_bundle(&bundle)?;
+                // Pin the verified binding into the local cache (§3.4): only now is it addressable.
+                self.add_contact(&res.ik, seal_pub);
+                Ok(res.ik)
             }
-            NameForm::NameChain(_) => {
-                return Err(crate::naming::ResolveError::NameResolution(
-                    "name-chain (.eth/.sol) resolver not wired — fail closed (§3.9 seam)",
-                ));
+            // A self-authenticating **key-name** (§3.9.6) → the crate's real [`SelfResolver`], which
+            // now derives/verifies against a key this node already holds rather than a fail-closed stub.
+            ResolverType::SelfKeyName => self.resolve_key_name(name),
+            // A local **petname** (§3.9.3) resolves only against an out-of-band pin held in a local
+            // petname book; the node carries none in the by-name send path, so it fails closed here
+            // (never a guess) rather than being coerced onto the DNS resolver.
+            ResolverType::Petname => Err(ResolveError::NameResolution(
+                "petname resolves only against a local out-of-band pin, not by name here",
+            )),
+            // A **name-chain** name (`.eth`/`.sol`, §3.12.5) enforces the §3.12.5(b) bidirectional
+            // key↔name binding, which needs the owner's signed `Identity` — an input the DNS
+            // `(resolver, kps)` seams cannot supply. Route it to [`resolve_name_chain`](Self::resolve_name_chain).
+            // (Off by default, `route` above already returned `0x011F`; this arm is reached only once
+            // name-chain is explicitly enabled via [`enable_name_chain`](Self::enable_name_chain).)
+            ResolverType::NameChain(_) => Err(ResolveError::NameResolution(
+                "name-chain resolution requires the owner's Identity — use resolve_name_chain",
+            )),
+        }
+    }
+
+    /// Opt into the OPTIONAL `name-chain` resolver type (ENS `.eth` / SNS `.sol`, spec §3.12.5(a))
+    /// by attaching a [`NameChainClient`] and enabling `name-chain` in this node's registry. Until
+    /// this is called a chain name fails closed (`0x011F`); after it, [`resolve_name_chain`](Self::resolve_name_chain)
+    /// resolves one by enforcing the §3.12.5(b) bidirectional binding through the crate's real resolver.
+    pub fn enable_name_chain(&mut self, client: impl NameChainClient + 'static) {
+        self.resolvers = self.resolvers.clone().enable(ResolverKind::NameChain);
+        self.name_chain = Some(Box::new(client));
+    }
+
+    /// Resolve a self-authenticating **key-name** (spec §3.9.6) via the crate's real [`SelfResolver`].
+    ///
+    /// A key-name is a one-way word-encoding of `BLAKE3-256(ik)` — it carries no locator, so it can
+    /// only resolve against a candidate key the node already holds. This searches the learned
+    /// directory for the key the name derives from; [`SelfResolver::resolve`] enforces the internal
+    /// checksum (typo/mishear defense) **and** the full `keyname::encode(ik) == name` derivation, so
+    /// the match is exact and never a guess. On a match the binding is (re-)pinned as a contact and
+    /// the identity key returned. Fail-closed: a bad checksum is [`ResolveError::KeyNameUnverified`],
+    /// a well-formed key-name deriving from no known key is a [`ResolveError::NameResolution`] miss.
+    pub fn resolve_key_name(&mut self, key_name: &str) -> Result<Vec<u8>, ResolveError> {
+        let found = self
+            .directory
+            .keys()
+            .find(|candidate| SelfResolver::resolve(key_name, candidate).is_ok())
+            .cloned();
+        match found {
+            Some(ik) => {
+                // The key-name is the key's own derivation (§3.9.6) — pinning it is authority-free.
+                self.contacts.insert(ik.clone());
+                Ok(ik)
+            }
+            // Distinguish a typo (fails the checksum) from an unknown-but-well-formed key-name, so a
+            // mistyped name reports as a bad key-name rather than merely "not found".
+            None if !dmtap_core::keyname::verify(key_name) => Err(ResolveError::KeyNameUnverified(
+                "key-name checksum failed — typo/mishear, fail closed",
+            )),
+            None => Err(ResolveError::NameResolution(
+                "key-name does not derive from any key known to this node",
+            )),
+        }
+    }
+
+    /// Resolve a **name-chain** name (`name@.eth` / `name.eth`, spec §3.12.5) via the node's injected
+    /// [`NameChainClient`], enforcing the crate's §3.12.5(b) **bidirectional key↔name binding**
+    /// against the owner's self-asserted `claimed` [`Identity`]. The chain record is only a discovery
+    /// pointer; the returned key is the identity's classical `IK`, pinned with `seal_pub`.
+    ///
+    /// Fail-closed, delegating to `dmtap-naming`'s real [`NameChainResolver`]: name-chain not enabled
+    /// / no client ⇒ [`ResolveError::ResolverTypeUnsupported`] (`0x011F`); the two binding directions
+    /// disagreeing ⇒ [`ResolveError::NameChainBindingUnverified`] (`0x011E`); no on-chain record ⇒ a
+    /// [`ResolveError::NameResolution`] miss.
+    pub fn resolve_name_chain(
+        &mut self,
+        name: &str,
+        claimed: &Identity,
+        seal_pub: [u8; 32],
+    ) -> Result<Vec<u8>, ResolveError> {
+        // Gate on the registry first (name-chain is OPTIONAL, §3.12.5(a)): an unconfigured node
+        // treats a chain name as unimplemented and fails closed (`0x011F`), never guessing.
+        match self.resolvers.route(name)? {
+            ResolverType::NameChain(_) => {}
+            _ => {
+                return Err(ResolveError::ResolverTypeUnsupported(
+                    "not a name-chain name",
+                ))
             }
         }
-        // KT-verify the binding (fail-closed) BEFORE trusting anything about the recipient (§3.3).
-        let res = resolver.resolve(name)?;
-        // Fetch + content-verify (§2.2) the sealing KeyPackage the verified identity advertises.
-        let bundle = kps.fetch_bundle(&res.keypkgs)?;
-        let seal_pub = naming::seal_key_from_bundle(&bundle)?;
-        // Pin the verified binding into the local cache (§3.4): only now is it addressable.
-        self.add_contact(&res.ik, seal_pub);
-        Ok(res.ik)
+        let client = self.name_chain.as_deref().ok_or(
+            ResolveError::ResolverTypeUnsupported("no name-chain client configured"),
+        )?;
+        // Reuse the crate's real resolver (the §3.12.5(b) bidirectional enforcement, `0x011E` on
+        // mismatch) over a thin borrow adapter — one source of truth, no re-implemented binding check.
+        let binding = NameChainResolver::new(ClientRef(client)).resolve(name, claimed)?;
+        // A verified binding — pin the classical IK the chain and the identity agree on (§3.4).
+        self.add_contact(&binding.ik, seal_pub);
+        Ok(binding.ik)
     }
 
     /// Resolve `name@domain` KT-verified (fail-closed, §3.3) and, only on success, send a mail MOTE
@@ -1103,6 +1203,21 @@ impl<T: Transport> Node<T> {
     /// The pinned mix-directory high-water-mark `(epoch, version)` for `authority`, or `None`.
     pub fn mix_directory_high_water_mark(&self, authority: &[u8]) -> Option<(u64, u64)> {
         self.mix_directory.high_water_mark(authority)
+    }
+}
+
+/// A thin borrow adapter so a node-held `&dyn NameChainClient` can drive `dmtap-naming`'s
+/// [`NameChainResolver`] (which takes its client **by value**): it forwards both trait methods to
+/// the borrowed client, letting the node reuse the crate's real §3.12.5(b) bidirectional-binding
+/// enforcement without owning or cloning the client per resolution. Pure delegation, no logic.
+struct ClientRef<'a>(&'a dyn NameChainClient);
+
+impl NameChainClient for ClientRef<'_> {
+    fn chain(&self) -> naming::Chain {
+        self.0.chain()
+    }
+    fn resolve(&self, name: &str) -> Option<Vec<u8>> {
+        self.0.resolve(name)
     }
 }
 
