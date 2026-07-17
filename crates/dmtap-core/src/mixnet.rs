@@ -167,6 +167,73 @@ impl MixNodeDescriptor {
         }
         verify_domain(&self.node_ik, MIX_DESCRIPTOR_DS, &self.signing_body(), &self.sig)
     }
+
+    /// Per-**descriptor** freshness / usable-key check (spec §4.4.4, §16.3), failing closed with
+    /// [`MixDescriptorError::Stale`] (`ERR_MIX_DESCRIPTOR_STALE`, `0x030C`).
+    ///
+    /// A path may be built to a mix only through a **current-epoch** key: a sender MUST encrypt each
+    /// hop to a mix key whose epoch that hop will process the packet in, and MUST NOT build to an
+    /// expired/rotated key (`valid_until` passed) — a packet built to a stale key is dropped
+    /// (`0x030C`, §4.4.4). This check fails closed at `now` when **either**:
+    ///
+    /// 1. the descriptor has **no usable mix key** — every [`MixKeyEntry`] is already at or past its
+    ///    `valid_until` (all epoch keys expired/rotated, "no key for a usable epoch"); or
+    /// 2. the descriptor itself is **past its re-attestation window** — it was last (re)issued more
+    ///    than `max_age` before `now` (`now > ts + max_age`), so a fresher self-descriptor is due.
+    ///
+    /// `max_age` is the caller's re-attestation cadence (e.g. one mix-key epoch, §16.3); pass `0` to
+    /// skip the age bound and rely only on the usable-key check. A key with `valid_until` exactly
+    /// equal to `now` is treated as **expired** (old epoch private keys are deleted *at*
+    /// `valid_until`, §4.4.4), i.e. fail-closed at the boundary.
+    ///
+    /// This is a **descriptor-level** freshness gate and is deliberately **distinct** from the
+    /// whole-directory anti-rollback [`MixDirectoryTracker`] (`ERR_MIX_DIRECTORY_STALE`, `0x0311`):
+    /// that guards a frozen *fleet view* (a stale, validly-signed directory replayed to shrink the
+    /// anonymity set), whereas this guards a single node's expired *keys / attestation* within an
+    /// otherwise-fresh directory.
+    pub fn check_fresh(
+        &self,
+        now: TimestampMs,
+        max_age: TimestampMs,
+    ) -> Result<(), MixDescriptorError> {
+        // (2) Re-attestation window: the descriptor MUST have been (re)issued within max_age of now.
+        // A max_age of 0 disables this bound (rely on the usable-key check alone).
+        if max_age != 0 && now > self.ts.saturating_add(max_age) {
+            return Err(MixDescriptorError::Stale);
+        }
+        // (1) Usable epoch key: at least one mix key must still be valid (valid_until strictly after
+        // now); if every key has reached/passed valid_until, there is no key for a usable epoch.
+        if !self.mix_keys.iter().any(|k| k.valid_until > now) {
+            return Err(MixDescriptorError::Stale);
+        }
+        Ok(())
+    }
+}
+
+/// A [`MixNodeDescriptor::check_fresh`] failure (`ERR_MIX_DESCRIPTOR_STALE`, §21.5 `0x030C`).
+///
+/// Disposition per §21.5/§4.4.4: `ROTATE_RETRY` — the descriptor has no key for a usable epoch, or
+/// a packet was built to an expired/rotated mix key (`valid_until` passed); re-fetch the
+/// `MixDirectory` and rebuild the path for the current epoch. Distinct from the whole-directory
+/// freeze defense [`MixDirectoryError::Stale`] (`0x0311`).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MixDescriptorError {
+    /// The descriptor has no usable (unexpired) mix key at `now`, or is past its re-attestation
+    /// window — a stale per-node descriptor (§4.4.4, §16.3).
+    #[error(
+        "mix node descriptor is stale — no usable-epoch mix key at `now`, or past its \
+         re-attestation window (ERR_MIX_DESCRIPTOR_STALE, §21.5 0x030C)"
+    )]
+    Stale,
+}
+
+impl MixDescriptorError {
+    /// The normative DMTAP wire error code (§21.5).
+    pub fn code(&self) -> u16 {
+        match self {
+            MixDescriptorError::Stale => 0x030C,
+        }
+    }
 }
 
 /// The signed, versioned, KT-anchored mix-fleet snapshot for an epoch (spec §4.4.2, §18.5.3).
@@ -403,6 +470,40 @@ mod tests {
             MixNodeDescriptor::from_det_cbor(&cbor::encode(&Cv::Map(m))),
             Err(CborError::UnknownDiscriminant(3))
         ));
+    }
+
+    #[test]
+    fn fresh_descriptor_passes_freshness_check() {
+        // descriptor() issues ts=1_700_000_000_000 with a key valid_until=1_700_000_600_000.
+        let d = descriptor(0x11, 0);
+        let now = 1_700_000_300_000; // before valid_until, within a 1h re-attestation window
+        assert_eq!(d.check_fresh(now, 3_600_000), Ok(()));
+        // max_age = 0 skips the age bound; the usable key alone keeps it fresh.
+        assert_eq!(d.check_fresh(now, 0), Ok(()));
+    }
+
+    #[test]
+    fn expired_key_fails_stale_030c() {
+        let d = descriptor(0x11, 0);
+        // now is at/after every key's valid_until (1_700_000_600_000) — no usable epoch key.
+        let at_expiry = d.check_fresh(1_700_000_600_000, 0).unwrap_err();
+        assert_eq!(at_expiry, MixDescriptorError::Stale); // boundary is fail-closed
+        assert_eq!(at_expiry.code(), 0x030C);
+        assert_eq!(d.check_fresh(1_700_000_900_000, 0), Err(MixDescriptorError::Stale));
+    }
+
+    #[test]
+    fn stale_descriptor_past_reattestation_window_fails_030c() {
+        let d = descriptor(0x11, 0); // ts = 1_700_000_000_000
+        // The key is still usable at `now`, but the descriptor was issued too long ago:
+        // now = ts + 120s while max_age = 60s ⇒ past the re-attestation window.
+        let now = 1_700_000_120_000;
+        assert!(d.mix_keys.iter().any(|k| k.valid_until > now), "key still usable at now");
+        let err = d.check_fresh(now, 60_000).unwrap_err();
+        assert_eq!(err, MixDescriptorError::Stale);
+        assert_eq!(err.code(), 0x030C);
+        // Widen the window to cover the age and it passes again.
+        assert_eq!(d.check_fresh(now, 3_600_000), Ok(()));
     }
 
     #[test]
