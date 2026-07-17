@@ -69,8 +69,56 @@ pub enum MoteError {
     SealFailed,
     #[error("malformed key material")]
     BadKey,
+    /// A **Referenced**-tier file's `ManifestRef` is missing its REQUIRED `durability`, carries an
+    /// unknown `class`, a `cluster-replicated` (class 2) with `replicas < 1`, or a `pinned`
+    /// (class 3) with no `retention` — a malformed/underspecified durability contract
+    /// (`ERR_FILE_MANIFEST_INVALID` `0x080A`, FAIL_CLOSED_BLOCK, §5.5.2/§18.3.7).
+    #[error("file durability contract missing/malformed (ERR_FILE_MANIFEST_INVALID 0x080A)")]
+    FileManifestInvalid,
+    /// A `pinned(term)` (class 3) contract's `retention` term has elapsed (the host MAY have GC'd
+    /// the bytes) — a fetch past expiry (`ERR_FILE_RETENTION_EXPIRED` `0x080B`, §5.5.4/§5.5.2).
+    #[error("pinned-file retention term elapsed (ERR_FILE_RETENTION_EXPIRED 0x080B)")]
+    FileRetentionExpired,
+    /// A **Referenced** file has no reachable holder and no satisfiable durability contract — the
+    /// disclosed origin-hold residual realized (whole-file loss, distinct from a single missing
+    /// chunk `0x0803`) (`ERR_FILE_UNAVAILABLE` `0x0809`, §5.5.2/§5.5.3/§6.6).
+    #[error("referenced file has no reachable holder (ERR_FILE_UNAVAILABLE 0x0809)")]
+    FileUnavailable,
+    /// A **pushed** Inline/Attached file would exceed the recipient's inbound spool cap for that
+    /// sender — a storage-based DoS (spool-fill); refused, never silently accepted or dropped
+    /// (`ERR_SPOOL_OVERFLOW` `0x080C`, DENY_POLICY, §5.5.5/§16.4).
+    #[error("inbound spool cap exceeded (ERR_SPOOL_OVERFLOW 0x080C)")]
+    SpoolOverflow,
+    /// An `Attachment`'s declared delivery mechanism does not match its size tier (§5.5.1/§16.4):
+    /// an `inline` attachment above the inline cap, a `manifest` reference below it, an attachment
+    /// carrying **both** or **neither** of `{inline, manifest}` (§18.3.7 requires exactly one), or
+    /// inline bytes whose length disagrees with the declared `size`. Fails closed at construction.
+    ///
+    /// NOTE: §21 has no dedicated size-tier-violation code; [`MoteError::code`] maps this to the
+    /// closest existing `0x080A` (`ERR_FILE_MANIFEST_INVALID`, "malformed delivery contract").
+    #[error("attachment size does not match its declared delivery tier (fail closed, §5.5.1)")]
+    SizeTierViolation,
     #[error("canonical CBOR decode failed: {0}")]
     BadEncoding(#[from] CborError),
+}
+
+impl MoteError {
+    /// The normative DMTAP wire error code (§21) when this failure carries one. The file/durability
+    /// failures (§21.8 `0x08xx`) each map to their assigned code; structural envelope/crypto
+    /// failures (bad signature, decrypt failure, …) have no assigned wire code and return `None`.
+    ///
+    /// [`MoteError::SizeTierViolation`] has no dedicated §21 code and is mapped to the closest
+    /// existing `0x080A` (`ERR_FILE_MANIFEST_INVALID`) — see that variant's note.
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            MoteError::FileUnavailable => Some(0x0809),
+            MoteError::FileManifestInvalid => Some(0x080A),
+            MoteError::FileRetentionExpired => Some(0x080B),
+            MoteError::SpoolOverflow => Some(0x080C),
+            MoteError::SizeTierViolation => Some(0x080A),
+            _ => None,
+        }
+    }
 }
 
 /// Error type of [`validate_pinned`]: either a base [`validate`] failure ([`MoteError`]) or a
@@ -94,7 +142,9 @@ impl ValidateError {
     pub fn code(&self) -> Option<u16> {
         match self {
             ValidateError::Suite(e) => Some(e.code()),
-            ValidateError::Mote(_) => None,
+            // Base structural failures have no code (`None`); the file/durability failures
+            // (§21.8 `0x08xx`) carry theirs via [`MoteError::code`].
+            ValidateError::Mote(e) => e.code(),
         }
     }
 }
@@ -691,6 +741,42 @@ impl Attachment {
         f.deny_unknown()?;
         Ok(Attachment { name, mime, size, inline, manifest, key })
     }
+
+    /// Fail-closed enforcement that this attachment's declared delivery mechanism matches its size
+    /// tier (spec §5.5.1, §16.4). Enforced at MOTE construction (see [`build_mote`]) and available
+    /// to a validating receiver:
+    ///
+    /// - Exactly one of `{inline, manifest}` MUST be present (§18.3.7) — both/neither is malformed.
+    /// - An **inline** attachment rides inside the sealed MOTE, so its `size` MUST be within the
+    ///   inline cap ([`DeliveryTier::Inline`], ≤ 64 KiB) and its `inline` bytes' length MUST equal
+    ///   the declared `size` (no size lying). An oversize inline is [`MoteError::SizeTierViolation`].
+    /// - A **manifest** reference is for the Attached/Referenced tiers (> inline cap); an
+    ///   undersized one (belongs inline) is [`MoteError::SizeTierViolation`]. A **Referenced**
+    ///   (> 25 MiB) reference MUST additionally carry a valid `durability`
+    ///   ([`ManifestRef::validate_durability`], [`MoteError::FileManifestInvalid`]).
+    pub fn check_delivery_tier(&self) -> Result<(), MoteError> {
+        let tier = DeliveryTier::classify(self.size);
+        match (&self.inline, &self.manifest) {
+            (Some(bytes), None) => {
+                if tier != DeliveryTier::Inline {
+                    return Err(MoteError::SizeTierViolation); // oversize for the inline tier
+                }
+                if bytes.len() as u64 != self.size {
+                    return Err(MoteError::SizeTierViolation); // inline bytes vs declared size
+                }
+                Ok(())
+            }
+            (None, Some(mref)) => {
+                if tier == DeliveryTier::Inline {
+                    return Err(MoteError::SizeTierViolation); // undersize; belongs inline
+                }
+                // Attached (push) or Referenced (pull) — the latter MUST carry durability.
+                mref.validate_durability()
+            }
+            // §18.3.7: exactly one of {inline, manifest} MUST be present.
+            (Some(_), Some(_)) | (None, None) => Err(MoteError::SizeTierViolation),
+        }
+    }
 }
 
 /// Reference to a file's manifest (spec §2.5, §18.3.7). `chunks` here is a *count* (u32).
@@ -699,15 +785,30 @@ pub struct ManifestRef {
     pub id: ContentId, // key 1 — BLAKE3 Merkle-DAG root (§18.9.5)
     pub size: u64,     // key 2
     pub chunks: u32,   // key 3 — NUMBER of chunks
+    /// Key 4 — the delivery/retention **durability contract** for THIS delivery (§5.5.2). It rides
+    /// in the `ManifestRef` **inside the sealed, signed MOTE** — NOT in the content-addressed
+    /// [`Manifest`] (§18.3.8) — so re-pinning/upgrading durability never changes the file's content
+    /// address, and a holder cannot tamper with it (it is covered by `Payload.sig`, §18.9.2).
+    ///
+    /// **MUST** be present with a valid, known `class` for the **Referenced** tier (> 25 MiB);
+    /// Inline/Attached files are durable by construction (delivery / push) and MAY omit it
+    /// ([`ManifestRef::validate_durability`], `ERR_FILE_MANIFEST_INVALID` `0x080A`).
+    pub durability: Option<Durability>,
 }
 
 impl ManifestRef {
     fn to_cv(&self) -> Cv {
-        Cv::Map(vec![
-            (1, Cv::Bytes(self.id.as_bytes().to_vec())),
+        let mut m = vec![
+            (1u64, Cv::Bytes(self.id.as_bytes().to_vec())),
             (2, Cv::U64(self.size)),
             (3, Cv::U64(self.chunks as u64)),
-        ])
+        ];
+        // Key 4 is optional and omitted when absent (§18.1.1) — so a `ManifestRef` without a
+        // durability contract encodes byte-for-byte as before (wire-compatible, suites 0x01/0x02).
+        if let Some(d) = &self.durability {
+            m.push((4, d.to_cv()));
+        }
+        Cv::Map(m)
     }
 
     fn from_cv(cv: Cv) -> Result<Self, CborError> {
@@ -715,8 +816,24 @@ impl ManifestRef {
         let id = ContentId(as_bytes(f.req(1)?)?);
         let size = as_u64(f.req(2)?)?;
         let chunks = as_u32(f.req(3)?)?;
+        let durability = f.take(4).map(Durability::from_cv).transpose()?;
         f.deny_unknown()?;
-        Ok(ManifestRef { id, size, chunks })
+        Ok(ManifestRef { id, size, chunks, durability })
+    }
+
+    /// Fail-closed durability validation of this reference against its size tier (§5.5.2, §18.3.7).
+    ///
+    /// A **Referenced** file (> 25 MiB, [`DeliveryTier::Referenced`]) **MUST** carry a `durability`
+    /// with a **known** `class` (and the per-class `replicas`/`retention` invariants) — a missing or
+    /// malformed contract is [`MoteError::FileManifestInvalid`] (`0x080A`), fail closed. Inline and
+    /// Attached files MAY omit the descriptor; if one is nonetheless present it must still be
+    /// well-formed. Closes DMTAP-FILE-06.
+    pub fn validate_durability(&self) -> Result<(), MoteError> {
+        match (&self.durability, DeliveryTier::classify(self.size)) {
+            (None, DeliveryTier::Referenced) => Err(MoteError::FileManifestInvalid),
+            (Some(d), _) => d.validate(),
+            (None, _) => Ok(()),
+        }
     }
 }
 
@@ -837,6 +954,303 @@ pub fn file_tier(size: u64) -> FileTier {
         FileTier::Normal
     } else {
         FileTier::Large
+    }
+}
+
+// --- Delivery tiers & durability contract (§5.5.1, §5.5.2, §16.4) ---------------------------
+
+/// Inline **delivery**-tier cap (§5.5.1, §16.4): ≤ 64 KiB rides *inside* the sealed MOTE
+/// (`Attachment.inline`, durable-by-delivery). Deliberately the top Sphinx bucket rung (§16.3) —
+/// a larger inline cap would push the MOTE above the top bucket and off the `private` mixnet.
+pub const INLINE_TIER_MAX: u64 = 64 * 1024;
+
+/// Attached **delivery**-tier cap (§5.5.1, §16.4): > 64 KiB and ≤ 25 MiB is content-addressed +
+/// chunked and **pushed with the message** into the recipient's store (a durable recipient copy
+/// that survives the sender dropping). Above this the file is Referenced (pull-on-demand).
+pub const ATTACHED_TIER_MAX: u64 = 25 * 1024 * 1024;
+
+/// The **delivery tier** of a file (spec §5.5.1) — the *durability* axis (inline / push / pull).
+///
+/// This is **orthogonal** to [`FileTier`] (the §16.4 *privacy* sub-tier: mixnet ≤ 4 MiB vs. bulk
+/// > 4 MiB). A 25 MiB **Attached** file is *pushed* (durable) *and* transits the weaker bulk path:
+/// push-vs-pull governs durability, mixnet-vs-bulk governs metadata privacy (§5.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryTier {
+    /// ≤ 64 KiB — bytes ride inside the sealed MOTE (`Attachment.inline`); durable-by-delivery.
+    Inline,
+    /// > 64 KiB, ≤ 25 MiB — chunks pushed with the message into the recipient's store; a durable
+    /// recipient copy. MAY carry a `durability` descriptor but is durable by construction.
+    Attached,
+    /// > 25 MiB — `ManifestRef` + key travel in the MOTE; chunks pulled on demand from a holder.
+    /// Best-effort by default: it **MUST** carry a [`Durability`] contract (§5.5.2).
+    Referenced,
+}
+
+impl DeliveryTier {
+    /// Classify a plaintext file size into its delivery tier (spec §5.5.1, §16.4 thresholds).
+    pub fn classify(size: u64) -> DeliveryTier {
+        if size <= INLINE_TIER_MAX {
+            DeliveryTier::Inline
+        } else if size <= ATTACHED_TIER_MAX {
+            DeliveryTier::Attached
+        } else {
+            DeliveryTier::Referenced
+        }
+    }
+}
+
+/// Durability **class** of a Referenced file (spec §5.5.2, §18.3.7) — who serves the bytes and
+/// what guarantee they carry. A decoded value outside `0..=3` is preserved as [`Unknown`] so it
+/// fails closed at [`Durability::validate`] (`ERR_FILE_MANIFEST_INVALID`) rather than at CBOR
+/// decode — the spec assigns unknown-class its own file-level code, not a generic malformed decode.
+///
+/// [`Unknown`]: DurabilityClass::Unknown
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityClass {
+    /// (0) Served best-effort by the owner's origin node + swarm; MAY become permanently
+    /// unavailable if the origin drops before the recipient fetches (`ERR_FILE_UNAVAILABLE`,
+    /// §6.6 item 10 — the honest default residual).
+    OriginHold,
+    /// (1) The recipient pinned a copy; durable at the recipient (survives origin drop).
+    RecipientPinned,
+    /// (2) A box-cluster (§5.6, §14) holds N replicas (`replicas`, MUST be ≥ 1); tolerates loss of
+    /// up to N−1 holders, repaired from any survivor.
+    ClusterReplicated,
+    /// (3) A paid relay / pinning host holds it for a `retention` term; durable until it elapses,
+    /// after which the host MAY GC (`ERR_FILE_RETENTION_EXPIRED`).
+    Pinned,
+    /// Any other on-the-wire value — always invalid (`ERR_FILE_MANIFEST_INVALID`, §5.5.2).
+    Unknown(u8),
+}
+
+impl DurabilityClass {
+    /// Total decode: `0..=3` map to the known classes; any other byte is [`Unknown`] (never a
+    /// decode failure — the invalidity is surfaced fail-closed at [`Durability::validate`]).
+    ///
+    /// [`Unknown`]: DurabilityClass::Unknown
+    pub fn from_u8(b: u8) -> DurabilityClass {
+        match b {
+            0 => DurabilityClass::OriginHold,
+            1 => DurabilityClass::RecipientPinned,
+            2 => DurabilityClass::ClusterReplicated,
+            3 => DurabilityClass::Pinned,
+            other => DurabilityClass::Unknown(other),
+        }
+    }
+
+    /// The wire byte for this class (round-trips [`DurabilityClass::from_u8`]).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            DurabilityClass::OriginHold => 0,
+            DurabilityClass::RecipientPinned => 1,
+            DurabilityClass::ClusterReplicated => 2,
+            DurabilityClass::Pinned => 3,
+            DurabilityClass::Unknown(b) => b,
+        }
+    }
+}
+
+/// The delivery/retention **durability contract** carried in a [`ManifestRef`] (spec §5.5.2,
+/// §18.3.7, CDDL `Durability`). Encoded as an integer-keyed canonical CBOR map:
+/// `{1 => class, ?2 => retention, ?3 => replicas, ?4 => holder_hint}`.
+///
+/// It lives inside the **sealed, signed** MOTE (covered by `Payload.sig`, §18.9.2), so it is
+/// per-delivery and tamper-proof, and is **not** part of the immutable content-addressed
+/// [`Manifest`] — re-pinning/upgrading durability never changes the file's content address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Durability {
+    /// Key 1 — durability class (§5.5.2).
+    pub class: DurabilityClass,
+    /// Key 2 — retention term as Unix seconds; **MUST** be present iff `class = Pinned`; absent ⇒
+    /// indefinite. After it elapses the host MAY GC (`ERR_FILE_RETENTION_EXPIRED`).
+    pub retention: Option<u64>,
+    /// Key 3 — replica count N; **MUST** be present and ≥ 1 iff `class = ClusterReplicated`.
+    pub replicas: Option<u32>,
+    /// Key 4 — advisory pull-locator hint. **NOT authoritative**: a fetcher MUST still
+    /// content-verify every chunk (§18.9.5) regardless of the hint (§5.5.2).
+    pub holder_hint: Option<String>,
+}
+
+impl Durability {
+    /// A best-effort origin-hold contract (the honest default residual, §6.6 item 10).
+    pub fn origin_hold() -> Self {
+        Durability { class: DurabilityClass::OriginHold, retention: None, replicas: None, holder_hint: None }
+    }
+
+    /// A recipient-pinned contract (durable at the recipient).
+    pub fn recipient_pinned() -> Self {
+        Durability { class: DurabilityClass::RecipientPinned, retention: None, replicas: None, holder_hint: None }
+    }
+
+    /// A cluster-replicated contract holding `replicas` copies (§5.5.2; `replicas` MUST be ≥ 1).
+    pub fn cluster_replicated(replicas: u32) -> Self {
+        Durability {
+            class: DurabilityClass::ClusterReplicated,
+            retention: None,
+            replicas: Some(replicas),
+            holder_hint: None,
+        }
+    }
+
+    /// A pinned(term) contract durable until `retention` (Unix seconds) elapses (§5.5.2/§5.5.4).
+    pub fn pinned(retention: u64) -> Self {
+        Durability {
+            class: DurabilityClass::Pinned,
+            retention: Some(retention),
+            replicas: None,
+            holder_hint: None,
+        }
+    }
+
+    /// Integer-keyed canonical map (§18.3.7). Absent optionals are omitted (§18.1.1).
+    fn to_cv(&self) -> Cv {
+        let mut m = vec![(1u64, Cv::U64(self.class.as_u8() as u64))];
+        if let Some(r) = self.retention {
+            m.push((2, Cv::U64(r)));
+        }
+        if let Some(n) = self.replicas {
+            m.push((3, Cv::U64(n as u64)));
+        }
+        if let Some(h) = &self.holder_hint {
+            m.push((4, Cv::Text(h.clone())));
+        }
+        Cv::Map(m)
+    }
+
+    /// The exact wire bytes of this descriptor: §18-canonical integer-keyed CBOR.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv())
+    }
+
+    fn from_cv(cv: Cv) -> Result<Self, CborError> {
+        let mut f = Fields::from_cv(cv)?;
+        let class = DurabilityClass::from_u8(as_u8(f.req(1)?)?);
+        let retention = f.take(2).map(as_u64).transpose()?;
+        let replicas = f.take(3).map(as_u32).transpose()?;
+        let holder_hint = f.take(4).map(as_text).transpose()?;
+        f.deny_unknown()?;
+        Ok(Durability { class, retention, replicas, holder_hint })
+    }
+
+    /// Decode a durability descriptor from its canonical CBOR (§18.3.7), failing closed on any
+    /// structural violation. An unknown *class value* is preserved (not a decode error) so it fails
+    /// at [`Durability::validate`] with the file-level `0x080A`.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, CborError> {
+        Self::from_cv(cbor::decode(bytes)?)
+    }
+
+    /// Fail-closed validation of the contract's internal invariants (§5.5.2, §18.3.7):
+    /// an unknown `class`, a `ClusterReplicated` with `replicas` absent or `< 1`, or a `Pinned`
+    /// with no `retention` is [`MoteError::FileManifestInvalid`] (`0x080A`). Closes DMTAP-FILE-06.
+    pub fn validate(&self) -> Result<(), MoteError> {
+        match self.class {
+            DurabilityClass::Unknown(_) => Err(MoteError::FileManifestInvalid),
+            DurabilityClass::ClusterReplicated => match self.replicas {
+                Some(n) if n >= 1 => Ok(()),
+                _ => Err(MoteError::FileManifestInvalid),
+            },
+            DurabilityClass::Pinned => match self.retention {
+                Some(_) => Ok(()),
+                None => Err(MoteError::FileManifestInvalid),
+            },
+            DurabilityClass::OriginHold | DurabilityClass::RecipientPinned => Ok(()),
+        }
+    }
+
+    /// Fail-closed retention check for a `Pinned(term)` contract (spec §5.5.4, §5.5.2): a fetch at
+    /// `now_unix_secs` **at or past** the `retention` term is [`MoteError::FileRetentionExpired`]
+    /// (`0x080B`) — the host MAY have GC'd the bytes; renew/re-pin before expiry. Non-`Pinned`
+    /// classes, and a `Pinned` with no term (indefinite), never expire here. Deterministic — the
+    /// caller supplies `now` (no wall clock, §16.1). Closes DMTAP-FILE-08.
+    pub fn check_retention(&self, now_unix_secs: u64) -> Result<(), MoteError> {
+        if let (DurabilityClass::Pinned, Some(term)) = (self.class, self.retention) {
+            if now_unix_secs >= term {
+                return Err(MoteError::FileRetentionExpired);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fail-closed whole-file availability check for a **Referenced** fetch (spec §5.5.2, §5.5.3,
+/// §6.6): if no holder is reachable and no durability contract can be satisfied, the fetch fails
+/// [`MoteError::FileUnavailable`] (`0x0809`) — the disclosed origin-hold residual realized (the
+/// origin dropped before the recipient fetched), distinct from a single missing chunk (`0x0803`).
+/// Closes DMTAP-FILE-09. `any_holder_reachable` is the caller's swarm/origin reachability verdict.
+pub fn check_file_available(any_holder_reachable: bool) -> Result<(), MoteError> {
+    if any_holder_reachable {
+        Ok(())
+    } else {
+        Err(MoteError::FileUnavailable)
+    }
+}
+
+/// The content address of a **ciphertext** file chunk (spec §5.5, §18.9.5): `0x1e ‖ BLAKE3-256(
+/// AEAD(key, plaintext_chunk))`. Content addressing is computed over the *encrypted* bytes, never
+/// the plaintext — this is the value stored in `Manifest.chunks`, and it is what kills the
+/// convergent-encryption / CAS-confirmation **dedup-confirmation leak**: the same plaintext under
+/// two different per-file keys yields two different chunk ids (and thus two different `Manifest.id`
+/// Merkle roots), so a holder cannot confirm "you have file X" by hash. Feed the AEAD **ciphertext**
+/// chunk here; feeding plaintext would reintroduce the leak.
+pub fn chunk_content_id(ciphertext_chunk: &[u8]) -> ContentId {
+    ContentId::of(ciphertext_chunk)
+}
+
+/// A caller-owned, fail-closed **inbound spool cap** for *pushed* Inline/Attached files from a
+/// given sender (spec §5.5.5, §16.4). Because Attached files are *pushed* into the recipient's
+/// store, a sender can try to fill a victim's spool (a storage-based DoS); a push that would carry
+/// the recorded `used` bytes over `cap` is refused [`MoteError::SpoolOverflow`] (`0x080C`), never
+/// silently accepted or dropped. Deterministic and caller-owned (no wall clock, §16.1); scope one
+/// per (recipient, sender) and persist across pushes. Closes DMTAP-FILE-07.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundSpool {
+    used: u64,
+    cap: u64,
+}
+
+impl InboundSpool {
+    /// A spool with the given per-sender aggregate `cap` (bytes) and no bytes used yet.
+    pub fn new(cap: u64) -> Self {
+        InboundSpool { used: 0, cap }
+    }
+
+    /// Bytes currently recorded as used against the cap.
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    /// The aggregate cap (bytes) this sender may fill.
+    pub fn cap(&self) -> u64 {
+        self.cap
+    }
+
+    /// Bytes still admissible before the cap (saturating at 0).
+    pub fn remaining(&self) -> u64 {
+        self.cap.saturating_sub(self.used)
+    }
+
+    /// Fail-closed check-and-record for an incoming pushed file of `incoming` bytes. On success the
+    /// bytes are recorded against the cap and `Ok(())` is returned; a push that would exceed the cap
+    /// (or overflow the running total) is [`MoteError::SpoolOverflow`] (`0x080C`, DENY_POLICY) and
+    /// the recorded total is left **unchanged** (a rejected push admits nothing).
+    pub fn admit(&mut self, incoming: u64) -> Result<(), MoteError> {
+        match self.used.checked_add(incoming) {
+            Some(total) if total <= self.cap => {
+                self.used = total;
+                Ok(())
+            }
+            _ => Err(MoteError::SpoolOverflow),
+        }
+    }
+}
+
+/// Pure, stateless spool-cap admission (spec §5.5.5): whether recording `incoming` more bytes on
+/// top of `used` stays within `cap`. `Ok(())` to admit, [`MoteError::SpoolOverflow`] (`0x080C`) to
+/// refuse fail-closed. Mirrors [`InboundSpool::admit`] without owning state.
+pub fn spool_admit(used: u64, incoming: u64, cap: u64) -> Result<(), MoteError> {
+    match used.checked_add(incoming) {
+        Some(total) if total <= cap => Ok(()),
+        _ => Err(MoteError::SpoolOverflow),
     }
 }
 
@@ -1033,6 +1447,13 @@ pub fn build_mote(
     let to = DeliveryTag::Key(recipient_ik.to_vec());
     let to_cbor = to.det_cbor();
 
+    // 0. Enforce the §5.5.1 delivery-size tiers fail-closed at construction: each attachment's
+    //    declared mechanism (inline vs. manifest) must match its size tier, and a Referenced
+    //    (> 25 MiB) reference must carry a valid durability contract (§5.5.2).
+    for att in &draft.attach {
+        att.check_delivery_tier()?;
+    }
+
     // 1. Build and sign the payload (identity signature lives inside the ciphertext).
     let mut payload = Payload {
         from: sender_ik.public(),
@@ -1099,6 +1520,11 @@ pub fn build_mote_hybrid(
     let suite = Suite::PqHybrid;
     let to = DeliveryTag::Key(recipient_ik.to_vec());
     let to_cbor = to.det_cbor();
+
+    // 0. Enforce the §5.5.1 delivery-size tiers fail-closed at construction (see [`build_mote`]).
+    for att in &draft.attach {
+        att.check_delivery_tier()?;
+    }
 
     // 1. Build and hybrid-sign the payload (identity signature lives inside the ciphertext).
     let mut payload = Payload {
@@ -1602,6 +2028,329 @@ mod tests {
         assert_eq!(file_tier(1024), FileTier::Inline);
         assert_eq!(file_tier(2 * 1024 * 1024), FileTier::Normal);
         assert_eq!(file_tier(8 * 1024 * 1024), FileTier::Large);
+    }
+
+    // --- Delivery tiers (§5.5.1, §16.4) — the DURABILITY axis, orthogonal to `FileTier` --------
+
+    #[test]
+    fn delivery_tier_boundaries() {
+        // Inline: ≤ 64 KiB (each side of the boundary).
+        assert_eq!(DeliveryTier::classify(0), DeliveryTier::Inline);
+        assert_eq!(DeliveryTier::classify(INLINE_TIER_MAX), DeliveryTier::Inline); // 64 KiB exact
+        assert_eq!(DeliveryTier::classify(INLINE_TIER_MAX + 1), DeliveryTier::Attached);
+        // Attached: > 64 KiB, ≤ 25 MiB (each side of the boundary).
+        assert_eq!(DeliveryTier::classify(ATTACHED_TIER_MAX), DeliveryTier::Attached); // 25 MiB exact
+        assert_eq!(DeliveryTier::classify(ATTACHED_TIER_MAX + 1), DeliveryTier::Referenced);
+        // Referenced: > 25 MiB (any size).
+        assert_eq!(DeliveryTier::classify(100 * 1024 * 1024), DeliveryTier::Referenced);
+    }
+
+    #[test]
+    fn delivery_tier_is_orthogonal_to_file_tier() {
+        // A 25 MiB file is Attached (durability axis) but Large (privacy axis) — the two axes are
+        // independent (§5.5.1): push-vs-pull governs durability, mixnet-vs-bulk governs privacy.
+        assert_eq!(DeliveryTier::classify(ATTACHED_TIER_MAX), DeliveryTier::Attached);
+        assert_eq!(file_tier(ATTACHED_TIER_MAX), FileTier::Large);
+    }
+
+    // --- Durability descriptor CBOR round-trip + validation (§5.5.2, §18.3.7) -------------------
+
+    #[test]
+    fn durability_cbor_round_trip_all_classes() {
+        for d in [
+            Durability::origin_hold(),
+            Durability::recipient_pinned(),
+            Durability::cluster_replicated(3),
+            Durability::pinned(1_900_000_000),
+            Durability {
+                class: DurabilityClass::Pinned,
+                retention: Some(1_900_000_000),
+                replicas: None,
+                holder_hint: Some("relay.example.invalid/pin/abc".into()),
+            },
+        ] {
+            let bytes = d.det_cbor();
+            // Integer-keyed canonical map (first key is integer 1, not a text key).
+            assert_eq!(bytes[0] & 0xe0, 0xa0, "durability is a CBOR map");
+            let back = Durability::from_det_cbor(&bytes).unwrap();
+            assert_eq!(back, d, "durability must survive a canonical CBOR round-trip");
+            assert_eq!(back.det_cbor(), bytes, "re-encode byte-identical");
+        }
+    }
+
+    #[test]
+    fn durability_unknown_class_decodes_then_fails_validate() {
+        // class = 99 is preserved through decode (not a generic malformed-CBOR error) and fails at
+        // validate() with the file-level 0x080A (§5.5.2) — the DMTAP-FILE-06 unknown-class variant.
+        let bytes = cbor::encode(&Cv::Map(vec![(1, Cv::U64(99))]));
+        let d = Durability::from_det_cbor(&bytes).expect("unknown class decodes, not a CBOR error");
+        assert_eq!(d.class, DurabilityClass::Unknown(99));
+        assert_eq!(d.validate(), Err(MoteError::FileManifestInvalid));
+        assert_eq!(d.validate().unwrap_err().code(), Some(0x080A));
+    }
+
+    #[test]
+    fn durability_class_invariants_fail_closed() {
+        // cluster-replicated (2) with replicas absent or < 1 → invalid.
+        assert_eq!(
+            Durability { class: DurabilityClass::ClusterReplicated, retention: None, replicas: None, holder_hint: None }.validate(),
+            Err(MoteError::FileManifestInvalid)
+        );
+        assert_eq!(
+            Durability { class: DurabilityClass::ClusterReplicated, retention: None, replicas: Some(0), holder_hint: None }.validate(),
+            Err(MoteError::FileManifestInvalid)
+        );
+        assert!(Durability::cluster_replicated(1).validate().is_ok());
+        // pinned (3) with no retention → invalid; with a term → ok.
+        assert_eq!(
+            Durability { class: DurabilityClass::Pinned, retention: None, replicas: None, holder_hint: None }.validate(),
+            Err(MoteError::FileManifestInvalid)
+        );
+        assert!(Durability::pinned(1_900_000_000).validate().is_ok());
+        // origin-hold / recipient-pinned need no extra fields.
+        assert!(Durability::origin_hold().validate().is_ok());
+        assert!(Durability::recipient_pinned().validate().is_ok());
+    }
+
+    // --- DMTAP-FILE-06: Referenced ManifestRef durability validation ----------------------------
+
+    fn mref(size: u64, durability: Option<Durability>) -> ManifestRef {
+        ManifestRef { id: ContentId::of(b"root"), size, chunks: 1, durability }
+    }
+
+    #[test]
+    fn file06_referenced_missing_durability_rejected() {
+        // A Referenced (> 25 MiB) reference with NO durability → 0x080A fail-closed.
+        let r = mref(ATTACHED_TIER_MAX + 1, None);
+        assert_eq!(r.validate_durability(), Err(MoteError::FileManifestInvalid));
+        assert_eq!(r.validate_durability().unwrap_err().code(), Some(0x080A));
+        // …and the malformed-contract variants (unknown class / replicas<1 / no retention).
+        for bad in [
+            Durability { class: DurabilityClass::Unknown(99), retention: None, replicas: None, holder_hint: None },
+            Durability { class: DurabilityClass::ClusterReplicated, retention: None, replicas: Some(0), holder_hint: None },
+            Durability { class: DurabilityClass::Pinned, retention: None, replicas: None, holder_hint: None },
+        ] {
+            let r = mref(ATTACHED_TIER_MAX + 1, Some(bad));
+            assert_eq!(r.validate_durability(), Err(MoteError::FileManifestInvalid));
+        }
+    }
+
+    #[test]
+    fn file06_referenced_with_valid_durability_accepted() {
+        for good in [
+            Durability::origin_hold(),
+            Durability::recipient_pinned(),
+            Durability::cluster_replicated(2),
+            Durability::pinned(1_900_000_000),
+        ] {
+            assert!(mref(ATTACHED_TIER_MAX + 1, Some(good)).validate_durability().is_ok());
+        }
+    }
+
+    #[test]
+    fn inline_and_attached_may_omit_durability() {
+        // Inline/Attached tiers are durable by construction and MAY omit the descriptor (§5.5.2).
+        assert!(mref(1024, None).validate_durability().is_ok());
+        assert!(mref(ATTACHED_TIER_MAX, None).validate_durability().is_ok());
+        // …but a present-yet-malformed descriptor is still rejected even below the Referenced tier.
+        let bad = Durability { class: DurabilityClass::Pinned, retention: None, replicas: None, holder_hint: None };
+        assert_eq!(mref(1024, Some(bad)).validate_durability(), Err(MoteError::FileManifestInvalid));
+    }
+
+    #[test]
+    fn manifest_ref_wire_compat_when_durability_absent() {
+        // A ManifestRef WITHOUT durability must encode exactly as the pre-change {1,2,3} map
+        // (wire-compatible with suites 0x01/0x02): key 4 is omitted, no trailing bytes.
+        let r = mref(4096, None);
+        let bytes = r.to_cv();
+        let encoded = cbor::encode(&bytes);
+        let expected = cbor::encode(&Cv::Map(vec![
+            (1, Cv::Bytes(ContentId::of(b"root").as_bytes().to_vec())),
+            (2, Cv::U64(4096)),
+            (3, Cv::U64(1)),
+        ]));
+        assert_eq!(encoded, expected, "absent durability ⇒ byte-identical legacy encoding");
+        // And with durability present, key 4 appears and round-trips through Attachment.
+        let r2 = mref(ATTACHED_TIER_MAX + 1, Some(Durability::cluster_replicated(3)));
+        let att = Attachment {
+            name: "big.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: r2.size,
+            inline: None,
+            manifest: Some(r2.clone()),
+            key: vec![0u8; 32],
+        };
+        let back = Attachment::from_cv(att.to_cv()).unwrap();
+        assert_eq!(back.manifest.unwrap().durability, Some(Durability::cluster_replicated(3)));
+    }
+
+    // --- Size-tier enforcement at construction (§5.5.1) -----------------------------------------
+
+    fn attach_inline(size: u64, bytes: Vec<u8>) -> Attachment {
+        Attachment { name: "f".into(), mime: "text/plain".into(), size, inline: Some(bytes), manifest: None, key: vec![0u8; 32] }
+    }
+    fn attach_manifest(size: u64, durability: Option<Durability>) -> Attachment {
+        Attachment {
+            name: "f".into(),
+            mime: "application/octet-stream".into(),
+            size,
+            inline: None,
+            manifest: Some(mref(size, durability)),
+            key: vec![0u8; 32],
+        }
+    }
+
+    #[test]
+    fn tier_check_accepts_well_formed_attachments() {
+        assert!(attach_inline(5, b"hello".to_vec()).check_delivery_tier().is_ok());
+        assert!(attach_manifest(4 * 1024 * 1024, None).check_delivery_tier().is_ok()); // Attached
+        assert!(attach_manifest(ATTACHED_TIER_MAX + 1, Some(Durability::origin_hold()))
+            .check_delivery_tier()
+            .is_ok()); // Referenced + durability
+    }
+
+    #[test]
+    fn tier_check_rejects_oversize_inline() {
+        // An inline attachment above the 64 KiB inline cap must fail closed — it cannot ride the MOTE.
+        let big = vec![0u8; (INLINE_TIER_MAX + 1) as usize];
+        let att = attach_inline(INLINE_TIER_MAX + 1, big);
+        assert_eq!(att.check_delivery_tier(), Err(MoteError::SizeTierViolation));
+    }
+
+    #[test]
+    fn tier_check_rejects_size_lying_and_wrong_mechanism() {
+        // inline bytes length disagreeing with declared size.
+        assert_eq!(attach_inline(10, b"short".to_vec()).check_delivery_tier(), Err(MoteError::SizeTierViolation));
+        // manifest reference for an inline-sized (≤ 64 KiB) file — belongs inline.
+        assert_eq!(attach_manifest(1024, None).check_delivery_tier(), Err(MoteError::SizeTierViolation));
+        // both inline AND manifest present (§18.3.7 requires exactly one).
+        let both = Attachment {
+            name: "f".into(), mime: "x".into(), size: 5, inline: Some(b"hello".to_vec()),
+            manifest: Some(mref(5, None)), key: vec![0u8; 32],
+        };
+        assert_eq!(both.check_delivery_tier(), Err(MoteError::SizeTierViolation));
+        // neither present.
+        let neither = Attachment { name: "f".into(), mime: "x".into(), size: 5, inline: None, manifest: None, key: vec![] };
+        assert_eq!(neither.check_delivery_tier(), Err(MoteError::SizeTierViolation));
+    }
+
+    #[test]
+    fn tier_check_referenced_without_durability_is_file_manifest_invalid() {
+        // A Referenced-tier manifest attachment missing durability surfaces the file-level 0x080A.
+        let att = attach_manifest(ATTACHED_TIER_MAX + 1, None);
+        assert_eq!(att.check_delivery_tier(), Err(MoteError::FileManifestInvalid));
+    }
+
+    #[test]
+    fn build_mote_enforces_delivery_tier_fail_closed() {
+        // build_mote rejects an oversize inline attachment at construction (fail closed).
+        let sender = IdentityKey::generate();
+        let eph = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let mut draft = MoteDraft::new(Kind::Mail, 1, b"body".to_vec());
+        draft.attach = vec![attach_inline(INLINE_TIER_MAX + 1, vec![0u8; (INLINE_TIER_MAX + 1) as usize])];
+        assert_eq!(
+            build_mote(&Hpke, &sender, &eph, &recipient.public(), seal.public(), draft),
+            Err(MoteError::SizeTierViolation)
+        );
+        // A well-formed Referenced attachment (with durability) builds and validates end-to-end.
+        let mut draft = MoteDraft::new(Kind::Mail, 1, b"body".to_vec());
+        draft.attach = vec![attach_manifest(ATTACHED_TIER_MAX + 1, Some(Durability::cluster_replicated(3)))];
+        let env = build_mote(&Hpke, &sender, &eph, &recipient.public(), seal.public(), draft)
+            .expect("well-formed Referenced attachment must build");
+        let ctx = RecipientCtx { our_ik: &recipient.public(), seal_secret: seal.secret(), sender_is_known: true };
+        assert!(matches!(validate(&Hpke, &env, &ctx).unwrap(), Outcome::Accepted(_)));
+    }
+
+    // --- DMTAP-FILE-07: inbound spool cap (§5.5.5) ----------------------------------------------
+
+    #[test]
+    fn file07_spool_overflow_rejected_fail_closed() {
+        let mut spool = InboundSpool::new(10 * 1024); // 10 KiB per-sender cap
+        assert!(spool.admit(6 * 1024).is_ok());
+        assert_eq!(spool.used(), 6 * 1024);
+        assert_eq!(spool.remaining(), 4 * 1024);
+        // A push that would exceed the cap is refused, and the running total is left unchanged.
+        let err = spool.admit(5 * 1024).unwrap_err();
+        assert_eq!(err, MoteError::SpoolOverflow);
+        assert_eq!(err.code(), Some(0x080C));
+        assert_eq!(spool.used(), 6 * 1024, "a refused push admits nothing");
+        // Exactly filling the cap is admitted (boundary); one more byte overflows.
+        assert!(spool.admit(4 * 1024).is_ok());
+        assert_eq!(spool.remaining(), 0);
+        assert_eq!(spool.admit(1), Err(MoteError::SpoolOverflow));
+        // The pure helper agrees, incl. saturating on an arithmetic overflow.
+        assert!(spool_admit(0, 10 * 1024, 10 * 1024).is_ok());
+        assert_eq!(spool_admit(1, u64::MAX, u64::MAX), Err(MoteError::SpoolOverflow));
+    }
+
+    // --- DMTAP-FILE-08: pinned(term) retention expiry (§5.5.4) ----------------------------------
+
+    #[test]
+    fn file08_pinned_retention_expiry() {
+        let d = Durability::pinned(1_000);
+        // A fetch before the term is honored; at/after the term is 0x080B fail-closed.
+        assert!(d.check_retention(999).is_ok());
+        let err = d.check_retention(1_000).unwrap_err();
+        assert_eq!(err, MoteError::FileRetentionExpired);
+        assert_eq!(err.code(), Some(0x080B));
+        assert_eq!(d.check_retention(2_000), Err(MoteError::FileRetentionExpired));
+        // Non-pinned classes never expire on a retention check; an indefinite pin (no term) never
+        // expires either.
+        assert!(Durability::origin_hold().check_retention(u64::MAX).is_ok());
+        assert!(Durability::cluster_replicated(3).check_retention(u64::MAX).is_ok());
+        let indefinite = Durability { class: DurabilityClass::Pinned, retention: None, replicas: None, holder_hint: None };
+        assert!(indefinite.check_retention(u64::MAX).is_ok());
+    }
+
+    // --- DMTAP-FILE-09: whole-file unavailability (§5.5.2/§5.5.3/§6.6) ---------------------------
+
+    #[test]
+    fn file09_referenced_no_holder_is_file_unavailable() {
+        assert!(check_file_available(true).is_ok());
+        let err = check_file_available(false).unwrap_err();
+        assert_eq!(err, MoteError::FileUnavailable);
+        assert_eq!(err.code(), Some(0x0809));
+    }
+
+    // --- Content addressing over CIPHERTEXT (§18.9.5) — dedup-confirmation defence ---------------
+
+    #[test]
+    fn chunk_content_id_addresses_ciphertext_not_plaintext() {
+        // The SAME plaintext sealed under two different per-file keys yields two different chunk
+        // ids (and thus two different Manifest.id Merkle roots): no cross-user/plaintext dedup, so a
+        // holder cannot confirm "you have file X" by hash (§5.5, §18.9.5).
+        let plaintext = b"the same file content under two unrelated keys".to_vec();
+        let aad = b"file-ciphertext-addressing-aad".to_vec();
+        let key_a = SealKeypair::generate();
+        let key_b = SealKeypair::generate();
+        let ct_a = Hpke.seal(key_a.public(), &aad, &plaintext).unwrap();
+        let ct_b = Hpke.seal(key_b.public(), &aad, &plaintext).unwrap();
+        assert_ne!(ct_a, ct_b, "sanity: two keys produce distinct ciphertext");
+
+        // chunk_content_id addresses the CIPHERTEXT bytes.
+        let id_a = chunk_content_id(&ct_a);
+        let id_b = chunk_content_id(&ct_b);
+        assert_eq!(id_a, ContentId::of(&ct_a), "id is over ciphertext bytes");
+        assert_ne!(id_a, id_b, "same plaintext, different keys ⇒ different ciphertext chunk ids");
+        // Feeding the plaintext would (wrongly) collide — proving the addressing input matters.
+        assert_eq!(chunk_content_id(&plaintext), chunk_content_id(&plaintext));
+        assert_ne!(id_a, chunk_content_id(&plaintext), "ciphertext id ≠ plaintext id");
+
+        // And the Manifest Merkle root over the ciphertext-derived chunk ids differs per key.
+        let manifest_for = |chunk_id: ContentId| Manifest {
+            id: ContentId(Vec::new()),
+            size: 0,
+            chunk_sz: 0,
+            chunks: vec![chunk_id],
+            suite: Suite::Classical,
+        };
+        assert_ne!(
+            manifest_for(id_a).merkle_root(),
+            manifest_for(id_b).merkle_root(),
+            "ciphertext-addressed manifests do not converge for the same plaintext"
+        );
     }
 
     #[test]
