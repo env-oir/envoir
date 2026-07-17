@@ -212,10 +212,21 @@ impl Resolver for InMemoryResolver {
         kt::check_dns_matches_identity(&txt.ik, &txt.id, identity)?;
 
         // The self-asserted name MUST be one the resolved Identity actually lists (§3.9.4 forward
-        // check); the KT leaf then binds *that* name → ik.
+        // check); the KT leaf then binds *that* name → ik. A name the resolved identity does **not**
+        // claim is an alias-specific failure, distinct from the plain `ik`/`id` pointer mismatch
+        // (`0x0109`) already caught above: it is either a *revoked* alias (once listed, since
+        // dropped — `0x011D`) or a *never-verified* self-asserted alias (`0x011C`). Fail closed on
+        // either; the two codes only differ in the mandated response (REJECT_NOTIFY vs BLOCK).
         let addr = dmtap_name.base_address();
         if !identity.names.iter().any(|n| n == &addr) {
-            return Err(ResolveError::DnsIdentityMismatch("name not listed in Identity.names"));
+            if self.alias_was_revoked(&addr, identity) {
+                return Err(ResolveError::AliasRevoked(
+                    "alias retired in a newer Identity version",
+                ));
+            }
+            return Err(ResolveError::AliasForwardUnverified(
+                "alias not claimed by the resolved identity — forward name→ik binding does not resolve back",
+            ));
         }
         let leaf = kt::leaf_for(&addr, identity)
             .ok_or(ResolveError::DnsIdentityMismatch("Identity has no classical ik"))?;
@@ -264,12 +275,52 @@ impl Resolver for InMemoryResolver {
     }
 }
 
+/// Bound on the `prev`-chain walk when distinguishing a revoked alias (§1.5). A signed `Identity`
+/// chain is monotonic in `version`, so this is only a defence against a malformed/cyclic mesh — it
+/// never truncates an honest history within any realistic key-rotation count.
+const MAX_ALIAS_CHAIN_WALK: u32 = 1_024;
+
 impl InMemoryResolver {
     fn check_fresh(&self, att: &KtProof) -> Result<(), ResolveError> {
         match self.freshness_window {
             Some(w) => kt::check_freshness(&att.sth, self.now, w),
             None => Ok(()),
         }
+    }
+
+    /// Was `addr` a **revoked** alias of `current` (§3.9.4, §3.11.5)? Walk `current`'s `prev` hash
+    /// chain (§1.5) looking for a **prior signed `Identity` version** that listed `addr`. A name
+    /// present in a prior version but absent from the current one was retired by the owner in a
+    /// newer signed version — a revocation (`0x011D`), as opposed to a name this identity *never*
+    /// verifiably claimed (`0x011C`).
+    ///
+    /// Fail-closed: this only ever *upgrades* the diagnosis from the stricter BLOCK (`0x011C`) to
+    /// the softer REJECT_NOTIFY (`0x011D`) when it can **prove**, on the content-addressed chain,
+    /// that the alias once existed. Any hop we cannot fetch, that fails its own signature/chain
+    /// verification, whose content address does not match the `prev` pointer, or that does not
+    /// strictly precede its successor in `version`, stops the walk — an unprovable "it was revoked"
+    /// claim is never asserted.
+    fn alias_was_revoked(&self, addr: &str, current: &Identity) -> bool {
+        let mut prev = current.prev.clone();
+        let mut successor_version = current.version;
+        for _ in 0..MAX_ALIAS_CHAIN_WALK {
+            let Some(pid) = prev else { return false };
+            let Some(older) = self.mesh.get(pid.as_bytes()) else { return false };
+            // Content address must bind the fetched object to the `prev` pointer, the object must
+            // verify on its own, and `version` must strictly decrease along the chain (§1.3, §1.5).
+            if older.content_id() != pid
+                || older.verify(None).is_err()
+                || older.version >= successor_version
+            {
+                return false;
+            }
+            if older.names.iter().any(|n| n == addr) {
+                return true;
+            }
+            successor_version = older.version;
+            prev = older.prev.clone();
+        }
+        false
     }
 }
 
@@ -507,6 +558,114 @@ mod tests {
         let res = r.resolve(name).unwrap();
         assert_eq!(res.keypkgs, bref);
         assert_eq!(r.fetch_keypackages(&res).unwrap(), b"gwen bundle".to_vec());
+    }
+
+    /// Build an identity with an explicit name list / version / prev (for alias + chain tests).
+    fn make_identity_full(
+        seed: u8,
+        version: u64,
+        names: &[&str],
+        prev: Option<ContentId>,
+    ) -> (Identity, IdentityKey) {
+        let ik = IdentityKey::from_seed(&[seed; 32]);
+        let id = Identity::create_classical(
+            &ik,
+            version,
+            vec![],
+            KeyPackageBundleRef::new("/kp", ContentId::of(b"k")),
+            ContentId::of(b"recovery"),
+            names.iter().map(|s| s.to_string()).collect(),
+            prev,
+            NOW,
+        );
+        (id, ik)
+    }
+
+    /// A TXT record carrying an identity's *own* ik/id (so `check_dns_matches_identity` passes and
+    /// the failure, if any, is alias-specific rather than a pointer mismatch).
+    fn txt_for(ik: &IdentityKey, id: &Identity) -> String {
+        DmtapTxtRecord {
+            version: "dmtap1".into(),
+            suite: 1,
+            ik: ik.public(),
+            id: id.content_id(),
+            kt: vec!["https://kt.example/log".into()],
+            keypkgs: "/mesh/kp/it".into(),
+        }
+        .to_txt()
+    }
+
+    #[test]
+    fn alias_not_claimed_is_forward_unverified_0x011c() {
+        // DNS points `mallory@example.com` at an identity whose ik/id genuinely match — but that
+        // identity only claims `alice@example.com`. The forward name→ik binding does not resolve
+        // back, so the alias is UNVERIFIED (ERR_ALIAS_FORWARD_UNVERIFIED, 0x011C), never the plain
+        // pointer mismatch (0x0109). DMTAP-ALIAS-01.
+        let (id, ik) = make_identity_full(1, 0, &["alice@example.com"], None);
+        let txt = txt_for(&ik, &id);
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("mallory._dmtap.example.com", &txt);
+        r.publish_identity(id);
+        let err = r.resolve("mallory@example.com").unwrap_err();
+        assert!(matches!(err, ResolveError::AliasForwardUnverified(_)));
+        assert_eq!(err.code(), 0x011C);
+    }
+
+    #[test]
+    fn revoked_alias_is_0x011d() {
+        // v0 lists `oldbob@example.com`; v1 (same IK, prev→v0) drops it, keeping `bob@example.com`.
+        // Resolving the retired alias against v1 must surface ERR_ALIAS_REVOKED (0x011D) — proven by
+        // walking the prev chain to the version that listed it — not the never-claimed 0x011C.
+        // DMTAP-ALIAS-02.
+        let (v0, ik) = make_identity_full(2, 0, &["bob@example.com", "oldbob@example.com"], None);
+        let (v1, _) = make_identity_full(2, 1, &["bob@example.com"], Some(v0.content_id()));
+        let txt = txt_for(&ik, &v1);
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("oldbob._dmtap.example.com", &txt);
+        r.publish_identity(v0);
+        r.publish_identity(v1);
+        let err = r.resolve("oldbob@example.com").unwrap_err();
+        assert!(matches!(err, ResolveError::AliasRevoked(_)));
+        assert_eq!(err.code(), 0x011D);
+    }
+
+    #[test]
+    fn revocation_unprovable_without_prior_version_falls_to_0x011c() {
+        // Same shape as the revoked case, but the prior version that listed the alias is NOT
+        // published: the chain walk cannot PROVE the alias ever existed, so it fails closed to the
+        // stricter 0x011C (BLOCK), never asserting an unprovable 0x011D (REJECT_NOTIFY).
+        let (v0, _) = make_identity_full(3, 0, &["bob@example.com", "oldbob@example.com"], None);
+        let (v1, ik) = make_identity_full(3, 1, &["bob@example.com"], Some(v0.content_id()));
+        let txt = txt_for(&ik, &v1);
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("oldbob._dmtap.example.com", &txt);
+        r.publish_identity(v1); // v0 withheld — the prior listing is unprovable
+        let err = r.resolve("oldbob@example.com").unwrap_err();
+        assert!(matches!(err, ResolveError::AliasForwardUnverified(_)));
+        assert_eq!(err.code(), 0x011C);
+    }
+
+    #[test]
+    fn plain_dns_pointer_mismatch_stays_0x0109() {
+        // A swapped ik= (the non-alias pointer mismatch) must remain ERR_NAME_RESOLUTION_FAILED
+        // (0x0109) — the distinct alias codes MUST NOT capture it.
+        let name = "dave@example.com";
+        let (id, _good) = make_identity(name, 4, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+        let evil_ik = IdentityKey::from_seed(&[0xee; 32]).public();
+        let tampered = format!(
+            "v=dmtap1; suite=1; ik={}; id={}; kt=https://kt/log; keypkgs=/kp",
+            base64url::encode(&evil_ik),
+            base64url::encode(id.content_id().as_bytes()),
+        );
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+        log.append_identity(name, &id).unwrap();
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("dave._dmtap.example.com", &tampered);
+        r.publish_identity(id);
+        r.pin_log(log);
+        let err = r.resolve(name).unwrap_err();
+        assert!(matches!(err, ResolveError::DnsIdentityMismatch(_)));
+        assert_eq!(err.code(), 0x0109);
     }
 
     #[test]
