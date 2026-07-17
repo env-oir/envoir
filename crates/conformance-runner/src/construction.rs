@@ -52,15 +52,19 @@ use dmtap_auth::{
 };
 use dmtap_deniable::{initiate, DeniableIdentity, DeniableResponder};
 use dmtap_mls::Member;
+use dmtap_naming::namechain::{InMemoryNameChain, NameChainResolver};
 use dmtap_naming::resolver::{InMemoryResolver, Resolver};
+use dmtap_naming::restype::{Chain, ResolverKind, ResolverRegistry};
 use dmtap_naming::{
     check_freshness, verify_quorum, DmtapTxtRecord, InMemoryKtLog, KtLog, KtProof, ResolveError,
     UnreachableLog,
 };
 use envoir_gateway::attestation::{AttestationError as GwAttestationError, AttestationKey};
 use envoir_gateway::outbound::{
-    AlwaysRequireTls, OutboundError, OutboundGateway, OutboundTransport, TransportResult,
+    AlwaysRequireTls, GovernedSend, OutboundError, OutboundGateway, OutboundTransport,
+    TransportResult,
 };
+use envoir_gateway::outbound_guard::{OutboundSenderGuard, SenderVerdict};
 
 use crate::{CaseOutcome, SuiteCase};
 
@@ -81,6 +85,7 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-FILE-02" => Some(chunk_hash_mismatch_rejected()),
         "DMTAP-FILE-03" => Some(size_tier_mismatch_detected()),
         "DMTAP-FILE-04" => Some(manifest_key_present_rejected()),
+        "DMTAP-FILE-05" => Some(manifest_root_distinct_per_key()),
         "DMTAP-VAL-01" => Some(val_unknown_version()),
         "DMTAP-VAL-02" => Some(val_bad_content_address()),
         "DMTAP-VAL-03" => Some(val_bad_sender_sig()),
@@ -122,6 +127,10 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-GRP-03" => Some(grp_stale_epoch_decrypt_rejected()),
         "DMTAP-LEG-01" => Some(leg_gateway_attestation_invalid_rejected()),
         "DMTAP-LEG-02" => Some(leg_dkim_undelegated_domain_rejected()),
+        "DMTAP-LEG-03" => Some(leg_outbound_open_relay_refused()),
+        "DMTAP-ALIAS-03" => Some(alias_multiple_names_same_identity()),
+        "DMTAP-RESOLVE-01" => Some(resolve_namechain_binding_disagreement_rejected()),
+        "DMTAP-RESOLVE-02" => Some(resolve_unsupported_type_rejected()),
         _ => None,
     };
     match result {
@@ -199,6 +208,64 @@ fn skip_reason(id: &str, operation: &str) -> String {
             advertised deniable-1:1' to a deniable-session refusal — a caller simply has no \
             `DeniablePrekeyBundle` to call `initiate()` with in that case, which is a structural absence \
             of input, not an executable 'refuse and notify' decision this crate makes.",
+        "DMTAP-FILE-06" | "DMTAP-FILE-08" | "DMTAP-FILE-09" => "mote.rs's `ManifestRef` (the wire \
+            attachment reference) is only `{id, size, chunks: u32}` (a chunk COUNT) and `Manifest` \
+            itself carries no durability metadata at all — neither crate anywhere in this workspace \
+            models a `Durability` type with a `class`/replica-count/retention-window/origin-hold \
+            concept (grepped for `Durability`/`retention`/`spool` across dmtap-core and envoir-gateway; \
+            none exists). There is no constructor or validator to call for 'a Referenced ManifestRef \
+            missing Durability' (FILE-06), 'a pinned(term) fetch past its retention' (FILE-08), or 'an \
+            origin-hold file with no reachable holder' (FILE-09) — this is a real, unimplemented spec \
+            surface, not a caller-policy gap like the mote-validate VAL-05/PRIV-04 family.",
+        "DMTAP-FILE-07" => "push.rs (`PushSubscription`/`WakePing`) is the device wake-signaling \
+            object only — there is no inbound-spool / per-sender storage-quota admission function \
+            anywhere in dmtap-core (grepped for `spool`/`Admission`; none exists) to refuse an \
+            over-cap Attached push against. A genuinely different concern from `file_tier`/ \
+            `size_tier_mismatch_detected` (FILE-03, already executed), which classifies a size, not \
+            admits a push against a spool cap.",
+        "DMTAP-SYNC-01" | "DMTAP-SYNC-02" | "DMTAP-SYNC-03" | "DMTAP-SYNC-04" | "DMTAP-SYNC-05" =>
+            "no `ClusterSyncFrame`/`ClusterOp`/OR-Set/HLC/CRDT-merge module exists anywhere in this \
+             workspace (grepped dmtap-core, dmtap-mls, dmtap-naming, dmtap-auth, dmtap-deniable, and \
+             envoir-gateway for `ClusterSyncFrame`/`ClusterOp`/`RangeFingerprint`/`HLC`/`OrSet`; zero \
+             hits). §5.6 multi-device cluster replication/reconciliation/CRDT-merge is unimplemented \
+             reference surface, distinct from the (implemented, already-executed) MLS group layer \
+             `DMTAP-GRP-*` cases exercise via dmtap-mls.",
+        "DMTAP-ALIAS-01" | "DMTAP-ALIAS-02" => "dmtap-naming's DNS+KT resolver (`resolver.rs`, \
+            `kt::check_dns_matches_identity`) DOES reject a name whose forward binding disagrees with \
+            the resolved Identity, or that the CURRENT Identity no longer lists in `names` — but it \
+            folds both into the single generic `ResolveError::DnsIdentityMismatch`/`NameResolution` \
+            bucket (wire code `0x0109`, by `error.rs`'s own explicit doc comment), not the distinct, \
+            more granular `ERR_ALIAS_FORWARD_UNVERIFIED` (`0x011C`) / `ERR_ALIAS_REVOKED` (`0x011D`) \
+            this case's `expect.error_code` names. (dmtap-naming DOES implement two adjacent, \
+            similarly-worded 0x011x codes newly — `ResolveError::NameChainBindingUnverified` `0x011E` \
+            in `namechain.rs` and `ResolverTypeUnsupported` `0x011F` in `restype.rs` — but those are the \
+            `name-chain` (`.eth`/`.sol`) resolver type specifically, §3.12.5, a materially different \
+            resolver path than this case's plain `local@domain` DNS+KT alias, so they are not an honest \
+            stand-in either.) Executing this against the real DNS+KT path and asserting only 'reject' \
+            while silently ignoring the documented code would misreport conformance with the committed \
+            `§21` code this case names — an honest run must skip rather than launder a different code \
+            as a match. (The un-coded semantic scenario itself is already proven distinctly by \
+            `DMTAP-ORG-02`/`DMTAP-IDENT-04`, which this harness DOES execute.)",
+        "DMTAP-RESOLVE-03" => "no cross-resolver reconciliation function exists anywhere in this \
+            workspace (grepped dmtap-naming's `resolver.rs`/`namechain.rs`/`restype.rs` and the rest \
+            of the workspace for anything comparing two independent resolvers'/resolver-types' \
+            outputs for one name); each of `InMemoryResolver::resolve` (dns), `NameChainResolver::\
+            resolve` (name-chain), and `SelfResolver`/`PetnameBook` (self/petname) is a single, \
+            independent lookup path with no caller-facing 'query N of them and compare' orchestrator, \
+            alert, or KT-quorum/OOB fallback trigger to call — §3.12.3's cross-resolver-disagreement \
+            defense is unimplemented reference surface, not a caller-policy gap this crate models \
+            elsewhere (distinct from the single-resolver-type quorum `verify_quorum`/`KTV1-02` this \
+            harness DOES execute, which is > n/2 agreement WITHIN one resolver type's pinned log set, \
+            not agreement ACROSS resolver types).",
+        "DMTAP-GWALIAS-01" | "DMTAP-GWALIAS-02" | "DMTAP-GWALIAS-03" => "no legacy-gateway alias \
+            encode/decode module exists anywhere in this workspace for the \
+            `localpart.nativedomain@gateway.domain` escaping scheme these cases describe (escape \
+            `-`->`--`, `.`->`-.`, join with a top-level `.`) or a `GatewayAliasMap` row store \
+            (grepped envoir-gateway and the `node` crate for `GatewayAliasMap`/`nativedomain`; the only \
+            hit is `gateway/src/authz.rs`'s `AliasAllocator`, which is the DMTAP-native mesh's \
+            vanity/key-derived LOCAL-part allocator — a different concern entirely from mapping a \
+            legacy SMTP local-part to a native `(localpart, nativedomain)` pair). §7.10's gateway-alias \
+            addressing scheme is unimplemented reference surface, not a caller-policy gap.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
@@ -558,6 +625,49 @@ fn manifest_key_present_rejected() -> Result<(), String> {
         Err(CborError::ManifestKeyPresent) => Ok(()),
         other => Err(format!("expected Err(ManifestKeyPresent), got {other:?}")),
     }
+}
+
+/// DMTAP-FILE-05: "the content address is over ciphertext: the same plaintext under two different
+/// per-file keys yields two different Manifest.id values (no cross-user/plaintext dedup; CAS-
+/// confirmation defense)" (§5.5, §18.9.5). Seals ONE fixed plaintext under two independently
+/// generated `SealKeypair`s via the real `Hpke` primitive (the same sealer `dmtap-core`'s own
+/// `build_mote`/`mote::validate` fixtures use elsewhere in this file), builds a single-chunk
+/// `Manifest` over each resulting ciphertext, and asserts the two Merkle roots differ — proving
+/// `Manifest.id` addresses CIPHERTEXT bytes, not plaintext content (a convergent-encryption/
+/// CAS-confirmation attack would need the SAME root for the SAME plaintext regardless of key).
+fn manifest_root_distinct_per_key() -> Result<(), String> {
+    let plaintext = b"the same file content, sealed under two unrelated per-file keys".to_vec();
+    let aad = b"conformance-runner file-05 aad".to_vec();
+
+    let key_a = SealKeypair::generate();
+    let key_b = SealKeypair::generate();
+    let ct_a = Hpke.seal(key_a.public(), &aad, &plaintext).map_err(|e| format!("seal (key A): {e}"))?;
+    let ct_b = Hpke.seal(key_b.public(), &aad, &plaintext).map_err(|e| format!("seal (key B): {e}"))?;
+    if ct_a == ct_b {
+        return Err(
+            "sanity: sealing the same plaintext under two independently generated keys produced \
+             IDENTICAL ciphertext"
+                .into(),
+        );
+    }
+
+    let manifest_for = |ciphertext: &[u8]| Manifest {
+        id: ContentId(Vec::new()),
+        size: ciphertext.len() as u64,
+        chunk_sz: ciphertext.len() as u32,
+        chunks: vec![ContentId::of(ciphertext)],
+        suite: Suite::Classical,
+    };
+    let root_a = manifest_for(&ct_a).merkle_root();
+    let root_b = manifest_for(&ct_b).merkle_root();
+    if root_a == root_b {
+        return Err(
+            "expected Manifest::merkle_root() to differ for the same plaintext sealed under two \
+             different keys (content address is over CIPHERTEXT, not plaintext), but the roots matched"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 // ============================================================================================
@@ -1411,6 +1521,144 @@ fn base64_url(bytes: &[u8]) -> String {
     out
 }
 
+/// DMTAP-ALIAS-03: "multiple verified aliases (distinct name, same ik/identity_id) resolve to the
+/// same identity — recognized as one person/one key, pinned per-key" (§3.9.4, §3.11.3, §18.4.9).
+/// Publishes ONE `Identity` that self-asserts three distinct names (a random-looking mesh address,
+/// a vanity address, and a BYOD-style address — mirroring the recipe's "random/vanity/byod"
+/// framing), installs a `_dmtap` TXT record + a KT leaf for EACH name against that SAME identity,
+/// and resolves all three through the real `InMemoryResolver` end-to-end (§3.2-§3.5: DNS lookup,
+/// Identity fetch+verify, DNS⇄Identity cross-check, KT attestation). Asserts every resolution pins
+/// the identical `identity_id`/`ik`/`version` — the "recognized as one person/one key" property,
+/// proven by three independent resolutions rather than merely asserted by construction.
+fn alias_multiple_names_same_identity() -> Result<(), String> {
+    let names = ["r7k2x9@mesh.example", "alice@example.com", "device-91k@byod.example"];
+    let ik_seed = 0x71u8;
+    let ik = IdentityKey::from_seed(&[ik_seed; 32]);
+    let id = Identity::create_classical(
+        &ik,
+        0,
+        vec![],
+        sample_keypkg_ref("alias-03"),
+        ContentId::of(b"recovery-alias-03"),
+        names.iter().map(|s| s.to_string()).collect(),
+        None,
+        1_700_000_000_000,
+    );
+
+    let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[0x72; 32]));
+    for name in &names {
+        log.append_identity(name, &id).ok_or("identity has no classical ik")?;
+    }
+
+    let mut r = InMemoryResolver::new(1_700_000_000_000);
+    for name in &names {
+        let dn = dmtap_naming::resolver::DmtapName::parse(name)
+            .map_err(|e| format!("parse {name}: {e}"))?;
+        r.set_txt(dn.txt_qname(), naming_txt(ik_seed, &id));
+    }
+    r.publish_identity(id.clone());
+    r.pin_log(log);
+
+    let mut resolutions = Vec::with_capacity(names.len());
+    for name in &names {
+        resolutions.push(r.resolve(name).map_err(|e| format!("resolve {name}: {e}"))?);
+    }
+    let first = &resolutions[0];
+    for (name, res) in names.iter().zip(resolutions.iter()) {
+        if res.identity_id != first.identity_id || res.ik != first.ik || res.version != first.version {
+            return Err(format!(
+                "alias `{name}` resolved to a DIFFERENT identity/key than `{}` — expected all \
+                 verified aliases sharing one ik/identity_id to resolve to the same identity",
+                names[0]
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// DMTAP-RESOLVE-01: "a name-chain resolution whose two binding directions disagree ... is rendered
+/// unverified and MUST NOT be used to address mail" (§3.12.5(b)). Drives the REAL
+/// `NameChainResolver` (§3.12.5): an identity legitimately claims a `.eth` name in its signed
+/// `Identity.names`, but the on-chain `name -> ik` record (via `InMemoryNameChain`, the network-seam
+/// mock) points at a DIFFERENT key — the two bidirectional-binding directions disagree, exactly the
+/// captured/hijacked-registrar scenario `namechain.rs`'s own module doc describes. Mirrors
+/// `namechain.rs`'s own unit test `binding_mismatch_chain_names_different_key_fails_011e`.
+fn resolve_namechain_binding_disagreement_rejected() -> Result<(), String> {
+    let name = "conformance-resolve01@.eth";
+    let ik = IdentityKey::generate();
+    let id = Identity::create_classical(
+        &ik, 0, vec![], sample_keypkg_ref("resolve-01"), ContentId::of(b"recovery-resolve-01"),
+        vec![name.to_owned()], None, 1_700_000_000_000,
+    );
+    let attacker_ik = IdentityKey::generate().public();
+
+    let mut chain = InMemoryNameChain::new(Chain::Ens);
+    chain.register(name, attacker_ik); // the chain record points at a DIFFERENT key than the claimant
+    let resolver = NameChainResolver::new(chain);
+
+    match resolver.resolve(name, &id) {
+        Err(e @ ResolveError::NameChainBindingUnverified(_)) => {
+            let code = e.code();
+            if code != 0x011E {
+                return Err(format!(
+                    "ERR_NAMECHAIN_BINDING_UNVERIFIED code mismatch: got {code:#06x}, want 0x011E"
+                ));
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "expected Err(NameChainBindingUnverified) (bidirectional binding disagrees, rendered \
+             unverified, never used to address mail), got {other:?}"
+        )),
+    }
+}
+
+/// DMTAP-RESOLVE-02: "a name in a resolver type the verifier does not implement, or that is
+/// unregistered, is treated as unresolvable and fails closed" (§3.12.2) — the "unknown ⇒ reject,
+/// never guess" discipline. Exercises BOTH disjuncts the case's own checks text names, against the
+/// real `restype.rs` dispatch layer: (1) a form this reference build recognizes (`name-chain`, by
+/// its `.eth` suffix) but has NOT enabled in its `ResolverRegistry` — "not implemented by this
+/// node"; and (2) a namespace form no resolver type registered here recognizes at all (an
+/// unregistered chain namespace) — "unregistered". Neither guesses a binding; both fail closed with
+/// the same `ERR_RESOLVER_TYPE_UNSUPPORTED` (`0x011F`). Mirrors `restype.rs`'s own unit tests
+/// `registry_gates_optional_name_chain` and `unknown_or_unregistered_type_fails_closed_011f`.
+fn resolve_unsupported_type_rejected() -> Result<(), String> {
+    // Disjunct 1: a recognized form (`name-chain`) this node's registry has not enabled.
+    let registry = ResolverRegistry::with_defaults();
+    match registry.route("conformance-resolve02@.eth") {
+        Err(ResolveError::ResolverTypeUnsupported(_)) => {}
+        other => {
+            return Err(format!(
+                "expected Err(ResolverTypeUnsupported) for an unimplemented-by-this-node \
+                 resolver type (name-chain, disabled by default), got {other:?}"
+            ))
+        }
+    }
+    // Enabling the type closes the gap — proving the refusal above was genuinely about
+    // "not implemented", not a permanent classification failure.
+    let with_chain = ResolverRegistry::with_defaults().enable(ResolverKind::NameChain);
+    if with_chain.route("conformance-resolve02@.eth").is_err() {
+        return Err("sanity: enabling ResolverKind::NameChain must make an .eth name routable".into());
+    }
+
+    // Disjunct 2: an unregistered/unrecognized namespace form (no chain this build carries).
+    match registry.route("conformance-resolve02b@.hns") {
+        Err(ResolveError::ResolverTypeUnsupported(_)) => {}
+        other => {
+            return Err(format!(
+                "expected Err(ResolverTypeUnsupported) for an unregistered chain namespace, \
+                 got {other:?}"
+            ))
+        }
+    }
+
+    let code = registry.route("conformance-resolve02@.eth").unwrap_err().code();
+    if code != 0x011F {
+        return Err(format!("ERR_RESOLVER_TYPE_UNSUPPORTED code mismatch: got {code:#06x}, want 0x011F"));
+    }
+    Ok(())
+}
+
 /// DMTAP-KTV1-02: "a name -> ik binding not attested by a > n/2 quorum of the pinned log set fails
 /// closed -> OOB". Pin three logs but make only one reachable (the other two model
 /// partitioned/censored logs, each `prove`-ing `None`) — a strict sub-quorum (1 of 3) — and assert
@@ -1886,21 +2134,71 @@ fn leg_dkim_undelegated_domain_rejected() -> Result<(), String> {
     }
 }
 
+/// DMTAP-LEG-03: "an outbound DMTAP->legacy relay from a sender the gateway has neither
+/// authenticated (no GatewayAuthz / key-registered relationship) nor been paid by (no valid
+/// redeemable postage) is refused fail-closed; a valid mesh sender_sig alone does NOT authorize
+/// egress (open-relay prevention)" (§7.11.2, §9.10, §7.12). `OutboundGateway::send_authenticated`
+/// is the mesh-ingest entry point named by this case's own doc comment: with an
+/// `OutboundSenderGuard` configured via `require_registered` (the authenticated-senders-only
+/// allowlist, §7.3, §9), an account NOT in that set is refused by the guard BEFORE any DKIM/SMTP
+/// work is attempted — even though the payload itself is a perfectly well-formed mail `Payload`,
+/// mirroring "a valid mesh sender_sig alone does NOT authorize egress": nothing about the
+/// payload's own authenticity is in question here, only the sender's egress authorization.
+/// Mirrors envoir-gateway's own `outbound_guard.rs` unit test
+/// `unauthenticated_sender_is_refused_no_open_outbound_relay`, driven through the `OutboundGateway`
+/// construction this case names (`gateway_outbound_admit`) rather than the bare guard in isolation.
+fn leg_outbound_open_relay_refused() -> Result<(), String> {
+    let guard = OutboundSenderGuard::new().require_registered(["acct-registered-sender"]);
+    let gateway = OutboundGateway::new(
+        vec![], // no delegated DKIM keys needed: the guard refuses before translate_and_sign runs
+        Box::new(AlwaysRequireTls),
+        Box::new(UnusedTransport),
+    )
+    .with_sender_guard(guard);
+
+    let payload = Payload {
+        from: IdentityKey::generate().public(),
+        sig: Vec::new(),
+        headers: Headers::default(),
+        body: b"conformance-runner leg-03 outbound relay attempt".to_vec(),
+        refs: vec![],
+        attach: vec![],
+        expires: None,
+    };
+
+    // "acct-stranger" has no GatewayAuthz relationship and no postage — exactly the open-relay
+    // scenario this case forbids, regardless of the mail payload's own well-formedness.
+    match gateway.send_authenticated(
+        &payload,
+        "alice@undelegated.example",
+        "bob@legacy.example",
+        "acct-stranger",
+        1_700_000_000_000,
+    ) {
+        GovernedSend::Blocked(SenderVerdict::Refuse { .. }) => Ok(()),
+        other => Err(format!(
+            "expected GovernedSend::Blocked(SenderVerdict::Refuse) (open-relay refused fail-closed), \
+             got {other:?}"
+        )),
+    }
+}
+
 /// Every `id` this dispatcher recognizes (used by tests to keep the executed-set and the reason
 /// table honest against each other and against `suite.json`).
 pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
     [
         "DMTAP-CBOR-11", "DMTAP-CBOR-12", "DMTAP-IDENT-01", "DMTAP-IDENT-02", "DMTAP-IDENT-03",
         "DMTAP-IDENT-05", "DMTAP-PRIV-01", "DMTAP-PRIV-02", "DMTAP-FILE-01", "DMTAP-FILE-02",
-        "DMTAP-FILE-03", "DMTAP-FILE-04", "DMTAP-VAL-01", "DMTAP-VAL-02", "DMTAP-VAL-03",
-        "DMTAP-VAL-04", "DMTAP-VAL-06", "DMTAP-VAL-07", "DMTAP-VAL-08", "DMTAP-VAL-09",
-        "DMTAP-VAL-10", "DMTAP-VAL-11", "DMTAP-VAL-12", "DMTAP-VAL-13", "DMTAP-VAL-14",
-        "DMTAP-VAL-15", "DMTAP-ORG-04", "DMTAP-ORG-05", "DMTAP-KTV1-01", "DMTAP-KTV1-04",
-        "DMTAP-DENIABLE-01", "DMTAP-DENIABLE-04", "DMTAP-DENIABLE-05", "DMTAP-PROFILE-01",
-        "DMTAP-PROFILE-02", "DMTAP-PUSH-01", "DMTAP-PUSH-02", "DMTAP-ATTEST-01", "DMTAP-ATTEST-02",
-        "DMTAP-IDENT-04", "DMTAP-ORG-02", "DMTAP-KTV1-02", "DMTAP-KTV1-03", "DMTAP-AUTH-01",
-        "DMTAP-AUTH-02", "DMTAP-AUTH-03", "DMTAP-AUTH-04", "DMTAP-AUTH-05", "DMTAP-DENIABLE-03",
-        "DMTAP-GRP-01", "DMTAP-GRP-03", "DMTAP-LEG-01", "DMTAP-LEG-02",
+        "DMTAP-FILE-03", "DMTAP-FILE-04", "DMTAP-FILE-05", "DMTAP-VAL-01", "DMTAP-VAL-02",
+        "DMTAP-VAL-03", "DMTAP-VAL-04", "DMTAP-VAL-06", "DMTAP-VAL-07", "DMTAP-VAL-08",
+        "DMTAP-VAL-09", "DMTAP-VAL-10", "DMTAP-VAL-11", "DMTAP-VAL-12", "DMTAP-VAL-13",
+        "DMTAP-VAL-14", "DMTAP-VAL-15", "DMTAP-ORG-04", "DMTAP-ORG-05", "DMTAP-KTV1-01",
+        "DMTAP-KTV1-04", "DMTAP-DENIABLE-01", "DMTAP-DENIABLE-04", "DMTAP-DENIABLE-05",
+        "DMTAP-PROFILE-01", "DMTAP-PROFILE-02", "DMTAP-PUSH-01", "DMTAP-PUSH-02",
+        "DMTAP-ATTEST-01", "DMTAP-ATTEST-02", "DMTAP-IDENT-04", "DMTAP-ORG-02", "DMTAP-ALIAS-03",
+        "DMTAP-KTV1-02", "DMTAP-KTV1-03", "DMTAP-AUTH-01", "DMTAP-AUTH-02", "DMTAP-AUTH-03",
+        "DMTAP-AUTH-04", "DMTAP-AUTH-05", "DMTAP-DENIABLE-03", "DMTAP-GRP-01", "DMTAP-GRP-03",
+        "DMTAP-LEG-01", "DMTAP-LEG-02", "DMTAP-LEG-03", "DMTAP-RESOLVE-01", "DMTAP-RESOLVE-02",
     ]
     .into_iter()
     .map(|id| (id, ()))

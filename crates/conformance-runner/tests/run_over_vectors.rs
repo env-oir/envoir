@@ -98,12 +98,12 @@ fn suite_json_cross_reference_matches_known_state() {
          a gap and this expectation needs updating). Full failure detail: {fails:?}"
     );
 
-    // Sanity: the catalog has grown past its original shape (104 cases as of writing; see
-    // SUITE.md/README) and this crate now executes the large majority of them — 92/104, with only
-    // 12 honestly left `Skipped` for behavior no crate in this workspace can exercise yet (see the
-    // `skip_reason` table in `construction.rs`). Rather than pin an exact total (which would break
-    // on every new spec case), just sanity-check the three buckets sum correctly and that both
-    // "some cases pass" and "some cases are honestly skipped" hold.
+    // Sanity: the catalog has grown past its original shape (124 cases as of writing, up from 104;
+    // see SUITE.md/README) and this crate now executes the large majority of them — 97/124 (up from
+    // 92/104), with only 27 honestly left `Skipped` for behavior no crate in this workspace can
+    // exercise yet (see the `skip_reason` table in `construction.rs`). Rather than pin an exact
+    // total (which would break on every new spec case), just sanity-check the three buckets sum
+    // correctly and that both "some cases pass" and "some cases are honestly skipped" hold.
     assert_eq!(pass + skip + fails.len(), outcomes.len());
     assert!(skip > 0, "expected at least some construction-todo cases to be skipped-with-note");
     assert!(pass > 0, "expected at least some vectored/self-contained cases to pass");
@@ -190,9 +190,9 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
         "construction-todo cases FAILED their construction (not just skipped): {failed:?}"
     );
     assert!(
-        executed.len() >= 53,
-        "expected at least 53 construction-todo cases to be actually executed (39 against \
-         dmtap-core directly, plus 14 more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/ \
+        executed.len() >= 58,
+        "expected at least 58 construction-todo cases to be actually executed (40 against \
+         dmtap-core directly, plus 18 more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/ \
          envoir-gateway — see the Cargo.toml comment), got {} ({executed:?}) — did \
          construction::run_construction_case regress?",
         executed.len()
