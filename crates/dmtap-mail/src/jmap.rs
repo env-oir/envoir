@@ -906,6 +906,34 @@ fn collect_filter_terms(filter: &Value) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// Case-insensitively locate `needle_lower` (already lowercased, as a `char` slice) inside
+/// `haystack`, returning the match's byte range **in `haystack`** (always on original char
+/// boundaries). `str::to_lowercase()` is not length-preserving — `'İ'` (U+0130) lowercases to two
+/// chars, `'ß'` to `"ss"` — so searching a lowercased copy and slicing the ORIGINAL with those
+/// offsets panics (or mis-slices) on non-ASCII, attacker-controlled subject/body text. This maps
+/// every lowercased char back to the byte range of the original char that produced it, so the
+/// returned range is always a valid slice of `haystack`.
+fn find_ci(haystack: &str, needle_lower: &[char]) -> Option<(usize, usize)> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    // Flatten `haystack` into lowercased chars, each tagged with its source char's byte range.
+    let tagged: Vec<(usize, usize, char)> = haystack
+        .char_indices()
+        .flat_map(|(i, c)| {
+            let end = i + c.len_utf8();
+            c.to_lowercase().map(move |lc| (i, end, lc))
+        })
+        .collect();
+    let n = needle_lower.len();
+    if tagged.len() < n {
+        return None;
+    }
+    (0..=tagged.len() - n)
+        .find(|&start| (0..n).all(|k| tagged[start + k].2 == needle_lower[k]))
+        .map(|start| (tagged[start].0, tagged[start + n - 1].1))
+}
+
 /// Highlight each term (case-insensitive) in `text` with `<mark>…</mark>`; `Null` when text empty.
 fn highlight(text: &str, terms: &[String]) -> Value {
     if text.is_empty() {
@@ -916,10 +944,8 @@ fn highlight(text: &str, terms: &[String]) -> Value {
         if term.is_empty() {
             continue;
         }
-        let lower = result.to_lowercase();
-        let needle = term.to_lowercase();
-        if let Some(pos) = lower.find(&needle) {
-            let end = pos + needle.len();
+        let needle: Vec<char> = term.to_lowercase().chars().collect();
+        if let Some((pos, end)) = find_ci(&result, &needle) {
             result = format!("{}<mark>{}</mark>{}", &result[..pos], &result[pos..end], &result[end..]);
         }
     }
@@ -1070,6 +1096,24 @@ mod tests {
         let req = Request { using: vec![CAP_MAIL.into()], method_calls: vec![(name.into(), args, "c1".into())] };
         let resp = process(store, "acct1", &req);
         resp.method_responses[0].1.clone()
+    }
+
+    /// M1: a non-ASCII subject/body whose `to_lowercase()` changes byte length (e.g. `'İ'`
+    /// U+0130 lowercases to two chars) must not panic when a search term is highlighted. The old
+    /// code searched a lowercased copy but sliced the original with the lowercased byte offsets,
+    /// panicking (out-of-bounds / non-char-boundary) on attacker-controlled received text.
+    #[test]
+    fn highlight_non_ascii_subject_does_not_panic() {
+        // "AİB": 'İ' is U+0130 (2 bytes) whose lowercase is "i̇" (3 bytes) — a length change that
+        // pushes the lowercased offset of "b" past the original string's length.
+        let v = highlight("AİB", &["b".to_string()]);
+        assert_eq!(v, Value::String("Aİ<mark>B</mark>".to_string()));
+        // Matching the multi-byte char itself snaps to its original byte range.
+        let v2 = highlight("İstanbul", &["i".to_string()]);
+        assert_eq!(v2, Value::String("<mark>İ</mark>stanbul".to_string()));
+        // A term that does not occur leaves the text unchanged (and still no panic).
+        let v3 = highlight("Grüße über İ", &["zzz".to_string()]);
+        assert_eq!(v3, Value::String("Grüße über İ".to_string()));
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub enum CborError {
     MissingKey(u64),
     #[error("Manifest carries forbidden key 5 (ERR_MANIFEST_KEY_PRESENT, §18.3.8)")]
     ManifestKeyPresent,
+    #[error("Manifest chunk list is empty — a manifest MUST carry ≥ 1 chunk (§18.3.8, fail closed)")]
+    ManifestEmptyChunks,
     #[error("unsupported / unknown algorithm suite byte {0:#04x} (fail closed)")]
     UnknownSuite(u8),
     #[error("unknown enum discriminator {0}")]

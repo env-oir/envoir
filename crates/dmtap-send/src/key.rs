@@ -266,12 +266,17 @@ impl SendService {
         chain.extend(prec.chain.iter().cloned());
 
         let caps = vec![child_scope.to_capability()];
+        // A delegated child MUST NOT outlive its delegator (§18.7.3 window nesting): clamp the
+        // child's expiry to the parent's and its not-before to ≥ the parent's, so the minted chain
+        // is always window-nested and `verify_chain` accepts it.
+        let nbf = now.max(parent.nbf);
+        let exp = now.saturating_add(ttl_ms).min(parent.exp);
         let token = CapabilityToken::issue(
             &self.signing,
             self.signing.public(),
             caps,
-            now,
-            now.saturating_add(ttl_ms),
+            nbf,
+            exp,
             random_bytes(16),
             Some(parent.content_id()),
         );
@@ -302,12 +307,19 @@ impl SendService {
         let prnt = rec.token.prnt.clone();
 
         let caps = vec![scope.to_capability()];
+        // Keep the rotated key window-nested inside its (unchanged) parent (§18.7.3): a rotation
+        // must not let a child outlive the delegator it descends from. For a root key (empty chain)
+        // there is no parent to clamp against.
+        let (nbf, exp) = match chain.first() {
+            Some(parent) => (now.max(parent.nbf), now.saturating_add(ttl_ms).min(parent.exp)),
+            None => (now, now.saturating_add(ttl_ms)),
+        };
         let token = CapabilityToken::issue(
             &self.signing,
             self.signing.public(),
             caps,
-            now,
-            now.saturating_add(ttl_ms),
+            nbf,
+            exp,
             random_bytes(16),
             prnt,
         );

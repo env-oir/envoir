@@ -50,6 +50,16 @@ pub enum CapabilityError {
     #[error("broken delegation chain — prnt/iss/aud discontinuity or unrooted chain \
              (ERR_CAPABILITY_DELEGATION_INVALID, 0x0508)")]
     BrokenChain,
+    /// A child's `[nbf, exp)` validity window is not nested within its parent's — a delegated
+    /// grant that outlives (or predates) its delegator's authority (§18.7.3, fail closed).
+    #[error("capability window not nested within parent — child nbf < parent nbf or exp > parent \
+             exp (ERR_CAPABILITY_DELEGATION_INVALID, 0x0508)")]
+    WindowNotNested,
+    /// The chain's root issuer is not the caller-supplied trust anchor — a chain rooted at an
+    /// untrusted key (§18.7.3 verification step 2, fail closed).
+    #[error("capability chain root is not the trusted anchor \
+             (ERR_CAPABILITY_DELEGATION_INVALID, 0x0508)")]
+    UntrustedRoot,
     /// Invocation clock is before `nbf` — the token is not yet valid (§18.7.3 step 3).
     #[error("capability not yet valid — now < nbf (ERR_CAPABILITY_DELEGATION_INVALID, 0x0508)")]
     NotYetValid,
@@ -73,6 +83,8 @@ impl CapabilityError {
             CapabilityError::BadSignature
             | CapabilityError::AttenuationViolation
             | CapabilityError::BrokenChain
+            | CapabilityError::WindowNotNested
+            | CapabilityError::UntrustedRoot
             | CapabilityError::NotYetValid
             | CapabilityError::Expired => 0x0508,
             CapabilityError::Revoked => 0x050B,
@@ -306,6 +318,11 @@ impl CapabilityToken {
             if child.iss != parent.aud {
                 return Err(CapabilityError::BrokenChain);
             }
+            // A delegated grant may not outlive (or predate) its delegator's authority: the child's
+            // `[nbf, exp)` window MUST nest inside the parent's. Fail closed on any overhang.
+            if child.nbf < parent.nbf || child.exp > parent.exp {
+                return Err(CapabilityError::WindowNotNested);
+            }
             for c in &child.caps {
                 if !parent.caps.iter().any(|p| capability_covers(p, c)) {
                     return Err(CapabilityError::AttenuationViolation);
@@ -316,6 +333,25 @@ impl CapabilityToken {
         // The walk MUST terminate at a token rooted at its own `iss` (no dangling parent link).
         if child.prnt.is_some() {
             return Err(CapabilityError::BrokenChain);
+        }
+        Ok(())
+    }
+
+    /// [`verify_chain`](Self::verify_chain) **plus a trust anchor** (§18.7.3 verification step 2): the
+    /// chain's rooted issuer (the final `chain` element's `iss`, or this token's own `iss` for a
+    /// self-rooted single token) MUST equal `trusted_root`. Without this, `verify_chain` proves a
+    /// chain is internally consistent but not that it descends from a key the verifier trusts — a
+    /// verifier that omits the anchor check accepts a well-formed chain rooted at any attacker key.
+    /// Fail closed with [`UntrustedRoot`](CapabilityError::UntrustedRoot).
+    pub fn verify_chain_rooted(
+        &self,
+        chain: &[CapabilityToken],
+        trusted_root: &[u8],
+    ) -> Result<(), CapabilityError> {
+        self.verify_chain(chain)?;
+        let root_iss = chain.last().map(|t| &t.iss).unwrap_or(&self.iss);
+        if root_iss.as_slice() != trusted_root {
+            return Err(CapabilityError::UntrustedRoot);
         }
         Ok(())
     }
@@ -409,11 +445,32 @@ impl CapabilityRevocation {
     }
 
     /// Verify the revocation signature under `iss` (§18.9.14).
+    ///
+    /// NOTE: this proves only that the revocation is authentically signed by *whatever* key it
+    /// names as `iss`. It does **not** prove that key is *authorized* to revoke `token` — a
+    /// revocation is only binding when its `iss` is the target token's own issuer or an ancestor
+    /// issuer in its delegation chain (§18.7.3). Callers holding the target's chain MUST use
+    /// [`verify_authorized`](Self::verify_authorized); a bare `verify()` accepts a signature by any
+    /// key and must not be treated as authority to revoke.
     pub fn verify(&self) -> Result<(), IdentityError> {
         if !self.suite.is_supported() {
             return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
         }
         verify_domain(&self.iss, CAP_REVOCATION_DS, &self.signing_body(), &self.sig)
+    }
+
+    /// [`verify`](Self::verify) **plus revoker authorization** (§18.7.3): the revocation's `iss`
+    /// MUST be one of `authorized_issuers` — the target token's own `iss` and the `iss` of every
+    /// ancestor in its chain (a chain root may revoke any descendant). Binds the revoker to the
+    /// target's issuer/ancestors so a third party cannot forge a binding revocation of someone
+    /// else's grant. Fail closed: an unauthorized revoker is [`IdentityError::BadSignature`].
+    pub fn verify_authorized(&self, authorized_issuers: &[&[u8]]) -> Result<(), IdentityError> {
+        self.verify()?;
+        if authorized_issuers.iter().any(|k| *k == self.iss.as_slice()) {
+            Ok(())
+        } else {
+            Err(IdentityError::BadSignature)
+        }
     }
 }
 
@@ -640,6 +697,67 @@ mod tests {
             Some(parent.content_id()),
         );
         assert!(child.verify_chain(&[parent]).is_ok());
+    }
+
+    #[test]
+    fn child_window_must_nest_within_parent() {
+        let root_k = key(0x11);
+        let mid_k = key(0x22);
+        let leaf_aud = key(0x33).public();
+        // Parent valid [1000, 9000). Child claims [1000, 20000) — outliving its delegator.
+        let parent = rooted(&root_k, mid_k.public(), vec![cap("mailbox:calendar", "read")]);
+        let child = CapabilityToken::issue(
+            &mid_k,
+            leaf_aud,
+            vec![cap("mailbox:calendar", "read")],
+            1_000,
+            20_000, // exp > parent.exp
+            b"child-nonce".to_vec(),
+            Some(parent.content_id()),
+        );
+        assert_eq!(child.verify_chain(&[parent]), Err(CapabilityError::WindowNotNested));
+    }
+
+    #[test]
+    fn chain_root_must_match_trust_anchor() {
+        let root_k = key(0x11);
+        let mid_k = key(0x22);
+        let leaf_aud = key(0x33).public();
+        let parent = rooted(&root_k, mid_k.public(), vec![cap("mailbox:calendar", "read")]);
+        let child = CapabilityToken::issue(
+            &mid_k,
+            leaf_aud,
+            vec![cap("mailbox:calendar", "read")],
+            1_000,
+            9_000,
+            b"child-nonce".to_vec(),
+            Some(parent.content_id()),
+        );
+        // Internally-consistent chain, but rooted at root_k — an attacker key is NOT the anchor.
+        assert!(child.verify_chain(std::slice::from_ref(&parent)).is_ok());
+        let attacker_anchor = key(0x99).public();
+        assert_eq!(
+            child.verify_chain_rooted(std::slice::from_ref(&parent), &attacker_anchor),
+            Err(CapabilityError::UntrustedRoot)
+        );
+        // The genuine root key is accepted.
+        assert!(child.verify_chain_rooted(&[parent], &root_k.public()).is_ok());
+    }
+
+    #[test]
+    fn revocation_requires_authorized_revoker() {
+        let issuer = key(0x11);
+        let stranger = key(0x77);
+        let token = rooted(&issuer, key(0x22).public(), vec![cap("mailbox:calendar", "read")]);
+        // A stranger signs a syntactically valid revocation of someone else's token.
+        let rev = CapabilityRevocation::issue(&stranger, token.content_id(), 100);
+        // Bare verify() passes (signature is authentic) — that is exactly the trap.
+        assert!(rev.verify().is_ok());
+        // But the stranger is not an authorized revoker (not the token's iss/ancestor).
+        assert!(rev.verify_authorized(&[&issuer.public()]).is_err());
+        // The genuine issuer's revocation is authorized.
+        let good = CapabilityRevocation::issue(&issuer, token.content_id(), 100);
+        assert!(good.verify_authorized(&[&issuer.public()]).is_ok());
     }
 
     #[test]

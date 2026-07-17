@@ -20,7 +20,7 @@ use crate::crdt::ClusterState;
 use crate::error::SyncError;
 use crate::journal::Journal;
 use crate::recon::{reconcile, ReconConfig};
-use crate::wire::{ClusterSyncFrame, Hash};
+use crate::wire::{ClusterSyncFrame, Hash, Hlc, StabilityMark};
 use dmtap_core::identity::Identity;
 use dmtap_core::ContentId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +65,11 @@ impl Cluster {
         self.members.len()
     }
 
+    /// The current member device keys (§5.6.1) — the set the §5.6.5 stability cut must cover.
+    pub fn members(&self) -> &BTreeSet<Vec<u8>> {
+        &self.members
+    }
+
     /// Authorise a device before exchanging any object or op with it (§5.6.1). A non-member is
     /// refused fail-closed (`ERR_CLUSTER_DEVICE_UNAUTHORIZED`, `0x0410`).
     pub fn authorize(&self, device_key: &[u8]) -> Result<(), SyncError> {
@@ -93,6 +98,9 @@ pub struct Replica {
     objects: BTreeMap<Hash, Vec<u8>>,
     state: ClusterState,
     journal: Journal,
+    /// Per-device max-applied-HLC stability marks ingested from peers (§5.6.5), the input to the
+    /// leaderless stability cut that drives tombstone GC.
+    stability: BTreeMap<Vec<u8>, Hlc>,
 }
 
 impl Replica {
@@ -105,6 +113,7 @@ impl Replica {
             objects: BTreeMap::new(),
             state: ClusterState::new(),
             journal: Journal::new(),
+            stability: BTreeMap::new(),
         }
     }
 
@@ -264,6 +273,70 @@ impl Replica {
         }
         Ok(learned)
     }
+
+    /// This replica's own stability mark (§5.6.5): its device id and its max-applied HLC watermark.
+    /// `None` until it has applied at least one op.
+    pub fn own_stability_mark(&self) -> Option<StabilityMark> {
+        self.state.max_hlc().map(|hlc| StabilityMark { device: self.device.clone(), hlc })
+    }
+
+    /// Build a type-5 stability frame advertising this replica's own watermark (§5.6.5), for a peer
+    /// to ingest via [`Replica::ingest_stability`]. Empty if nothing has been applied yet.
+    pub fn stability_frame(&self) -> ClusterSyncFrame {
+        let marks = self.own_stability_mark().into_iter().collect();
+        ClusterSyncFrame::stability(self.device.clone(), marks)
+    }
+
+    /// Ingest a peer's type-5 stability marks (§5.6.5): authorise the origin (`0x0410`), then record
+    /// each mark as a **monotonic per-device max** (a mark can only advance a device's watermark,
+    /// never rewind it — a stale/replayed lower mark is ignored, so GC never over-collects).
+    pub fn ingest_stability(&mut self, frame: &ClusterSyncFrame) -> Result<(), SyncError> {
+        self.cluster.authorize_frame(frame)?;
+        for mark in &frame.stability {
+            self.stability
+                .entry(mark.device.clone())
+                .and_modify(|cur| {
+                    if mark.hlc > *cur {
+                        *cur = mark.hlc.clone();
+                    }
+                })
+                .or_insert_with(|| mark.hlc.clone());
+        }
+        Ok(())
+    }
+
+    /// The §5.6.5 **stability cut**: the minimum max-applied-HLC across *every* cluster member,
+    /// folding in this replica's own watermark ([`own_stability_mark`](Self::own_stability_mark)).
+    /// Returns `None` — **fail-closed, no GC** — unless a mark is known for every current member, so
+    /// a silent member (which might still originate a concurrent op below a naive cut) can never
+    /// cause premature tombstone collection.
+    pub fn stability_cut(&self) -> Option<Hlc> {
+        let mut cut: Option<Hlc> = None;
+        for member in self.cluster.members() {
+            let mark = if member == &self.device {
+                self.state.max_hlc()
+            } else {
+                self.stability.get(member).cloned()
+            };
+            let hlc = mark?; // any member without a known watermark ⇒ no cut (fail closed)
+            cut = Some(match cut {
+                Some(c) if c <= hlc => c,
+                _ => hlc,
+            });
+        }
+        cut
+    }
+
+    /// Run the §5.6.5 stability-cut GC: if a cut exists ([`stability_cut`](Self::stability_cut)),
+    /// reclaim every collapsed OR-Set add+tombstone pair at/below it
+    /// ([`ClusterState::prune_stable`]). Observable state and convergence are preserved. Returns the
+    /// number of tags reclaimed (0 if no cut is available yet).
+    pub fn gc(&mut self) -> usize {
+        match self.stability_cut() {
+            Some(cut) => self.state.prune_stable(&cut),
+            None => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -327,10 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn cert_signed_by_a_foreign_ik_is_not_a_member() {
+    fn cert_signed_by_a_foreign_ik_is_rejected_fail_closed() {
         // A DeviceCert that verifies under some *other* IK (not this identity's) must not be
-        // admitted — membership requires chaining to THIS identity. The owner re-signs an identity
-        // doc that (maliciously or by confusion) lists a foreign-IK cert; it must still be excluded.
+        // admitted. `Identity::verify` now transitively validates every embedded device cert and
+        // binds it to this identity's IK, so an identity doc that (maliciously or by confusion)
+        // lists a foreign-IK cert no longer verifies at all — `Cluster::from_identity` refuses it
+        // fail-closed (`0x0410`) rather than silently tolerating the doc and filtering the intruder.
         let owner = IdentityKey::from_seed(&[7u8; 32]);
         let owner_dk = IdentityKey::from_seed(&[100u8; 32]);
         let owner_cert =
@@ -351,10 +426,25 @@ mod tests {
             None,
             1_000,
         );
-        let cluster = Cluster::from_identity(&identity).unwrap();
-        // The owner's own device is a member; the foreign-IK cert's subject is not.
+        assert_eq!(
+            Cluster::from_identity(&identity).unwrap_err(),
+            SyncError::DeviceUnauthorized,
+            "an identity embedding a foreign-IK device cert must not verify"
+        );
+
+        // A clean identity (only its own device) still forms a cluster and admits that device.
+        let clean = Identity::create_classical(
+            &owner,
+            0,
+            vec![DeviceCert::issue(&owner, owner_dk.public(), "device-0", 1_000, None, vec![])],
+            KeyPackageBundleRef::new("loc", ContentId::of(b"kp")),
+            ContentId::of(b"recovery"),
+            vec!["alice".into()],
+            None,
+            1_000,
+        );
+        let cluster = Cluster::from_identity(&clean).unwrap();
         assert!(cluster.is_member(&owner_dk.public()));
-        assert!(!cluster.is_member(&foreign_dk.public()), "foreign-IK cert must be excluded");
     }
 
     #[test]
@@ -422,6 +512,61 @@ mod tests {
         let learned = fresh.backfill_via_journal(&mut full).unwrap();
         assert_eq!(learned.len(), 10);
         assert_eq!(fresh.object_ids(), full.object_ids());
+    }
+
+    #[test]
+    fn stability_cut_gc_prunes_dead_tombstones_and_is_fail_closed() {
+        use crate::wire::{AddTag, StabilityMark, OP_SET_ADD, OP_SET_REMOVE};
+        let (_ik, identity, dks) = identity_with_devices(2);
+        let cluster = Cluster::from_identity(&identity).unwrap();
+        let mut r0 = Replica::new(dks[0].clone(), cluster);
+        let d0 = dks[0].clone();
+
+        let now = 10_000_000u64;
+        let add_hlc = Hlc { wall: 10, counter: 0, device: d0.clone() };
+        // add "m", then remove it (a collapsed delete), plus a live "keep".
+        r0.state_mut()
+            .ingest(&ClusterOp { kind: OP_SET_ADD, target: "m".into(), field: None, value: None, hlc: add_hlc.clone(), observed: None }, now)
+            .unwrap();
+        r0.state_mut()
+            .ingest(
+                &ClusterOp {
+                    kind: OP_SET_REMOVE,
+                    target: "m".into(),
+                    field: None,
+                    value: None,
+                    hlc: Hlc { wall: 11, counter: 0, device: d0.clone() },
+                    observed: Some(vec![AddTag { device: d0.clone(), hlc: add_hlc }]),
+                },
+                now,
+            )
+            .unwrap();
+        r0.state_mut()
+            .ingest(&ClusterOp { kind: OP_SET_ADD, target: "keep".into(), field: None, value: None, hlc: Hlc { wall: 30, counter: 0, device: d0.clone() }, observed: None }, now)
+            .unwrap();
+        let before = r0.state().snapshot();
+
+        // Fail-closed: without device 1's mark, no cut exists ⇒ GC is a no-op.
+        assert!(r0.stability_cut().is_none(), "missing a member mark ⇒ no cut");
+        assert_eq!(r0.gc(), 0);
+
+        // Device 1 advertises a watermark (wall 40) above the dead delete's tags (≤ 11).
+        let mark_frame = ClusterSyncFrame::stability(
+            dks[1].clone(),
+            vec![StabilityMark { device: dks[1].clone(), hlc: Hlc { wall: 40, counter: 0, device: dks[1].clone() } }],
+        );
+        r0.ingest_stability(&mark_frame).unwrap();
+        // Cut = min(own max = 30, peer = 40) = 30, which is ≥ the delete tags.
+        assert!(r0.stability_cut().is_some());
+        let reclaimed = r0.gc();
+        assert_eq!(reclaimed, 1, "the stable dead tombstone pair is reclaimed");
+        // Observable state unchanged; the live element survives.
+        assert_eq!(r0.state().snapshot(), before, "GC must not change observable state");
+        assert!(r0.state().set.contains("keep"));
+
+        // A stability frame from a non-member is refused fail-closed (0x0410).
+        let stranger = ClusterSyncFrame::stability(vec![0xEE; 32], vec![]);
+        assert_eq!(r0.ingest_stability(&stranger).unwrap_err(), SyncError::DeviceUnauthorized);
     }
 
     #[test]

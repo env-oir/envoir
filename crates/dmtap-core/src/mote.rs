@@ -951,10 +951,15 @@ impl Manifest {
         let id = ContentId(as_bytes(f.req(1)?)?);
         let size = as_u64(f.req(2)?)?;
         let chunk_sz = as_u32(f.req(3)?)?;
-        let chunks = as_array(f.req(4)?)?
+        let chunks: Vec<ContentId> = as_array(f.req(4)?)?
             .into_iter()
             .map(|c| as_bytes(c).map(ContentId))
             .collect::<Result<_, _>>()?;
+        // §18.3.8: a manifest MUST carry ≥ 1 chunk. Reject an empty list at decode (fail closed) —
+        // otherwise the downstream `merkle_root()` / `merkle_tree_head()` panics on zero leaves.
+        if chunks.is_empty() {
+            return Err(CborError::ManifestEmptyChunks);
+        }
         let suite = suite_from_cv(f.req(6)?)?;
         f.deny_unknown()?;
         Ok(Manifest { id, size, chunk_sz, chunks, suite })
@@ -1674,11 +1679,20 @@ pub fn validate(
     }
 
     // 3. Verify sender_sig over the §18.9.1 preimage under the ephemeral key (cheap).
-    if let Some(sig) = &env.sender_sig {
-        let eph = env.sender_eph.as_ref().ok_or(MoteError::MissingSenderKey)?;
-        let authed = sender_authed_bytes(env);
-        verify_sig_for_suite(env.suite, eph, ENVELOPE_SENDER_DS, &authed, sig)?;
-    }
+    //
+    // The §2.7-step-3 ephemeral signature is MANDATORY on every well-formed MOTE: both legitimate
+    // builders (`build_mote`, `build_mote_hybrid`) always populate `sender_sig`/`sender_eph`, so a
+    // missing pair is either a truncation attack or a forgery. Enforce it fail-closed BEFORE the
+    // expensive HPKE/X-Wing open() — otherwise an attacker strips key 11/12, no-ops this check, and
+    // walks straight into asymmetric decryption (a decryption-DoS + ephemeral/challenge-binding
+    // bypass). There is no legitimately-unsigned MOTE kind, so this is unconditional (not an
+    // allow-list gate). A missing signature is reported as `BadSignature` (the §2.7-step-3
+    // authentication failed); a missing ephemeral key as `MissingSenderKey` — both are existing
+    // variants, so no downstream error mapping changes.
+    let sig = env.sender_sig.as_ref().ok_or(MoteError::BadSignature)?;
+    let eph = env.sender_eph.as_ref().ok_or(MoteError::MissingSenderKey)?;
+    let authed = sender_authed_bytes(env);
+    verify_sig_for_suite(env.suite, eph, ENVELOPE_SENDER_DS, &authed, sig)?;
 
     // 4. Resolve `to` to this node (default KeyTag == our identity key, §2.7 step 4).
     if !env.to.resolves_to_key(ctx.our_ik) {
@@ -1923,6 +1937,50 @@ mod tests {
             sender_is_known: true,
         };
         assert_eq!(validate(&Hpke, &env, &ctx), Err(MoteError::BadSignature));
+    }
+
+    /// H1: an attacker strips the mandatory §2.7-step-3 ephemeral signature (`sender_sig = None`)
+    /// and re-encodes. The pre-decryption check must reject it fail-closed — BEFORE any HPKE open()
+    /// — rather than silently no-op the signature step and fall through to decryption.
+    #[test]
+    fn stripped_sender_sig_is_rejected_before_decrypt() {
+        let (mut env, recipient, seal) = round(Kind::Mail);
+        env.sender_sig = None; // strip key 11 — a truncation attack, survives CBOR round-trip
+        env.sender_eph = None; // and key 12 (the ephemeral key it verifies under)
+        // Content address still matches (attacker did not touch the ciphertext), so step 2 passes;
+        // the object is genuine except for the missing signature.
+        assert!(env.id.verify(&env.ciphertext));
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert_eq!(validate(&Hpke, &env, &ctx), Err(MoteError::BadSignature));
+        // Also reject when only the signature is stripped but the ephemeral key is kept: still
+        // fail-closed at step 3 before any decryption.
+        let (mut env2, _r2, _s2) = round(Kind::Mail);
+        env2.sender_sig = None;
+        assert_eq!(validate(&Hpke, &env2, &ctx), Err(MoteError::BadSignature));
+        // And the mirror: ephemeral key stripped but signature present ⇒ MissingSenderKey.
+        let (mut env3, _r3, _s3) = round(Kind::Mail);
+        env3.sender_eph = None;
+        assert_eq!(validate(&Hpke, &env3, &ctx), Err(MoteError::MissingSenderKey));
+    }
+
+    /// M2: a canonical manifest CBOR with an empty `chunks` list (key 4 = []) must be rejected at
+    /// decode — §18.3.8 requires ≥ 1 chunk. Before the fix this decoded fine and a later
+    /// `merkle_root()` panicked on zero leaves.
+    #[test]
+    fn manifest_with_empty_chunks_is_rejected_at_decode() {
+        let m = Manifest {
+            id: ContentId(vec![crate::id::MH_BLAKE3_256]),
+            size: 0,
+            chunk_sz: 1024,
+            chunks: vec![], // §18.3.8 violation
+            suite: Suite::Classical,
+        };
+        let bytes = m.det_cbor();
+        assert_eq!(Manifest::from_det_cbor(&bytes), Err(CborError::ManifestEmptyChunks));
     }
 
     #[test]
