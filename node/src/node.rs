@@ -1236,8 +1236,16 @@ fn drop_reason(e: MoteError) -> DropReason {
         // only when decryption has necessarily succeeded is not distinguishable here — both are
         // "authentication failed", reported as BadPayloadSig for the caller.
         MoteError::BadSignature => DropReason::BadPayloadSig,
-        // Sealing/encoding errors cannot arise from a decode+validate path, but map defensively.
-        MoteError::SealFailed | MoteError::BadEncoding(_) => DropReason::Malformed,
+        // Sealing/encoding errors, and the §5.5 file-tier / durability / spool failures (raised at
+        // MOTE construction and by the file-durability helpers, not by this decode+validate path),
+        // cannot arise here but map defensively to Malformed.
+        MoteError::SealFailed
+        | MoteError::BadEncoding(_)
+        | MoteError::FileManifestInvalid
+        | MoteError::FileRetentionExpired
+        | MoteError::FileUnavailable
+        | MoteError::SpoolOverflow
+        | MoteError::SizeTierViolation => DropReason::Malformed,
     }
 }
 
