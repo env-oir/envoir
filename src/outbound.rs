@@ -17,6 +17,7 @@ use crate::b64;
 use crate::dkim::{self, DkimKey};
 use crate::mta_sts::any_pattern_matches;
 use crate::mx::{InMemoryMxResolver, MxHost, MxResolver};
+use crate::outbound_guard::{OutboundSenderGuard, SenderVerdict};
 
 /// TLS requirement for a destination, from an MTA-STS/DANE policy lookup (§7.3 step 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,22 @@ pub struct OutboundGateway {
     tls_policy: Box<dyn TlsPolicy>,
     transport: Box<dyn OutboundTransport>,
     mx_resolver: Box<dyn MxResolver>,
+    /// Optional outbound anti-spam governor (§7.3, §9): authenticated-senders-only + per-sender
+    /// rate-limit / volume cap / reputation backoff. `None` ⇒ the operator authenticated and
+    /// rate-governed the sender upstream (e.g. at the mesh ingress) — [`Self::send`] is unguarded.
+    sender_guard: Option<OutboundSenderGuard>,
+}
+
+/// The result of a governed outbound send ([`OutboundGateway::send_authenticated`]): either the send
+/// ran and produced an [`OutboundReport`], or the outbound anti-spam guard refused/deferred it before
+/// any SMTP was attempted. Kept distinct from [`OutboundReport`] so the guard's rate/volume/reputation
+/// decisions never masquerade as a destination-MX result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GovernedSend {
+    /// The guard allowed the send; this is the destination-MX outcome.
+    Sent(OutboundReport),
+    /// The guard blocked the send (unauthenticated sender, rate/volume cap, or reputation backoff).
+    Blocked(SenderVerdict),
 }
 
 /// The report handed back to the node after an outbound attempt (§19.7.2 step 5). The node's
@@ -138,7 +155,16 @@ impl OutboundGateway {
             tls_policy,
             transport,
             mx_resolver: Box::new(InMemoryMxResolver::new()),
+            sender_guard: None,
         }
+    }
+
+    /// Attach the outbound anti-spam governor (§7.3, §9). With it set, [`Self::send_authenticated`]
+    /// enforces authenticated-senders-only + per-sender rate-limit / volume cap / reputation backoff
+    /// so the gateway cannot be turned into a spam relay. See [`OutboundSenderGuard`].
+    pub fn with_sender_guard(mut self, guard: OutboundSenderGuard) -> Self {
+        self.sender_guard = Some(guard);
+        self
     }
 
     /// Swap in a different MX resolver (spec §7.3 step 4 / RFC 5321 §5.1) — e.g.
@@ -244,6 +270,42 @@ impl OutboundGateway {
                 OutboundReport::Failed(OutboundError::TlsEnforcementFailed(dest_domain))
             }
         }
+    }
+
+    /// Outbound send **governed by the anti-spam guard** for an authenticated sender `account`
+    /// (§7.3, §9). This is the entry point the mesh-ingest path uses once it has admitted the sender
+    /// (see [`crate::authz::IdentityRegistry::admit`]): the guard is consulted **before** any SMTP is
+    /// attempted, so an unauthenticated sender, a sender over its rate/volume cap, or one in
+    /// reputation backoff is blocked without ever touching the destination MX. On an allowed send the
+    /// destination outcome is fed back into the sender's reputation (a permanent reject / TLS abort is
+    /// a bad signal that arms backoff; a delivery decays it), so a sender that keeps producing
+    /// blacklisting outcomes is progressively throttled. With no guard configured this is exactly
+    /// [`Self::send`] wrapped in [`GovernedSend::Sent`] (the operator governed the sender upstream).
+    pub fn send_authenticated(
+        &self,
+        payload: &Payload,
+        from_addr: &str,
+        to_addr: &str,
+        account: &str,
+        now: TimestampMs,
+    ) -> GovernedSend {
+        if let Some(guard) = &self.sender_guard {
+            match guard.authorize_send(account) {
+                SenderVerdict::Allow => {}
+                blocked => return GovernedSend::Blocked(blocked),
+            }
+        }
+        let report = self.send(payload, from_addr, to_addr, now);
+        if let Some(guard) = &self.sender_guard {
+            // A permanent destination reject or a TLS-enforcement abort is the kind of outcome that
+            // gets a relay blacklisted; feed it into reputation. Transient defers are not penalized.
+            let bad = matches!(report, OutboundReport::Failed(_));
+            let delivered = matches!(report, OutboundReport::Delivered);
+            if bad || delivered {
+                guard.report_outcome(account, delivered);
+            }
+        }
+        GovernedSend::Sent(report)
     }
 }
 
