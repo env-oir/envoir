@@ -59,6 +59,7 @@
 //! doubles remain for unit tests; the socket/DNS impls are the production leg (unit-tested via pure
 //! wire-format round-trips, not live network calls).
 
+pub mod alias_map;
 pub mod attestation;
 pub mod authz;
 pub mod b64;
@@ -80,6 +81,9 @@ pub mod personal;
 pub mod provenance;
 pub mod spf;
 
+pub use alias_map::{
+    random_alias_token, AliasTarget, GatewayAliasError, GatewayAliasMap, TOKEN_ENTROPY_BYTES,
+};
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 pub use authz::{
     key_derived_localpart, random_nonce, Admission, AdmissionError, AliasAllocator, AliasError,
