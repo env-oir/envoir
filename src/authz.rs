@@ -651,7 +651,13 @@ impl AliasAllocator {
     /// vanity that collides with it is refused, so a chosen name can never shadow a real account.
     /// Idempotent; the value is lowercased for a case-insensitive match.
     pub fn reserve_localpart(&mut self, local_part: impl AsRef<str>) {
-        self.reserved.insert(local_part.as_ref().trim().to_ascii_lowercase());
+        let lp = local_part.as_ref().trim().to_ascii_lowercase();
+        // Purge any vanity already allocated at this local-part: a reservation added AFTER an
+        // allocation must still win, so a chosen vanity can never keep shadowing a real directory
+        // identity even if the reserve happens later (audit-5 #5). The vanity holder falls back to
+        // its conflict-free key-derived alias.
+        self.vanity.remove(&lp);
+        self.reserved.insert(lp);
     }
 
     /// Reserve the local-part of a full directory address `email` **iff** it is on this gateway's own
@@ -1301,6 +1307,25 @@ mod tests {
         ));
         // A non-colliding vanity is still fine.
         assert_eq!(alloc.allocate_vanity(&a.public(), "founderx").unwrap(), format!("founderx@{GW}"));
+    }
+
+    #[test]
+    fn rule5_reserving_a_localpart_purges_an_earlier_conflicting_vanity() {
+        // audit-5 #5: a reservation added AFTER an allocation must still win, so a chosen vanity can
+        // never keep shadowing a real directory identity because of ordering.
+        let a = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+        assert_eq!(alloc.allocate_vanity(&a.public(), "alice").unwrap(), format!("alice@{GW}"));
+        assert_eq!(alloc.alias_for(&a.public()), format!("alice@{GW}"));
+        // Operator later reserves that local-part as a directory identity.
+        alloc.reserve_localpart("alice");
+        // The vanity is purged — the key falls back to its conflict-free key-derived alias.
+        assert_ne!(alloc.alias_for(&a.public()), format!("alice@{GW}"));
+        // And it can no longer be re-allocated (now reserved).
+        assert!(matches!(
+            alloc.allocate_vanity(&a.public(), "alice"),
+            Err(AliasError::ShadowsDirectoryIdentity(_))
+        ));
     }
 
     // ── Rule 6: basic hygiene ────────────────────────────────────────────────────────────────────
