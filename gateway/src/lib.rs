@@ -60,6 +60,7 @@
 //! wire-format round-trips, not live network calls).
 
 pub mod attestation;
+pub mod authz;
 pub mod b64;
 pub mod directory;
 pub mod dkim;
@@ -72,11 +73,17 @@ pub mod mta_sts;
 pub mod mx;
 pub mod net;
 pub mod outbound;
+pub mod outbound_guard;
 pub mod outbound_tcp;
 pub mod provenance;
 pub mod spf;
 
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
+pub use authz::{
+    key_derived_localpart, random_nonce, Admission, AdmissionError, AliasAllocator, AliasError,
+    AuthzMode, Challenge, IdentityRegistry, Quota, QuotaError, QuotaLedger, RegisteredIdentity,
+    Usage,
+};
 pub use dkim::{
     parse_public_key_txt, signing_domain_selector, verify_with_resolver, DkimError, DkimKey,
     DkimKeyResolver, DkimVerdict, DnsDkimKeyResolver, StaticDkimKeys,
@@ -101,9 +108,10 @@ pub use mta_sts::{
 };
 pub use mx::{DnsMxResolver, InMemoryMxResolver, MxHost, MxResolver};
 pub use outbound::{
-    AlwaysRequireTls, OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy,
-    TlsRequirement, TransportResult,
+    AlwaysRequireTls, GovernedSend, OutboundError, OutboundGateway, OutboundReport,
+    OutboundTransport, TlsPolicy, TlsRequirement, TransportResult,
 };
+pub use outbound_guard::{OutboundSenderGuard, SenderVerdict};
 pub use provenance::{
     chain_append, msg_digest, AuthzDecision, Bridge, BridgeDirection, BridgeError, CountingMeter,
     GatewayAttestation, GatewayAuthz, GatewayMeter, MeterEvent, NullMeter, Origin, Profile,

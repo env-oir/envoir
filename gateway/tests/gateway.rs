@@ -20,9 +20,10 @@ use envoir_gateway::provenance::{
 use envoir_gateway::mta_sts::{InMemoryPolicyFetcher, InMemoryTxtResolver, MtaStsTlsPolicy};
 use envoir_gateway::mx::{InMemoryMxResolver, MxHost};
 use envoir_gateway::outbound::{
-    OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy, TlsRequirement,
-    TransportResult,
+    GovernedSend, OutboundError, OutboundGateway, OutboundReport, OutboundTransport, TlsPolicy,
+    TlsRequirement, TransportResult,
 };
+use envoir_gateway::outbound_guard::{OutboundSenderGuard, SenderVerdict};
 use envoir_gateway::spf::{InMemorySpfResolver, SpfResult};
 
 const NOW: u64 = 1_752_600_000_000;
@@ -1350,6 +1351,99 @@ fn greylist_entry_expires_after_its_ttl_and_the_sender_is_greylisted_again() {
     // And the normal retry-after-delay behavior resumes from this fresh sighting.
     advance(&clock, 60_000);
     assert_eq!(gate.check("203.0.113.20", "occasional@gmail.com"), AbuseDecision::Accept);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Outbound anti-spam governor wired into the outbound gateway (§7.3, §9)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn governed_send_delivers_for_an_authenticated_sender() {
+    let transport =
+        std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let clock = ManualClock::new(1_000_000);
+    let guard = OutboundSenderGuard::with_clock(Box::new(clock.clone()))
+        .require_registered(["acct-alice"])
+        .with_rate_limit(5, 60_000);
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_sender_guard(guard);
+
+    let out =
+        gw.send_authenticated(&sample_payload(), "alice@alice-domain.com", "bob@gmail.com", "acct-alice", NOW);
+    assert_eq!(out, GovernedSend::Sent(OutboundReport::Delivered));
+    assert_eq!(transport.dialed_hosts().len(), 1, "an allowed send reached the destination MX");
+}
+
+#[test]
+fn governed_send_blocks_an_unauthenticated_sender_before_any_smtp() {
+    let transport =
+        std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let guard = OutboundSenderGuard::new().require_registered(["acct-alice"]);
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_sender_guard(guard);
+
+    // A sender not on the authenticated allowlist is refused — no open outbound relay.
+    let out = gw.send_authenticated(
+        &sample_payload(),
+        "mallory@alice-domain.com",
+        "bob@gmail.com",
+        "acct-mallory",
+        NOW,
+    );
+    assert!(matches!(out, GovernedSend::Blocked(SenderVerdict::Refuse { .. })));
+    assert!(transport.dialed_hosts().is_empty(), "a blocked send never touched the destination MX");
+}
+
+#[test]
+fn governed_send_throttles_a_flood_and_never_dials_the_throttled_message() {
+    let transport =
+        std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    let clock = ManualClock::new(1_000_000);
+    let guard = OutboundSenderGuard::with_clock(Box::new(clock.clone()))
+        .require_registered(["flooder"])
+        .with_rate_limit(2, 60_000)
+        .with_volume_cap(1000, 24 * 3_600_000);
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    )
+    .with_sender_guard(guard);
+
+    let send = |from: &str| {
+        gw.send_authenticated(&sample_payload(), from, "bob@gmail.com", "flooder", NOW)
+    };
+    assert_eq!(send("a@alice-domain.com"), GovernedSend::Sent(OutboundReport::Delivered));
+    assert_eq!(send("a@alice-domain.com"), GovernedSend::Sent(OutboundReport::Delivered));
+    // Third within the window is throttled — deferred to the node's retry queue, MX never dialed for it.
+    assert!(matches!(send("a@alice-domain.com"), GovernedSend::Blocked(SenderVerdict::Throttle { .. })));
+    assert_eq!(transport.dialed_hosts().len(), 2, "only the two allowed sends were dialed");
 }
 
 // ---------------------------------------------------------------------------------------------
