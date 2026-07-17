@@ -31,6 +31,25 @@
 //!   application message over the real libp2p mesh (`dmtap-p2p`), a member is removed, and the
 //!   removed member's stale state cannot decrypt a message created after removal (post-compromise
 //!   security, §5.2) even when a network observer relays the exact ciphertext straight at them.
+//! - `resolution_forms_e2e.rs` — the two name **forms** `full_roundtrip.rs`'s DNS/KT path doesn't
+//!   cover: a real `dmtap-naming` **`self`** key-name resolution seals and delivers over the real
+//!   libp2p mesh into a JMAP-readable inbox, and a real `dmtap-naming` **`name-chain`** resolution
+//!   (`dmtap_naming::InMemoryNameChain`) does the same on a bidirectional binding match — while a
+//!   hijacked/mismatched chain record fails closed (`NameChainBindingUnverified`, wire code `0x011E`)
+//!   and is proven, concretely, to be delivered nowhere.
+//! - `gateway_alias_roundtrip.rs` — a live `Node::gateway_alias()` local-part decodes back to the
+//!   exact identity key at two independently-constructed "gateways" (no shared state), and a real
+//!   MOTE addressed via the decoded key reaches the node over the mesh.
+//! - `gateway_authz_antispam.rs` — `envoir-gateway`'s authz + anti-spam modules composed for real
+//!   across outbound and inbound: a domain-authorized sender's account drives a real
+//!   `OutboundSenderGuard` (rate limit → volume cap → reputation backoff) governing a real,
+//!   DKIM-verifiable `OutboundGateway` relay, while a forged admission signature is rejected; and a
+//!   real `ColdSenderGate` (not the permissive `AllowAllAbuse` the other gateway tests use) greylists
+//!   a cold sender before `DATA` and only a legitimate retry reaches a real node's inbox. The
+//!   valid-admission / unregistered-`UnknownKey` halves of challenge–response are a documented,
+//!   explained gap (see that file's module doc) rather than a fake pass: they need
+//!   `envoir_gateway::authz`'s private admission domain-separation tag, which this crate has no
+//!   public way to reach.
 //!
 //! ## Scenarios considered and deliberately not added here
 //! - **Suite-downgrade / capability-rollback rejection through a live node.** `dmtap_core::suite`'s
