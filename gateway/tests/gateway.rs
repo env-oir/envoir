@@ -1446,6 +1446,37 @@ fn governed_send_throttles_a_flood_and_never_dials_the_throttled_message() {
     assert_eq!(transport.dialed_hosts().len(), 2, "only the two allowed sends were dialed");
 }
 
+#[test]
+fn governed_send_fails_closed_with_no_guard_configured() {
+    let transport =
+        std::sync::Arc::new(RecordingTransport::new(true, TransportResult::Delivered { code: 250 }));
+    struct ArcTransport(std::sync::Arc<RecordingTransport>);
+    impl OutboundTransport for ArcTransport {
+        fn deliver(&self, dest: &str, message: &[u8], require_tls: bool) -> TransportResult {
+            self.0.deliver(dest, message, require_tls)
+        }
+    }
+    // No sender guard attached: the governed egress path must REFUSE rather than relay ungoverned,
+    // so a gateway with no guard is not a silent open outbound relay. (Old behavior sent Delivered.)
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Opportunistic)),
+        Box::new(ArcTransport(transport.clone())),
+    );
+    let out = gw.send_authenticated(
+        &sample_payload(),
+        "alice@alice-domain.com",
+        "bob@gmail.com",
+        "acct-alice",
+        NOW,
+    );
+    assert!(
+        matches!(out, GovernedSend::Blocked(SenderVerdict::Refuse { .. })),
+        "no guard ⇒ fail-closed refusal, got {out:?}",
+    );
+    assert!(transport.dialed_hosts().is_empty(), "nothing was relayed without a guard");
+}
+
 // ---------------------------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------------------------
