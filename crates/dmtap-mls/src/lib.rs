@@ -34,12 +34,19 @@
 //!
 //! [openmls]: https://docs.rs/openmls
 
+mod ciphersuite;
 mod committer;
 mod error;
 mod member;
 mod session;
 
-pub use committer::{Committer, LogEntry};
+pub use ciphersuite::{
+    all_members_pq, is_pq_ciphersuite, security_level, MemberPqCapability, MlsCiphersuiteError,
+    MlsCiphersuiteRatchet,
+};
+pub use committer::{
+    CommitStatus, Committer, ForkEvidence, LogEntry, OrderOutcome, SuspendedError,
+};
 pub use error::MlsError;
 pub use member::Member;
 pub use session::{Handshake, Session};
