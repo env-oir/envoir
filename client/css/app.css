@@ -1054,6 +1054,7 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .compose .cfield > span { margin: 0; text-transform: none; letter-spacing: 0; font-size: 12px; }
 .compose textarea { min-height: 200px; resize: vertical; line-height: 1.6; margin-bottom: 12px; }
 .compose-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.compose .resolver-hint { margin-left: 70px; }
 .sched-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .sched-lbl { font-size: 12px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 5px; }
 .sched-lbl .ic { width: 14px; height: 14px; }
@@ -1291,6 +1292,35 @@ kbd { font-family: var(--mono); font-size: 11px; background: var(--bg-3); border
 .id-vbar.pinned span { color: var(--accent); }
 .id-vbar.legacy span { color: var(--legacy); }
 
+/* ---- Naming ladder (spec §3.13.2) — a rung per name, floor rung visually distinct ---- */
+.id-ladder { display: grid; gap: 8px; }
+.id-rung { display: flex; align-items: flex-start; gap: 13px; padding: 13px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg-2); }
+.id-rung.floor { border-color: color-mix(in srgb, var(--indigo) 34%, var(--line)); background: var(--grad-soft); }
+.id-rung-badge { flex-shrink: 0; padding-top: 1px; }
+.id-rung-main { flex: 1; min-width: 0; }
+.id-rung-h { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13.5px; font-weight: 640; }
+.id-rung-h .mono { overflow-wrap: anywhere; }
+.id-rung-main small { display: block; font-size: 11.5px; color: var(--text-faint); line-height: 1.5; margin-top: 3px; }
+.id-ladder-note { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; color: var(--text-dim); line-height: 1.55; margin-top: 14px; padding: 12px 14px; border: 1px dashed var(--line-2); border-radius: var(--r); }
+.id-ladder-note .ic { width: 15px; height: 15px; flex-shrink: 0; color: var(--accent); margin-top: 1px; }
+
+.id-gwalias { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--bg-2); font-size: 13.5px; }
+.id-gwalias .mono { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Resolver chip (spec §3.12) — which resolver a name would use, honestly labelled ---- */
+.resolver-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 650; padding: 2px 8px 2px 6px; border-radius: var(--r-pill); white-space: nowrap; }
+.resolver-chip .ic { width: 11px; height: 11px; }
+.resolver-chip.rc-self      { color: color-mix(in srgb, var(--indigo) 78%, var(--text)); background: color-mix(in srgb, var(--indigo) 18%, transparent); }
+.resolver-chip.rc-petname   { color: var(--text-dim); background: var(--bg-3); }
+.resolver-chip.rc-dns       { color: var(--text-dim); background: var(--bg-3); }
+.resolver-chip.rc-namechain { color: color-mix(in srgb, var(--violet) 80%, var(--text)); background: color-mix(in srgb, var(--violet) 18%, transparent); }
+.resolver-chip.rc-directory { color: var(--text-dim); background: var(--bg-3); }
+.resolver-chip.rc-unknown   { color: var(--warn); background: color-mix(in srgb, var(--warn) 16%, transparent); }
+.pill.chain { background: color-mix(in srgb, var(--violet) 16%, transparent); color: color-mix(in srgb, var(--violet) 80%, var(--text)); }
+.resolver-hint { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 20px; margin: -6px 0 10px; padding: 0 2px; }
+.resolver-note { font-size: 11.5px; color: var(--text-faint); }
+.verify-note.resolver-context { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--line); }
+
 /* identity modals */
 .id-modal { padding: 22px 24px; }
 .id-pair { display: flex; gap: 22px; margin: 6px 0 14px; align-items: center; flex-wrap: wrap; }
@@ -1524,6 +1554,7 @@ mark.hl.cur { background: var(--warn); color: #241a02; box-shadow: 0 0 0 2px col
   .wk-head, .wk-grid { grid-template-columns: 34px repeat(7, 1fr); }
   .day-grid { grid-template-columns: 44px 1fr; }
   .compose .cfield { grid-template-columns: 52px 1fr; }
+  .compose .resolver-hint { margin-left: 62px; }
   .files-inner, .set-inner, .id-inner { padding-left: 16px; padding-right: 16px; }
 
   /* identity: hero stacks, KPI strip wraps to a 2×2 grid instead of dividers, and every

@@ -101,6 +101,28 @@ export async function verifySafety(rawPublicKeyBytes, expectedFull) {
   return { match: again.full === expectedFull, recomputed: again.full };
 }
 
+// Key-name (spec §3.9.6): the zero-authority FLOOR of the naming ladder (§3.13.2) — an 8-word,
+// no-"@" name derived SOLELY from the identity's own public key. No lookup, no DNS, no
+// name-chain, no registration: whoever holds the key already holds this name, and no authority
+// can allocate, deny, seize, or repoint it (resolver-type `self`, §3.12.4 — "resolution" is a
+// local derivation, nothing to KT-audit because the binding *is* the key).
+//
+// Domain-separated from the safety number above by a single trailing tag byte before hashing,
+// so the two word-sequences differ even though both are ultimately digests of key material —
+// exactly the spec §3.9.6 "not a safety number" distinction: the key-name may be typed at to
+// reach someone (an address, floor rung of §3.13.2); the safety number never routes and only
+// confirms an out-of-band pin (§3.4.1). Rendered dot-joined (no "@") to read as one addressable
+// token rather than a sentence.
+export async function deriveKeyName(rawPublicKeyBytes) {
+  const tagged = new Uint8Array(rawPublicKeyBytes.length + 1);
+  tagged.set(rawPublicKeyBytes, 0);
+  tagged[rawPublicKeyBytes.length] = 0x4b; // ASCII 'K' — keyname domain-separator tag
+  const digest = await digestOf(tagged);
+  const words = [];
+  for (let i = 0; i < 8; i++) words.push(WORDLIST[digest[i]]);
+  return words.join('.');
+}
+
 // A lightweight safety number derived from an opaque contact key string (demo contacts don't
 // carry real key bytes). Deterministic per string so a contact's number is stable in the UI.
 export async function deriveSafetyFromString(s) {

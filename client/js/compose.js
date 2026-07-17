@@ -4,13 +4,14 @@
 // UNDO window (§17#17). Building a message constructs a REAL MOTE (real signature) and animates
 // its simulated delivery through the inspector.
 
-import { openModal, closeModal, toast, icon, esc, avatar, showInspector, litHop, sanitizeHtml } from './ui.js';
+import { openModal, closeModal, toast, icon, esc, avatar, showInspector, litHop, sanitizeHtml, trustPill } from './ui.js';
 import { buildMote, KIND } from './mote.js';
 import { planDelivery, animatePath } from './mesh-sim.js';
 import { currentIdentity, displayAddress, selfPerson } from './identity.js';
 import { state, thread, uid, stripHtml } from './store.js';
 import { person, PEOPLE, fmtBytes } from './seed.js';
 import { bus } from './bus.js';
+import { classifyName, resolverChip, resolverDetail, RESOLVER_TYPES } from './resolver.js';
 
 const UNDO_MS = 5000;
 
@@ -39,7 +40,8 @@ export function openCompose(opts = {}) {
         <button class="icon-btn" id="cx" aria-label="Close">${icon('x')}</button>
       </div>
       <label class="cfield"><span>From</span><div class="from-chip">${avatar(selfPerson(), 22)}${esc(displayAddress(id))}</div></label>
-      <label class="cfield"><span>To</span><div class="ac-wrap"><input id="cto" value="${esc(draft.to)}" placeholder="name@domain, @handle, or a group address" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false"><div class="ac-list" id="cac" role="listbox"></div></div></label>
+      <label class="cfield"><span>To</span><div class="ac-wrap"><input id="cto" value="${esc(draft.to)}" placeholder="name@domain, a key-name, alice.eth/.sol, @handle, or a group address" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false"><div class="ac-list" id="cac" role="listbox"></div></div></label>
+      <div class="resolver-hint" id="cresolver"></div>
       <label class="cfield"><span>Subject</span><input id="csubj" value="${esc(draft.subject)}" placeholder="Subject"></label>
       <div class="rt-toolbar" role="toolbar" aria-label="Formatting">
         <button class="rt-btn" data-cmd="bold" title="Bold (Ctrl-B)"><b>B</b></button>
@@ -90,8 +92,13 @@ export function openCompose(opts = {}) {
   $('#csubj').oninput = markDirty;
   bodyEl.oninput = markDirty;
 
-  // recipient autocomplete from contacts + groups (spec §17#33)
-  wireAutocomplete($('#cto'), $('#cac'), markDirty);
+  // recipient autocomplete from contacts + groups (spec §17#33), plus a live resolver-type
+  // indicator (spec §3.12 the pluggable resolver framework) so the sender sees, honestly,
+  // which resolver a typed name would use and its verification state — never a silent guess.
+  const updateResolverHint = () => drawResolverHint($('#cto'), $('#cresolver'));
+  wireAutocomplete($('#cto'), $('#cac'), markDirty, updateResolverHint);
+  $('#cto').addEventListener('input', updateResolverHint);
+  updateResolverHint();
 
   // rich-text toolbar
   card.querySelectorAll('.rt-btn').forEach(b => b.onmousedown = (e) => {
@@ -156,7 +163,7 @@ function tomorrow9() { const d = new Date(); d.setDate(d.getDate() + 1); d.setHo
 function monday9() { const d = new Date(); const add = ((8 - d.getDay()) % 7) || 7; d.setDate(d.getDate() + add); d.setHours(9, 0, 0, 0); return d.getTime() - Date.now(); }
 
 // ----- recipient autocomplete (contacts + groups) -----
-function wireAutocomplete(input, listEl, onChange) {
+function wireAutocomplete(input, listEl, onChange, onPick) {
   const suggestions = [
     ...PEOPLE.map(p => ({ name: p.name, addr: p.address, hue: p.hue, kind: 'contact' })),
     ...state.groups.map(g => ({ name: g.name, addr: g.address, hue: 250, kind: 'group' })),
@@ -176,7 +183,7 @@ function wireAutocomplete(input, listEl, onChange) {
     const m = matches[i]; if (!m) return;
     const parts = input.value.split(','); parts[parts.length - 1] = ' ' + m.addr;
     input.value = parts.join(',').replace(/^\s+/, '') + ', ';
-    close(); onChange && onChange(); input.focus();
+    close(); onChange && onChange(); onPick && onPick(m); input.focus();
   };
   input.oninput = () => { draw(); onChange && onChange(); };
   input.onkeydown = (e) => {
@@ -187,6 +194,24 @@ function wireAutocomplete(input, listEl, onChange) {
     else if (e.key === 'Escape') { close(); }
   };
   input.onblur = () => setTimeout(close, 150);
+}
+
+// Live resolver-type feedback for the last comma-separated token in the To field (spec §3.12).
+// A typed name matching an existing contact's DISPLAY NAME (not its literal address) resolves
+// as a petname (§3.9.3, local, no lookup) using that contact's real trust state; otherwise the
+// raw text is pattern-classified (key-name / DNS / name-chain / @handle / unrecognized) — never
+// a silent guess, matching the spec §3.12.2 fail-closed discipline for an unrecognized form.
+function drawResolverHint(input, hintEl) {
+  const parts = input.value.split(',');
+  const frag = parts[parts.length - 1].trim();
+  if (!frag) { hintEl.innerHTML = ''; return; }
+  const byAddr = PEOPLE.find(p => p.address.toLowerCase() === frag.toLowerCase());
+  const byName = !byAddr && PEOPLE.find(p => p.name.toLowerCase() === frag.toLowerCase());
+  let info, trust;
+  if (byName) { info = RESOLVER_TYPES.petname; trust = byName.trust; }
+  else { info = classifyName(frag); trust = byAddr ? byAddr.trust : undefined; }
+  hintEl.innerHTML = resolverChip(info) + (trust ? trustPill(trust) : '') +
+    `<span class="resolver-note">${esc(resolverDetail(info, trust))}</span>`;
 }
 
 // ----- draft persistence (autosave upsert) -----

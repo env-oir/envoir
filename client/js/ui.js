@@ -88,6 +88,8 @@ const P = {
   // from shield (pure-mesh) and bolt (fast/direct): an arch + deck reads as "crossed a boundary".
   bridge: '<path d="M3 17c2.2-6.4 5-9.6 9-9.6s6.8 3.2 9 9.6"/><path d="M2 17h20"/><path d="M6.5 13.5V17M12 11.5V17M17.5 13.5V17"/>',
   chevRight: '<path d="M9 5l7 7-7 7"/>',
+  // Naming-ladder glyph (spec §3.13.2) — rungs from zero-authority floor to human convenience.
+  ladder: '<path d="M7 3v18M17 3v18"/><path d="M7 8h10M7 13h10M7 18h10"/>',
 };
 export function icon(name, cls = '') {
   return `<svg class="ic ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
