@@ -233,15 +233,36 @@ impl IdentityRegistry {
         Challenge::new(nonce, issued_at)
     }
 
-    /// Consume a single-use admission nonce: remove it from the issued ledger, returning
-    /// [`AdmissionError::UnknownOrConsumedChallenge`] fail-closed if it was never issued or was
-    /// already spent. This is the anti-replay gate.
-    fn consume_nonce(&self, nonce: &[u8; 32]) -> Result<(), AdmissionError> {
+    /// The gateway's own record of when it issued `nonce` (a non-consuming peek), or `None` if the
+    /// nonce was never issued or has already been spent. [`Self::admit`] uses this **authoritative**
+    /// issue time — not the client-presented one — for the freshness window, so a sender cannot widen
+    /// its own validity window by presenting a later `issued_at` (defense-in-depth on top of the
+    /// signature, which already binds `issued_at`).
+    fn peek_issued_at(&self, nonce: &[u8; 32]) -> Option<TimestampMs> {
+        self.issued_nonces.lock().expect("gateway nonce ledger poisoned").get(nonce).copied()
+    }
+
+    /// Consume a single-use admission nonce. **Fail-closed** with
+    /// [`AdmissionError::UnknownOrConsumedChallenge`] if the nonce was never issued, was already
+    /// spent, **or** the client-presented `presented_issued_at` does not EQUAL the issue time the
+    /// gateway recorded at issuance. Binding the presented issue time to the stored one closes an
+    /// admission defense-in-depth gap: the nonce is only removed on an exact match, so a mismatched
+    /// tuple is rejected without burning the live challenge. Returns the gateway's stored issue time
+    /// on success. This is the anti-replay gate.
+    fn consume_nonce(
+        &self,
+        nonce: &[u8; 32],
+        presented_issued_at: TimestampMs,
+    ) -> Result<TimestampMs, AdmissionError> {
         let mut issued = self.issued_nonces.lock().expect("gateway nonce ledger poisoned");
-        if issued.remove(nonce).is_some() {
-            Ok(())
-        } else {
-            Err(AdmissionError::UnknownOrConsumedChallenge)
+        match issued.get(nonce).copied() {
+            // Only spend the nonce when the presented issue time matches what we stored at issuance.
+            Some(stored) if stored == presented_issued_at => {
+                issued.remove(nonce);
+                Ok(stored)
+            }
+            // Never issued, already consumed, or a mismatched issued_at → reject, do NOT remove.
+            _ => Err(AdmissionError::UnknownOrConsumedChallenge),
         }
     }
 
@@ -268,8 +289,14 @@ impl IdentityRegistry {
         sig: &[u8],
         now: TimestampMs,
     ) -> Result<Admission, AdmissionError> {
-        // Freshness first (cheap, secondary replay bound) — reject stale and clock-skew-future challenges.
-        if now < challenge.issued_at || now.saturating_sub(challenge.issued_at) > self.challenge_ttl_ms {
+        // Freshness first (cheap, secondary replay bound) — reject stale and clock-skew-future
+        // challenges. Prefer the gateway's OWN recorded issue time for this nonce over the
+        // client-presented `challenge.issued_at`: a sender must not be able to stretch its validity
+        // window by presenting a later timestamp. When we have no record (a never-issued nonce) we
+        // fall back to the presented value so the request still flows to the single-use consume gate
+        // below, which rejects it fail-closed rather than silently admitting it.
+        let effective_issued_at = self.peek_issued_at(&challenge.nonce).unwrap_or(challenge.issued_at);
+        if now < effective_issued_at || now.saturating_sub(effective_issued_at) > self.challenge_ttl_ms {
             return Err(AdmissionError::ChallengeExpired);
         }
         // Proof of key control: the signature MUST verify under the presented key. A forged answer
@@ -301,9 +328,11 @@ impl IdentityRegistry {
             },
         };
 
-        // Anti-replay gate: the presented nonce must be one this gateway issued and has not already
-        // consumed. Removing it makes the challenge single-use — a captured tuple fails the second time.
-        self.consume_nonce(&challenge.nonce)?;
+        // Anti-replay gate: the presented nonce must be one this gateway issued, not already
+        // consumed, AND carry the exact issue time we recorded at issuance. Removing it makes the
+        // challenge single-use — a captured tuple fails the second time; a tampered issued_at fails
+        // the equality check (defense-in-depth on top of the signature that already binds it).
+        self.consume_nonce(&challenge.nonce, challenge.issued_at)?;
         Ok(admission)
     }
 }
@@ -726,6 +755,42 @@ mod tests {
         assert!(
             reg.admit(&ch2, &alice.public(), &sig2, 1_000_400).is_ok(),
             "a newly issued nonce admits",
+        );
+    }
+
+    #[test]
+    fn admission_rejects_a_mismatched_issued_at_even_with_a_valid_signature() {
+        // Defense-in-depth (the signature already binds issued_at): a challenge presenting a nonce the
+        // gateway issued but a DIFFERENT issued_at than the one recorded at issuance is rejected, and
+        // the equality mismatch does NOT burn the live nonce, so the correctly-timed challenge still
+        // admits afterwards.
+        let alice = IdentityKey::generate();
+        let reg = IdentityRegistry::key_registered().register(RegisteredIdentity {
+            public_key: alice.public(),
+            account: "acct-alice".into(),
+            domain: "alice.net".into(),
+            quota: Quota::messages(10, 10),
+        });
+
+        // Gateway issues nonce N at issue time 1_000_000.
+        let issued = reg.issue_challenge([55u8; 32], 1_000_000);
+
+        // The sender presents the SAME nonce but a tampered issued_at (1_000_050), and signs THAT
+        // (so the signature genuinely verifies over the presented body — the signature guard does not
+        // catch this; the stored-vs-presented equality guard must).
+        let tampered = Challenge::new(issued.nonce, 1_000_050);
+        let sig = signed_answer(&alice, &tampered);
+        assert_eq!(
+            reg.admit(&tampered, &alice.public(), &sig, 1_000_100),
+            Err(AdmissionError::UnknownOrConsumedChallenge),
+            "a nonce presented with an issued_at that differs from the recorded one is refused",
+        );
+
+        // The live nonce survived the mismatch: the correctly-timed challenge still admits once.
+        let sig_ok = signed_answer(&alice, &issued);
+        assert!(
+            reg.admit(&issued, &alice.public(), &sig_ok, 1_000_100).is_ok(),
+            "the correctly-timed challenge for the same nonce still admits (mismatch didn't burn it)",
         );
     }
 

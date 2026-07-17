@@ -61,6 +61,13 @@ impl InMemoryDirectory {
         self.entries.is_empty()
     }
 
+    /// Iterate the configured `(lowercased-email, key)` recipients. The personal run-mode uses this
+    /// to seed the key-registered admission registry from the operator's own directory, so the same
+    /// file that resolves inbound recipients also authorizes those identities to relay outbound.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RecipientKey)> {
+        self.entries.iter().map(|(e, k)| (e.as_str(), k))
+    }
+
     /// Parse the reference directory file format into an [`InMemoryDirectory`].
     ///
     /// One recipient per line, whitespace-separated:
@@ -136,6 +143,11 @@ impl FileDirectory {
     /// Whether the directory resolves nobody.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Iterate the loaded `(lowercased-email, key)` recipients (see [`InMemoryDirectory::iter`]).
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &RecipientKey)> {
+        self.inner.iter()
     }
 }
 

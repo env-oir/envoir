@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# envoir-gateway — PERSONAL (single-operator) config
+#
+#   Run: envoir-gateway personal /path/to/personal.toml
+#
+# This is the "just a gateway for my own email" configuration: one person bridging
+# THEIR OWN domain between legacy SMTP and DMTAP. No mesh, cloud, or billing needed.
+#
+# Format: flat `key = value`. `#` starts a comment. Values may be double-quoted.
+# Every key is OPTIONAL and has a safe default — an unset key is never an open relay.
+# Unknown keys and malformed values are HARD startup errors (fail-closed).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The domain this gateway is the MX for, and signs attestations / DKIM as. YOUR domain.
+domain = "example.org"
+
+# MX listen address.
+#   Production: "0.0.0.0:25"  — needs a real public IP and inbound port 25 open.
+#   Local test: "127.0.0.1:2525" (default is 0.0.0.0:2525).
+listen = "0.0.0.0:25"
+
+# The DKIM / gateway-attestation selector published under your domain (see README DNS).
+selector = "gw1"
+
+# Recursive DNS resolver (ip:port) used for outbound MX/MTA-STS and inbound
+# DKIM/SPF/DMARC TXT lookups.
+dns_server = "1.1.1.1:53"
+
+# Recipient directory: YOUR OWN identities, one per line, whitespace-separated:
+#     <email>  <ed25519-identity-key-b64>  <x25519-seal-key-b64>
+# These come from your envoir node/client (its published keys). Copy the example:
+#     gateway/examples/recipients.directory
+# Unset ⇒ empty directory: every inbound RCPT gets 550 (resolves nobody — safe default).
+directory = "recipients.directory"
+
+# Your envoir node's ingest URL. The converted, recipient-sealed MOTE is POSTed here;
+# a 2xx is the durable-custody ack that lets the gateway answer SMTP 250. Unset ⇒
+# NullMesh: inbound always 451 (the legacy sender retries) — honest, never a silent drop.
+mesh_endpoint = "http://127.0.0.1:8710/dmtap/ingest"
+
+# STARTTLS (all-or-nothing): PEM certificate chain + private key for your MX hostname.
+# Leave both unset for a plaintext dev listener. Get real certs from e.g. Let's Encrypt.
+# tls_cert = "/etc/letsencrypt/live/example.org/fullchain.pem"
+# tls_key  = "/etc/letsencrypt/live/example.org/privkey.pem"
+
+# Outbound-relay admission mode:
+#   "key-registered" (default) — only your own directory identities may relay outbound.
+#   "open-public"              — anyone may relay. A SPAM MAGNET. Never on the public
+#                                internet; only on a trusted, firewalled segment.
+authz_mode = "key-registered"
+
+# Inbound legacy-auth enforcement. Default false = "annotate only" (evaluate but never
+# bounce), so a fresh gateway does not reject legitimate mail on a check you haven't
+# deliberately turned on. Flip to true once you trust each check for your traffic.
+dkim_enforce  = false   # reject present-but-invalid DKIM signatures
+spf_enforce   = false   # reject SPF hard-fails at MAIL FROM
+dmarc_enforce = false   # reject unaligned p=reject / sp=reject
+
+# Optional per-identity hard caps (0 = unlimited). A personal gateway enforces a ceiling;
+# it does not price overage. Handy to bound blast radius if a key is compromised.
+quota_messages = 0
+quota_bytes    = 0
