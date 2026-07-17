@@ -111,17 +111,33 @@ fn main() {
                  \x20   dmarc_enforce   true/false — reject unaligned p=reject/sp=reject (default false)\n\
                  \x20   quota_messages  per-identity message cap (0 = unlimited)\n\
                  \x20   quota_bytes     per-identity byte cap (0 = unlimited)\n\
-                 \x20   imap_enable     serve legacy IMAP to old clients (default off; needs tls_*)\n\
+                 \x20 LEGACY CLIENT ACCESS (spec §7.15; all OFF by default, need tls_*):\n\
+                 \x20   gateway_mode    private (default) | registered-clients-only | public\n\
+                 \x20                    who the legacy surfaces serve; non-private CAN read the mail\n\
+                 \x20   imap_enable     serve legacy IMAP to old clients (RFC 9051; read)\n\
                  \x20   imap_listen     IMAP bind address (default 127.0.0.1:1143)\n\
                  \x20   imap_tls        starttls (default) | implicit\n\
                  \x20   imap_credentials app-password file: '<user> <app-pw> [<ik-b64>]' per line\n\
-                 \x20   imap_maildir    dir of .eml files to project into the served INBOX\n\
+                 \x20                    (shared by IMAP/POP3/submission)\n\
+                 \x20   imap_maildir    dir of .eml files to project into the served INBOX (IMAP+POP3)\n\
+                 \x20   pop3_enable     serve legacy POP3 maildrop (RFC 1939; read)\n\
+                 \x20   pop3_listen     POP3 bind address (default 127.0.0.1:1110)\n\
+                 \x20   pop3_tls        starttls (default, STLS) | implicit\n\
+                 \x20   submission_enable        serve legacy SMTP submission (RFC 6409; outbound)\n\
+                 \x20   submission_listen        bind address (default 127.0.0.1:1587)\n\
+                 \x20   submission_tls           starttls (default) | implicit\n\
+                 \x20   submission_spool         hand-off dir your node picks up (REQUIRED when enabled)\n\
+                 \x20   submission_native_domains domains treated as native (default: domain)\n\
+                 \x20   (CalDAV/CardDAV are NOT served — dmtap-mail has no DAV server yet; see README)\n\
                  \n\
                  ENV (run): the same keys as GATEWAY_DOMAIN, GATEWAY_LISTEN, GATEWAY_GW_SELECTOR,\n\
                  \x20 GATEWAY_DNS_SERVER, GATEWAY_DIRECTORY, GATEWAY_MESH_ENDPOINT, GATEWAY_TLS_CERT,\n\
                  \x20 GATEWAY_TLS_KEY, GATEWAY_AUTHZ_MODE, GATEWAY_{{DKIM,SPF,DMARC}}_ENFORCE,\n\
-                 \x20 GATEWAY_QUOTA_MESSAGES, GATEWAY_QUOTA_BYTES, GATEWAY_IMAP_ENABLE,\n\
-                 \x20 GATEWAY_IMAP_LISTEN, GATEWAY_IMAP_TLS, GATEWAY_IMAP_CREDENTIALS, GATEWAY_IMAP_MAILDIR.\n\
+                 \x20 GATEWAY_QUOTA_MESSAGES, GATEWAY_QUOTA_BYTES, GATEWAY_MODE, GATEWAY_IMAP_ENABLE,\n\
+                 \x20 GATEWAY_IMAP_LISTEN, GATEWAY_IMAP_TLS, GATEWAY_IMAP_CREDENTIALS, GATEWAY_IMAP_MAILDIR,\n\
+                 \x20 GATEWAY_POP3_ENABLE, GATEWAY_POP3_LISTEN, GATEWAY_POP3_TLS, GATEWAY_SUBMISSION_ENABLE,\n\
+                 \x20 GATEWAY_SUBMISSION_LISTEN, GATEWAY_SUBMISSION_TLS, GATEWAY_SUBMISSION_SPOOL,\n\
+                 \x20 GATEWAY_SUBMISSION_NATIVE_DOMAINS.\n\
                  \n\
                  The daemon runs until SIGINT/SIGTERM, then shuts down gracefully.\n\
                  Spec: ../dmtap/07-gateway.md (normative). Stateless; needs a reputable public IP for real mail."

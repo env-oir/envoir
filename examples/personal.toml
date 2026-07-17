@@ -89,5 +89,58 @@ quota_bytes    = 0
 # imap_credentials = "app-passwords.txt"
 
 # Optional directory of RFC 5322 `.eml` files projected into the served INBOX — the
-# operator's own mailbox snapshot. Unset ⇒ the standard empty folder layout.
+# operator's own mailbox snapshot. Shared by the IMAP and POP3 surfaces (same maildrop).
+# Unset ⇒ the standard empty folder layout.
 # imap_maildir = "/var/mail/owner"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR MODE for legacy client access (spec §7.15.4) — governs WHICH accounts
+# the legacy surfaces (IMAP/POP3/submission) will serve, and carries the honest-
+# privacy disclosure (§7.15.3): a NON-private gateway DECRYPTS and can read the
+# mail it serves — that is a deliberate trust decision, not zero-access.
+#
+#   "private" (default)        single operator — you, on your OWN gateway. Zero
+#                              third party reads the mail. At most ONE account.
+#   "registered-clients-only"  only your registered `directory` identities.
+#   "public"                   open registration — any provisioned account (the
+#                              operator can read every served user's mail).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# gateway_mode = "private"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL legacy POP3 access server (spec §7.15.1, RFC 1939) — OFF by default.
+# Download-and-delete maildrop for old clients. Reuses imap_credentials (app-
+# passwords) and imap_maildir (the served maildrop). Requires tls_cert/tls_key.
+# Deletions are session-local (not persisted back; your node is the authority).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# pop3_enable = true
+# Production: "0.0.0.0:995" (implicit TLS) or "0.0.0.0:110" (STLS).
+# pop3_listen = "127.0.0.1:1110"
+# TLS mode: "starttls" (default, STLS) or "implicit".
+# pop3_tls = "starttls"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL legacy SMTP-submission access server (spec §7.15.1, RFC 6409) — OFF by
+# default. Lets old clients SEND. Requires tls_cert/tls_key (the app-password must
+# not travel in cleartext; AUTH is refused on a cleartext channel). Each accepted
+# message is converted to a MOTE and written to submission_spool for YOUR NODE to
+# pick up (native recipients → mesh; legacy recipients → the §7.3 SMTP relay).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# submission_enable = true
+# Production: "0.0.0.0:465" (implicit TLS) or "0.0.0.0:587" (STARTTLS).
+# submission_listen = "127.0.0.1:1587"
+# TLS mode: "starttls" (default) or "implicit".
+# submission_tls = "starttls"
+# Hand-off directory your node picks up accepted outbound messages from (REQUIRED
+# when submission_enable = true — must already exist; the gateway keeps no queue).
+# submission_spool = "/var/spool/envoir-out"
+# Recipient domains treated as NATIVE (→ MOTE / mesh) vs legacy (→ §7.3 bridge).
+# Whitespace/comma-separated. Unset ⇒ defaults to `domain` above.
+# submission_native_domains = "example.org"
+
+# NOTE: CalDAV (RFC 4791) / CardDAV (RFC 6352) are NOT served — dmtap-mail has no
+# DAV server yet, so calendar/contact client access is a documented follow-up gap
+# (not faked). See README "Gaps".

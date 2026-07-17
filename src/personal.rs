@@ -27,7 +27,9 @@ use dmtap_mail::store::{Flag, MemoryStore};
 use rustls::ServerConfig;
 
 use crate::attestation::AttestationKey;
-use crate::authz::{AuthzMode, IdentityRegistry, Quota, QuotaLedger, RegisteredIdentity};
+use crate::authz::{
+    AuthzMode, GatewayMode, IdentityRegistry, Quota, QuotaLedger, RegisteredIdentity,
+};
 use crate::directory::FileDirectory;
 use crate::dkim::DnsDkimKeyResolver;
 use crate::dmarc::DnsDmarcResolver;
@@ -35,10 +37,13 @@ use crate::imap_access::{load_maildir_messages, ImapAccessServer, ImapTls};
 use crate::inbound::{
     AllowAllAbuse, DkimPolicy, DmarcHandling, InboundGateway, KeyDirectory, MeshDelivery, SpfPolicy,
 };
+use crate::legacy_net::LegacyTls;
 use crate::mesh::{HttpMeshDelivery, NullMesh};
 use crate::mta_sts::{DnsTxtResolver, HttpsPolicyFetcher, MtaStsTlsPolicy};
 use crate::mx::DnsMxResolver;
 use crate::outbound::OutboundGateway;
+use crate::pop3_access::Pop3AccessServer;
+use crate::smtp_submission::{SpoolSink, SubmissionServer};
 use crate::spf::DnsSpfResolver;
 use crate::{server_config_from_pem, InMemoryDirectory, MxListener, SmtpTcpTransport};
 
@@ -98,8 +103,39 @@ pub struct PersonalConfig {
     /// email. Unset ⇒ no credentials ⇒ every login is refused (fail-closed).
     pub imap_credentials: Option<String>,
     /// Optional directory of RFC 5322 `.eml` files projected into the served `INBOX` — the operator's
-    /// own mailbox snapshot handed to the gateway. Unset ⇒ the standard empty folder layout.
+    /// own mailbox snapshot handed to the gateway. Unset ⇒ the standard empty folder layout. Shared by
+    /// the IMAP and POP3 surfaces (they project the same maildrop).
     pub imap_maildir: Option<String>,
+    /// The legacy-client service mode (§7.15.4): which accounts the legacy surfaces (IMAP/POP3/
+    /// submission) will serve. Default [`GatewayMode::Private`] (single operator; most restrictive).
+    pub gateway_mode: GatewayMode,
+    /// Enable the OPTIONAL legacy POP3 access server (spec §7.15.1, RFC 1939) so old clients can
+    /// download the INBOX maildrop. **Off by default.** Requires [`tls_cert`](Self::tls_cert)/
+    /// [`tls_key`](Self::tls_key). Reuses [`imap_credentials`](Self::imap_credentials) (app-passwords)
+    /// and [`imap_maildir`](Self::imap_maildir) (the maildrop).
+    pub pop3_enable: bool,
+    /// POP3 access bind address (default `127.0.0.1:1110`). Production: `0.0.0.0:995` with
+    /// `pop3_tls = implicit`, or `0.0.0.0:110` with `pop3_tls = starttls` (STLS).
+    pub pop3_listen: String,
+    /// How the POP3 access server presents TLS: `starttls` (default, STLS) or `implicit`.
+    pub pop3_tls: LegacyTls,
+    /// Enable the OPTIONAL legacy SMTP-submission access server (spec §7.15.1, RFC 6409) so old
+    /// clients can send outbound. **Off by default.** Requires [`tls_cert`](Self::tls_cert)/
+    /// [`tls_key`](Self::tls_key): the app-password must never travel in cleartext, and AUTH is
+    /// refused on a cleartext channel. Reuses [`imap_credentials`](Self::imap_credentials).
+    pub submission_enable: bool,
+    /// Submission access bind address (default `127.0.0.1:1587`). Production: `0.0.0.0:465` with
+    /// `submission_tls = implicit`, or `0.0.0.0:587` with `submission_tls = starttls` (STARTTLS).
+    pub submission_listen: String,
+    /// How the submission access server presents TLS: `starttls` (default) or `implicit`.
+    pub submission_tls: LegacyTls,
+    /// Directory the accepted submissions are handed off into for the operator's node to pick up
+    /// (§7.4: the gateway keeps no queue). Unset ⇒ accepted messages are logged and dropped after the
+    /// `250` (honest: no durable hand-off), so set this to actually deliver.
+    pub submission_spool: Option<String>,
+    /// Recipient domains treated as **native** DMTAP destinations (→ MOTE / mesh) rather than legacy
+    /// (→ §7.3 bridge). Whitespace/comma-separated. Unset ⇒ defaults to [`domain`](Self::domain).
+    pub submission_native_domains: Option<String>,
 }
 
 impl Default for PersonalConfig {
@@ -124,6 +160,15 @@ impl Default for PersonalConfig {
             imap_tls: ImapTls::StartTls,
             imap_credentials: None,
             imap_maildir: None,
+            gateway_mode: GatewayMode::Private,
+            pop3_enable: false,
+            pop3_listen: "127.0.0.1:1110".to_string(),
+            pop3_tls: LegacyTls::StartTls,
+            submission_enable: false,
+            submission_listen: "127.0.0.1:1587".to_string(),
+            submission_tls: LegacyTls::StartTls,
+            submission_spool: None,
+            submission_native_domains: None,
         }
     }
 }
@@ -239,6 +284,30 @@ impl PersonalConfig {
             }
             "imap_credentials" => self.imap_credentials = non_empty(value),
             "imap_maildir" => self.imap_maildir = non_empty(value),
+            "gateway_mode" => {
+                self.gateway_mode = GatewayMode::parse(&value).ok_or_else(|| {
+                    bad("expected \"private\", \"registered-clients-only\", or \"public\"")
+                })?
+            }
+            "pop3_enable" => {
+                self.pop3_enable = parse_bool(&value).ok_or_else(|| bad("expected true/false"))?
+            }
+            "pop3_listen" => self.pop3_listen = value,
+            "pop3_tls" => {
+                self.pop3_tls = LegacyTls::parse(&value)
+                    .ok_or_else(|| bad("expected \"starttls\" or \"implicit\""))?
+            }
+            "submission_enable" => {
+                self.submission_enable =
+                    parse_bool(&value).ok_or_else(|| bad("expected true/false"))?
+            }
+            "submission_listen" => self.submission_listen = value,
+            "submission_tls" => {
+                self.submission_tls = LegacyTls::parse(&value)
+                    .ok_or_else(|| bad("expected \"starttls\" or \"implicit\""))?
+            }
+            "submission_spool" => self.submission_spool = non_empty(value),
+            "submission_native_domains" => self.submission_native_domains = non_empty(value),
             other => return Err(ConfigError::UnknownKey { line, key: other.to_string() }),
         }
         Ok(())
@@ -287,6 +356,28 @@ impl PersonalConfig {
         }
         cfg.imap_credentials = std::env::var("GATEWAY_IMAP_CREDENTIALS").ok().and_then(non_empty);
         cfg.imap_maildir = std::env::var("GATEWAY_IMAP_MAILDIR").ok().and_then(non_empty);
+        if let Some(m) = std::env::var("GATEWAY_MODE").ok().and_then(|v| GatewayMode::parse(&v)) {
+            cfg.gateway_mode = m;
+        }
+        cfg.pop3_enable = env_flag("GATEWAY_POP3_ENABLE");
+        if let Ok(v) = std::env::var("GATEWAY_POP3_LISTEN") {
+            cfg.pop3_listen = v;
+        }
+        if let Some(m) = std::env::var("GATEWAY_POP3_TLS").ok().and_then(|v| LegacyTls::parse(&v)) {
+            cfg.pop3_tls = m;
+        }
+        cfg.submission_enable = env_flag("GATEWAY_SUBMISSION_ENABLE");
+        if let Ok(v) = std::env::var("GATEWAY_SUBMISSION_LISTEN") {
+            cfg.submission_listen = v;
+        }
+        if let Some(m) =
+            std::env::var("GATEWAY_SUBMISSION_TLS").ok().and_then(|v| LegacyTls::parse(&v))
+        {
+            cfg.submission_tls = m;
+        }
+        cfg.submission_spool = std::env::var("GATEWAY_SUBMISSION_SPOOL").ok().and_then(non_empty);
+        cfg.submission_native_domains =
+            std::env::var("GATEWAY_SUBMISSION_NATIVE_DOMAINS").ok().and_then(non_empty);
         cfg
     }
 
@@ -418,18 +509,21 @@ impl PersonalConfig {
         ledger
     }
 
-    /// Load the IMAP app-password authenticator from the credentials file (`<username>
-    /// <app-password> [<identity-pub-b64>]` per line). When the identity key is omitted it is
-    /// resolved from the recipient directory by username→email. Fail-closed: a malformed line, a bad
-    /// base64 key, or an unknown user with no explicit key is a hard error; an unset file yields an
-    /// empty authenticator (every login refused). Returns the authenticator and the credential count.
-    fn load_imap_authenticator(
+    /// Load the shared legacy app-password authenticator from the credentials file (`<username>
+    /// <app-password> [<identity-pub-b64>]` per line) — used by all legacy surfaces (IMAP, POP3,
+    /// SMTP-submission). When the identity key is omitted it is resolved from the recipient directory
+    /// by username→email. Fail-closed: a malformed line, a bad base64 key, or an unknown user with no
+    /// explicit key is a hard error; an unset file yields an empty authenticator (every login
+    /// refused). Returns the authenticator and the list of credential usernames (accounts served) so
+    /// the caller can enforce the operator mode (§7.15.4).
+    fn load_legacy_credentials(
         &self,
         dir: &DirectorySource,
-    ) -> std::io::Result<(StaticAuthenticator, usize)> {
+    ) -> std::io::Result<(StaticAuthenticator, Vec<String>)> {
         let mut auth = StaticAuthenticator::new();
+        let mut accounts = Vec::new();
         let Some(path) = &self.imap_credentials else {
-            return Ok((auth, 0));
+            return Ok((auth, accounts));
         };
         let text = std::fs::read_to_string(path)
             .map_err(|e| std::io::Error::new(e.kind(), format!("imap_credentials {path}: {e}")))?;
@@ -439,7 +533,6 @@ impl PersonalConfig {
                 format!("imap_credentials {path} line {line}: {msg}"),
             )
         };
-        let mut count = 0usize;
         for (idx, raw) in text.lines().enumerate() {
             let line = idx + 1;
             let stripped = strip_comment(raw);
@@ -466,9 +559,63 @@ impl PersonalConfig {
                 return Err(invalid(line, "too many fields"));
             }
             auth.issue(user, password, identity_pub, "app-password");
-            count += 1;
+            accounts.push(user.to_string());
         }
-        Ok((auth, count))
+        Ok((auth, accounts))
+    }
+
+    /// Enforce the legacy-client operator mode (§7.15.4) against the accounts a credentials file would
+    /// serve — the fail-closed gate that decides *which* accounts the legacy surfaces admit:
+    ///
+    /// - [`GatewayMode::Private`]: a single-operator gateway. At most **one** distinct account may be
+    ///   served; a credentials file naming two different users is refused (a private gateway is for
+    ///   *your own* clients, not several people's).
+    /// - [`GatewayMode::RegisteredClientsOnly`]: every served account MUST be one of the operator's
+    ///   own directory identities (the established registration relationship, §7.12). An account with
+    ///   no matching directory entry is refused.
+    /// - [`GatewayMode::Public`]: open registration — any provisioned account is served.
+    ///
+    /// Case-insensitive account/email comparison throughout. Returns the number of distinct accounts.
+    fn enforce_gateway_mode(
+        &self,
+        dir: &DirectorySource,
+        accounts: &[String],
+    ) -> std::io::Result<usize> {
+        let deny = |msg: String| std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg);
+        let mut distinct: Vec<String> = Vec::new();
+        for a in accounts {
+            let lc = a.to_ascii_lowercase();
+            if !distinct.contains(&lc) {
+                distinct.push(lc);
+            }
+        }
+        match self.gateway_mode {
+            GatewayMode::Private => {
+                if distinct.len() > 1 {
+                    return Err(deny(format!(
+                        "gateway_mode=private serves a single operator, but the credentials name {} \
+                         distinct accounts ({:?}). Use registered-clients-only or public to serve \
+                         more than one identity (§7.15.4).",
+                        distinct.len(),
+                        distinct,
+                    )));
+                }
+            }
+            GatewayMode::RegisteredClientsOnly => {
+                for a in &distinct {
+                    let registered = dir.iter().any(|(email, _)| email.eq_ignore_ascii_case(a));
+                    if !registered {
+                        return Err(deny(format!(
+                            "gateway_mode=registered-clients-only serves only registered directory \
+                             identities, but credential account {a:?} is not in the recipient \
+                             directory (§7.15.4). Add it to `directory` or switch mode."
+                        )));
+                    }
+                }
+            }
+            GatewayMode::Public => {}
+        }
+        Ok(distinct.len())
     }
 
     /// Build the optional IMAP access deployment, or `None` when `imap_enable` is false. Fail-closed:
@@ -488,7 +635,8 @@ impl PersonalConfig {
                 "imap_enable=true requires tls_cert + tls_key — IMAP app-passwords must not travel in cleartext",
             )
         })?;
-        let (auth, cred_count) = self.load_imap_authenticator(dir)?;
+        let (auth, accounts) = self.load_legacy_credentials(dir)?;
+        let served = self.enforce_gateway_mode(dir, &accounts)?;
         let seed = match &self.imap_maildir {
             Some(d) => load_maildir_messages(d)?,
             None => Vec::new(),
@@ -496,18 +644,130 @@ impl PersonalConfig {
         let server = ImapAccessServer::bind(&self.imap_listen, tls, self.imap_tls)?;
         let bound = server.local_addr()?;
         eprintln!(
-            "gateway[imap]: legacy IMAP access on {bound} ({:?}); {} credential(s); {} seeded message(s)",
+            "gateway[imap]: legacy IMAP access on {bound} ({:?}); mode={}; {} account(s); {} seeded message(s)",
             self.imap_tls,
-            cred_count,
+            self.gateway_mode.label(),
+            served,
             seed.len()
         );
-        if cred_count == 0 {
+        if accounts.is_empty() {
             eprintln!(
                 "gateway[imap]: WARNING — no imap_credentials configured; every login will be refused \
                  (fail-closed). Set imap_credentials to issue app-passwords."
             );
         }
         Ok(Some(ImapDeployment { server, seed: Arc::new(seed), auth: Arc::new(auth) }))
+    }
+
+    /// Build the optional POP3 access deployment, or `None` when `pop3_enable` is false. Same
+    /// fail-closed rules as [`Self::build_imap`]: TLS is mandatory (app-passwords must not travel in
+    /// cleartext), the operator mode (§7.15.4) is enforced against the served accounts, and the served
+    /// maildrop is the operator's own `imap_maildir` snapshot.
+    fn build_pop3(
+        &self,
+        dir: &DirectorySource,
+        tls: Option<Arc<ServerConfig>>,
+    ) -> std::io::Result<Option<Pop3Deployment>> {
+        if !self.pop3_enable {
+            return Ok(None);
+        }
+        let tls = tls.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pop3_enable=true requires tls_cert + tls_key — POP3 app-passwords must not travel in cleartext",
+            )
+        })?;
+        let (auth, accounts) = self.load_legacy_credentials(dir)?;
+        let served = self.enforce_gateway_mode(dir, &accounts)?;
+        let seed = match &self.imap_maildir {
+            Some(d) => load_maildir_messages(d)?,
+            None => Vec::new(),
+        };
+        let server = Pop3AccessServer::bind(&self.pop3_listen, tls, self.pop3_tls)?;
+        let bound = server.local_addr()?;
+        eprintln!(
+            "gateway[pop3]: legacy POP3 access on {bound} ({:?}); mode={}; {} account(s); {} seeded message(s)",
+            self.pop3_tls,
+            self.gateway_mode.label(),
+            served,
+            seed.len()
+        );
+        if accounts.is_empty() {
+            eprintln!(
+                "gateway[pop3]: WARNING — no imap_credentials configured; every login will be refused \
+                 (fail-closed)."
+            );
+        }
+        Ok(Some(Pop3Deployment { server, seed: Arc::new(seed), auth: Arc::new(auth) }))
+    }
+
+    /// The recipient domains a submitted message is treated as **native** for (→ MOTE / mesh); any
+    /// other domain is legacy (→ §7.3 bridge). From `submission_native_domains` if set, else the
+    /// gateway's own `domain`.
+    fn submission_native_domains(&self) -> Vec<String> {
+        match &self.submission_native_domains {
+            Some(list) => list
+                .split([',', ' ', '\t'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+            None => vec![self.domain.clone()],
+        }
+    }
+
+    /// Build the optional SMTP-submission access deployment, or `None` when `submission_enable` is
+    /// false. Fail-closed like the read surfaces: TLS is mandatory (the app-password must not travel
+    /// in cleartext, and `dmtap-mail`'s session refuses AUTH on a cleartext channel), the operator
+    /// mode (§7.15.4) is enforced, and a configured `submission_spool` must be an existing directory.
+    fn build_submission(
+        &self,
+        dir: &DirectorySource,
+        tls: Option<Arc<ServerConfig>>,
+    ) -> std::io::Result<Option<SubmissionDeployment>> {
+        if !self.submission_enable {
+            return Ok(None);
+        }
+        let tls = tls.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submission_enable=true requires tls_cert + tls_key — the app-password must not travel in cleartext",
+            )
+        })?;
+        let (auth, accounts) = self.load_legacy_credentials(dir)?;
+        let served = self.enforce_gateway_mode(dir, &accounts)?;
+        let native = self.submission_native_domains();
+        let sink: Arc<SpoolSink> = match &self.submission_spool {
+            Some(spool) => Arc::new(SpoolSink::new(spool)?),
+            None => return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "submission_enable=true requires submission_spool (a hand-off directory your node \
+                     picks up); without it accepted mail would be dropped after the 250",
+            )),
+        };
+        let server = SubmissionServer::bind(
+            &self.submission_listen,
+            tls,
+            self.submission_tls,
+            native.clone(),
+        )?;
+        let bound = server.local_addr()?;
+        eprintln!(
+            "gateway[submission]: legacy SMTP-submission on {bound} ({:?}); mode={}; {} account(s); \
+             native domains {:?}; spool {}",
+            self.submission_tls,
+            self.gateway_mode.label(),
+            served,
+            native,
+            self.submission_spool.as_deref().unwrap_or("-"),
+        );
+        if accounts.is_empty() {
+            eprintln!(
+                "gateway[submission]: WARNING — no imap_credentials configured; every AUTH will be \
+                 refused (fail-closed)."
+            );
+        }
+        Ok(Some(SubmissionDeployment { server, auth: Arc::new(auth), sink }))
     }
 
     /// Run the personal gateway daemon: bind the inbound MX, wire the outbound/admission/quota seams,
@@ -559,9 +819,24 @@ impl PersonalConfig {
             );
         }
 
-        // Build the optional legacy IMAP access server BEFORE consuming the directory (it resolves
-        // credential identities from the same directory) — fail-closed at startup on any misconfig.
+        // Build the optional legacy access surfaces (IMAP / POP3 / SMTP-submission, §7.15.1) BEFORE
+        // consuming the directory (they resolve credential identities from the same directory and
+        // enforce the operator mode §7.15.4 against it) — fail-closed at startup on any misconfig.
+        eprintln!(
+            "gateway[personal]: legacy-client mode = {} (§7.15.4)",
+            self.gateway_mode.label()
+        );
+        if !self.gateway_mode.is_zero_third_party()
+            && (self.imap_enable || self.pop3_enable || self.submission_enable)
+        {
+            eprintln!(
+                "gateway[personal]: NOTE — a non-private gateway DECRYPTS and can read the mail it \
+                 serves (§7.15.3). This is a disclosed trust decision, not zero-access."
+            );
+        }
         let imap = self.build_imap(&dir_source, tls.clone())?;
+        let pop3 = self.build_pop3(&dir_source, tls.clone())?;
+        let submission = self.build_submission(&dir_source, tls.clone())?;
 
         let directory: Box<dyn KeyDirectory> = dir_source.into_boxed();
         let gw = self.build_inbound(directory, mesh);
@@ -574,21 +849,26 @@ impl PersonalConfig {
         let bound = listener.local_addr()?;
         eprintln!("gateway[personal]: inbound MX listening on {bound} for {} — up (SIGINT/SIGTERM to stop)", self.domain);
 
-        // Serve the inbound MX (this thread) and, when enabled, the legacy IMAP access server (its own
-        // thread) concurrently. Both poll the SAME shutdown flag, so one SIGINT/SIGTERM stops both.
-        // The MX gateway is not `Send`, so it stays on this thread; the IMAP side is fully `Send`.
-        match imap {
-            Some(dep) => std::thread::scope(|scope| -> std::io::Result<()> {
-                let imap_handle = scope.spawn(|| dep.run(shutdown));
-                let mx = listener.serve_until(&gw, shutdown);
-                let imap_res = imap_handle
-                    .join()
-                    .map_err(|_| std::io::Error::other("IMAP thread panicked"))?;
-                mx?;
-                imap_res
-            })?,
-            None => listener.serve_until(&gw, shutdown)?,
-        }
+        // Serve the inbound MX (this thread) and every enabled legacy access surface (each on its own
+        // thread) concurrently. All poll the SAME shutdown flag, so one SIGINT/SIGTERM stops them all.
+        // The MX gateway is not `Send`, so it stays on this thread; the legacy servers are all `Send`.
+        std::thread::scope(|scope| -> std::io::Result<()> {
+            let mut handles: Vec<std::thread::ScopedJoinHandle<std::io::Result<()>>> = Vec::new();
+            if let Some(dep) = imap {
+                handles.push(scope.spawn(move || dep.run(shutdown)));
+            }
+            if let Some(dep) = pop3 {
+                handles.push(scope.spawn(move || dep.run(shutdown)));
+            }
+            if let Some(dep) = submission {
+                handles.push(scope.spawn(move || dep.run(shutdown)));
+            }
+            let mx = listener.serve_until(&gw, shutdown);
+            for h in handles {
+                h.join().map_err(|_| std::io::Error::other("legacy access thread panicked"))??;
+            }
+            mx
+        })?;
         eprintln!(
             "gateway[personal]: shutdown signal received — stopped accepting, exiting cleanly"
         );
@@ -668,6 +948,51 @@ impl ImapDeployment {
             move || (*auth).clone(),
             shutdown,
         )
+    }
+}
+
+/// A built, bound legacy POP3 access server plus the maildrop snapshot + authenticator — the POP3
+/// sibling of [`ImapDeployment`]. Serves the same `imap_maildir` snapshot as a POP3 maildrop.
+struct Pop3Deployment {
+    server: Pop3AccessServer,
+    seed: Arc<Vec<(Vec<u8>, u64)>>,
+    auth: Arc<StaticAuthenticator>,
+}
+
+impl Pop3Deployment {
+    /// Serve the POP3 access listener until `shutdown` flips. Each connection gets its own store
+    /// (rebuilt from the snapshot) and a clone of the app-password authenticator.
+    fn run(self, shutdown: &AtomicBool) -> std::io::Result<()> {
+        let seed = self.seed;
+        let auth = self.auth;
+        self.server.serve_until(
+            move || {
+                let mut store = MemoryStore::new();
+                for (raw, ts) in seed.iter() {
+                    store.deliver_raw("INBOX", raw.clone(), vec![Flag::Recent], *ts);
+                }
+                store
+            },
+            move || (*auth).clone(),
+            shutdown,
+        )
+    }
+}
+
+/// A built, bound legacy SMTP-submission access server plus the authenticator and the [`SpoolSink`]
+/// accepted messages are handed off to — the outbound sibling of [`ImapDeployment`].
+struct SubmissionDeployment {
+    server: SubmissionServer,
+    auth: Arc<StaticAuthenticator>,
+    sink: Arc<SpoolSink>,
+}
+
+impl SubmissionDeployment {
+    /// Serve the submission access listener until `shutdown` flips. Each connection gets a clone of
+    /// the app-password authenticator; all share the one spool sink.
+    fn run(self, shutdown: &AtomicBool) -> std::io::Result<()> {
+        let auth = self.auth;
+        self.server.serve_until(move || (*auth).clone(), self.sink, shutdown)
     }
 }
 
@@ -801,6 +1126,112 @@ mod tests {
     }
 
     #[test]
+    fn pop3_and_submission_keys_parse_and_default_off_and_require_tls() {
+        // Off by default; safe defaults.
+        let cfg = PersonalConfig::default();
+        assert!(!cfg.pop3_enable && !cfg.submission_enable, "both legacy surfaces off by default");
+        assert_eq!(cfg.gateway_mode, GatewayMode::Private, "default mode is the most restrictive");
+        assert_eq!(cfg.pop3_tls, LegacyTls::StartTls);
+        assert_eq!(cfg.submission_tls, LegacyTls::StartTls);
+
+        let text = r#"
+            gateway_mode              = public
+            pop3_enable               = true
+            pop3_listen               = "0.0.0.0:995"
+            pop3_tls                  = implicit
+            submission_enable         = true
+            submission_listen         = "0.0.0.0:465"
+            submission_tls            = implicit
+            submission_spool          = "/var/spool/envoir-out"
+            submission_native_domains = "example.org, mail.example.org"
+        "#;
+        let cfg = PersonalConfig::parse(text).unwrap();
+        assert_eq!(cfg.gateway_mode, GatewayMode::Public);
+        assert!(cfg.pop3_enable && cfg.submission_enable);
+        assert_eq!(cfg.pop3_listen, "0.0.0.0:995");
+        assert_eq!(cfg.pop3_tls, LegacyTls::Implicit);
+        assert_eq!(cfg.submission_tls, LegacyTls::Implicit);
+        assert_eq!(cfg.submission_spool.as_deref(), Some("/var/spool/envoir-out"));
+        assert_eq!(
+            cfg.submission_native_domains(),
+            vec!["example.org".to_string(), "mail.example.org".to_string()]
+        );
+
+        // A bad mode value fails closed.
+        assert!(matches!(
+            PersonalConfig::parse("gateway_mode = whatever\n").unwrap_err(),
+            ConfigError::BadValue { key, .. } if key == "gateway_mode"
+        ));
+
+        // Enabling either surface without TLS is a hard error (no cleartext app-passwords).
+        let dir = PersonalConfig::default().load_directory().unwrap();
+        let no_tls = PersonalConfig { pop3_enable: true, ..PersonalConfig::default() };
+        assert!(no_tls.build_pop3(&dir, None).is_err(), "pop3 without TLS must fail closed");
+        let no_tls = PersonalConfig { submission_enable: true, ..PersonalConfig::default() };
+        assert!(
+            no_tls.build_submission(&dir, None).is_err(),
+            "submission without TLS must fail closed"
+        );
+
+        // Native domains default to the gateway's own domain.
+        let cfg = PersonalConfig { domain: "host.net".into(), ..PersonalConfig::default() };
+        assert_eq!(cfg.submission_native_domains(), vec!["host.net".to_string()]);
+    }
+
+    #[test]
+    fn operator_mode_gates_which_accounts_are_served() {
+        // Set up a directory with ONE registered identity (me@example.org).
+        let ik = IdentityKey::generate();
+        let seal = dmtap_core::mote::SealKeypair::generate();
+        let mut dirpath = std::env::temp_dir();
+        dirpath.push(format!("envoir-gw-mode-dir-{}.txt", std::process::id()));
+        std::fs::write(
+            &dirpath,
+            format!(
+                "me@example.org {} {}\n",
+                b64::encode(&ik.public()),
+                b64::encode(seal.public())
+            ),
+        )
+        .unwrap();
+
+        let base = PersonalConfig {
+            domain: "example.org".into(),
+            directory: Some(dirpath.display().to_string()),
+            ..PersonalConfig::default()
+        };
+        let dir = base.load_directory().unwrap();
+
+        let one = vec!["me@example.org".to_string()];
+        let two = vec!["me@example.org".to_string(), "guest@example.org".to_string()];
+        let stranger = vec!["stranger@elsewhere.net".to_string()];
+
+        // PRIVATE: one account OK, two distinct accounts refused (single operator, §7.15.4).
+        let private = PersonalConfig { gateway_mode: GatewayMode::Private, ..base.clone() };
+        assert!(private.enforce_gateway_mode(&dir, &one).is_ok());
+        assert!(
+            private.enforce_gateway_mode(&dir, &two).is_err(),
+            "private serves a single operator only"
+        );
+
+        // REGISTERED-CLIENTS-ONLY: a registered account OK, an unregistered one refused.
+        let reg =
+            PersonalConfig { gateway_mode: GatewayMode::RegisteredClientsOnly, ..base.clone() };
+        assert!(reg.enforce_gateway_mode(&dir, &one).is_ok());
+        assert!(
+            reg.enforce_gateway_mode(&dir, &stranger).is_err(),
+            "an unregistered account is refused in registered-clients-only mode"
+        );
+
+        // PUBLIC: anything goes (open registration).
+        let public = PersonalConfig { gateway_mode: GatewayMode::Public, ..base.clone() };
+        assert!(public.enforce_gateway_mode(&dir, &two).is_ok());
+        assert!(public.enforce_gateway_mode(&dir, &stranger).is_ok());
+
+        let _ = std::fs::remove_file(&dirpath);
+    }
+
+    #[test]
     fn imap_credentials_bind_to_directory_identity_and_fail_closed() {
         // A credentials file that omits the identity key resolves it from the recipient directory.
         let ik = IdentityKey::generate();
@@ -835,8 +1266,8 @@ mod tests {
             ..PersonalConfig::default()
         };
         let dir = cfg.load_directory().unwrap();
-        let (auth, count) = cfg.load_imap_authenticator(&dir).unwrap();
-        assert_eq!(count, 2, "both credential lines load");
+        let (auth, accounts) = cfg.load_legacy_credentials(&dir).unwrap();
+        assert_eq!(accounts.len(), 2, "both credential lines load");
         // The directory-bound credential authenticates and resolves to the directory identity key.
         assert_eq!(
             dmtap_mail::auth::Authenticator::verify(&auth, "me@example.org", "app-pw-1"),
@@ -851,7 +1282,7 @@ mod tests {
         // An unknown user with no explicit key is a hard error (cannot bind an identity).
         std::fs::write(&credpath, "ghost@example.org app-pw-3\n").unwrap();
         assert!(
-            cfg.load_imap_authenticator(&dir).is_err(),
+            cfg.load_legacy_credentials(&dir).is_err(),
             "unknown user + no key must fail closed"
         );
 

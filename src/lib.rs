@@ -71,6 +71,7 @@ pub mod forwarded_addr;
 pub mod imap_access;
 pub mod inbound;
 pub mod inbound_tcp;
+pub mod legacy_net;
 pub mod mesh;
 pub mod mta_sts;
 pub mod mx;
@@ -79,7 +80,9 @@ pub mod outbound;
 pub mod outbound_guard;
 pub mod outbound_tcp;
 pub mod personal;
+pub mod pop3_access;
 pub mod provenance;
+pub mod smtp_submission;
 pub mod spf;
 
 pub use alias_map::{
@@ -88,8 +91,8 @@ pub use alias_map::{
 pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolver, StaticGwKeys};
 pub use authz::{
     key_derived_localpart, random_nonce, Admission, AdmissionError, AliasAllocator, AliasError,
-    AuthzMode, Challenge, IdentityRegistry, Quota, QuotaError, QuotaLedger, RegisteredIdentity,
-    Usage, RESERVED_ALIAS_PREFIX,
+    AuthzMode, Challenge, GatewayMode, IdentityRegistry, Quota, QuotaError, QuotaLedger,
+    RegisteredIdentity, Usage, RESERVED_ALIAS_PREFIX,
 };
 pub use directory::{DirectoryError, FileDirectory, InMemoryDirectory};
 pub use dkim::{
@@ -114,6 +117,7 @@ pub use inbound::{
 pub use inbound_tcp::{
     load_certs, load_private_key, server_config, server_config_from_pem, MxListener,
 };
+pub use legacy_net::{LegacyTls, LineProtocol};
 pub use mesh::{HttpMeshDelivery, MeshConfigError, NullMesh};
 pub use mta_sts::{
     DnsTxtResolver, HttpsPolicyFetcher, InMemoryPolicyFetcher, InMemoryTxtResolver,
@@ -127,9 +131,13 @@ pub use outbound::{
 pub use outbound_guard::{OutboundSenderGuard, SenderVerdict};
 pub use outbound_tcp::SmtpTcpTransport;
 pub use personal::{ConfigError, DirectorySource, PersonalConfig};
+pub use pop3_access::Pop3AccessServer;
 pub use provenance::{
     chain_append, msg_digest, AuthzDecision, Bridge, BridgeDirection, BridgeError, CountingMeter,
     GatewayAttestation, GatewayAuthz, GatewayMeter, MeterEvent, NullMeter, Origin, Profile,
     ProvenanceError, ProvenanceRecord, StaticGatewayAuthz, Tier,
+};
+pub use smtp_submission::{
+    Destination, RoutedSubmission, SpoolSink, SubmissionServer, SubmissionSink,
 };
 pub use spf::{DnsSpfResolver, InMemorySpfResolver, SpfOutcome, SpfResolver, SpfResult};

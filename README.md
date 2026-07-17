@@ -53,7 +53,11 @@ from `GATEWAY_*` environment variables instead (handy for systemd/containers). S
 [`examples/personal.toml`](examples/personal.toml) or `envoir-gateway help` for the full key list:
 `domain`, `listen`, `selector`, `dns_server`, `directory`, `mesh_endpoint`, `tls_cert`/`tls_key`,
 `authz_mode` (`key-registered` default / `open-public`), `dkim_enforce`/`spf_enforce`/`dmarc_enforce`,
-`quota_messages`/`quota_bytes`.
+`quota_messages`/`quota_bytes`; legacy client access (§7.15, all off by default): `gateway_mode`
+(`private` default / `registered-clients-only` / `public`), `imap_enable`/`imap_listen`/`imap_tls`,
+`imap_credentials`, `imap_maildir`, `pop3_enable`/`pop3_listen`/`pop3_tls`,
+`submission_enable`/`submission_listen`/`submission_tls`, `submission_spool`,
+`submission_native_domains`.
 
 ### DNS records you must publish for your domain
 
@@ -95,6 +99,74 @@ selector label.
 - **Outbound** (DMTAP → legacy): translate a `mail` MOTE to RFC 5322, DKIM-sign as the sender's
   domain via a **delegated selector** (the gateway never holds the user's DMTAP key), send via
   SMTP with MTA-STS/DANE. On failure the user's node retries. Stores nothing.
+- **Legacy client access** (§7.15): serve the operator's own mailbox to old client apps
+  (Thunderbird, Apple Mail, Outlook, mutt) over **IMAP**, **POP3**, and **SMTP-submission** —
+  all optional, off by default, TLS-required, and app-password authenticated. See below.
+
+## Legacy client access & the reachability ingress (§7.15)
+
+The DMTAP node itself speaks only JMAP over the mesh and runs **no** legacy protocol server. Every
+legacy client surface — and the ingress that carries a legacy client to it — is a **gateway** surface
+(spec §7.15). This gateway can optionally serve:
+
+| Surface | RFC | Direction | Config |
+| ------- | --- | --------- | ------ |
+| IMAP | 9051 / 3501 | read (folders/flags) | `imap_enable` |
+| POP3 | 1939 | read (maildrop) | `pop3_enable` |
+| SMTP-submission | 6409 | outbound (submit) | `submission_enable` |
+| CalDAV / CardDAV | 4791 / 6352 | calendar/contacts | **not yet — see "Gaps" below** |
+
+All three implemented surfaces are **OFF by default**, require `tls_cert`/`tls_key` (an app-password
+must never travel in cleartext — the submission server additionally refuses `AUTH` on a cleartext
+channel, `538`), and authenticate with **app-passwords** issued in `imap_credentials` (shared across
+IMAP/POP3/submission). The read surfaces project the operator's own mailbox snapshot (`imap_maildir`)
+and are **session-local** (mutations are not persisted back — the node stays the mailbox authority).
+The submission server converts each accepted RFC 5322 message to a MOTE and hands it to a hand-off
+**spool** directory (`submission_spool`) the operator's node picks up (native recipients → mesh,
+legacy recipients → the §7.3 SMTP relay); the classification of *native* vs *legacy* is by
+`submission_native_domains` (defaults to your own `domain`).
+
+### The reachability ingress
+
+A legacy client opens a raw protocol/TLS connection (IMAPS 993, POP3S 995, SMTPS 465, or the
+STARTTLS/STLS variants on 143/110/587) to a hostname. Because DMTAP nodes have no static IP and
+legacy clients cannot speak the mesh, **the gateway is the reachability ingress**: it accepts the
+inbound legacy connection (routed by SNI / stream to the right mailbox), **terminates TLS**, and
+speaks the legacy protocol against the mailbox. This is a gateway surface and is **distinct from** the
+node's native mesh relay (which carries ciphertext-only, content-blind node↔node traffic and never
+speaks a legacy protocol). The legacy protocol is spoken in the clear only *after* TLS is terminated
+here.
+
+### Honest privacy (§7.15.3) — a non-private gateway can read your mail
+
+To speak IMAP/POP3/SMTP-submission the gateway **MUST decrypt** the mailbox — these protocols have no
+notion of DMTAP object encryption. So a legacy client's mail is **visible in the clear to whatever
+gateway serves it**: a gateway serving legacy clients is **not** content-blind for those clients.
+This is unlike the node's native JMAP + mesh path, which is zero-access / zero-intermediary. Run your
+**own** gateway (mode `private`) and no external party ever decrypts your mail; a public / third-party
+gateway is a deliberate trust decision, equivalent to choosing a hosted mail provider.
+
+### Operator modes (§7.15.4) — `gateway_mode`
+
+The operator declares, and this gateway **enforces**, which accounts the legacy surfaces will serve:
+
+| `gateway_mode` | Serves | Trust |
+| -------------- | ------ | ----- |
+| `private` (**default**) | a single operator — you, on your own gateway | zero third party can read the mail (you *are* the operator) |
+| `registered-clients-only` | only your registered directory identities | same read-access for those users; not open to strangers |
+| `public` | open registration — any provisioned account | the operator can read the mail of every user it serves |
+
+The gate is fail-closed at startup: in `private` mode a credentials file naming more than one distinct
+account is refused; in `registered-clients-only` every credential account must be present in
+`directory`; `public` is unrestricted. Default is the most restrictive (`private`).
+
+### Gaps (not faked)
+
+**CalDAV (RFC 4791) / CardDAV (RFC 6352) are NOT implemented.** The shared `dmtap-mail` library
+provides IMAP/POP3/SMTP/JMAP servers but **no DAV server**, so there is nothing to wire yet — the
+gateway does not pretend to serve calendar/contacts. Projecting JSCalendar/JSContact MOTEs as
+iCalendar/vCard for DAV clients is a documented follow-up (it needs a DAV server + iCalendar/vCard
+projection in `dmtap-mail` first).
 
 ## Statelessness
 
@@ -149,7 +221,7 @@ gateway now depends on `dmtap-core` / `dmtap-mail` via a git tag rather than sib
 
 ```sh
 cargo build            # fetches the git-tag dmtap-core / dmtap-mail deps, then builds
-cargo test             # ~220 tests, all in-process (no sockets, no network)
+cargo test             # ~240 tests (unit in-process + real-socket TLS legacy-access integration)
 ```
 
 If your environment restricts anonymous git fetches, set `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo

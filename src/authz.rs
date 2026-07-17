@@ -56,6 +56,65 @@ pub enum AuthzMode {
     KeyRegistered,
 }
 
+// ── Legacy-client operator modes (§7.15.4, normative) ─────────────────────────────────────────
+
+/// The operator's declared service mode for **legacy client access** (IMAP/POP3/SMTP-submission /
+/// CalDAV/CardDAV) — spec §7.15.4. It governs *which accounts* the legacy surfaces will serve, and
+/// carries the honest-privacy trust disclosure (§7.15.3): a non-`private` gateway decrypts and can
+/// read the mail it serves.
+///
+/// This is **orthogonal** to [`AuthzMode`], which governs the SMTP *bridge*'s inbound/outbound
+/// relay admission (§7.9). One is "who may relay legacy mail through me"; the other is "whose
+/// mailbox may a legacy client read/submit through me".
+///
+/// The default is [`GatewayMode::Private`] — the most restrictive, honest-privacy-preserving option
+/// (§7.15.4): a single-operator gateway for the operator's own clients, where **no third party ever
+/// decrypts the mail** because the operator *is* the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GatewayMode {
+    /// **Single operator** (own gateway): serves exactly one account — the operator themselves. Zero
+    /// third party can read the mail. The safe default.
+    #[default]
+    Private,
+    /// Serves only identities the operator has an established registration relationship with (§7.12) —
+    /// i.e. the operator's own directory identities. Not open to strangers. Same read-access trust as
+    /// any hosted provider for those users (disclosed, §7.15.3).
+    RegisteredClientsOnly,
+    /// **Open registration**: any user MAY obtain legacy access. The operator can read the mail of
+    /// every user it serves; users accept it like a public mail provider (disclosed, §7.15.3).
+    Public,
+}
+
+impl GatewayMode {
+    /// Parse the config spelling (`private` / `registered-clients-only` / `public`), case- and
+    /// separator-insensitive.
+    pub fn parse(v: &str) -> Option<GatewayMode> {
+        match v.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "private" | "single" | "operator" => Some(GatewayMode::Private),
+            "registered-clients-only" | "registered-clients" | "registered" | "clients" => {
+                Some(GatewayMode::RegisteredClientsOnly)
+            }
+            "public" | "open" | "open-registration" => Some(GatewayMode::Public),
+            _ => None,
+        }
+    }
+
+    /// The canonical spelling for logs / directory-descriptor disclosure (§7.5, §7.15.4).
+    pub fn label(&self) -> &'static str {
+        match self {
+            GatewayMode::Private => "private",
+            GatewayMode::RegisteredClientsOnly => "registered-clients-only",
+            GatewayMode::Public => "public",
+        }
+    }
+
+    /// Whether this mode is content-blind to third parties (only `private` is — §7.15.3): a
+    /// non-`private` gateway decrypts and can read the mail it serves, a fact a client MUST disclose.
+    pub fn is_zero_third_party(&self) -> bool {
+        matches!(self, GatewayMode::Private)
+    }
+}
+
 // ── Challenge–response admission (§9, DMTAP-Auth style) ────────────────────────────────────────
 
 /// Domain-separation label for the admission challenge signature (§18.1.6 style): a distinct tag so
