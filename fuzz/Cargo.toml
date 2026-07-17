@@ -22,6 +22,11 @@ path = "../crates/dmtap-core"
 [dependencies.dmtap-naming]
 path = "../crates/dmtap-naming"
 
+# Device-cluster sync CRDT + wire objects (§5.6 / §18.6.3) — fuzzed by `clustersync_merge` for
+# ClusterSyncFrame/ClusterOp decode and OR-Set + DeathReg + LWW merge convergence (D3).
+[dependencies.dmtap-clustersync]
+path = "../crates/dmtap-clustersync"
+
 # --- node key-derived gateway alias (§3.9, §7) — `envoir-node`'s library crate is named `dmtap`
 # (see `../node/Cargo.toml` `[lib]`); every existing consumer in this workspace (`integration`,
 # `dmtap-p2p`) imports it the same way, as `dmtap::...`.
@@ -218,6 +223,64 @@ bench = false
 [[bin]]
 name = "namechain_resolve"
 path = "fuzz_targets/namechain_resolve.rs"
+test = false
+doc = false
+bench = false
+
+# --- new deep protocol-path targets (recently-changed paths + broad decode/merge coverage) ---
+
+# 1. Envelope/MOTE decode + the §2.7 validate path incl. the S2 context-binding gate (0x0211).
+[[bin]]
+name = "envelope_validate"
+path = "fuzz_targets/envelope_validate.rs"
+test = false
+doc = false
+bench = false
+
+# 2. Manifest decode + Merkle root — guards the M2 empty-chunks fix (no panic in merkle_root).
+[[bin]]
+name = "manifest_merkle"
+path = "fuzz_targets/manifest_merkle.rs"
+test = false
+doc = false
+bench = false
+
+# 3. The strict canonical-CBOR decoder in isolation (decode/encode/decode stability).
+[[bin]]
+name = "cbor_canonical"
+path = "fuzz_targets/cbor_canonical.rs"
+test = false
+doc = false
+bench = false
+
+# 4. KeyRotation decode + the S1 authorize gate (0x0121) with a synthesized policy/quorum.
+[[bin]]
+name = "key_rotation"
+path = "fuzz_targets/key_rotation.rs"
+test = false
+doc = false
+bench = false
+
+# 5. Clustersync frame/op decode + the D3 OR-Set/DeathReg/LWW merge convergence.
+[[bin]]
+name = "clustersync_merge"
+path = "fuzz_targets/clustersync_merge.rs"
+test = false
+doc = false
+bench = false
+
+# 6a. Capability-token decode + offline delegation-chain verification (no forgery/escalation).
+[[bin]]
+name = "capability_chain"
+path = "fuzz_targets/capability_chain.rs"
+test = false
+doc = false
+bench = false
+
+# 6b. Sphinx fixed-length binary parsing across all four §18.5.4 layouts.
+[[bin]]
+name = "sphinx_parse"
+path = "fuzz_targets/sphinx_parse.rs"
 test = false
 doc = false
 bench = false

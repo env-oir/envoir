@@ -382,4 +382,107 @@ mod tests {
         // After retirement the (now-higher) classical suite is accepted again.
         assert!(r.accept(&g, MLS_AES128, &members).is_ok());
     }
+
+    // ---- Property test: the MLS-ciphersuite high-water-mark is MONOTONE under any random inbound ----
+    // ---- schedule (accept never lowers it), the all-members-PQ gate always forces PQ, and the ----
+    // ---- ratchet lowers ONLY via an explicit retirement — matching a pure shadow oracle. ----
+
+    /// A tiny deterministic SplitMix64 PRNG — dependency-free, reproducible generative testing.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    // A spread of ciphersuites across all three security levels, plus an unknown code (floor).
+    const SUITES: [u16; 5] = [MLS_AES128, MLS_CHACHA, MLS_256_X448, MLS_XWING, 0xFFFF];
+
+    fn member(sel: u64) -> MemberPqCapability {
+        match sel % 4 {
+            0 => MemberPqCapability::fully_pq(),
+            1 => MemberPqCapability::classical(),
+            2 => MemberPqCapability { pq_identity: true, pq_mls_ciphersuite: false },
+            _ => MemberPqCapability { pq_identity: false, pq_mls_ciphersuite: true },
+        }
+    }
+
+    /// The pure oracle for `check`: gate first (all-members-PQ ⇒ PQ), then the high-water-mark.
+    fn expected(
+        floor: Option<u8>,
+        selected: u16,
+        members: &[MemberPqCapability],
+    ) -> Result<(), MlsCiphersuiteError> {
+        if all_members_pq(members) && !is_pq_ciphersuite(selected) {
+            return Err(MlsCiphersuiteError::AllMembersPqRequiresPq);
+        }
+        if let Some(f) = floor {
+            if security_level(selected) < f {
+                return Err(MlsCiphersuiteError::BelowHighWaterMark);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mls_ciphersuite_ratchet_is_monotone_and_gate_holds() {
+        let mut rng = Rng(0x0414_0414);
+        let groups: [&[u8]; 3] = [b"g-alpha", b"g-beta", b"g-gamma"];
+        for _ in 0..8_000 {
+            let mut r = MlsCiphersuiteRatchet::new();
+            let mut floor: std::collections::BTreeMap<Vec<u8>, u8> = Default::default();
+            for _ in 0..30 {
+                let group = groups[(rng.below(groups.len() as u64)) as usize];
+                let selected = SUITES[(rng.below(SUITES.len() as u64)) as usize];
+                let n = rng.below(4); // 0..=3 members
+                let members: Vec<MemberPqCapability> = (0..n).map(|_| member(rng.next())).collect();
+                let prev = floor.get(group).copied();
+
+                // Occasionally perform an explicit member-agreed retirement (the ONLY legal lowering).
+                if rng.below(7) == 0 {
+                    let retire_to = SUITES[(rng.below(SUITES.len() as u64)) as usize];
+                    r.retire_to(group, retire_to);
+                    floor.insert(group.to_vec(), security_level(retire_to));
+                    assert_eq!(r.high_water_mark(group), floor.get(group).copied());
+                    continue;
+                }
+
+                // `check` is pure and must equal the oracle exactly.
+                let want = expected(prev, selected, &members);
+                assert_eq!(r.check(group, selected, &members).map_err(|e| e.code()),
+                           want.clone().map_err(|e| e.code()));
+                assert_eq!(r.check(group, selected, &members).is_ok(), want.is_ok());
+
+                // `accept` = check-then-observe: on success the mark ratchets UP to selected's level
+                // (never past it, never down); on failure the mark is untouched.
+                let before = r.high_water_mark(group);
+                let res = r.accept(group, selected, &members);
+                match &want {
+                    Ok(()) => {
+                        assert!(res.is_ok());
+                        let nf = prev.map_or(security_level(selected), |f| f.max(security_level(selected)));
+                        floor.insert(group.to_vec(), nf);
+                    }
+                    Err(e) => {
+                        assert_eq!(res.as_ref().map_err(|x| x.code()), Err(e.code()));
+                        assert_eq!(res.unwrap_err().code(), 0x0414);
+                        assert_eq!(r.high_water_mark(group), before, "a rejected handshake never moves the mark");
+                    }
+                }
+
+                // Monotonicity: an inbound accept never LOWERS the mark below its prior value.
+                if let (Some(b), Some(a)) = (before, r.high_water_mark(group)) {
+                    assert!(a >= b, "the high-water-mark must never ratchet down via accept");
+                }
+                assert_eq!(r.high_water_mark(group), floor.get(group).copied(), "mark tracks the oracle floor");
+            }
+        }
+    }
 }

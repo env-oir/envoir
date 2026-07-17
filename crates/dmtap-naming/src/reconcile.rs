@@ -535,4 +535,99 @@ mod tests {
         ];
         assert_eq!(reconcile(name, &answers).unwrap_err().code(), 0x0120);
     }
+
+    // ---- Property test (D8, §3.12.3): the reconcile outcome is a pure function of ONLY the ----
+    // ---- step-2-verified positive answers. Over many random answer sets, `0x0120` fires iff ----
+    // ---- ≥2 distinct VERIFIED keys appear; unverified/abstain answers never change the verdict. ----
+
+    /// A tiny deterministic SplitMix64 PRNG — dependency-free, reproducible generative testing.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    // A three-key alphabet so verified disagreement is common in random sets.
+    fn key_for(i: u64) -> Vec<u8> {
+        vec![[0xAA, 0xBB, 0xCC][(i % 3) as usize]; 32]
+    }
+    fn rtype(i: u64) -> ResolverType {
+        match i % 4 {
+            0 => ResolverType::Dns,
+            1 => ResolverType::Petname,
+            2 => ResolverType::NameChain(Chain::Ens),
+            _ => ResolverType::NameChain(Chain::Sns),
+        }
+    }
+
+    #[test]
+    fn reconcile_outcome_depends_only_on_verified_votes_d8() {
+        let name = "prop@example.com";
+        let mut rng = Rng(0xD8D8_D8D8);
+        for _ in 0..50_000 {
+            let n = rng.below(6); // 0..=5 answers
+            let mut answers: Vec<ResolverAnswer> = Vec::new();
+            // The oracle: the multiset of DISTINCT keys among step-2-VERIFIED positive answers.
+            let mut verified_keys: std::collections::BTreeSet<Vec<u8>> = Default::default();
+            for _ in 0..n {
+                let t = rtype(rng.next());
+                match rng.below(3) {
+                    0 => {
+                        // step-2-verified positive: it VOTES.
+                        let k = key_for(rng.next());
+                        verified_keys.insert(k.clone());
+                        answers.push(ResolverAnswer::found(t, k));
+                    }
+                    1 => {
+                        // forged/unverified positive: MUST NOT vote (discovery is never proof).
+                        answers.push(ResolverAnswer::unverified(t, key_for(rng.next())));
+                    }
+                    _ => answers.push(ResolverAnswer::abstain(t)), // silence: MUST NOT vote.
+                }
+            }
+
+            let result = reconcile(name, &answers);
+            match verified_keys.len() {
+                // ≥2 distinct verified keys ⇒ genuine equivocation across trusted channels ⇒ 0x0120,
+                // regardless of how many forged/abstaining answers surround them.
+                k if k >= 2 => {
+                    let err = result.expect_err("≥2 verified keys must be a disagreement");
+                    assert!(matches!(err, ResolveError::ResolverDisagreement(_)));
+                    assert_eq!(err.code(), 0x0120);
+                }
+                // Exactly one verified key ⇒ resolves to it; forged/abstain noise is discarded.
+                1 => {
+                    let res = result.expect("a lone verified key must resolve");
+                    assert_eq!(&res.ik, verified_keys.iter().next().unwrap());
+                    // Only verified voters are listed (all with that key); none are the forged key.
+                    assert!(!res.agreed_by.is_empty());
+                }
+                // No verified vote (all forged and/or all silent) ⇒ ordinary not-found (0x0109),
+                // NEVER a spurious 0x0120 disagreement. Forged-only degrades like silence.
+                _ => {
+                    let err = result.expect_err("no verified vote must be not-found");
+                    assert!(matches!(err, ResolveError::NameResolution(_)));
+                    assert_eq!(err.code(), 0x0109);
+                    assert_ne!(err.code(), 0x0120);
+                }
+            }
+
+            // Order-independence: shuffling the answers (reverse) yields the SAME verdict code.
+            let mut reversed = answers.clone();
+            reversed.reverse();
+            assert_eq!(
+                reconcile(name, &answers).map(|r| r.ik).map_err(|e| e.code()),
+                reconcile(name, &reversed).map(|r| r.ik).map_err(|e| e.code()),
+                "reconcile verdict must be order-independent"
+            );
+        }
+    }
 }
