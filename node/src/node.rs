@@ -63,7 +63,7 @@ use crate::journal::{
     Journal, JournalError, NullJournal, PersistedEntry, PersistedSuiteMark, Snapshot,
 };
 use crate::mixdir::{MixDirError, MixDirectoryTracker};
-use crate::naming::{self, AddressError, KeyPackageSource, Resolver};
+use crate::naming::{self, classify, AddressError, KeyPackageSource, NameForm, Resolver};
 use crate::outbound::{OutEvent, OutState, OutboundEntry};
 use crate::transport::{Frame, Transport, TransportError};
 use dmtap_auth::AuthError;
@@ -298,6 +298,16 @@ impl<T: Transport> Node<T> {
         self.seal_public
     }
 
+    /// This node's **key-derived legacy gateway alias** local-part (§3.9, §7) — a stateless,
+    /// registration-free address for legacy SMTP↔DMTAP bridging. It is a pure function of the
+    /// identity key ([`naming::gateway_alias_local`]), so it is identical at every gateway and any
+    /// gateway can decode it straight back to this node's key ([`naming::ik_from_gateway_alias`])
+    /// with no directory lookup. Combined with a gateway's domain it forms a full legacy address,
+    /// e.g. `dmtap1-…@gateway.example`.
+    pub fn gateway_alias(&self) -> String {
+        naming::gateway_alias_local(&self.ik.public())
+    }
+
     /// Record how to reach a peer: pin them as a known contact and learn their sealing key
     /// (§3.4 pin + §5.3 KeyPackage, collapsed into one directory entry for the in-process model).
     pub fn add_contact(&mut self, ik: &[u8], seal_pub: [u8; 32]) {
@@ -329,6 +339,25 @@ impl<T: Transport> Node<T> {
         resolver: &dyn Resolver,
         kps: &dyn KeyPackageSource,
     ) -> Result<Vec<u8>, crate::naming::ResolveError> {
+        // Route the name by its FORM (§3.9): `local@domain` → the wired DNS+KT resolver; a
+        // self-authenticating key-name (§3.9.1) → the *derive* resolver; `name.eth`/`name.sol` →
+        // the on-chain name registry. Only the DNS form has a networked resolver wired today, so the
+        // other two are routed to their documented seams and **fail closed** (never a silent accept)
+        // — the per-form resolvers ([`KeyNameResolver`]/[`NameChainResolver`]) drop into this match
+        // once `dmtap-naming` exposes them.
+        match classify(name)? {
+            NameForm::Dns => {}
+            NameForm::KeyName => {
+                return Err(crate::naming::ResolveError::NameResolution(
+                    "key-name (derive) resolver not wired — fail closed (§3.9.1 seam)",
+                ));
+            }
+            NameForm::NameChain(_) => {
+                return Err(crate::naming::ResolveError::NameResolution(
+                    "name-chain (.eth/.sol) resolver not wired — fail closed (§3.9 seam)",
+                ));
+            }
+        }
         // KT-verify the binding (fail-closed) BEFORE trusting anything about the recipient (§3.3).
         let res = resolver.resolve(name)?;
         // Fetch + content-verify (§2.2) the sealing KeyPackage the verified identity advertises.

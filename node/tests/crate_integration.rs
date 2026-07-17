@@ -207,6 +207,70 @@ fn tampered_dns_pointer_fails_closed() {
     ));
 }
 
+#[test]
+fn non_dns_name_forms_dispatch_and_fail_closed_at_the_node() {
+    // The node routes a recipient name by its FORM (§3.9). The DNS resolver here has NOTHING
+    // published, so if a non-DNS form leaked into the DNS path it would fail with a DNS/KT error;
+    // instead it must be intercepted by the form dispatch and fail closed as an *unwired seam*,
+    // pinning nothing — proving the dispatch runs before the DNS resolver is even consulted.
+    let net = InMemoryNetwork::new();
+    let empty = InMemoryResolver::new(NOW);
+    let kps = InMemoryKeyPackages::new();
+
+    let alice_ik = IdentityKey::generate();
+    let alice_ik_pub = alice_ik.public();
+    let mut alice =
+        Node::with_identity(alice_ik, SealKeypair::generate(), net.endpoint(alice_ik_pub));
+
+    // A self-authenticating key-name (§3.9.1) → the derive seam (unwired ⇒ fail closed).
+    let key_name = dmtap::keyname::encode(&IdentityKey::from_seed(&[21u8; 32]).public());
+    let err = alice.resolve_and_pin(&key_name, &empty, &kps).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::NameResolution(m) if m.contains("key-name")),
+        "key-name routes to the derive seam and fails closed, got {err:?}"
+    );
+
+    // A name-chain name → the on-chain seam (unwired ⇒ fail closed).
+    let err = alice.resolve_and_pin("vitalik.eth", &empty, &kps).unwrap_err();
+    assert!(
+        matches!(err, ResolveError::NameResolution(m) if m.contains("name-chain")),
+        "a .eth name routes to the name-chain seam and fails closed, got {err:?}"
+    );
+
+    // Garbage that matches no form is rejected outright (fail closed, not coerced into DNS).
+    let err = alice.resolve_and_pin("not a name", &empty, &kps).unwrap_err();
+    assert!(matches!(err, ResolveError::MalformedName(_)), "unrecognized form is rejected");
+}
+
+#[test]
+fn key_derived_gateway_alias_is_stable_and_stateless_decodable() {
+    // Two independently-built nodes for the SAME identity yield the SAME gateway alias — the alias
+    // is a pure function of the key with no per-node/per-gateway state.
+    let net = InMemoryNetwork::new();
+    let seed = [33u8; 32];
+    let node_a = Node::with_identity(
+        IdentityKey::from_seed(&seed),
+        SealKeypair::generate(),
+        net.endpoint(IdentityKey::from_seed(&seed).public()),
+    );
+    let node_b = Node::with_identity(
+        IdentityKey::from_seed(&seed),
+        SealKeypair::generate(),
+        net.endpoint(b"a-different-transport-address".to_vec()),
+    );
+    assert_eq!(
+        node_a.gateway_alias(),
+        node_b.gateway_alias(),
+        "the alias is identical at every gateway (key-derived, stateless)"
+    );
+
+    // Any gateway decodes the alias straight back to the node's identity key — no registration.
+    let alias = node_a.gateway_alias();
+    let recovered = dmtap::naming::ik_from_gateway_alias(&alias).expect("decodes back to a key");
+    assert_eq!(recovered, node_a.ik_public(), "the alias round-trips to the exact key");
+    assert!(alias.len() <= 64, "fits an RFC 5321 local-part");
+}
+
 // ============================================================================================
 // 2. Deniable 1:1 (§5.2.1): a MOTE round-trips through a deniable session; tamper fails closed.
 // ============================================================================================
