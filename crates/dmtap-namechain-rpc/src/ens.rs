@@ -116,9 +116,13 @@ impl<T: HttpTransport> EnsClient<T> {
             let expanded = url
                 .replace("{sender}", &sender_hex)
                 .replace("{data}", &data_hex);
+            // The gateway URL is attacker-controlled (anyone can point a name at their resolver) — guard
+            // it against SSRF before any socket is opened.
+            crate::ssrf::guard_gateway_url(&expanded)?;
             self.transport.get(&expanded)?
         } else {
             let expanded = url.replace("{sender}", &sender_hex);
+            crate::ssrf::guard_gateway_url(&expanded)?;
             let payload = serde_json::json!({ "sender": sender_hex, "data": data_hex });
             self.transport
                 .post_json(&expanded, payload.to_string().as_bytes())?

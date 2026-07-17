@@ -5,6 +5,11 @@
 //! socket. The sole real implementation, [`UreqTransport`], is a small blocking rustls client behind
 //! the default `net` feature.
 
+/// Hard cap on any single response body. Name-chain RPC answers (an `eth_call` word array, a
+/// `getAccountInfo` account, a CCIP `{"data":"0x…"}`) are kilobytes; 4 MiB is generous headroom while
+/// still refusing a gateway that tries to stream an unbounded body to exhaust memory.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
 /// A transport-layer failure (network, TLS, or a non-2xx HTTP status). Read-only name-chain lookups
 /// treat every transport failure as fail-closed (§3.12.5(c)): the binding is simply not discovered.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -59,9 +64,16 @@ impl UreqTransport {
             Err(ureq::Error::Status(code, _)) => return Err(TransportError::Status(code)),
             Err(e) => return Err(TransportError::Request(e.to_string())),
         };
+        // Cap the response body: a malicious CCIP gateway (or RPC endpoint) could otherwise stream a
+        // multi-GB body to OOM the resolver. Read one byte past the cap so we can tell "at the limit"
+        // (fine) from "over it" (refuse).
         let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
+        let mut limited = std::io::Read::take(resp.into_reader(), MAX_RESPONSE_BYTES + 1);
+        std::io::Read::read_to_end(&mut limited, &mut buf)
             .map_err(|e| TransportError::Request(e.to_string()))?;
+        if buf.len() as u64 > MAX_RESPONSE_BYTES {
+            return Err(TransportError::Request("response body exceeds cap".into()));
+        }
         Ok(buf)
     }
 }

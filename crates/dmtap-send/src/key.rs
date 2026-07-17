@@ -291,6 +291,12 @@ impl SendService {
     ) -> Result<ApiKey, SendError> {
         let hash = ContentId::of(secret.as_bytes());
         let rec = self.keys.get(&hash).ok_or(SendError::Unauthorized)?;
+        // A revoked key must NOT be rotatable — otherwise a holder of a leaked-then-revoked secret
+        // could mint a fresh, unrevoked token at the same scope (the new token has a new content_id
+        // absent from the revocation set), defeating the kill-switch. Mirror attenuate_key's guard.
+        if rec.revoked {
+            return Err(SendError::Revoked);
+        }
         let scope = rec.scope.clone();
         let chain = rec.chain.clone();
         let prnt = rec.token.prnt.clone();
@@ -488,6 +494,18 @@ mod tests {
         // Old rejected, new accepted.
         assert_eq!(svc.verify_key(old.secret(), now + 2), Err(SendError::Revoked));
         assert!(svc.verify_key(new.secret(), now + 2).is_ok());
+    }
+
+    #[test]
+    fn revoked_key_cannot_be_rotated_back_to_life() {
+        // A leaked-then-revoked key must not be resurrectable via rotate_key (kill-switch bypass).
+        let mut svc = SendService::new(owner());
+        let now = 1_700_000_000_000;
+        let key = svc.issue_key(SendScope::account(Environment::Prod), now, YEAR);
+        svc.revoke_key(key.secret(), now + 1).unwrap();
+        assert!(matches!(svc.rotate_key(key.secret(), now + 2, YEAR), Err(SendError::Revoked)));
+        // Still revoked — no fresh live token was minted.
+        assert_eq!(svc.verify_key(key.secret(), now + 3), Err(SendError::Revoked));
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod abi;
 pub mod ens;
 pub mod rpc;
 pub mod sns;
+mod ssrf;
 pub mod transport;
 
 pub use ens::EnsClient;
@@ -73,4 +74,10 @@ pub enum NamechainError {
     /// condition per se, but modeled fallibly so callers can distinguish "miss" from "decode failure".
     #[error("no on-chain record for the name")]
     NotFound,
+
+    /// A CCIP-Read (EIP-3668) gateway URL from an attacker-controlled `OffchainLookup` revert failed
+    /// the SSRF guard (non-HTTPS scheme, or a host that resolves into a loopback/private/link-local/
+    /// metadata address). Refused before any socket is opened — fail closed (§3.12.5(c)).
+    #[error("ccip gateway url refused: {0}")]
+    BlockedGatewayUrl(&'static str),
 }
