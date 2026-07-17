@@ -110,6 +110,10 @@ pub struct PersistedEntry {
     pub deadline: u64,
     pub delivered_late: bool,
     pub sealed_cbor: Option<Vec<u8>>,
+    /// The terminal-GC grace-window start (§20.1), if the entry was terminal when persisted. `default`
+    /// so an older journal (no field) still loads and the node re-stamps it on the next GC pass.
+    #[serde(default)]
+    pub terminal_at: Option<u64>,
 }
 
 impl PersistedEntry {
@@ -123,6 +127,7 @@ impl PersistedEntry {
             deadline: e.deadline,
             delivered_late: e.delivered_late,
             sealed_cbor: e.sealed.as_ref().map(|env| env.det_cbor()),
+            terminal_at: e.terminal_at,
         }
     }
 
@@ -137,6 +142,18 @@ impl PersistedEntry {
             ),
             None => None,
         };
+        // Fail-closed integrity check on restore: the persisted `id` MUST be the content address
+        // (§2.2) of the sealed envelope's ciphertext AND match the envelope's own `id`. A tampered
+        // `0600` journal that swapped the id (or the ciphertext) would otherwise silently break retry
+        // idempotency (§19.3.3: a retry must re-dispatch the SAME immutable id) and recipient dedup
+        // (§2.6). Reject it as corruption rather than resuming a mismatched entry.
+        if let Some(env) = &sealed {
+            if !env.id.verify(&env.ciphertext) || env.id.as_bytes() != self.id.as_slice() {
+                return Err(JournalError::Corrupt(
+                    "journal entry id does not match its sealed content address",
+                ));
+            }
+        }
         Ok(OutboundEntry {
             id: ContentId(self.id),
             to: self.to,
@@ -145,6 +162,7 @@ impl PersistedEntry {
             attempts: self.attempts,
             deadline: self.deadline,
             delivered_late: self.delivered_late,
+            terminal_at: self.terminal_at,
         })
     }
 }
@@ -377,6 +395,34 @@ mod tests {
         let mut pe = PersistedEntry::from_entry(&sample_entry(4));
         pe.state = 200; // no such OutState
         assert!(matches!(pe.into_entry(), Err(JournalError::Corrupt(_))));
+    }
+
+    #[test]
+    fn tampered_id_mismatching_sealed_content_address_is_refused() {
+        // A tampered 0600 journal that swaps the persisted `id` (leaving the sealed envelope intact)
+        // would break retry idempotency (§19.3.3: a retry must re-dispatch the SAME immutable id) and
+        // recipient dedup (§2.6). Restore MUST reject it, not resume a mismatched entry.
+        let mut pe = PersistedEntry::from_entry(&sample_entry(5));
+        // Flip a byte of the persisted id so it no longer equals the sealed ciphertext's content
+        // address, while the sealed envelope (and its own id) still verify.
+        pe.id[1] ^= 0xff;
+        assert!(
+            matches!(pe.into_entry(), Err(JournalError::Corrupt(_))),
+            "a persisted id that is not the sealed content address is refused"
+        );
+
+        // Independently: tampering the sealed ciphertext (so the envelope's own id no longer matches
+        // its bytes) is likewise refused, even if the persisted `id` was updated to match the envelope.
+        let good = sample_entry(6);
+        let mut pe2 = PersistedEntry::from_entry(&good);
+        let mut env = good.sealed.clone().unwrap();
+        env.ciphertext[0] ^= 0xff; // now env.id no longer content-addresses env.ciphertext
+        pe2.sealed_cbor = Some(env.det_cbor());
+        pe2.id = env.id.as_bytes().to_vec(); // persisted id matches the (tampered) envelope id...
+        assert!(
+            matches!(pe2.into_entry(), Err(JournalError::Corrupt(_))),
+            "an envelope whose id is not its ciphertext's content address is refused"
+        );
     }
 
     fn unique() -> u128 {

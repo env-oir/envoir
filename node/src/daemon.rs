@@ -134,6 +134,9 @@ pub async fn run_loop<T: Transport>(
                 node.set_now(now_ms());
                 let inbound = node.poll();
                 stats.inbound += inbound.len() as u64;
+                // Deliver any inbound group application messages buffered by `poll` (§5.4) — the real
+                // daemon must drain + deliver them, not just the tests.
+                node.pump_group_inbox();
                 stats.retried += node.retry_pending() as u64;
                 node.tick_deadlines();
                 stats.ticks += 1;

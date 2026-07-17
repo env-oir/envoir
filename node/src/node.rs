@@ -68,7 +68,8 @@ use crate::naming::{
     Resolver, ResolverKind, ResolverRegistry, ResolverType, SelfResolver,
 };
 use dmtap_core::identity::Identity;
-use crate::outbound::{OutEvent, OutState, OutboundEntry};
+use crate::outbound::{OutEvent, OutState, OutboundEntry, TERMINAL_GRACE_MS};
+use crate::seen::SeenSet;
 use crate::transport::{Frame, Transport, TransportError};
 use crate::usage::{
     NodeUsageMeter, NullUsageMeter, QuotaDecision, StorageQuota, UnlimitedStorage, UsageEvent,
@@ -79,6 +80,13 @@ use dmtap_core::mixnet::MixDirectory;
 /// The requests-area mailbox for deferred cold-sender MOTEs (§2.7a: never the inbox). Mapped onto
 /// the Junk SPECIAL-USE folder so existing IMAP/JMAP clients surface it distinctly from the inbox.
 const REQUESTS_MAILBOX: &str = "Junk";
+
+/// Upper bound on buffered inbound group **application** MOTEs awaiting decrypt (§5.4). The buffer is
+/// drained each tick by [`Node::pump_group_inbox`] (the serve loops) / [`Node::poll_group_messages`],
+/// but without a cap a peer streaming [`Frame::Group`] faster than it drains would grow it without
+/// bound (an OOM vector). At the cap further group frames are dropped (fail-safe backpressure),
+/// mirroring the transport's `MAX_INBOX_FRAMES`.
+const MAX_GROUP_INBOX: usize = 1024;
 
 /// Why a [`Node::send_mail`] could not admit a MOTE for delivery.
 #[derive(Debug, PartialEq, Eq)]
@@ -124,9 +132,10 @@ pub struct Node<T: Transport> {
     seal_public: [u8; 32],
     /// The MOTE-store projection every mail client is a view of (§8).
     store: MemoryStore,
-    /// Dedup / replay set: `id → sender return path`, so a re-delivered `id` is acked without
-    /// reprocessing (§2.6) and the ack can be routed even for a duplicate we no longer decrypt.
-    seen: HashMap<Vec<u8>, Vec<u8>>,
+    /// Dedup / replay set (§2.6): a re-delivered `id` is acked without reprocessing. **Bounded** by a
+    /// sliding receive-time window + a hard LRU cap ([`SeenSet`]) so it — and the durable snapshot it
+    /// feeds (§19.3.3) — cannot grow without limit on a long-running or flooded node.
+    seen: SeenSet,
     /// The sender-side retry queue, keyed by MOTE `id` (§20.1).
     outbound: HashMap<Vec<u8>, OutboundEntry>,
     /// Known-contact identity keys — the fast-path sender classification (§2.7 step 5) and the
@@ -178,6 +187,14 @@ pub struct Node<T: Transport> {
     group_inbox: Vec<(Vec<u8>, Vec<u8>)>,
     /// Injected clock (ms). Explicit so deadline/backoff behavior is deterministic in tests.
     now: TimestampMs,
+    /// Checkpoint **coalescing** (§19.3.3 write-amplification): while `true`, per-mutation
+    /// [`checkpoint`](Self::checkpoint) calls only set `checkpoint_dirty` instead of rewriting the
+    /// whole snapshot — the enclosing batch (a [`poll`](Self::poll) tick) writes once at the end. This
+    /// turns a K-frame tick from K full-snapshot writes into one, without weakening the send path's
+    /// "durable before return" guarantee (which runs outside a batch).
+    checkpoint_deferred: bool,
+    /// Set by a deferred [`checkpoint`](Self::checkpoint) call to mark the batch needs a flush.
+    checkpoint_dirty: bool,
     /// Durable store for the outbound retry queue + dedup set (§19.3.3). Every mutation of that
     /// state is checkpointed here so a restarted node resumes its pending sends; the default
     /// [`NullJournal`] persists nothing (ephemeral node).
@@ -222,7 +239,7 @@ impl<T: Transport> Node<T> {
             seal_secret,
             seal_public,
             store: MemoryStore::new(),
-            seen: HashMap::new(),
+            seen: SeenSet::new(),
             outbound: HashMap::new(),
             contacts: HashSet::new(),
             directory: HashMap::new(),
@@ -241,6 +258,8 @@ impl<T: Transport> Node<T> {
             group_inbox: Vec::new(),
             transport,
             now: 1_700_000_000_000,
+            checkpoint_deferred: false,
+            checkpoint_dirty: false,
             journal,
             // Self-host defaults: unlimited storage, no-op meter (§12.2). A hosted deployment injects
             // a cloud impl via `set_storage_quota` / `set_usage_meter`.
@@ -285,7 +304,9 @@ impl<T: Transport> Node<T> {
             node.outbound.insert(entry.id.as_bytes().to_vec(), entry);
         }
         for (id, from) in snapshot.seen {
-            node.seen.insert(id, from);
+            // Stamp restored entries at the node's current clock: a fresh (never shorter) dedup window
+            // so re-ack-on-redelivery still works across the restart (§2.6, §19.3.3), still bounded.
+            node.seen.restore(id, from, node.now);
         }
         // Restore the per-contact suite high-water-marks (§1.3, §2.7 step 8), fail-closed on a bad
         // suite byte. A restored mark is authoritative: `observe` re-establishes the floor so a
@@ -550,7 +571,7 @@ impl<T: Transport> Node<T> {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             outbound: self.outbound.values().map(PersistedEntry::from_entry).collect(),
-            seen: self.seen.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            seen: self.seen.persist_pairs(),
             suite_marks: self
                 .suite_contacts
                 .iter()
@@ -573,7 +594,15 @@ impl<T: Transport> Node<T> {
     /// the outbound queue / dedup set. Best-effort: a journal write failure is swallowed here (there
     /// is no useful in-line recovery mid-operation), matching a durable-queue node that logs and
     /// continues; [`flush`](Self::flush) exposes the same write with its error for explicit checks.
-    fn checkpoint(&self) {
+    ///
+    /// **Coalescing:** inside a [`poll`](Self::poll) batch this only marks the batch dirty; the batch
+    /// writes one full snapshot at the end instead of one per frame — bounding write amplification
+    /// (§19.3.3) so a K-frame tick is one disk write, not K.
+    fn checkpoint(&mut self) {
+        if self.checkpoint_deferred {
+            self.checkpoint_dirty = true;
+            return;
+        }
         let _ = self.journal.save(&self.snapshot());
     }
 
@@ -722,8 +751,18 @@ impl<T: Transport> Node<T> {
         let mut redispatched = 0;
         for key in &retry_ids {
             let mut entry = self.outbound.remove(key).expect("just enumerated");
+            // Defensive: a RETRY entry should always carry its sealed envelope (dispatch seals before
+            // it can reach RETRY). If a future async-resolution path ever leaves one unsealed, SKIP it
+            // (re-insert untouched) rather than panicking the whole delivery task — one malformed entry
+            // must not take down every other pending send.
+            let env = match entry.sealed.clone() {
+                Some(env) => env,
+                None => {
+                    self.outbound.insert(key.clone(), entry);
+                    continue;
+                }
+            };
             entry.apply(OutEvent::RetryTimerFires).expect("RETRY→IN_FLIGHT");
-            let env = entry.sealed.clone().expect("a RETRY entry is always sealed");
             match self.transport.send(&entry.to, Frame::Mote(env.det_cbor())) {
                 Ok(()) => redispatched += 1,
                 Err(TransportError::Unreachable) => {
@@ -736,8 +775,9 @@ impl<T: Transport> Node<T> {
         redispatched
     }
 
-    /// Check every non-terminal entry against the deadline, expiring those past it (§16.1). Uses
-    /// the injected clock; returns the ids that transitioned to `EXPIRED`.
+    /// Check every non-terminal entry against the deadline, expiring those past it (§16.1), then
+    /// garbage-collect terminal entries whose grace window has elapsed (§20.1). Uses the injected
+    /// clock; returns the ids that transitioned to `EXPIRED` this tick.
     pub fn tick_deadlines(&mut self) -> Vec<ContentId> {
         let mut expired = Vec::new();
         for entry in self.outbound.values_mut() {
@@ -746,10 +786,45 @@ impl<T: Transport> Node<T> {
                 expired.push(entry.id.clone());
             }
         }
-        if !expired.is_empty() {
-            self.checkpoint(); // some entries reached the EXPIRED terminal — persist it.
+        let gc = self.gc_terminal_outbound();
+        if !expired.is_empty() || gc {
+            self.checkpoint(); // terminal transitions and/or GC removals — persist the queue.
         }
         expired
+    }
+
+    /// Garbage-collect terminal (`ACKED`/`EXPIRED`) outbound entries once their grace window has
+    /// elapsed (§20.1: terminal slots "may be GC'd"), so the queue — and the durable snapshot it
+    /// feeds (§19.3.3) — cannot accumulate terminal entries without bound on a long-running node. A
+    /// terminal entry is first *stamped* with the current clock (`terminal_at`) on the tick it is
+    /// observed terminal, then removed once `now >= terminal_at + TERMINAL_GRACE_MS`. The grace keeps
+    /// a late ack (§20.1 fill) able to find its entry before it is dropped. Returns `true` if anything
+    /// was stamped or removed (so the caller persists).
+    fn gc_terminal_outbound(&mut self) -> bool {
+        let now = self.now;
+        let mut changed = false;
+        let mut remove: Vec<Vec<u8>> = Vec::new();
+        for (key, entry) in self.outbound.iter_mut() {
+            if !entry.state.is_terminal() {
+                continue;
+            }
+            match entry.terminal_at {
+                None => {
+                    // First observation of this terminal entry — start its grace window.
+                    entry.terminal_at = Some(now);
+                    changed = true;
+                }
+                Some(since) if now.saturating_sub(since) >= TERMINAL_GRACE_MS => {
+                    remove.push(key.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for key in remove {
+            self.outbound.remove(&key);
+            changed = true;
+        }
+        changed
     }
 
     // --- receiving (§19.3, §20.2) -----------------------------------------------------------
@@ -758,24 +833,59 @@ impl<T: Transport> Node<T> {
     /// acked when eligible), acks advance the matching outbound entry (§20.1). Returns the list of
     /// inbound MOTE dispositions for inspection/testing (acks produce no entry here).
     pub fn poll(&mut self) -> Vec<InboundOutcome> {
+        // Coalesce the batch's checkpoints into a single write at the end (§19.3.3 write-amplification):
+        // a K-frame tick that accepts/acks K MOTEs otherwise rewrote the full snapshot K times.
+        self.checkpoint_deferred = true;
+        self.checkpoint_dirty = false;
         let mut outcomes = Vec::new();
         for (from, frame) in self.transport.drain() {
             match frame {
                 Frame::Mote(bytes) => outcomes.push(self.receive_mote(&from, &bytes)),
-                Frame::Ack(id) => self.receive_ack(&id),
+                // Bind the ack to its transport return path: only an ack arriving from the entry's
+                // tracked recipient advances it (§19.3.2). An on-path relay that echoes `Ack(id)` (the
+                // id = BLAKE3(ciphertext) is visible to it) can no longer forge a delivery receipt.
+                Frame::Ack(id) => self.receive_ack(&from, &id),
                 // A group application MOTE (§5): buffer it for `poll_group_messages` to decrypt,
                 // keeping the 1:1 outcome list clean. (Group handshakes never arrive here — they
-                // travel the ordered committer log, not the mesh, §5.1.)
-                Frame::Group { group_id, body } => self.group_inbox.push((group_id, body)),
+                // travel the ordered committer log, not the mesh, §5.1.) BOUNDED: past the cap the
+                // frame is dropped rather than growing the buffer without limit (a peer streaming
+                // `Frame::Group` must not be able to OOM the node), mirroring the transport inbox cap.
+                Frame::Group { group_id, body } => {
+                    if self.group_inbox.len() < MAX_GROUP_INBOX {
+                        self.group_inbox.push((group_id, body));
+                    }
+                }
             }
+        }
+        // Flush the batch once (if anything mutated durable state).
+        self.checkpoint_deferred = false;
+        if self.checkpoint_dirty {
+            self.checkpoint();
         }
         outcomes
     }
 
-    /// Consume an `ack(id)`: advance the tracked outbound entry to `ACKED`, or apply a late ack to
-    /// an already-`EXPIRED` one, or ignore it (idempotent, §19.3.2). Unknown ids are ignored.
-    pub fn receive_ack(&mut self, id: &[u8]) {
+    /// Consume an `ack(id)` arriving over the transport from `from`: advance the tracked outbound entry
+    /// to `ACKED`, or apply a late ack to an already-`EXPIRED` one, or ignore it (idempotent,
+    /// §19.3.2). Unknown ids are ignored.
+    ///
+    /// **Fail-closed against a forged ack:** the ack `id` is `BLAKE3(ciphertext)` (§2.2), visible to
+    /// any on-path relay, so an attacker can inject `Ack(id)` to *suppress the sender's retries* and
+    /// falsely report the send delivered. We therefore honor an ack only when `from` matches the
+    /// entry's tracked recipient (`entry.to`) — the return path over the shipped transports (§4). A
+    /// mismatched `from` is dropped without advancing the entry, so a legitimate retry continues.
+    ///
+    /// NOTE (deeper binding): over a real sealed-sender mixnet the ack rides a single-use reply block
+    /// (§6.2, §19.3.2) and `from` is not the recipient's identity in the clear — that path must bind
+    /// the ack to the specific outbound MOTE via the reply-block/DR token it was sent under, not this
+    /// return-path equality. This check is the correct, sufficient defense for the shipped transports.
+    pub fn receive_ack(&mut self, from: &[u8], id: &[u8]) {
         if let Some(entry) = self.outbound.get_mut(id) {
+            if entry.to != from {
+                // The ack did not come from this MOTE's recipient — a forged/misrouted receipt. Ignore
+                // it: retries keep going and the send is not falsely marked delivered.
+                return;
+            }
             let ev = match entry.state {
                 OutState::InFlight | OutState::Retry | OutState::Acked => OutEvent::AckReceived,
                 OutState::Expired => OutEvent::LateAck,
@@ -783,8 +893,13 @@ impl<T: Transport> Node<T> {
                 // rather than force an undefined transition.
                 OutState::Sealed | OutState::Queued => return,
             };
+            let before = (entry.state, entry.delivered_late);
             let _ = entry.apply(ev);
-            self.checkpoint(); // ACKED/late-ack state change — persist it.
+            // Only persist on an actual state change (a duplicate ack on an already-ACKED entry is a
+            // no-op) — no pointless full-snapshot write per redundant/forged-but-matching ack.
+            if before != (entry.state, entry.delivered_late) {
+                self.checkpoint();
+            }
         }
     }
 
@@ -801,7 +916,7 @@ impl<T: Transport> Node<T> {
         // §20.2 ADDR_OK → duplicate: a MOTE whose `id` we already hold is acked immediately,
         // without reprocessing (§2.6, §19.3.1 step 9). Verify the content address first (cheap)
         // so a forged `id` cannot spoof a dedup-ack for a body we never actually stored.
-        if env.id.verify(&env.ciphertext) && self.seen.contains_key(env.id.as_bytes()) {
+        if env.id.verify(&env.ciphertext) && self.seen.contains(env.id.as_bytes(), self.now) {
             self.send_ack(from, &env.id);
             return InboundOutcome::Duplicate { id: env.id.clone() };
         }
@@ -889,7 +1004,7 @@ impl<T: Transport> Node<T> {
             .store
             .deliver_mote(&payload, "INBOX", self.now)
             .expect("INBOX always exists");
-        self.seen.insert(id.as_bytes().to_vec(), from.to_vec());
+        self.seen.record(id.as_bytes().to_vec(), from.to_vec(), self.now);
         // dedup set grew and the suite mark advanced — persist so a post-restart redelivery is still
         // re-acked and a post-restart downgrade below this sender's mark is still rejected.
         self.checkpoint();
@@ -1086,6 +1201,27 @@ impl<T: Transport> Node<T> {
             out.push((group_id, result));
         }
         out
+    }
+
+    /// Drain the buffered inbound group **application** MOTEs and **deliver** each successfully
+    /// decrypted plaintext into the mail store (INBOX), returning how many were delivered. This is the
+    /// serve-loop drainer (called each tick by [`crate::daemon::run_loop`] /
+    /// [`crate::send_api::run_loop_with_send_api`]) so group messages the real daemon receives are
+    /// actually delivered — and so the bounded `group_inbox` is emptied rather than merely capped. A
+    /// decrypt failure (e.g. a message from an epoch this node was removed from, §5.2) is dropped, not
+    /// delivered. Group content is filed under the `group_id` as its `from` (the reference store has no
+    /// separate group surface; §8.1 JMAP renders it in INBOX).
+    pub fn pump_group_inbox(&mut self) -> usize {
+        let mut delivered = 0;
+        for (group_id, result) in self.poll_group_messages() {
+            if let Ok(plaintext) = result {
+                let payload = group_message_payload(&group_id, &plaintext);
+                if self.store.deliver_mote(&payload, "INBOX", self.now).is_some() {
+                    delivered += 1;
+                }
+            }
+        }
+        delivered
     }
 
     /// Decode one [`Frame::Group`] body into a [`GroupMote`] and decrypt its application ciphertext
@@ -1357,6 +1493,21 @@ fn drop_reason(e: MoteError) -> DropReason {
         | MoteError::FileUnavailable
         | MoteError::SpoolOverflow
         | MoteError::SizeTierViolation => DropReason::Malformed,
+    }
+}
+
+/// A payload projecting a decrypted group **application** message (§5.4) into the mail store. The
+/// `group_id` stands in as `from` (the reference store has no dedicated group surface); the plaintext
+/// is the body. Signature-free — MLS already authenticated it inside the group session.
+fn group_message_payload(group_id: &[u8], plaintext: &[u8]) -> Payload {
+    Payload {
+        from: group_id.to_vec(),
+        sig: Vec::new(),
+        headers: Headers { subject: Some("(group message)".into()), ..Headers::default() },
+        body: plaintext.to_vec(),
+        refs: Vec::new(),
+        attach: Vec::new(),
+        expires: None,
     }
 }
 

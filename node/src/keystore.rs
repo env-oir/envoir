@@ -214,8 +214,10 @@ impl Keystore {
     /// a mismatch (encrypted file + no passphrase, or plaintext file + a passphrase) is a typed error
     /// rather than a silent fallback. AEAD failure (wrong passphrase / tamper) fails closed.
     pub fn load(path: &Path, passphrase: Option<&str>) -> Result<Self, KeystoreError> {
-        let bytes = std::fs::read(path)?;
-        let file: KeystoreFile =
+        // The raw file bytes hold the plaintext-mode secret material (base64url seed ‖ sealing secret);
+        // wipe them on drop so the secrets do not linger in a stray heap buffer after load.
+        let bytes = Zeroizing::new(std::fs::read(path)?);
+        let mut file: KeystoreFile =
             serde_json::from_slice(&bytes).map_err(|e| KeystoreError::Serde(e.to_string()))?;
         if file.version != KEYSTORE_VERSION {
             return Err(KeystoreError::Corrupt("unsupported keystore version"));
@@ -223,8 +225,17 @@ impl Keystore {
 
         let (ik_seed, seal_secret) = match file.encryption.as_str() {
             ENC_NONE => {
-                let seed = decode_32(file.ik_seed.as_deref(), "ik_seed")?;
-                let sseal = decode_32(file.seal_secret.as_deref(), "seal_secret")?;
+                // Route the base64url-decoded secret temporaries through Zeroizing so the intermediate
+                // seed/sealing-secret buffers are wiped, not left on the heap.
+                let seed = decode_32_secret(file.ik_seed.as_deref(), "ik_seed")?;
+                let sseal = decode_32_secret(file.seal_secret.as_deref(), "seal_secret")?;
+                // Wipe the base64url secret strings parsed out of the JSON.
+                if let Some(s) = file.ik_seed.as_mut() {
+                    s.zeroize();
+                }
+                if let Some(s) = file.seal_secret.as_mut() {
+                    s.zeroize();
+                }
                 (seed, sseal)
             }
             ENC_AEAD => {
@@ -351,6 +362,14 @@ fn decode_field(field: Option<&str>, what: &'static str) -> Result<Vec<u8>, Keys
 /// Decode a required base64url field that must be exactly 32 bytes.
 fn decode_32(field: Option<&str>, what: &'static str) -> Result<[u8; 32], KeystoreError> {
     let v = decode_field(field, what)?;
+    v.as_slice().try_into().map_err(|_| KeystoreError::Encoding(what))
+}
+
+/// Like [`decode_32`] but for **secret** material: the decoded intermediate buffer is wrapped in
+/// [`Zeroizing`] so it is wiped once copied into the fixed array (the array itself lives in a
+/// zero-on-drop [`Keystore`]).
+fn decode_32_secret(field: Option<&str>, what: &'static str) -> Result<[u8; 32], KeystoreError> {
+    let v = Zeroizing::new(decode_field(field, what)?);
     v.as_slice().try_into().map_err(|_| KeystoreError::Encoding(what))
 }
 

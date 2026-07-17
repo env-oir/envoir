@@ -17,6 +17,12 @@ use dmtap_core::{ContentId, TimestampMs};
 
 /// The §16.1 retry deadline: 72 hours from `QUEUED` entry, after which an unacked MOTE `EXPIRED`s.
 pub const RETRY_DEADLINE_MS: u64 = 72 * 60 * 60 * 1000;
+/// How long a **terminal** (`ACKED`/`EXPIRED`) entry is retained after it is first observed terminal
+/// before the queue slot is garbage-collected (§20.1: terminal slots "may be GC'd"). The grace lets a
+/// late ack (§20.1 fill) still find its entry and correct the UI, and absorbs duplicate acks, before
+/// the entry is dropped so the queue — and the durable snapshot — cannot accumulate terminal entries
+/// without bound.
+pub const TERMINAL_GRACE_MS: u64 = 60 * 60 * 1000; // 1 hour
 /// §16.1 backoff base (30 s) and cap (1 h).
 pub const BACKOFF_BASE_MS: u64 = 30 * 1000;
 pub const BACKOFF_CAP_MS: u64 = 60 * 60 * 1000;
@@ -143,6 +149,11 @@ pub struct OutboundEntry {
     pub deadline: TimestampMs,
     /// True once a late ack corrected an already-`EXPIRED` entry (UI hint, §20.1 fill).
     pub delivered_late: bool,
+    /// When this entry was first observed in a terminal state (`ACKED`/`EXPIRED`), the start of its
+    /// GC grace window ([`TERMINAL_GRACE_MS`]). `None` until then. Stamped lazily by the node's
+    /// terminal-GC pass (not by the pure state machine, which carries no clock), so a restored terminal
+    /// entry gets a fresh grace window.
+    pub terminal_at: Option<TimestampMs>,
 }
 
 impl OutboundEntry {
@@ -167,6 +178,7 @@ impl OutboundEntry {
             attempts: 0,
             deadline,
             delivered_late: false,
+            terminal_at: None,
         }
     }
 

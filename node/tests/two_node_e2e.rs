@@ -12,8 +12,9 @@ use dmtap::mote::{
     build_mote, ChallengeResponse, Envelope, Hpke, Kind, MoteDraft, PowSolution, SealKeypair,
 };
 use dmtap::node::Node;
-use dmtap::outbound::OutState;
-use dmtap::transport::{InMemoryNetwork, InMemoryTransport};
+use dmtap::outbound::{OutState, TERMINAL_GRACE_MS};
+use dmtap::seen::DEDUP_WINDOW_MS;
+use dmtap::transport::{Frame, InMemoryNetwork, InMemoryTransport, Transport};
 
 /// Build a node whose transport address equals its identity key (the in-process addressing model),
 /// returning it alongside its identity public key and sealing public key for wiring peers.
@@ -244,9 +245,99 @@ fn ack_is_idempotent_and_late_ack_does_not_resurrect() {
         Some(OutState::Expired),
         "terminal EXPIRED absorbs a late ack; it does not become ACKED"
     );
-    // A further duplicate ack is a harmless no-op.
-    alice.receive_ack(id.as_bytes());
+    // A further duplicate ack (from the real recipient) is a harmless no-op.
+    alice.receive_ack(&bob_ik, id.as_bytes());
     assert_eq!(alice.outbound_state(&id), Some(OutState::Expired));
+}
+
+// --- H-C: a forged ack from a non-recipient must NOT suppress retries ------------------------
+
+#[test]
+fn forged_ack_from_non_recipient_does_not_advance_the_send() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, alice_seal) = make_node(&net);
+    let (mut bob, bob_ik, bob_seal) = make_node(&net);
+    alice.add_contact(&bob_ik, bob_seal);
+    bob.add_contact(&alice_ik, alice_seal);
+
+    let id = alice.send_mail(&bob_ik, "hi", b"deliver me for real").unwrap();
+    assert_eq!(alice.outbound_state(&id), Some(OutState::InFlight));
+
+    // An on-path relay learns the ack `id` (= BLAKE3(ciphertext), visible on the wire) and injects a
+    // forged `Ack(id)` back to Alice from ITS OWN address — not Bob's. If honored, Alice would stop
+    // retrying and falsely report the send delivered (silent non-delivery).
+    let mallory = net.endpoint(b"mallory-relay".to_vec());
+    mallory.send(&alice_ik, Frame::Ack(id.as_bytes().to_vec())).unwrap();
+    alice.poll(); // consume the forged ack
+
+    assert_eq!(
+        alice.outbound_state(&id),
+        Some(OutState::InFlight),
+        "a forged ack whose `from` != the tracked recipient is ignored — retries continue"
+    );
+
+    // The genuine ack from Bob (from == entry.to) still advances the entry to ACKED.
+    bob.poll(); // Bob stores + acks
+    alice.poll(); // Alice consumes Bob's real ack
+    assert_eq!(
+        alice.outbound_state(&id),
+        Some(OutState::Acked),
+        "a legitimate ack from the real recipient still delivers"
+    );
+}
+
+// --- H-A: the dedup `seen` set is bounded by a sliding window --------------------------------
+
+#[test]
+fn dedup_window_expires_so_seen_does_not_grow_forever() {
+    let net = InMemoryNetwork::new();
+    let (mut bob, bob_ik, bob_seal) = make_node(&net);
+    let (bytes, sender_addr) = sealed_to(&net, &bob_ik, &bob_seal, b"windowed", None);
+    bob.add_contact(&sender_addr, [7u8; 32]);
+
+    // First delivery stores + records the id in the dedup set.
+    assert!(matches!(bob.receive_mote(&sender_addr, &bytes), InboundOutcome::Stored { .. }));
+    assert_eq!(bob.inbox().exists(), 1);
+    // An immediate redelivery is within the window ⇒ deduped (re-acked, not reprocessed).
+    assert!(matches!(bob.receive_mote(&sender_addr, &bytes), InboundOutcome::Duplicate { .. }));
+    assert_eq!(bob.inbox().exists(), 1, "still one — deduped inside the window");
+
+    // Advance the receive clock PAST the dedup window: the entry ages out of `seen` (the set is a
+    // recent window, not an unbounded log), so the same id is no longer a dedup hit.
+    bob.set_now(1_700_000_000_000 + DEDUP_WINDOW_MS + 1);
+    let after = bob.receive_mote(&sender_addr, &bytes);
+    assert!(
+        matches!(after, InboundOutcome::Stored { .. }),
+        "past the window the id is no longer retained in `seen` — reprocessed, not a Duplicate: {after:?}"
+    );
+}
+
+// --- H-A: terminal outbound entries are garbage-collected after a grace window ---------------
+
+#[test]
+fn terminal_outbound_entries_are_gc_d_after_the_grace() {
+    let net = InMemoryNetwork::new();
+    let (mut alice, alice_ik, alice_seal) = make_node(&net);
+    let (mut bob, bob_ik, bob_seal) = make_node(&net);
+    alice.add_contact(&bob_ik, bob_seal);
+    bob.add_contact(&alice_ik, alice_seal);
+
+    let id = alice.send_mail(&bob_ik, "gc", b"reach a terminal state").unwrap();
+    bob.poll(); // Bob stores + acks
+    alice.poll(); // Alice reaches ACKED (terminal)
+    assert_eq!(alice.outbound_state(&id), Some(OutState::Acked));
+    assert_eq!(alice.outbound_len(), 1, "the terminal entry is still tracked (within grace)");
+
+    // A tick stamps the terminal entry's grace-window start; it is not yet removed.
+    alice.tick_deadlines();
+    assert_eq!(alice.outbound_len(), 1, "still retained during the grace window");
+
+    // Advance past the grace window and tick again: the terminal slot is garbage-collected, so the
+    // outbound queue (and the durable snapshot it feeds) cannot accumulate terminal entries forever.
+    alice.set_now(1_700_000_000_000 + TERMINAL_GRACE_MS + 1);
+    alice.tick_deadlines();
+    assert_eq!(alice.outbound_len(), 0, "the terminal entry was GC'd past the grace");
+    assert_eq!(alice.outbound_state(&id), None, "no longer tracked");
 }
 
 // --- cold-sender paths (§2.7a) -------------------------------------------------------------

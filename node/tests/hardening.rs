@@ -323,3 +323,53 @@ fn node_rejects_a_stale_mix_directory_but_accepts_a_newer_one() {
     assert!(node.ingest_mix_directory(&forged.det_cbor()).is_err());
     assert_eq!(node.mix_directory_high_water_mark(&auth_pub), Some((11, 0)), "forgery pins nothing");
 }
+
+// ============================================================================================
+// 4. Checkpoint write-amplification: a poll() batch persists once, not once-per-accept (H-A)
+// ============================================================================================
+
+/// The receive path checkpointed the FULL snapshot after every accepted MOTE (and every ack), so a
+/// tick draining K frames performed K full-snapshot writes — O(n²) disk I/O over a node's lifetime.
+/// A `poll()` batch now coalesces its per-frame checkpoints into a SINGLE durable write, so N accepts
+/// across a tick cost one snapshot, not N. (Combined with the bounded `seen`/outbound state, each
+/// snapshot is itself bounded, so total delivery I/O is linear.)
+#[test]
+fn a_poll_batch_of_many_accepts_checkpoints_once() {
+    let net = InMemoryNetwork::new();
+    let journal = CountingJournal::default();
+
+    let bob_id = IdentityKey::generate();
+    let bob_ik = bob_id.public();
+    let mut bob = Node::with_journal(
+        bob_id,
+        SealKeypair::generate(),
+        net.endpoint(bob_ik.clone()),
+        Box::new(journal.clone()),
+    )
+    .expect("build bob on a counting journal");
+    let bob_seal = bob.seal_public();
+
+    // Queue K real end-to-end-sealed MOTEs from K distinct KNOWN senders onto Bob's transport (each is
+    // accepted, so each would have triggered its own checkpoint on the old per-frame path).
+    const K: usize = 16;
+    for i in 0..K {
+        let (mut sender, sender_ik, sender_seal) = make_node(&net);
+        bob.add_contact(&sender_ik, sender_seal); // known ⇒ accepted (not deferred)
+        sender.add_contact(&bob_ik, bob_seal);
+        sender.send_mail(&bob_ik, "batch", format!("mote {i}").as_bytes()).unwrap();
+    }
+
+    let baseline = journal.saves();
+    let outcomes = bob.poll();
+    assert_eq!(outcomes.len(), K, "all {K} MOTEs were processed in one poll");
+    assert!(
+        outcomes.iter().all(|o| matches!(o, InboundOutcome::Stored { .. })),
+        "every MOTE was accepted (each would have checkpointed on the old path)"
+    );
+    assert_eq!(bob.inbox().exists(), K);
+    assert_eq!(
+        journal.saves(),
+        baseline + 1,
+        "the whole batch persisted with exactly ONE snapshot write, not one per accept"
+    );
+}

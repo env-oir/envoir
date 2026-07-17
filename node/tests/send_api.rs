@@ -299,3 +299,76 @@ async fn live_tcp_round_trip_delivers_a_real_mote() {
     let ctx = RecipientCtx { our_ik: &f.rik_public, seal_secret: f.rseal.secret(), sender_is_known: true };
     assert!(matches!(validate(&Hpke, &env, &ctx).unwrap(), Outcome::Accepted(_)));
 }
+
+// --- H-D: the delivery tick must not be starved by a stream of Send-API connections ----------
+
+/// The send-API serve loop handles connections INLINE (a `Node` is `!Send`); a `biased` select that
+/// ranked `accept` above the delivery `tick` let a stream of connections crowd out delivery/retry
+/// processing. With the bias removed the select is fair, so the delivery tick makes progress even
+/// under relentless connection load: a queued RETRY MOTE is re-dispatched to the (now reachable) peer.
+///
+/// Timing-tolerant by design: the daemon runs a **current-thread** runtime (Node is `!Send`, so the
+/// production runtime cannot be multi-thread), where a biased select does not *totally* starve the
+/// tick — it only degrades its share. This asserts the observable, robust property (delivery still
+/// happens under load) and guards against a re-introduced starvation regression.
+#[tokio::test]
+async fn delivery_tick_fires_under_a_stream_of_connections() {
+    use dmtap::send_api::run_loop_with_send_api;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    let net = InMemoryNetwork::new();
+    let node_ik = IdentityKey::from_seed(&[7u8; 32]);
+    let node_t = net.endpoint(node_ik.public());
+    let mut node = Node::with_identity(IdentityKey::from_seed(&[7u8; 32]), SealKeypair::generate(), node_t);
+
+    // A known peer that is (for now) unreachable, so the send lands in the RETRY queue.
+    let peer_ik = IdentityKey::generate();
+    let peer_seal = SealKeypair::generate();
+    let peer = net.endpoint(peer_ik.public());
+    node.add_contact(&peer_ik.public(), *peer_seal.public());
+    node.set_now(NOW);
+    net.set_down(&peer_ik.public(), true);
+    let id = node.send_mail(&peer_ik.public(), "queued", b"retry me under load").unwrap();
+    assert_eq!(node.outbound_state(&id), Some(dmtap::outbound::OutState::Retry), "unreachable ⇒ RETRY");
+    // Bring the peer back up: only a delivery tick (retry_pending) can now re-dispatch it.
+    net.set_down(&peer_ik.public(), false);
+    let _ = peer.drain(); // clear anything buffered
+
+    let mut api = SendApi::new(IdentityKey::from_seed(&[7u8; 32]), Some(ADMIN.to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Relentless connection load: many tasks each open a connection, write a complete minimal request,
+    // and immediately reconnect — a continuous stream competing with the delivery tick.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut hammers = Vec::new();
+    for _ in 0..16 {
+        let stop = stop.clone();
+        hammers.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(mut s) = tokio::net::TcpStream::connect(addr).await {
+                    let _ = s.write_all(b"GET / HTTP/1.1\r\n\r\n").await;
+                }
+            }
+        }));
+    }
+
+    // Run the loop under load for a bounded window with a fast tick.
+    let shutdown = tokio::time::sleep(Duration::from_millis(500));
+    let stats = run_loop_with_send_api(&mut node, &mut api, listener, Duration::from_millis(1), shutdown).await;
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in hammers {
+        let _ = h.await;
+    }
+
+    // The delivery tick fired despite the connection stream: the RETRY MOTE was re-dispatched to the
+    // (now reachable) peer. Under the old biased+inline loop this starved and the peer got nothing.
+    assert!(stats.ticks >= 1, "at least one delivery tick ran under connection load");
+    let got_mote = peer.drain().iter().any(|(_, f)| matches!(f, Frame::Mote(_)));
+    assert!(
+        got_mote,
+        "the delivery/retry tick re-dispatched the queued MOTE (not starved by the accept stream)"
+    );
+}

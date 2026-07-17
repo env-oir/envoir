@@ -40,6 +40,7 @@ pub mod mixdir;
 pub mod naming;
 pub mod node;
 pub mod outbound;
+pub mod seen;
 pub mod send_api;
 pub mod transport;
 pub mod usage;
