@@ -19,13 +19,19 @@
 //! - **Vanity local-parts** ([`AliasAllocator`], §7.10): the operator may allocate a chosen
 //!   local-part for a registered key, while the **key-derived alias** ([`key_derived_localpart`])
 //!   remains the stable default that always resolves — a vanity name is opt-in sugar on top of it,
-//!   and collisions are refused fail-closed.
+//!   and collisions are refused fail-closed. The allocator **enforces the normative naming rules**:
+//!   a vanity is dot-free (dotted local-parts are reserved for [`crate::forwarded_addr`]), is only
+//!   ever meaningful **fully-qualified** as `vanity@<gatewaydomain>` (never a bare, un-anchored
+//!   handle — the flat-namespace-consensus problem DMTAP does not solve), may not shadow the
+//!   auto-derived namespace ([`RESERVED_ALIAS_PREFIX`] / a key-derived shape) nor an operator
+//!   directory identity on the same domain, is **first-come + revocable**, and must pass basic
+//!   hygiene. Every failure is a hard, fail-closed reject — the allocator never silently normalizes.
 //!
 //! Deterministic throughout: challenge freshness takes the clock as an explicit parameter and the
 //! nonce is supplied by the caller (production draws it from the OS CSPRNG via [`random_nonce`]), so
 //! the whole flow is exercised without a wall clock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use dmtap_core::identity::verify_domain;
@@ -541,103 +547,291 @@ pub fn key_derived_localpart(public_key: &[u8]) -> String {
     format!("k{}", base32_lower(&ContentId::of(public_key).digest()[..10]))
 }
 
-/// Why a vanity local-part could not be allocated (fail-closed).
+/// The reserved prefix that anchors the human-facing spelling of the auto-derived, key-derived
+/// namespace (§7.10, the normative naming model). A chosen vanity local-part MUST NOT begin with it,
+/// so a vanity can never shadow or impersonate an auto-derived alias. This is enforced **in addition
+/// to** the compact `k<base32>` [`key_derived_localpart`] shape (see [`is_key_derived_form`]): both
+/// spellings of the auto-derived namespace are reserved against vanity capture.
+pub const RESERVED_ALIAS_PREFIX: &str = "dmtap1-";
+
+/// The RFC 5321 §4.5.3.1.1 local-part octet limit — the ceiling for a vanity local-part.
+const MAX_VANITY_LEN: usize = 64;
+
+/// Why a chosen vanity local-part could not be allocated on the gateway domain (fail-closed). Every
+/// variant is a hard reject with a clear reason — the allocator **never silently normalizes** a name
+/// into something acceptable (spec §7.10, the normative vanity-alias rules).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AliasError {
-    /// The requested local-part is empty or contains characters outside an RFC 5321 dot-atom.
-    #[error("vanity local-part {0:?} is empty or not a valid dot-atom local-part")]
+    /// Hygiene (rule 6): the local-part is empty, over-length, or contains whitespace / CR / LF /
+    /// NUL / any byte outside the dot-free dot-atom charset (letters, digits, `- _ +`).
+    #[error("vanity local-part {0:?} is empty, over-length, or contains a disallowed character")]
     InvalidLocalPart(String),
-    /// The requested local-part is already allocated to a **different** key.
-    #[error("vanity local-part {0:?} is already taken")]
+    /// Rule 1 (DOT-FREE): the local-part contains a `.`. Dotted local-parts are **reserved** for the
+    /// forwarded-address encoding ([`crate::forwarded_addr`], `local.nativedomain@gateway`), so a
+    /// vanity must be dot-free to keep dot-free-vanity vs dotted-forwarded unambiguous. Refused, not
+    /// stripped.
+    #[error("vanity local-part {0:?} contains a '.' — dotted local-parts are reserved for forwarded addresses")]
+    ContainsDot(String),
+    /// Rule 4 (FIRST-COME): the local-part is already allocated to a **different** identity on this
+    /// gateway domain. Release it first (see [`AliasAllocator::release_vanity`]) to free the name.
+    #[error("vanity local-part {0:?} is already taken by another identity on this gateway")]
     Taken(String),
-    /// The requested local-part collides with the reserved key-derived form of another key.
-    #[error("vanity local-part {0:?} collides with a reserved key-derived alias")]
+    /// Rule 3 (RESERVED-PREFIX / auto-derived namespace): the local-part would shadow or parse as an
+    /// auto-derived alias — it begins with [`RESERVED_ALIAS_PREFIX`] or matches the `k<base32>`
+    /// key-derived shape ([`is_key_derived_form`]).
+    #[error("vanity local-part {0:?} collides with the reserved auto-derived (key-derived) namespace")]
     ReservedCollision(String),
+    /// Rule 5 (NETWORK-NAME non-shadow): the local-part is already claimed by one of the operator's
+    /// own directory identities on this same gateway domain, so a vanity may not shadow the real
+    /// account.
+    #[error("vanity local-part {0:?} would shadow an existing directory identity on this gateway")]
+    ShadowsDirectoryIdentity(String),
+    /// Rule 2 (construction): the gateway domain the allocator is anchored to is not a syntactically
+    /// valid DNS domain, so no fully-qualified `vanity@<gatewaydomain>` could ever be formed.
+    #[error("gateway domain {0:?} is not a valid DNS domain")]
+    InvalidGatewayDomain(String),
 }
 
-/// Allocates local-parts for one domain (§7.10): the operator may grant a chosen **vanity** name to a
-/// registered key, while the [`key_derived_localpart`] stays the stable default that always resolves.
-/// [`Self::resolve`] accepts either form; [`Self::alias_for`] returns the vanity if one was allocated,
-/// otherwise the key-derived default.
-#[derive(Debug, Default, Clone)]
+/// Allocates **fully-qualified** vanity local-parts on a single gateway domain (§7.10). The operator
+/// may grant a chosen vanity name to a registered key, while the [`key_derived_localpart`] stays the
+/// stable default that always resolves.
+///
+/// The allocator is **anchored to the gateway's own domain** ([`Self::for_domain`]): a vanity is only
+/// ever meaningful as `vanity@<gatewaydomain>`, so both what it stores and what it returns is that
+/// fully-qualified form — it never hands out or accepts a bare, un-anchored handle (rule 2). The
+/// anchoring domain is also *why* a vanity cannot shadow a real network name (`x@otherdomain`,
+/// `x.eth`): those are structurally different strings from `vanity@<gatewaydomain>`. On top of that
+/// structural guarantee, the allocator additionally refuses a vanity that would shadow one of the
+/// operator's **own** directory identities on the same domain (rule 5) — reserve those with
+/// [`Self::reserve_localpart`] / [`Self::reserve_directory_address`].
+///
+/// [`Self::allocate_vanity`] enforces every naming rule fail-closed and returns the bound
+/// `vanity@<gatewaydomain>`; [`Self::alias_for`] returns the fully-qualified vanity if allocated,
+/// else the fully-qualified key-derived default; [`Self::resolve`] accepts only a fully-qualified
+/// address on this gateway's domain; [`Self::release_vanity`] revokes an allocation so the name can
+/// be reused ("yours only as long as you hold the registration").
+#[derive(Debug, Clone)]
 pub struct AliasAllocator {
+    /// The gateway's own domain (lowercased), the anchor every vanity is qualified against (rule 2).
+    domain: String,
     /// vanity local-part (lowercased) → public key
     vanity: HashMap<String, Vec<u8>>,
     /// public key → its allocated vanity local-part (lowercased)
     reverse: Vec<(Vec<u8>, String)>,
+    /// local-parts (lowercased) claimed by the operator's own directory identities on this domain: a
+    /// vanity that collides with one is refused (rule 5, network-name non-shadow).
+    reserved: HashSet<String>,
 }
 
 impl AliasAllocator {
-    /// A fresh allocator with no vanity names (every key resolves by its key-derived default).
-    pub fn new() -> Self {
-        Self::default()
+    /// A fresh allocator anchored to the gateway's own `domain` (rule 2). **Fail-closed**: rejects a
+    /// syntactically invalid gateway domain, since no fully-qualified vanity could be formed against
+    /// it. Every key then resolves by its fully-qualified key-derived default until a vanity is
+    /// allocated.
+    pub fn for_domain(domain: impl AsRef<str>) -> Result<Self, AliasError> {
+        let raw = domain.as_ref();
+        let d = raw.trim().to_ascii_lowercase();
+        if !is_valid_dns_domain(&d) {
+            return Err(AliasError::InvalidGatewayDomain(raw.to_string()));
+        }
+        Ok(AliasAllocator {
+            domain: d,
+            vanity: HashMap::new(),
+            reverse: Vec::new(),
+            reserved: HashSet::new(),
+        })
     }
 
-    /// Allocate `local_part` as a vanity alias for `public_key` (§7.10). **Fail-closed**: rejects an
-    /// invalid local-part, one already taken by a different key, or one that collides with the
-    /// reserved key-derived alias of some *other* key (so a vanity name can never shadow another
-    /// sender's stable default). Idempotent for the same key.
-    pub fn allocate_vanity(&mut self, public_key: &[u8], local_part: &str) -> Result<(), AliasError> {
-        let lp = local_part.trim().to_ascii_lowercase();
-        if !is_valid_local_part(&lp) {
-            return Err(AliasError::InvalidLocalPart(local_part.to_string()));
+    /// The gateway domain this allocator qualifies vanity names against.
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Reserve `local_part` as an operator directory identity on this gateway domain (rule 5): a
+    /// vanity that collides with it is refused, so a chosen name can never shadow a real account.
+    /// Idempotent; the value is lowercased for a case-insensitive match.
+    pub fn reserve_localpart(&mut self, local_part: impl AsRef<str>) {
+        self.reserved.insert(local_part.as_ref().trim().to_ascii_lowercase());
+    }
+
+    /// Reserve the local-part of a full directory address `email` **iff** it is on this gateway's own
+    /// domain (rule 5). Addresses on other domains are ignored — a vanity is structurally distinct
+    /// from `x@otherdomain` and cannot shadow it. Returns whether the address was on-domain and thus
+    /// reserved. The personal run-mode feeds the operator's directory through this so the same file
+    /// that resolves inbound recipients also blocks a vanity from shadowing one of them.
+    pub fn reserve_directory_address(&mut self, email: &str) -> bool {
+        match email.rsplit_once('@') {
+            Some((lp, dom)) if dom.trim().eq_ignore_ascii_case(&self.domain) => {
+                self.reserve_localpart(lp);
+                true
+            }
+            _ => false,
         }
+    }
+
+    /// Allocate `local_part` as a vanity alias for `public_key`, returning the bound
+    /// **fully-qualified** address `vanity@<gatewaydomain>` (§7.10, rule 2). **Fail-closed** — each
+    /// normative rule is a hard reject, never a silent normalization:
+    ///
+    /// - rule 1 [`AliasError::ContainsDot`] — a `.` is reserved for forwarded addresses;
+    /// - rule 6 [`AliasError::InvalidLocalPart`] — empty / whitespace / CRLF / NUL / over-length /
+    ///   out-of-charset;
+    /// - rule 3 [`AliasError::ReservedCollision`] — the auto-derived (key-derived) namespace;
+    /// - rule 5 [`AliasError::ShadowsDirectoryIdentity`] — an operator directory identity;
+    /// - rule 4 [`AliasError::Taken`] — already held by a *different* identity.
+    ///
+    /// Idempotent for the **same** key (re-allocating its current name returns the same FQ address).
+    /// One vanity per key: allocating a new name drops the key's prior one (the key-derived default
+    /// always remains, so the identity stays reachable).
+    pub fn allocate_vanity(
+        &mut self,
+        public_key: &[u8],
+        local_part: &str,
+    ) -> Result<String, AliasError> {
+        // Rules 1, 3, 5, 6 (all the stateless, name-only checks). Returns the normalized local-part.
+        let lp = self.check_vanity(local_part)?;
+
+        // Rule 4 (FIRST-COME): a name held by a *different* identity is refused; the same key is
+        // idempotent.
         if let Some(existing) = self.vanity.get(&lp) {
             if existing == public_key {
-                return Ok(()); // idempotent re-allocation of the same name to the same key
+                return Ok(self.qualify(&lp)); // idempotent re-allocation of the same name/key
             }
             return Err(AliasError::Taken(local_part.to_string()));
         }
-        // A vanity name must not shadow the reserved key-derived alias of a *different* key.
-        if lp != key_derived_localpart(public_key) && is_key_derived_form(&lp) {
-            return Err(AliasError::ReservedCollision(local_part.to_string()));
-        }
-        // Drop any prior vanity for this key (one vanity per key; the key-derived default remains).
+
+        // One vanity per key: drop any prior name for this key (the key-derived default remains).
         if let Some(pos) = self.reverse.iter().position(|(k, _)| k == public_key) {
             let (_, old) = self.reverse.remove(pos);
             self.vanity.remove(&old);
         }
         self.vanity.insert(lp.clone(), public_key.to_vec());
-        self.reverse.push((public_key.to_vec(), lp));
-        Ok(())
+        self.reverse.push((public_key.to_vec(), lp.clone()));
+        Ok(self.qualify(&lp))
     }
 
-    /// The address local-part to present for `public_key`: its vanity name if allocated, else the
-    /// stable [`key_derived_localpart`] default (§7.10).
+    /// Release (revoke) the vanity currently held by `public_key`, freeing the name for another
+    /// identity to claim (rule 4, revocable — *"yours only as long as you hold the registration"*).
+    /// Returns the freed **fully-qualified** address, or `None` if the key held no vanity. The
+    /// key-derived default always remains, so the identity stays reachable after a release.
+    pub fn release_vanity(&mut self, public_key: &[u8]) -> Option<String> {
+        let pos = self.reverse.iter().position(|(k, _)| k == public_key)?;
+        let (_, lp) = self.reverse.remove(pos);
+        self.vanity.remove(&lp);
+        Some(self.qualify(&lp))
+    }
+
+    /// The **fully-qualified** address to present for `public_key`: its `vanity@<gatewaydomain>` if
+    /// one is allocated, else the fully-qualified [`key_derived_localpart`] default (§7.10, rule 2 —
+    /// never a bare local-part).
     pub fn alias_for(&self, public_key: &[u8]) -> String {
-        self.reverse
+        let lp = self
+            .reverse
             .iter()
             .find(|(k, _)| k == public_key)
             .map(|(_, lp)| lp.clone())
-            .unwrap_or_else(|| key_derived_localpart(public_key))
+            .unwrap_or_else(|| key_derived_localpart(public_key));
+        self.qualify(&lp)
     }
 
-    /// Resolve a local-part (either a vanity name or a key-derived alias) back to its public key,
-    /// checking against the registered set. A vanity name resolves via the allocation table; a
-    /// key-derived alias resolves by matching it against each registered key's derived form.
-    pub fn resolve(&self, local_part: &str, registered_keys: &[Vec<u8>]) -> Option<Vec<u8>> {
-        let lp = local_part.trim().to_ascii_lowercase();
-        if let Some(k) = self.vanity.get(&lp) {
+    /// Resolve a **fully-qualified** address (either a vanity name or a key-derived alias, always
+    /// `local@<gatewaydomain>`) back to its public key. Rule 2: a bare, un-anchored handle (no `@`)
+    /// or an address on any other domain is refused (`None`) — the allocator never accepts an
+    /// un-anchored name. A vanity resolves via the allocation table; a key-derived alias resolves by
+    /// matching it against each registered key's derived form.
+    pub fn resolve(&self, address: &str, registered_keys: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let addr = address.trim().to_ascii_lowercase();
+        let (lp, dom) = addr.rsplit_once('@')?; // a bare handle (no '@') is never accepted (rule 2)
+        if dom != self.domain {
+            return None; // only this gateway's own fully-qualified aliases resolve here
+        }
+        if let Some(k) = self.vanity.get(lp) {
             return Some(k.clone());
         }
         registered_keys.iter().find(|k| key_derived_localpart(k) == lp).cloned()
     }
+
+    /// Qualify a bare local-part into `local@<gatewaydomain>` — the one place the anchoring suffix is
+    /// appended, so stored/returned/resolved forms are all consistently fully-qualified (rule 2).
+    fn qualify(&self, local_part: &str) -> String {
+        format!("{local_part}@{}", self.domain)
+    }
+
+    /// Run the stateless naming rules on `local_part` (rules 1, 3, 5, 6) and return the normalized
+    /// (lowercased) local-part, WITHOUT touching allocation state (rule 4 / first-come lives in
+    /// [`Self::allocate_vanity`]). Fail-closed, in check order.
+    fn check_vanity(&self, local_part: &str) -> Result<String, AliasError> {
+        // Rule 1 (DOT-FREE): checked on the RAW input, before any case-folding, so a dot is refused
+        // rather than normalized away. Because a vanity is dot-free, it can never spell a forwarded
+        // address (whose one bare separator dot is structurally required), so the forwarded-alias
+        // "would otherwise parse as" guard of rule 3 is satisfied structurally by this check.
+        if local_part.contains('.') {
+            return Err(AliasError::ContainsDot(local_part.to_string()));
+        }
+        // Rule 6 (hygiene): lowercase-fold for the case-insensitive namespace, then require a
+        // non-empty, in-length, dot-free dot-atom. Whitespace, CR, LF, NUL, and any control or
+        // out-of-charset byte are rejected here (they are not in the charset) — we do NOT trim.
+        let lp = local_part.to_ascii_lowercase();
+        if !is_valid_vanity_charset(&lp) {
+            return Err(AliasError::InvalidLocalPart(local_part.to_string()));
+        }
+        // Rule 3 (RESERVED-PREFIX / auto-derived namespace): a vanity must not shadow or parse as an
+        // auto-derived alias — neither the human `dmtap1-…` prefix nor the compact `k<base32>` shape.
+        if lp.starts_with(RESERVED_ALIAS_PREFIX) || is_key_derived_form(&lp) {
+            return Err(AliasError::ReservedCollision(local_part.to_string()));
+        }
+        // Rule 5 (NETWORK-NAME non-shadow): a vanity must not shadow an operator directory identity
+        // already claimed on this same gateway domain.
+        if self.reserved.contains(&lp) {
+            return Err(AliasError::ShadowsDirectoryIdentity(local_part.to_string()));
+        }
+        Ok(lp)
+    }
 }
 
 /// Whether `lp` matches the reserved key-derived shape (`k` + 16 base32 chars) so a vanity request
-/// for that exact shape is treated as reserved.
+/// for that exact shape is treated as reserved (rule 3).
 fn is_key_derived_form(lp: &str) -> bool {
     let Some(rest) = lp.strip_prefix('k') else { return false };
     rest.len() == 16 && rest.bytes().all(|c| BASE32_LOWER.contains(&c))
 }
 
-/// A conservative RFC 5321 dot-atom local-part check (letters, digits, and `.-_+`), non-empty, no
-/// leading/trailing/double dot — enough to keep a vanity name safe as an SMTP address without quoting.
-fn is_valid_local_part(lp: &str) -> bool {
-    if lp.is_empty() || lp.len() > 64 || lp.starts_with('.') || lp.ends_with('.') || lp.contains("..") {
+/// A conservative **dot-free** RFC 5321 dot-atom local-part check for a vanity: non-empty, within the
+/// 64-octet cap, and every byte an ASCII alphanumeric or one of `- _ +`. A `.` is intentionally NOT
+/// permitted (rule 1 — dotted local-parts are reserved for forwarded addresses), and because the
+/// charset is a strict allow-list, whitespace / CR / LF / NUL / control bytes are all rejected too
+/// (rule 6). Kept dot-free-strict here on purpose; the dotted forwarded-address form has its own
+/// validator in [`crate::forwarded_addr`].
+fn is_valid_vanity_charset(lp: &str) -> bool {
+    if lp.is_empty() || lp.len() > MAX_VANITY_LEN {
         return false;
     }
-    lp.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_' | b'+'))
+    lp.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'+'))
+}
+
+/// A conservative RFC 1035 / RFC 5321 domain-syntax check for the gateway's own anchoring domain:
+/// one or more dot-separated labels, each 1..=63 bytes of ASCII alphanumerics and `-` (no
+/// leading/trailing hyphen), total 1..=253 bytes. Used only to validate the [`AliasAllocator`]
+/// anchor at construction (rule 2), so a fully-qualified `vanity@<gatewaydomain>` is always a legal
+/// address.
+fn is_valid_dns_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 {
+        return false;
+    }
+    let mut labels = 0;
+    for label in domain.split('.') {
+        labels += 1;
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+            return false;
+        }
+    }
+    labels >= 1
 }
 
 #[cfg(test)]
@@ -935,8 +1129,10 @@ mod tests {
 
     // ── Vanity + key-derived local-parts (§7.10) ─────────────────────────────────────────────
 
+    const GW: &str = "gw.example";
+
     #[test]
-    fn key_derived_alias_is_stable_and_the_default() {
+    fn key_derived_alias_is_stable_and_fully_qualified_by_default() {
         let k = IdentityKey::generate();
         let a1 = key_derived_localpart(&k.public());
         let a2 = key_derived_localpart(&k.public());
@@ -944,57 +1140,200 @@ mod tests {
         assert!(a1.starts_with('k') && a1.len() == 17);
         assert!(is_key_derived_form(&a1));
 
-        // With no vanity allocated, alias_for returns the key-derived default.
-        let alloc = AliasAllocator::new();
-        assert_eq!(alloc.alias_for(&k.public()), a1);
-        // ...and it resolves back to the key.
-        assert_eq!(alloc.resolve(&a1, &[k.public()]), Some(k.public()));
+        // With no vanity allocated, alias_for returns the FULLY-QUALIFIED key-derived default (rule 2).
+        let alloc = AliasAllocator::for_domain(GW).unwrap();
+        assert_eq!(alloc.alias_for(&k.public()), format!("{a1}@{GW}"));
+        // ...and its fully-qualified form resolves back to the key.
+        assert_eq!(alloc.resolve(&format!("{a1}@{GW}"), &[k.public()]), Some(k.public()));
     }
 
-    #[test]
-    fn vanity_allocation_overrides_the_default_but_default_still_resolves() {
-        let k = IdentityKey::generate();
-        let mut alloc = AliasAllocator::new();
-        alloc.allocate_vanity(&k.public(), "Alice").unwrap();
+    // ── Rule 2: fully-qualified only (bind/return/accept only `vanity@<gatewaydomain>`) ──────────
 
-        // The presented alias is now the vanity form (lowercased)...
-        assert_eq!(alloc.alias_for(&k.public()), "alice");
-        // ...both the vanity and the stable key-derived default resolve to the key.
-        assert_eq!(alloc.resolve("alice", &[k.public()]), Some(k.public()));
+    #[test]
+    fn rule2_allocation_binds_and_returns_the_fully_qualified_form_and_rejects_bare_handles() {
+        let k = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+
+        // allocate_vanity returns the FQ address, not a bare handle.
+        let fq = alloc.allocate_vanity(&k.public(), "Alice").unwrap();
+        assert_eq!(fq, format!("alice@{GW}"), "the stored/returned form is fully-qualified (lowercased)");
+        // alias_for presents the FQ vanity.
+        assert_eq!(alloc.alias_for(&k.public()), format!("alice@{GW}"));
+
+        // resolve accepts ONLY a fully-qualified address on this gateway domain.
+        assert_eq!(alloc.resolve(&format!("alice@{GW}"), &[k.public()]), Some(k.public()));
+        // A bare, un-anchored handle (no '@') is refused (rule 2 — never accept an un-anchored name).
+        assert_eq!(alloc.resolve("alice", &[k.public()]), None);
+        // The same local-part on some OTHER domain does not resolve here (structurally different).
+        assert_eq!(alloc.resolve("alice@other.net", &[k.public()]), None);
+        // The stable key-derived default still resolves, fully-qualified.
         assert_eq!(
-            alloc.resolve(&key_derived_localpart(&k.public()), &[k.public()]),
+            alloc.resolve(&format!("{}@{GW}", key_derived_localpart(&k.public())), &[k.public()]),
             Some(k.public())
         );
     }
 
     #[test]
-    fn vanity_collisions_and_invalid_names_fail_closed() {
+    fn rule2_construction_rejects_an_invalid_gateway_domain_fail_closed() {
+        assert!(AliasAllocator::for_domain("gw.example").is_ok());
+        for bad in ["", " ", "no_underscores.example", "-lead.example", "trail-.example", "a..b"] {
+            assert!(
+                matches!(AliasAllocator::for_domain(bad), Err(AliasError::InvalidGatewayDomain(_))),
+                "gateway domain {bad:?} must be rejected"
+            );
+        }
+    }
+
+    // ── Rule 1: dot-free (dotted local-parts reserved for forwarded addresses) ───────────────────
+
+    #[test]
+    fn rule1_dotted_vanity_is_rejected_not_normalized() {
+        let k = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+        for dotted in ["first.last", ".lead", "trail.", "a.b.c", "imran.mydomain-.com"] {
+            assert_eq!(
+                alloc.allocate_vanity(&k.public(), dotted),
+                Err(AliasError::ContainsDot(dotted.to_string())),
+                "dotted vanity {dotted:?} must be refused (reserved for forwarded encoding), not stripped"
+            );
+        }
+        // And nothing was silently allocated as a side effect.
+        assert_eq!(alloc.alias_for(&k.public()), format!("{}@{GW}", key_derived_localpart(&k.public())));
+    }
+
+    // ── Rule 3: reserved-prefix / auto-derived namespace guard ───────────────────────────────────
+
+    #[test]
+    fn rule3_reserved_prefix_and_key_derived_shapes_are_rejected() {
         let a = IdentityKey::generate();
         let b = IdentityKey::generate();
-        let mut alloc = AliasAllocator::new();
-        alloc.allocate_vanity(&a.public(), "team").unwrap();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
 
-        // Same name for a different key → Taken.
-        assert_eq!(alloc.allocate_vanity(&b.public(), "team"), Err(AliasError::Taken("team".into())));
-        // Re-allocating the same name to the same key is idempotent.
-        alloc.allocate_vanity(&a.public(), "team").unwrap();
-        // An invalid local-part → InvalidLocalPart.
+        // The human `dmtap1-…` reserved prefix is refused (case-insensitive).
         assert!(matches!(
-            alloc.allocate_vanity(&b.public(), "bad name!"),
-            Err(AliasError::InvalidLocalPart(_))
+            alloc.allocate_vanity(&a.public(), "dmtap1-anything"),
+            Err(AliasError::ReservedCollision(_))
         ));
-        // Trying to claim ANOTHER key's reserved key-derived alias as a vanity → ReservedCollision.
-        let reserved = key_derived_localpart(&a.public());
         assert!(matches!(
-            alloc.allocate_vanity(&b.public(), &reserved),
+            alloc.allocate_vanity(&a.public(), "DMTAP1-Upper"),
+            Err(AliasError::ReservedCollision(_))
+        ));
+        // A key's OWN key-derived shape may not be claimed as a vanity either (no shadowing at all).
+        let own = key_derived_localpart(&a.public());
+        assert!(matches!(
+            alloc.allocate_vanity(&a.public(), &own),
+            Err(AliasError::ReservedCollision(_))
+        ));
+        // Another key's key-derived shape is likewise refused.
+        let other = key_derived_localpart(&b.public());
+        assert!(matches!(
+            alloc.allocate_vanity(&a.public(), &other),
             Err(AliasError::ReservedCollision(_))
         ));
     }
 
+    // ── Rule 4: first-come + revocable ───────────────────────────────────────────────────────────
+
     #[test]
-    fn base32_lower_is_a_valid_local_part_charset() {
+    fn rule4_duplicate_allocation_is_refused_but_same_key_is_idempotent() {
+        let a = IdentityKey::generate();
+        let b = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+        assert_eq!(alloc.allocate_vanity(&a.public(), "team").unwrap(), format!("team@{GW}"));
+
+        // Same name for a DIFFERENT identity → Taken (first-come).
+        assert_eq!(
+            alloc.allocate_vanity(&b.public(), "team"),
+            Err(AliasError::Taken("team".into()))
+        );
+        // Re-allocating the same name to the SAME key is idempotent and returns the FQ form.
+        assert_eq!(alloc.allocate_vanity(&a.public(), "team").unwrap(), format!("team@{GW}"));
+        // The name still resolves to the first-comer, not the challenger.
+        assert_eq!(alloc.resolve(&format!("team@{GW}"), &[a.public(), b.public()]), Some(a.public()));
+    }
+
+    #[test]
+    fn rule4_release_then_reallocate_to_a_different_identity_works() {
+        let a = IdentityKey::generate();
+        let b = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+        alloc.allocate_vanity(&a.public(), "team").unwrap();
+
+        // While held, b cannot take it.
+        assert!(matches!(alloc.allocate_vanity(&b.public(), "team"), Err(AliasError::Taken(_))));
+
+        // a releases (revokes) the registration — the freed FQ name is returned.
+        assert_eq!(alloc.release_vanity(&a.public()), Some(format!("team@{GW}")));
+        // a now falls back to its key-derived default; the vanity no longer resolves to anyone until reclaimed.
+        assert_eq!(alloc.alias_for(&a.public()), format!("{}@{GW}", key_derived_localpart(&a.public())));
+        assert_eq!(alloc.resolve(&format!("team@{GW}"), &[a.public(), b.public()]), None);
+
+        // Now b can claim the freed name ("yours only as long as you hold the registration").
+        assert_eq!(alloc.allocate_vanity(&b.public(), "team").unwrap(), format!("team@{GW}"));
+        assert_eq!(alloc.resolve(&format!("team@{GW}"), &[a.public(), b.public()]), Some(b.public()));
+
+        // Releasing a key that holds no vanity is a no-op.
+        let c = IdentityKey::generate();
+        assert_eq!(alloc.release_vanity(&c.public()), None);
+    }
+
+    // ── Rule 5: network-name / directory non-shadow ──────────────────────────────────────────────
+
+    #[test]
+    fn rule5_vanity_cannot_shadow_an_operator_directory_identity() {
+        let a = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+
+        // Operator's own directory identities on this domain are reserved.
+        alloc.reserve_localpart("postmaster");
+        // A full on-domain address reserves just its local-part; an off-domain one is ignored.
+        assert!(alloc.reserve_directory_address(&format!("founder@{GW}")));
+        assert!(!alloc.reserve_directory_address("someone@other.net"));
+
+        assert!(matches!(
+            alloc.allocate_vanity(&a.public(), "postmaster"),
+            Err(AliasError::ShadowsDirectoryIdentity(_))
+        ));
+        // Case-insensitive: the folded form still collides.
+        assert!(matches!(
+            alloc.allocate_vanity(&a.public(), "Founder"),
+            Err(AliasError::ShadowsDirectoryIdentity(_))
+        ));
+        // A non-colliding vanity is still fine.
+        assert_eq!(alloc.allocate_vanity(&a.public(), "founderx").unwrap(), format!("founderx@{GW}"));
+    }
+
+    // ── Rule 6: basic hygiene ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rule6_hygiene_rejections_fail_closed() {
+        let k = IdentityKey::generate();
+        let mut alloc = AliasAllocator::for_domain(GW).unwrap();
+        let long = "a".repeat(65);
+        for bad in [
+            "",            // empty
+            " ",           // whitespace only
+            "with space",  // embedded whitespace
+            "line\r\nbreak", // CRLF injection
+            "nul\0byte",   // NUL
+            "tab\tchar",   // control
+            "bad!name",    // out-of-charset punctuation
+            "emoji😀",     // non-ASCII
+            long.as_str(), // over the 64-octet cap
+        ] {
+            assert!(
+                matches!(alloc.allocate_vanity(&k.public(), bad), Err(AliasError::InvalidLocalPart(_))),
+                "hygiene must reject {bad:?}"
+            );
+        }
+        // A clean dot-free dot-atom is accepted (letters/digits/-/_/+).
+        assert_eq!(alloc.allocate_vanity(&k.public(), "user_name-01+tag").unwrap(), format!("user_name-01+tag@{GW}"));
+    }
+
+    #[test]
+    fn base32_lower_is_a_valid_vanity_charset() {
         let s = base32_lower(&[0xff, 0x00, 0x99, 0x12, 0x34]);
         assert!(!s.is_empty());
-        assert!(is_valid_local_part(&s));
+        assert!(is_valid_vanity_charset(&s));
     }
 }
