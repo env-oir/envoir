@@ -96,8 +96,10 @@ fn base32_decode(s: &str) -> Option<Vec<u8>> {
             buf &= (1 << bits) - 1;
         }
     }
-    // Any leftover bits are padding and MUST be zero — otherwise two spellings could decode alike.
-    if buf != 0 {
+    // Leftover bits are padding and MUST be zero — otherwise two spellings could decode alike.
+    // A leftover of 5+ bits is an invalid base32 length (char-count ≡ 1,3,6 mod 8): a stray char
+    // that carries bits but completes no byte. Reject it so decoding is injective on length too.
+    if bits >= 5 || buf != 0 {
         return None;
     }
     Some(out)
@@ -130,7 +132,13 @@ pub fn ik_from_gateway_alias(local_part: &str) -> Option<Vec<u8>> {
     if body.is_empty() {
         return None;
     }
-    base32_decode(body)
+    let decoded = base32_decode(body)?;
+    // A key-derived alias carries exactly the 32-byte identity key; any other length is malformed
+    // (the doc promises "the exact 32-byte key") — fail closed so no caller routes on a short/long key.
+    if decoded.len() != 32 {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Encode a recipient's X25519 sealing public key as the reference KeyPackage bundle bytes (the
@@ -203,6 +211,17 @@ mod tests {
         // 'a','b' (b=1) leaves the low padding bit set ⇒ non-canonical ⇒ fail closed.
         assert_eq!(base32_decode("aa").unwrap(), vec![0u8]);
         assert!(base32_decode("ab").is_none());
+    }
+
+    #[test]
+    fn base32_invalid_length_and_non32_alias_fail_closed() {
+        // Char-counts that complete no byte-group (char-count ≡ 1,3,6 mod 8) are invalid base32
+        // lengths — previously "a" silently decoded to []. Now they fail closed (injective on length).
+        assert!(base32_decode("a").is_none()); // 5 leftover bits
+        assert!(base32_decode("aaa").is_none()); // 7 leftover bits
+        assert!(base32_decode("aaaaaa").is_none()); // 6 leftover bits
+        // A key-derived alias whose body decodes to other than the 32-byte key is malformed.
+        assert!(ik_from_gateway_alias(&format!("{GATEWAY_ALIAS_PREFIX}aa")).is_none());
     }
 
     #[test]
