@@ -28,9 +28,38 @@ pub enum ResolveError {
 
     /// The DNS `ik`/`id` pointer does not match the fetched/pinned `Identity` (§3.3 step 3–4). The
     /// pointer and the signed object disagree — fail closed, never trust the pointer. Rendered as a
-    /// binding mismatch; `0x0109` at the resolution layer.
+    /// binding mismatch; `0x0109` at the resolution layer. This is the **plain, non-alias** DNS
+    /// identity mismatch (a swapped `ik`/`id` pointer); an *alias*-specific forward-verify failure
+    /// carries its own distinct code — see [`ResolveError::AliasForwardUnverified`] (`0x011C`).
     #[error("DNS binding does not match the resolved identity: {0}")]
     DnsIdentityMismatch(&'static str),
+
+    /// A self-asserted alias whose forward `name → ik` binding (DNS + KT, §3.3–3.5) does **not**
+    /// resolve back to this same identity key — an alias claiming (or addressed at) an identity the
+    /// key does not control. `Identity.names` is self-asserted (§3.9.4): a name it lists — or a name
+    /// a DNS pointer aims at an identity — proves nothing until the *identity itself* claims it back.
+    /// When the resolved `Identity` does not list the resolved name, the bidirectional binding is
+    /// broken and the alias is **unverified**. This is the identity's-own-list analogue of the
+    /// org-directory forward-verify (`0x0114`). `ERR_ALIAS_FORWARD_UNVERIFIED` (`0x011C`),
+    /// FAIL_CLOSED_BLOCK — render the alias unverified; MUST NOT display it as authenticated nor use
+    /// it to address mail. Distinct from the plain `0x0109` [`ResolveError::DnsIdentityMismatch`] (a
+    /// swapped `ik`/`id` pointer) and from [`ResolveError::AliasRevoked`] (`0x011D`, a *once-listed*
+    /// alias later dropped).
+    #[error("alias forward-unverified — the resolved identity does not claim this alias (0x011C): {0}")]
+    AliasForwardUnverified(&'static str),
+
+    /// An alias used to address the identity has been **revoked**: dropped in a newer signed
+    /// `Identity` version (its `name → ik` DNS + KT binding retired), while the key and the
+    /// identity's *other* aliases remain valid (§3.9.4, §3.11.5). Aliases are independently
+    /// revocable, so revoking one MUST NOT remain usable off a stale cache/DNS pointer. Detected by
+    /// walking the resolved identity's `prev` hash chain (§1.5): a name **absent** from the current
+    /// version but **present** in a prior signed version was retired, not merely never claimed.
+    /// `ERR_ALIAS_REVOKED` (`0x011D`), REJECT_NOTIFY — tell the sender to use a live alias or the
+    /// key-name (§3.9.6); the key and the identity's other aliases are unaffected. Distinct from
+    /// [`ResolveError::AliasForwardUnverified`] (`0x011C`, a name this identity *never* verifiably
+    /// listed).
+    #[error("alias revoked — retired in a newer Identity version; use a live alias or the key-name (0x011D): {0}")]
+    AliasRevoked(&'static str),
 
     /// KT log is unreachable/partitioned/censored at first contact (§3.3). MUST NOT silently
     /// TOFU-pin. `ERR_KT_UNREACHABLE` (`0x0106`), FAIL_CLOSED_BLOCK.
@@ -123,6 +152,8 @@ impl ResolveError {
             ResolveError::MalformedDns(_) => 0x0109,
             ResolveError::NameResolution(_) => 0x0109,
             ResolveError::DnsIdentityMismatch(_) => 0x0109,
+            ResolveError::AliasForwardUnverified(_) => 0x011C,
+            ResolveError::AliasRevoked(_) => 0x011D,
             ResolveError::KtUnreachable => 0x0106,
             ResolveError::KtProofInvalid => 0x0108,
             ResolveError::KtLeafHashMismatch => 0x0117,
