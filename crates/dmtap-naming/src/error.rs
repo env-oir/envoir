@@ -101,6 +101,18 @@ pub enum ResolveError {
     /// *different* key. Rendered at the resolution layer as `ERR_NAME_RESOLUTION_FAILED` (`0x0109`).
     #[error("key-name unverified — checksum/derivation mismatch, fail closed (0x0109): {0}")]
     KeyNameUnverified(&'static str),
+
+    /// Two independent resolvers returned **different** `ik` for the **same** name (§3.12.3): e.g. a
+    /// `dns` `_dmtap` pointer and a `name-chain` record the owner also publishes disagree. Because a
+    /// genuine identity has exactly one key, an *inter-resolver* disagreement is treated as a
+    /// potential attack (split view / a corrupted registrar or chain), never silently reconciled to
+    /// one key. Distinct from `0x011E` ([`ResolveError::NameChainBindingUnverified`], the
+    /// *bidirectional* key↔name mismatch **within one** name-chain resolution): this is disagreement
+    /// **across** resolver types, strengthening the anti-equivocation posture of §3.5.
+    /// `ERR_RESOLVER_DISAGREEMENT` (`0x0120`), HALT_ALERT — MUST NOT pin; raise a security alert and
+    /// fall back to KT-quorum (§3.5.2(b)) or out-of-band verification (§3.4.1) to decide the true key.
+    #[error("resolver disagreement — resolvers returned different keys for one name, halt and alert (0x0120): {0}")]
+    ResolverDisagreement(&'static str),
 }
 
 impl ResolveError {
@@ -121,6 +133,7 @@ impl ResolveError {
             ResolveError::ResolverTypeUnsupported(_) => 0x011F,
             ResolveError::NameChainBindingUnverified(_) => 0x011E,
             ResolveError::KeyNameUnverified(_) => 0x0109,
+            ResolveError::ResolverDisagreement(_) => 0x0120,
             ResolveError::KeyPackage(_) => 0x0109,
             ResolveError::Identity(e) => match e {
                 IdentityError::BadSignature => 0x0103,

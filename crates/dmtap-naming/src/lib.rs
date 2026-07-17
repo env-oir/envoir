@@ -29,6 +29,10 @@
 //!   [`NameChainClient`](namechain::NameChainClient) RPC seam (mock-backed here) plus the
 //!   §3.12.5(b) bidirectional key↔name binding enforcement (`ERR_NAMECHAIN_BINDING_UNVERIFIED`,
 //!   `0x011E`).
+//! - [`reconcile`] — the §3.12.3 **multi-resolver cross-check**: resolvers are mutual auditors, so
+//!   several answers for one name are reconciled by [`reconcile`](reconcile::reconcile) and MUST agree
+//!   on `ik`; disagreement fails closed (`ERR_RESOLVER_DISAGREEMENT`, `0x0120`, HALT_ALERT) while an
+//!   abstaining resolver simply does not vote.
 //!
 //! ## What is real vs. seam
 //! DNS **parsing**, KT **verification** (RFC 6962 folding, STH signatures, leaf binding, quorum,
@@ -47,6 +51,7 @@ pub mod keypackage;
 pub mod kt;
 pub mod merkle;
 pub mod namechain;
+pub mod reconcile;
 pub mod resolver;
 pub mod restype;
 
@@ -59,6 +64,7 @@ pub use kt::{
 };
 pub use merkle::{verify_inclusion, MerkleTree};
 pub use namechain::{InMemoryNameChain, NameChainClient, NameChainResolver};
+pub use reconcile::{reconcile, reconcile_bindings, ReconciledResolution, ResolverAnswer};
 pub use resolver::{DmtapName, InMemoryResolver, KtMode, PinnedResolution, Resolver};
 pub use restype::{
     classify, Chain, PetnameBook, ResolvedBinding, ResolverKind, ResolverRegistry, ResolverType,
