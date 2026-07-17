@@ -46,7 +46,7 @@ quantified version of this answer; don't trust a shorter one, including this one
 
 **Is this audited?**
 Not yet. Formal (ProVerif) proofs exist for the two hardest cryptographic ceremonies, every wire
-decoder is fuzzed, and a 91-case conformance suite exists — but none of that substitutes for the
+decoder is fuzzed, and a 124-case conformance suite exists — but none of that substitutes for the
 independent external audit the project treats as a hard gate before any production deployment.
 See [security.md](security.md).
 

@@ -11,7 +11,7 @@
 
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{Identity, IdentityKey, KeyPackageBundleRef};
-use dmtap_naming::namechain::{InMemoryNameChain, NameChainClient, NameChainResolver};
+use dmtap_naming::namechain::{InMemoryNameChain, NameChainResolver};
 use dmtap_naming::restype::{classify, Chain, ResolverType};
 
 /// A tiny, dependency-free splitmix64-based PRNG — good enough to generate varied byte strings

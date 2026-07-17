@@ -3,8 +3,8 @@
 This page collects everything in the repository that lets you check Envoir's security claims
 yourself, rather than take them on faith: machine-checked formal proofs, fuzzing of every wire
 decoder, a byte-exact conformance suite, and a dedicated downgrade/fail-closed regression suite —
-backed by `cargo test --workspace`, which currently runs **761 passing tests** (0 failing) across
-every crate, the node, and the gateway. It closes with the honest gate that stands between this
+backed by `cargo test --workspace`, which currently runs **771 passing tests** (0 failing) across
+every crate and the node. It closes with the honest gate that stands between this
 code and any production deployment.
 
 ## Formal (ProVerif) models
@@ -84,17 +84,17 @@ ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the sam
 machine-readable data (`suite.json`), and byte-exact known-answer vectors
 (`vectors/vectors.json`).
 
-- **121 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
+- **124 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
   Clients, Auth) — mirrored against the spec's own catalog of **132 registered error codes**
   (§21.3–§21.11).
-- **92 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
+- **110 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
   the key-name checksum, safety numbers, Ed25519 sign/verify with two RFC 8032 cross-checks,
   canonical CBOR of the four core signed objects, suite fail-closed behavior, and the MOTE
-  content-address + signature validation order) plus 25 more exercised directly against
+  content-address + signature validation order) plus 43 more exercised directly against
   `dmtap-core`'s (and `dmtap-naming`'s) public API — including the pluggable resolver-type
   dispatch, the `name-chain` bidirectional-binding guardrail, and canonical-CBOR's rejection of
   non-shortest integers, indefinite-length items, and out-of-order map keys. Zero failures.
-- **29 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
+- **14 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
   "no Profile/avatar module in `dmtap-core`," "TOFU-pin comparison is caller policy," "no
   auth-assertion module yet") rather than a silent gap — covering mixnet freshness/replay,
   MLS/group handshake bytes, key-transparency quorum, device attestation, gateway/DKIM-delegation,

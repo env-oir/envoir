@@ -46,13 +46,10 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v1 key-transparency hardening** (federated multi-log gossip, quorum-audited bindings,
   equivocation halt) — v0's single-log, TOFU+pinning model is what's implemented; see
   [privacy.md](privacy.md#what-this-project-does-not-claim).
-- **52 of 91 conformance cases** carry an exact construction recipe and expected error code but
-  aren't yet byte-vectored (mostly mixnet, MLS handshake bytes, and gateway/auth subsystems not
-  yet reduced to a fixed-input known-answer test) — see
-  [security.md](security.md#conformance-suite).
-- **Canonical-CBOR enforcement at decode time** — the low-level decoder doesn't yet reject
-  non-shortest-form integers or out-of-order map keys, a real and tracked gap surfaced by fuzzing
-  (see [security.md](security.md#fuzzing)).
+- **14 of 124 conformance cases** carry an exact construction recipe and expected error code but
+  aren't yet executed here (mostly mixnet, MLS handshake bytes, and auth subsystems not yet reduced
+  to a fixed-input known-answer test, plus the legacy-gateway cases now run in the separate
+  `env-oir/envoir-gateway` repo) — see [security.md](security.md#conformance-suite).
 - **Real TLS, JMAP push transport, and DEFLATE compression** in the mail-protocol layer —
   explicitly out of scope for the std-only protocol core, deferred to the node binary's transport
   layer.

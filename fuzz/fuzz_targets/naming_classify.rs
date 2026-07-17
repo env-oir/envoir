@@ -2,24 +2,24 @@
 use libfuzzer_sys::fuzz_target;
 use dmtap_naming::restype::{classify, ResolverType};
 
-/// `dmtap_naming::restype::classify` (§3.12.4) dispatches a name to its resolver type **by form**,
-/// independent of what any node implements — every other resolver (`route`, `SelfResolver`,
-/// `NameChainResolver`, …) trusts this dispatch to have picked the right bucket. It is fed a fully
-/// attacker-controlled name (a hostile `MAIL FROM`, a hostile directory entry, a pasted address) and
-/// MUST:
-///
-///  1. **never panic** on any input — the base property this harness checks by simply calling it, and
-///  2. **never misclassify in a way that would let one form's guardrail be silently skipped** — the
-///     specific residual risk this harness also checks: an input that could be read as *both* a
-///     `name-chain` form (`.eth`/`.sol`) and a checksum-valid `self` key-name must not be accepted as
-///     `SelfKeyName` (the key-name floor's checksum has no chain-suffix carve-out, so if the two
-///     ever overlapped, a hostile `…-….eth` key-name look-alike could smuggle a name-chain name past
-///     the self resolver's zero-authority, no-network path — this asserts that gap can't open).
-///
-/// `classify` is a total function over `&str`; any byte sequence that fails UTF-8 decoding is simply
-/// outside its domain (never handed to it) rather than excluded from the fuzz corpus's mutation
-/// space — `classify` itself never sees non-UTF-8 bytes in real use (every caller already holds a
-/// `&str`), so this mirrors the real call boundary exactly.
+// `dmtap_naming::restype::classify` (§3.12.4) dispatches a name to its resolver type **by form**,
+// independent of what any node implements — every other resolver (`route`, `SelfResolver`,
+// `NameChainResolver`, …) trusts this dispatch to have picked the right bucket. It is fed a fully
+// attacker-controlled name (a hostile `MAIL FROM`, a hostile directory entry, a pasted address) and
+// MUST:
+//
+//  1. **never panic** on any input — the base property this harness checks by simply calling it, and
+//  2. **never misclassify in a way that would let one form's guardrail be silently skipped** — the
+//     specific residual risk this harness also checks: an input that could be read as *both* a
+//     `name-chain` form (`.eth`/`.sol`) and a checksum-valid `self` key-name must not be accepted as
+//     `SelfKeyName` (the key-name floor's checksum has no chain-suffix carve-out, so if the two
+//     ever overlapped, a hostile `…-….eth` key-name look-alike could smuggle a name-chain name past
+//     the self resolver's zero-authority, no-network path — this asserts that gap can't open).
+//
+// `classify` is a total function over `&str`; any byte sequence that fails UTF-8 decoding is simply
+// outside its domain (never handed to it) rather than excluded from the fuzz corpus's mutation
+// space — `classify` itself never sees non-UTF-8 bytes in real use (every caller already holds a
+// `&str`), so this mirrors the real call boundary exactly.
 fuzz_target!(|data: &[u8]| {
     let Ok(name) = std::str::from_utf8(data) else { return };
 

@@ -56,13 +56,14 @@ cargo +nightly fuzz run envelope -- -max_total_time=5   # smoke run
 cargo +nightly fuzz build                               # just prove it all builds
 ```
 
-**Known, disclosed finding:** running any target with `DMTAP_FUZZ_STRICT_CANONICAL=1` set
-currently finds that non-shortest-form integers and out-of-order map keys are accepted at decode
-time and still produce a semantically valid object, even though the canonical re-encoding then
-differs from the input bytes. This is a real, systemic gap in the low-level CBOR decoder
-(`dmtap-core::cbor`), tracked and reported — not swallowed — by the fuzz harness and by three
-matching conformance cases (`DMTAP-CBOR-05/06/07`), which currently `FAIL`. See
-[`fuzz/README.md`](../fuzz/README.md) for the exact fix location.
+**Previously-disclosed finding, now closed:** the `DMTAP_FUZZ_STRICT_CANONICAL=1` mode exists
+because canonical-form enforcement (shortest-form integers, no indefinite-length items, strictly
+ascending map keys) used to be missing at decode time in the low-level CBOR decoder
+(`dmtap-core::cbor`) — non-shortest-form integers and out-of-order map keys were accepted and still
+produced a semantically valid object. That enforcement is now real: the decoder rejects all three
+forms explicitly, the three matching conformance cases (`DMTAP-CBOR-05/06/07`) pass, and re-running
+the fuzz target with the strict flag set finds nothing. See
+[`fuzz/README.md`](../fuzz/README.md) for the harness details and history.
 
 ## Conformance suite
 
@@ -73,14 +74,16 @@ ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the sam
 machine-readable data (`suite.json`), and byte-exact known-answer vectors
 (`vectors/vectors.json`).
 
-- **91 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
+- **124 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
   Clients, Auth).
-- **39 are byte-runnable today** — 33 backed by a committed vector, 6 self-contained CBOR-reject
-  cases — covering content addressing, the 8-word key-name checksum, safety numbers, Ed25519
-  sign/verify (with two RFC 8032 cross-checks), canonical CBOR of the four core signed objects,
-  suite fail-closed behavior, and the MOTE content-address + signature validation order.
-- **45 carry an exact construction recipe and expected error code** for subsystems not yet
-  vectored (mixnet, MLS, gateway, auth) — deferred honestly, not silently skipped.
+- **110 execute and pass today** — 67 backed by committed byte-exact vectors covering content
+  addressing, the 8-word key-name checksum, safety numbers, Ed25519 sign/verify (with two RFC 8032
+  cross-checks), canonical CBOR of the four core signed objects, suite fail-closed behavior, and
+  the MOTE content-address + signature validation order — plus 43 more exercised directly against
+  the reference crates' public API. Zero failures.
+- **14 are skipped with a documented, per-case reason** for subsystems not yet vectored (mixnet,
+  MLS, auth) and for the legacy-gateway cases now executed in the separate `env-oir/envoir-gateway`
+  repo — deferred honestly, not silently skipped.
 
 [`crates/conformance-runner`](../crates/conformance-runner) is the reference runner: it drives the
 vector-dispatch loop plus a **drift guard** that fails the build if the committed vectors and what

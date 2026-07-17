@@ -285,7 +285,7 @@ naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance
 registry of **132 error codes** (§21.3–§21.11), grounded against current standards, plus a
 compiled **`dmtap.pdf`**. This repo is one implementation of that spec; conformance is checked
 mechanically by [`crates/conformance-runner`](crates/conformance-runner) against the spec's own
-**121-case conformance catalog** — see [Security & honesty](#security--honesty).
+**124-case conformance catalog** — see [Security & honesty](#security--honesty).
 
 ## Security & honesty
 
@@ -299,11 +299,11 @@ machine-checked **ProVerif symbolic models** in [`formal/`](formal) (secrecy, mu
 authentication, forward secrecy, deniability, replay/origin-binding, post-compromise security,
 inclusion/no-rollback/split-view soundness — see its README for exact property statements and
 honest limitations); the wire-format
-decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **121-case conformance
-suite** runs 92 cases to a pass today (0 failures, the other 29 each skipped with a documented
+decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **124-case conformance
+suite** runs 110 cases to a pass today (0 failures, the other 14 each skipped with a documented
 reason) via [`crates/conformance-runner`](crates/conformance-runner); the node's anti-rollback/anti-abuse state
 survives a restart instead of resetting to a weaker baseline; and `cargo test --workspace` runs
-**761 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None
+**771 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None
 of this substitutes for an **independent external security audit**, which has not yet happened and
 is the gate before any production deployment. Treat everything here as pre-alpha.
 

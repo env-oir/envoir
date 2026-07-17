@@ -3,28 +3,28 @@ use libfuzzer_sys::fuzz_target;
 
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{Identity, IdentityKey, KeyPackageBundleRef};
-use dmtap_naming::namechain::{InMemoryNameChain, NameChainClient, NameChainResolver};
+use dmtap_naming::namechain::{InMemoryNameChain, NameChainResolver};
 use dmtap_naming::restype::Chain;
 
-/// `dmtap-naming`'s `name-chain` resolver (§3.12.5) has no on-chain wire format of its own in this
-/// reference build — [`NameChainClient::resolve`] is a documented network *seam* (a real Ethereum/
-/// Solana RPC read lives behind it, not implemented here), so there is no byte-level record decoder
-/// to fuzz directly the way `dmtap-core`'s CBOR objects have one. What IS real and load-bearing is
-/// [`NameChainResolver::resolve`]'s §3.12.5(b) **bidirectional-binding** check that sits directly on
-/// top of that seam's return value — every byte of the "on-chain record" (the `ik` pointer a chain
-/// read hands back) is exactly as attacker-controlled as any wire-decoded field would be, since a
-/// compromised/malicious RPC endpoint, a censoring relay, or a spoofed CCIP-Read response can return
-/// *anything*. This target fuzzes exactly that boundary: an arbitrary-bytes chain record compared
-/// against a real, validly-signed `Identity` — the fail-closed comparison (§3.12.5(b) direction B)
-/// must never panic, and MUST only produce `Ok` when the record byte-for-byte equals the identity's
-/// classical `IK`.
-///
-/// The `name` string and the on-chain record bytes are both taken from `data` (attacker-controlled);
-/// the `Identity` is real (built once, validly Ed25519-signed by a fixed key) so `claimed.verify`
-/// passes and the interesting §3.12.5(b) comparison logic actually runs on every input rather than
-/// bailing out at the signature check — the "arbitrary bytes" attack surface here is the pointer the
-/// chain seam returns, not the identity's own signature (that byte-level decode is already covered by
-/// the `identity` fuzz target, which round-trip-checks `Identity::from_det_cbor`).
+// `dmtap-naming`'s `name-chain` resolver (§3.12.5) has no on-chain wire format of its own in this
+// reference build — [`NameChainClient::resolve`] is a documented network *seam* (a real Ethereum/
+// Solana RPC read lives behind it, not implemented here), so there is no byte-level record decoder
+// to fuzz directly the way `dmtap-core`'s CBOR objects have one. What IS real and load-bearing is
+// [`NameChainResolver::resolve`]'s §3.12.5(b) **bidirectional-binding** check that sits directly on
+// top of that seam's return value — every byte of the "on-chain record" (the `ik` pointer a chain
+// read hands back) is exactly as attacker-controlled as any wire-decoded field would be, since a
+// compromised/malicious RPC endpoint, a censoring relay, or a spoofed CCIP-Read response can return
+// *anything*. This target fuzzes exactly that boundary: an arbitrary-bytes chain record compared
+// against a real, validly-signed `Identity` — the fail-closed comparison (§3.12.5(b) direction B)
+// must never panic, and MUST only produce `Ok` when the record byte-for-byte equals the identity's
+// classical `IK`.
+//
+// The `name` string and the on-chain record bytes are both taken from `data` (attacker-controlled);
+// the `Identity` is real (built once, validly Ed25519-signed by a fixed key) so `claimed.verify`
+// passes and the interesting §3.12.5(b) comparison logic actually runs on every input rather than
+// bailing out at the signature check — the "arbitrary bytes" attack surface here is the pointer the
+// chain seam returns, not the identity's own signature (that byte-level decode is already covered by
+// the `identity` fuzz target, which round-trip-checks `Identity::from_det_cbor`).
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {
         return;
