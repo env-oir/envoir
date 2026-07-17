@@ -30,7 +30,8 @@ an address*; it is now correctly a verification affordance, never an address.)
 
 ## Feature set
 
-- **Unified shell** — left rail (Mail · Chat · Calendar · Contacts · Files · Groups · Settings),
+- **Unified shell** — left rail (Mail · Chat · Calendar · Contacts · Files · Identity · Groups ·
+  Settings),
   a live **global search**, a **command palette** (⌘/Ctrl-K), and full **keyboard shortcuts** with
   a help overlay (`?`).
 - **Accessible & responsive** — semantic landmarks + ARIA (dialog/listbox/status/`aria-current`),
@@ -78,8 +79,9 @@ an address*; it is now correctly a verification affordance, never an address.)
 
 ### Keyboard shortcuts
 
-`⌘K`/`Ctrl K` command palette · `/` search · `c` compose · `g` then `m/c/a/p/f/r` go to
-Mail/Chat/cAlendar/People/Files/gRoups · `1`–`7` jump to view · `j`/`k` next/prev conversation ·
+`⌘K`/`Ctrl K` command palette · `/` search · `c` compose · `g` then `m/c/a/p/f/i/r` go to
+Mail/Chat/cAlendar/People/Files/Identity/gRoups · `1`–`8` jump to view · `j`/`k` next/prev
+conversation ·
 `Enter` open · `e` archive · `#` delete · `r` reply · `s` star · `u` mark unread · `x` select ·
 `?` help · `Esc` close overlay.
 
@@ -120,11 +122,15 @@ sw.js                 service worker: app-shell precache (offline load) + conten
 manifest.webmanifest  PWA manifest (standalone display, themed, maskable icon)
 
 js/identity.js        REAL Web Crypto identity: keygen, signing, aliases, plus-addressing, safety number
-js/safety.js          deterministic safety-number derivation (words + digits + QR-grid) — key verification
+js/safety.js          deterministic safety-number derivation (words + digits + QR-grid) + key-name — key verification
+js/avatar.js          the avatar ladder: user URL → opt-in Gravatar → key-derived identicon → initials
+js/resolver.js        pattern-classify a name against the resolver ladder (key-name/DNS/name-chain/@handle/petname) — presentation only
+js/provenance.js      transport-path provenance (pure-mesh vs gateway-touched) badges + expandable path graph
 js/mote.js            MOTE construction (spec §2), real payload signature; mail/chat/calendar/contact/group kinds
 js/mesh-sim.js        SIMULATED mesh/mixnet delivery planning + @handle directory
 js/seed.js            rich seed data for every module (people, mail threads, chats, events, files, groups)
 js/compose.js         compose modal: signatures, privacy tier, scheduled send, undo send, drafts
+js/profileModal.js    shared "Edit profile" modal (self-asserted name + avatar) for Settings + Identity
 js/signin.js          "Sign in with Envoir" demo (real signature over an origin-bound challenge)
 js/ui.js              DOM helpers, icon set, avatars, MOTE inspector, safety visuals, toast, modal, shimmer
 
@@ -133,6 +139,7 @@ js/views/chat.js      DMs + channels, reactions, threads, typing/presence, denia
 js/views/calendar.js  month/week/day, recurring events, invitations + RSVP, reminders
 js/views/contacts.js  cards + per-contact safety-number verification, import/export
 js/views/files.js     content-addressed E2E files, shared-folder = group
+js/views/identity.js  identity surface: naming ladder, safety number, devices, sessions, recovery, key lifecycle
 js/views/groups.js    groups-as-addresses: members + roles, broadcast vs channel, membership visibility
 js/views/settings.js  identity, aliases, signatures, vacation, filters, privacy, theme, shortcuts, sign-in
 ```

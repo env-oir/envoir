@@ -10,7 +10,7 @@
 // MOTE (sender, subject, body) is pulled later over the user's own mesh connection, end-to-end,
 // once the app is open; it never rides in the push payload.
 
-const CACHE_VERSION = 'envoir-shell-v1';
+const CACHE_VERSION = 'envoir-shell-v2';
 
 const PRECACHE_URLS = [
   './',
@@ -26,6 +26,7 @@ const PRECACHE_URLS = [
   './js/safety.js',
   './js/mote.js',
   './js/mesh-sim.js',
+  './js/resolver.js',
   './js/seed.js',
   './js/compose.js',
   './js/signin.js',
