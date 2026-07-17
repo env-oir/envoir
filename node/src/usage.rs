@@ -107,6 +107,11 @@ impl StorageQuota for UnlimitedStorage {
 pub enum UsageEvent {
     /// A MOTE/file was durably accepted into the mailbox: `delta_bytes` were added. This is the
     /// primary "node usage" (hosted-mailbox storage) signal a cloud samples into GB-month (§12.4).
+    /// CONTRACT for a node→cloud bridge: the cloud's `NodeStorageBytes` meter accumulates a *level*,
+    /// so a bridge MUST forward the current stored-bytes level (the running sum of
+    /// [`UsageEvent::stored_delta`], i.e. `Stored − Evicted`), NOT raw per-accept `Stored` deltas —
+    /// otherwise a churny mailbox is
+    /// over-billed and bytes held across months under-billed.
     Stored { account: Vec<u8>, delta_bytes: u64, at: TimestampMs },
     /// Durably-stored bytes were released (expunge/retention eviction): `delta_bytes` were freed. The
     /// running signed sum of `Stored − Evicted` is the current stored-bytes level a GB-month sample

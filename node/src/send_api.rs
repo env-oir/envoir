@@ -61,6 +61,10 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 /// How long a single connection may take to deliver its request before it is dropped (it runs on the
 /// daemon's own task, so an unbounded read would stall delivery/retry ticks).
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// The daemon services Send-API connections INLINE on its single task (a `Node` is `!Send`), so a
+/// client that stalls its TCP receive window during our write would otherwise freeze delivery/retries
+/// for the whole node. Bound the write too, and drop the connection on elapse.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The node-hosted Envoir Send service: the capability [`SendService`] plus the admin token that
 /// guards key management. Construct with the node's own identity so issued keys delegate from — and
@@ -230,22 +234,18 @@ impl SendApi {
         mut stream: TcpStream,
         now: TimestampMs,
     ) -> io::Result<()> {
-        let req = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream)).await {
-            Ok(Ok(Some(req))) => req,
+        let resp = match tokio::time::timeout(READ_TIMEOUT, read_request(&mut stream)).await {
+            Ok(Ok(Some(req))) => self.handle(node, &req, now),
             Ok(Ok(None)) => return Ok(()), // empty connection, nothing to answer
-            Ok(Err(e)) => {
-                let resp = json_response(400, json!({ "error": "bad_request", "detail": e.to_string() }));
-                let _ = write_response(&mut stream, &resp).await;
-                return Ok(());
-            }
-            Err(_) => {
-                let resp = json_response(408, json!({ "error": "request_timeout" }));
-                let _ = write_response(&mut stream, &resp).await;
-                return Ok(());
-            }
+            Ok(Err(e)) => json_response(400, json!({ "error": "bad_request", "detail": e.to_string() })),
+            Err(_) => json_response(408, json!({ "error": "request_timeout" })),
         };
-        let resp = self.handle(node, &req, now);
-        write_response(&mut stream, &resp).await
+        // Bound the write (see WRITE_TIMEOUT): a slow-reading client must not pin this inline task and
+        // stall the daemon's delivery/retry/deadline loop. On elapse, drop the connection.
+        match tokio::time::timeout(WRITE_TIMEOUT, write_response(&mut stream, &resp)).await {
+            Ok(r) => r,
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -361,17 +361,28 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Option<HttpRequest>>
     let path = request_line.next().unwrap_or("").to_string();
 
     let mut authorization = None;
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     for line in lines {
         if let Some((k, val)) = line.split_once(':') {
             let (k, val) = (k.trim(), val.trim());
             if k.eq_ignore_ascii_case("authorization") {
                 authorization = Some(val.to_string());
             } else if k.eq_ignore_ascii_case("content-length") {
-                content_length = val.parse().unwrap_or(0);
+                // Reject a duplicate/unparseable Content-Length — no ambiguity a fronting proxy could
+                // desync on (defense-in-depth; this endpoint is one-request-per-connection + close).
+                let parsed = val
+                    .parse::<usize>()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad content-length"))?;
+                if content_length.replace(parsed).is_some() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate content-length"));
+                }
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                // We do not implement chunked decoding; refuse rather than mis-frame the body.
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "transfer-encoding not supported"));
             }
         }
     }
+    let content_length = content_length.unwrap_or(0);
     if content_length > MAX_REQUEST_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "request body too large"));
     }
