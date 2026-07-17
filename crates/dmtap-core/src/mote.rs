@@ -2754,4 +2754,163 @@ mod tests {
             assert_eq!(ChallengeResponse::from_cv(cbor::decode(&bytes).unwrap()).unwrap(), c);
         }
     }
+
+    // ---- Property tests: build → validate round-trips, and ANY single-field mutation of the ----
+    // ---- S2 envelope context (kind/ts/to) or the sealed payload fails CLOSED — never Accepted. ----
+
+    /// A tiny deterministic SplitMix64 PRNG — dependency-free, reproducible generative testing.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    const KINDS: [Kind; 11] = [
+        Kind::Mail, Kind::Chat, Kind::Reaction, Kind::Edit, Kind::Redact, Kind::FileOffer,
+        Kind::GroupEvent, Kind::Receipt, Kind::Presence, Kind::Identity, Kind::System,
+    ];
+
+    /// Re-mint the envelope's `sender_sig` with a FRESH ephemeral (anyone-can-mint, §2.2) over the
+    /// current — possibly mutated — envelope context, so §2.7 step 3 passes and validation proceeds
+    /// past it to the AEAD / step-8 identity-signature gates that actually bind kind/ts/to.
+    fn remint_sender_sig(env: &mut Envelope, seed: u8) {
+        let e = IdentityKey::from_seed(&[seed; 32]);
+        env.sender_eph = Some(e.public());
+        env.sender_sig = Some(e.sign_domain(ENVELOPE_SENDER_DS, &sender_authed_bytes(env)));
+    }
+
+    #[test]
+    fn build_validate_roundtrip_and_single_field_tamper_fail_closed() {
+        let mut rng = Rng(0x5165_2A2A);
+        for _ in 0..400 {
+            let sender = IdentityKey::from_seed(&[(rng.next() as u8).wrapping_add(1); 32]);
+            let eph = IdentityKey::from_seed(&[(rng.next() as u8) | 0x40; 32]);
+            let recipient = IdentityKey::from_seed(&[(rng.next() as u8) | 0x80; 32]);
+            let seal = SealKeypair::generate();
+            let kind_idx = (rng.next() % KINDS.len() as u64) as usize;
+            let kind = KINDS[kind_idx];
+            let ts: TimestampMs = 1_600_000_000_000 + (rng.next() % 1_000_000_000);
+            let body: Vec<u8> = (0..(rng.next() % 40)).map(|i| (i as u8) ^ 0x5a).collect();
+            let mut draft = MoteDraft::new(kind, ts, body.clone());
+            if rng.next() & 1 == 0 {
+                draft.headers.subject = Some(format!("s{}", rng.next() % 97));
+            }
+            let our_ik = recipient.public();
+            let env = build_mote(&Hpke, &sender, &eph, &our_ik, seal.public(), draft).unwrap();
+
+            let ctx = || RecipientCtx {
+                our_ik: &our_ik,
+                seal_secret: seal.secret(),
+                sender_is_known: true,
+            };
+
+            // Positive control: a freshly-built MOTE validates and round-trips byte-for-byte.
+            match validate(&Hpke, &env, &ctx()) {
+                Ok(Outcome::Accepted(p)) => {
+                    assert_eq!(p.body, body);
+                    assert_eq!(p.from, sender.public());
+                }
+                other => panic!("a well-formed MOTE must be Accepted, got {other:?}"),
+            }
+            assert_eq!(Envelope::from_det_cbor(&env.det_cbor()).unwrap(), env, "canonical round-trip");
+
+            // (a) Mutate `kind` to a DIFFERENT kind, re-mint sender_sig over the new context. The
+            //     payload AEAD binds kind (aad_bytes) ⇒ decryption fails closed; never Accepted.
+            {
+                let mut m = env.clone();
+                m.kind = KINDS[(kind_idx + 1 + (rng.next() as usize % (KINDS.len() - 1))) % KINDS.len()];
+                assert_ne!(m.kind, env.kind);
+                remint_sender_sig(&mut m, rng.next() as u8);
+                m.id = ContentId::of(&m.ciphertext); // ciphertext untouched — id still valid
+                assert!(!matches!(validate(&Hpke, &m, &ctx()), Ok(Outcome::Accepted(_))),
+                    "a rewritten kind must never be Accepted (S2 / AEAD)");
+            }
+
+            // (b) Mutate `ts` to a different value; AAD binds ts ⇒ fail closed.
+            {
+                let mut m = env.clone();
+                m.ts ^= rng.next() | 1; // XOR with an odd value ⇒ guaranteed different, no overflow
+                assert_ne!(m.ts, env.ts);
+                remint_sender_sig(&mut m, rng.next() as u8);
+                assert!(!matches!(validate(&Hpke, &m, &ctx()), Ok(Outcome::Accepted(_))),
+                    "a rewritten ts must never be Accepted (S2 / AEAD)");
+            }
+
+            // (c) Mutate `to` to a different routing key; step 4 (NotForUs) / AAD ⇒ fail closed.
+            {
+                let mut m = env.clone();
+                m.to = DeliveryTag::Key(vec![(rng.next() as u8) ^ 0x11; 32]);
+                remint_sender_sig(&mut m, rng.next() as u8);
+                assert!(!matches!(validate(&Hpke, &m, &ctx()), Ok(Outcome::Accepted(_))),
+                    "a rewritten routing target must never be Accepted");
+            }
+
+            // (d) Flip a ciphertext byte, re-address id and re-mint sig ⇒ AEAD open fails closed.
+            {
+                let mut m = env.clone();
+                let idx = (rng.next() as usize) % m.ciphertext.len();
+                m.ciphertext[idx] ^= 0xff;
+                m.id = ContentId::of(&m.ciphertext);
+                remint_sender_sig(&mut m, rng.next() as u8);
+                assert_eq!(validate(&Hpke, &m, &ctx()), Err(MoteError::DecryptFailed));
+            }
+        }
+    }
+
+    #[test]
+    fn unbound_vs_bound_payload_sig_over_random_kinds_s2() {
+        // The pure S2 gate over many kinds: a Payload.sig bound to the envelope context validates;
+        // the same payload signed over the OLD unbound preimage is EnvelopeContextMismatch (0x0211).
+        let mut rng = Rng(0x0211_0211);
+        for _ in 0..200 {
+            let kind = KINDS[(rng.next() % KINDS.len() as u64) as usize];
+
+            let (env_ok, r_ok, s_ok) = manual_env_with_payload_sig(kind, |sk, p, k, t, to| {
+                sk.sign_domain(PAYLOAD_SIG_DS, &payload_hash(p, k, t, to))
+            });
+            assert!(matches!(
+                validate(&Hpke, &env_ok, &RecipientCtx { our_ik: &r_ok.public(), seal_secret: s_ok.secret(), sender_is_known: true }),
+                Ok(Outcome::Accepted(_))
+            ), "context-bound Payload.sig must validate");
+
+            let (env_bad, r_bad, s_bad) = manual_env_with_payload_sig(kind, |sk, p, _k, _t, _to| {
+                sk.sign_domain(PAYLOAD_SIG_DS, &payload_hash_unbound(p))
+            });
+            assert_eq!(
+                validate(&Hpke, &env_bad, &RecipientCtx { our_ik: &r_bad.public(), seal_secret: s_bad.secret(), sender_is_known: true }),
+                Err(MoteError::EnvelopeContextMismatch),
+                "an unbound-context Payload.sig must be rejected 0x0211"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_build_validate_roundtrip_and_tamper_fail_closed() {
+        // The PQ-hybrid (suite 0x02) path: build_mote_hybrid → validate Accepted, and a rewritten
+        // kind fails closed. Fewer iterations — X-Wing / ML-DSA are far heavier than Ed25519.
+        use crate::pq::{HybridSeal, HybridSigningKey};
+        let mut rng = Rng(0x0202_0202);
+        for _ in 0..8 {
+            let (mut env, recipient_ik, seal) = round_hybrid();
+            let ctx = RecipientCtx { our_ik: &recipient_ik, seal_secret: seal.secret(), sender_is_known: true };
+            assert!(matches!(validate(&HybridSeal, &env, &ctx), Ok(Outcome::Accepted(_))));
+            assert_eq!(Envelope::from_det_cbor(&env.det_cbor()).unwrap(), env);
+
+            // Rewrite the kind and re-mint the envelope sender_sig with a fresh HYBRID ephemeral.
+            let orig = env.kind;
+            env.kind = KINDS[(KINDS.iter().position(|k| *k == orig).unwrap() + 1) % KINDS.len()];
+            let e = HybridSigningKey::generate();
+            env.sender_eph = Some(e.public());
+            env.sender_sig = Some(e.sign_domain(ENVELOPE_SENDER_DS, &sender_authed_bytes(&env)));
+            env.id = ContentId::of(&env.ciphertext);
+            let _ = &mut rng;
+            assert!(!matches!(validate(&HybridSeal, &env, &ctx), Ok(Outcome::Accepted(_))),
+                "a rewritten kind on a hybrid MOTE must never be Accepted");
+        }
+    }
 }

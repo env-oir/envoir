@@ -903,4 +903,136 @@ mod tests {
         // The skew bound still applies to a durable delete.
         assert_eq!(validate_op(&del("m", DeleteClass::Redact, 300_000, 1), 0), Err(SyncError::CrdtOpInvalid));
     }
+
+    // ── Property tests (§5.6.4): the merge is a CvRDT — commutative, associative, idempotent — so ──
+    // ── over MANY random op sequences applied/merged in random orders every replica converges to a ──
+    // ── byte-identical snapshot; and the D3 remove-wins invariant (a durable delete is never ──
+    // ── resurrected by concurrent adds) holds across every random schedule. ──
+
+    /// A tiny deterministic SplitMix64 PRNG — dependency-free, reproducible generative testing.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+        /// A Fisher-Yates shuffle of `v`.
+        fn shuffle<T>(&mut self, v: &mut [T]) {
+            for i in (1..v.len()).rev() {
+                let j = self.below(i + 1);
+                v.swap(i, j);
+            }
+        }
+    }
+
+    /// Generate one random, well-formed op over small target/device alphabets so ops collide and
+    /// concurrency is real (many ops touch the same object). Dense low `wall` values force HLC ties.
+    fn gen_op(rng: &mut Rng) -> ClusterOp {
+        let target = format!("o{}", rng.below(4));
+        let wall = (rng.below(8)) as u64; // 0..=7 — heavy HLC collision
+        let dev = rng.below(3) as u8;
+        match rng.below(6) {
+            0 | 1 => add(&target, wall, dev), // adds are common so removes/deletes have prey
+            2 => {
+                // A remove citing a causally-valid add-tag drawn from the same small space.
+                let ow = wall.saturating_sub(rng.below(3) as u64);
+                let od = rng.below(3) as u8;
+                remove(&target, wall, dev, vec![AddTag { device: vec![od], hlc: hlc(ow, 0, od) }])
+            }
+            3 => lww(&target, &format!("f{}", rng.below(3)), wall, dev, Cv::U64(rng.next() % 5)),
+            4 => {
+                let class = match rng.below(3) {
+                    0 => DeleteClass::Redact,
+                    1 => DeleteClass::Expires,
+                    _ => DeleteClass::Sensitive,
+                };
+                del(&target, class, wall, dev)
+            }
+            _ => undel(&target, wall, dev),
+        }
+    }
+
+    #[test]
+    fn crdt_merge_converges_under_random_schedules_and_d3_holds() {
+        let mut rng = Rng(0xC0FFEE_5E6);
+        for _ in 0..20_000 {
+            let n = 1 + rng.below(24);
+            let ops: Vec<ClusterOp> = (0..n).map(|_| gen_op(&mut rng)).collect();
+
+            // The reference snapshot: all ops applied to a fresh state, in generation order.
+            let reference = state_of(&ops).snapshot();
+
+            // (1) Commutativity: a random permutation of the SAME ops converges identically.
+            let mut permuted = ops.clone();
+            rng.shuffle(&mut permuted);
+            assert_eq!(reference, state_of(&permuted).snapshot(), "random-order apply must converge");
+
+            // (2) Associativity via a per-op singleton fold, merged in a random order.
+            let mut singletons: Vec<ClusterState> = ops
+                .iter()
+                .map(|op| {
+                    let mut s = ClusterState::new();
+                    s.apply(op);
+                    s
+                })
+                .collect();
+            rng.shuffle(&mut singletons);
+            let mut folded = ClusterState::new();
+            for s in &singletons {
+                folded.merge(s);
+            }
+            assert_eq!(reference, folded.snapshot(), "singleton-merge fold must converge");
+
+            // (3) Two independent replicas that each saw a random subset, then exchanged, converge —
+            // and to the same fixed point as the full application (join = least upper bound).
+            let mut ra = ClusterState::new();
+            let mut rb = ClusterState::new();
+            for op in &ops {
+                if rng.next() & 1 == 0 {
+                    ra.apply(op);
+                } else {
+                    rb.apply(op);
+                }
+                // Sprinkle in cross-merges at random points (anti-entropy at arbitrary times).
+                if rng.next() % 5 == 0 {
+                    ra.merge(&rb);
+                }
+            }
+            let mut ab = ra.clone();
+            ab.merge(&rb);
+            let mut ba = rb.clone();
+            ba.merge(&ra);
+            assert_eq!(ab.snapshot(), ba.snapshot(), "A∨B == B∨A (commutative merge)");
+            assert_eq!(reference, ab.snapshot(), "gossiping replicas reach the full-apply fixed point");
+
+            // (4) Idempotence: merging the converged state with itself, and re-applying every op a
+            // second time, changes nothing.
+            let mut idem = state_of(&ops);
+            let copy = idem.clone();
+            idem.merge(&copy);
+            for op in &ops {
+                idem.apply(op);
+            }
+            assert_eq!(reference, idem.snapshot(), "merge(x,x)=x and re-applying seen ops is a no-op");
+
+            // (5) D3 remove-wins invariant: in EVERY converged replica, a durably-deleted object is
+            // never present — no concurrent OR-Set add-tag, at any HLC, resurrects it.
+            let converged = state_of(&ops);
+            for target in ["o0", "o1", "o2", "o3"] {
+                if converged.is_deleted(target) {
+                    assert!(!converged.is_present(target), "D3: a durable delete is never present");
+                    assert!(!converged.present_elements().contains(&target.to_string()));
+                    // The domination holds identically in the gossiped replica.
+                    assert_eq!(ab.is_deleted(target), converged.is_deleted(target));
+                    assert!(!ab.is_present(target));
+                }
+            }
+        }
+    }
 }

@@ -361,4 +361,103 @@ mod tests {
         let other = b"other".to_vec();
         assert!(r.check(&other, Suite::Classical).is_ok());
     }
+
+    // ---- Property tests: negotiation always picks the highest common suite (or fails closed on ----
+    // ---- a disjoint intersection), and the ratchet high-water-mark is MONOTONE (never lowers). ----
+
+    /// A tiny deterministic SplitMix64 PRNG — dependency-free, reproducible generative testing.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    const ALL: [Suite; 3] = [Suite::Classical, Suite::PqHybrid, Suite::ReservedAeadGcm];
+
+    /// Build a random subset of the three suites from a bitmask.
+    fn subset(mask: u64) -> Vec<Suite> {
+        ALL.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, s)| *s).collect()
+    }
+
+    #[test]
+    fn negotiate_always_picks_highest_common_or_fails_closed() {
+        let mut rng = Rng(0x5017_5017);
+        for _ in 0..20_000 {
+            let s = subset(rng.next() % 8);
+            let r = subset(rng.next() % 8);
+            // The oracle: the greatest suite byte present in BOTH sets, if any.
+            let expected = s
+                .iter()
+                .filter(|x| r.contains(x))
+                .copied()
+                .max();
+            match (negotiate_suite(&s, &r), expected) {
+                (Ok(got), Some(want)) => {
+                    assert_eq!(got, want, "must pick the highest common suite");
+                    // Never a suite outside the intersection.
+                    assert!(s.contains(&got) && r.contains(&got));
+                }
+                (Err(e), None) => {
+                    // Disjoint (or an empty side) ⇒ fail closed, never a silent downgrade.
+                    assert_eq!(e, SuiteNegotiationError::IntersectionEmpty);
+                    assert_eq!(e.code(), 0x0102);
+                }
+                (got, exp) => panic!("negotiate disagreed with the intersection oracle: {got:?} vs {exp:?}"),
+            }
+            // Symmetry: the negotiated suite does not depend on argument order (both sets are sets).
+            assert_eq!(
+                negotiate_suite(&s, &r).ok(),
+                negotiate_suite(&r, &s).ok(),
+                "negotiation is symmetric in the two supported-suite sets"
+            );
+        }
+    }
+
+    #[test]
+    fn ratchet_high_water_mark_is_monotone_over_random_schedules() {
+        let mut rng = Rng(0x2ACC_2ACC);
+        // A handful of contacts so schedules interleave; a shadow oracle of each contact's floor.
+        let contacts: [&[u8]; 3] = [b"alice", b"bob", b"carol"];
+        for _ in 0..5_000 {
+            let mut r = SuiteRatchet::new();
+            let mut floor: std::collections::BTreeMap<Vec<u8>, u8> = Default::default();
+            for _ in 0..40 {
+                let contact = contacts[(rng.next() % contacts.len() as u64) as usize];
+                let suite = ALL[(rng.next() % ALL.len() as u64) as usize];
+                let prev = floor.get(contact).copied();
+
+                let res = r.accept(contact, suite);
+                match prev {
+                    // Below an established floor ⇒ downgrade rejected; floor is UNCHANGED.
+                    Some(f) if suite.as_u8() < f => {
+                        assert_eq!(res, Err(SuiteRatchetError::SuiteDowngrade));
+                        assert_eq!(res.unwrap_err().code(), 0x020F);
+                    }
+                    // First contact or an equal/higher suite ⇒ accepted, floor ratchets UP.
+                    _ => {
+                        assert!(res.is_ok());
+                        let nf = prev.map_or(suite.as_u8(), |f| f.max(suite.as_u8()));
+                        floor.insert(contact.to_vec(), nf);
+                    }
+                }
+
+                // The observable mark ALWAYS equals the shadow floor, and never decreases.
+                assert_eq!(
+                    r.high_water_mark(contact).map(|s| s.as_u8()),
+                    floor.get(contact).copied(),
+                    "high-water-mark must track the monotone floor"
+                );
+                // A pure `check` never mutates and agrees with the floor for every suite.
+                for &s in &ALL {
+                    let want_ok = floor.get(contact).is_none_or(|&f| s.as_u8() >= f);
+                    assert_eq!(r.check(contact, s).is_ok(), want_ok);
+                }
+            }
+        }
+    }
 }
