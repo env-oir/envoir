@@ -42,8 +42,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use dmtap_core::identity::IdentityKey;
 use dmtap_core::mote::{
-    build_mote, validate_pinned, Envelope, Headers, Hpke, Kind, MoteDraft, MoteError, Outcome,
-    Payload, RecipientCtx, SealKeypair, ValidateError,
+    build_mote, validate_pinned, ChallengeResponse, Envelope, Headers, Hpke, Kind, MoteDraft,
+    MoteError, Outcome, Payload, RecipientCtx, SealKeypair, ValidateError,
 };
 use dmtap_core::suite::SuiteRatchet;
 use dmtap_core::{ContentId, Suite, TimestampMs};
@@ -68,7 +68,10 @@ use crate::naming::{
     Resolver, ResolverKind, ResolverRegistry, ResolverType, SelfResolver,
 };
 use dmtap_core::identity::Identity;
-use crate::outbound::{OutEvent, OutState, OutboundEntry, TERMINAL_GRACE_MS};
+use crate::onion::{self, MixPath};
+use crate::outbound::{OutEvent, OutState, OutboundEntry, Tier, TERMINAL_GRACE_MS};
+use crate::pow::{PowCheck, PowGate};
+use crate::reassembly::{Reassembled, ReassemblyCache};
 use crate::seen::SeenSet;
 use crate::transport::{Frame, Transport, TransportError};
 use crate::usage::{
@@ -98,6 +101,9 @@ pub enum SendError {
     Unresolved,
     /// The core rejected the build/seal (should not happen for a well-formed draft).
     Mote(MoteError),
+    /// A `private`-tier send could not be onion-wrapped over the supplied mix path — fail closed,
+    /// never downgraded onto a shorter/direct path (§4.4.9, §20.1).
+    Onion(onion::OnionError),
 }
 
 impl From<MoteError> for SendError {
@@ -111,6 +117,7 @@ impl std::fmt::Display for SendError {
         match self {
             SendError::Unresolved => f.write_str("recipient sealing key not resolved"),
             SendError::Mote(e) => write!(f, "seal failed: {e}"),
+            SendError::Onion(e) => write!(f, "private onion-wrap failed: {e}"),
         }
     }
 }
@@ -208,6 +215,15 @@ pub struct Node<T: Transport> {
     /// [`UsageEvent::Stored`] on each durable inbox accept for the operator's billing (a separate
     /// repo) to consume. The default [`NullUsageMeter`] is a no-op, so self-host bills no one.
     usage_meter: Box<dyn NodeUsageMeter>,
+    /// The cold-sender **memory-hard PoW** verification gate (spec §9.4, §16.5): a per-connection
+    /// budget in front of the symmetric-cost Argon2id verifier. A cold MOTE whose PoW would push a
+    /// delivering connection past its budget is deferred **without** being verified, so a bogus-PoW
+    /// flood cannot turn the cold-sender gate into a memory/CPU DoS.
+    pow_gate: PowGate,
+    /// The bounded **multi-cell reassembly** cache (spec §4.4.1 safety part, §16.3): partial
+    /// `private`-tier MOTEs held with a reassembly timeout so a lost fragment cannot pin memory.
+    /// Pruned each deadline tick. Per-cell ARQ/FEC recovery is the tracked follow-up.
+    reassembly: ReassemblyCache,
 }
 
 impl<T: Transport> Node<T> {
@@ -265,6 +281,8 @@ impl<T: Transport> Node<T> {
             // a cloud impl via `set_storage_quota` / `set_usage_meter`.
             storage_quota: Box::new(UnlimitedStorage),
             usage_meter: Box::new(NullUsageMeter),
+            pow_gate: PowGate::new(),
+            reassembly: ReassemblyCache::new(),
         }
     }
 
@@ -719,12 +737,13 @@ impl<T: Transport> Node<T> {
         Ok(id)
     }
 
-    /// Hand a SEALED entry's envelope to the transport, driving `dispatch_ok`/`tier_unreachable`
-    /// (§20.1). Requires `entry.sealed` to be present.
+    /// Hand a SEALED entry to the transport, driving `dispatch_ok`/`tier_unreachable` (§20.1).
+    /// Requires `entry.sealed` to be present. The wire form is tier-dependent ([`Self::wire_frame`]):
+    /// a `fast` MOTE ships its identical sealed bytes to the recipient; a `private` MOTE ships a
+    /// **fresh** Sphinx onion to its entry mix (§4.4).
     fn dispatch(&mut self, entry: &mut OutboundEntry) {
-        let env = entry.sealed.clone().expect("dispatch requires a sealed envelope");
-        let frame = Frame::Mote(env.det_cbor());
-        match self.transport.send(&entry.to, frame) {
+        let (dest, frame) = Self::wire_frame(entry);
+        match self.transport.send(&dest, frame) {
             Ok(()) => {
                 entry.apply(OutEvent::DispatchOk).expect("SEALED→IN_FLIGHT");
             }
@@ -735,6 +754,84 @@ impl<T: Transport> Node<T> {
                 entry.apply(OutEvent::TierUnreachable).expect("IN_FLIGHT→RETRY");
             }
         }
+    }
+
+    /// Build the `(destination, frame)` to hand the transport for `entry`, **tier-aware** (§20.1):
+    ///
+    /// - **`fast`** (§4.3): the sealed [`Envelope`] CBOR, to the recipient — **identical** bytes on
+    ///   every attempt (a direct resend carries no per-hop mix tag, so a retry is just a retransmit).
+    /// - **`private`** (§4.4): a **fresh** Sphinx onion of the sealed envelope, drawn over the
+    ///   retained path with a fresh `α` + current-epoch keys ([`onion::wrap`]), handed to the entry
+    ///   mix. Re-building it on **every** call is the §20.1 `RETRY (private)` fix: the retry's per-hop
+    ///   tags differ from the first attempt's (§4.4.6), so the first honest hop does not drop it as a
+    ///   replay. The stable envelope `id` is untouched (the inner envelope is re-wrapped, never
+    ///   re-sealed, §2.2). The wrap is stored on the entry ([`OutboundEntry::last_onion`]) for
+    ///   inspection. A `private` entry with no retained path (e.g. restored from the journal) or an
+    ///   unwrappable payload falls back to shipping the sealed bytes so the state machine still
+    ///   advances — a real node re-draws the path from the live mix directory / fails closed (§4.4.9).
+    fn wire_frame(entry: &mut OutboundEntry) -> (Vec<u8>, Frame) {
+        let env = entry.sealed.clone().expect("dispatch requires a sealed envelope");
+        match (entry.tier, entry.mix_path.clone()) {
+            (Tier::Private, Some(path)) => {
+                let seed = fresh_seed();
+                match onion::wrap(&env.det_cbor(), &path, &seed) {
+                    Ok(wrap) => {
+                        let dest = path.hops[0].node_ik.clone();
+                        let bytes = wrap.to_bytes();
+                        entry.last_onion = Some(wrap);
+                        (dest, Frame::Mote(bytes))
+                    }
+                    // Should not happen (the path was validated at send time); ship sealed bytes so
+                    // the SM advances rather than wedging.
+                    Err(_) => (entry.to.clone(), Frame::Mote(env.det_cbor())),
+                }
+            }
+            // `fast`, or a `private` entry whose path was not restored (never replay an old onion).
+            _ => (entry.to.clone(), Frame::Mote(env.det_cbor())),
+        }
+    }
+
+    /// Send a `private`-tier mail MOTE to `to_ik` over the mixnet `path` (spec §4.4, §4.6). Builds +
+    /// HPKE-seals the MOTE exactly as [`send_mail`](Self::send_mail), then **onion-wraps** it over
+    /// `path` (fail-closed on a sub-3-hop / over-long path or over-ladder payload, §4.4.9) and
+    /// dispatches the onion to the entry mix. The path is retained so a `RETRY` **re-onion-wraps**
+    /// with a fresh `α` rather than replaying (§20.1 `RETRY (private)`). Returns the stable `id`.
+    pub fn send_mail_private(
+        &mut self,
+        to_ik: &[u8],
+        subject: &str,
+        body: &[u8],
+        path: MixPath,
+    ) -> Result<ContentId, SendError> {
+        let seal_pub = self.directory.get(to_ik).copied().ok_or(SendError::Unresolved)?;
+        let mut draft = MoteDraft::new(Kind::Mail, self.now, body.to_vec());
+        draft.headers = Headers { subject: Some(subject.to_string()), ..Headers::default() };
+        let expires = draft.expires;
+
+        let ephemeral = IdentityKey::generate();
+        let env = build_mote(&Hpke, &self.ik, &ephemeral, to_ik, &seal_pub, draft)?;
+        let id = env.id.clone();
+        // Validate the path up front by wrapping once (fail closed here, §4.4.9) — the retry path then
+        // never fails to re-wrap.
+        onion::wrap(&env.det_cbor(), &path, &fresh_seed()).map_err(SendError::Onion)?;
+
+        let mut entry = OutboundEntry::enqueue(id.clone(), to_ik.to_vec(), self.now, expires);
+        entry.tier = Tier::Private;
+        entry.mix_path = Some(path);
+        entry.apply(OutEvent::SealOk).expect("QUEUED→SEALED");
+        entry.sealed = Some(env);
+        self.dispatch(&mut entry); // SEALED → IN_FLIGHT (or → RETRY if the entry mix is unreachable)
+        self.outbound.insert(id.as_bytes().to_vec(), entry);
+        self.checkpoint(); // §19.3.3: the queued MOTE (with its tier) is durable before we return.
+        Ok(id)
+    }
+
+    /// The most recent onion a `private`-tier outbound MOTE was dispatched as, by `id` — the fresh
+    /// wrap from its last (re)dispatch. `None` for a `fast` MOTE or one never dispatched as `private`.
+    /// Its [`OnionWrap::replay_tags`](crate::onion::OnionWrap::replay_tags) differ across a retry,
+    /// proving the §20.1 `RETRY (private)` re-onion-wrap (§4.4.6).
+    pub fn outbound_onion(&self, id: &ContentId) -> Option<crate::onion::OnionWrap> {
+        self.outbound.get(id.as_bytes()).and_then(|e| e.last_onion.clone())
     }
 
     /// Fire the retry timer for every `RETRY` entry: re-dispatch the same immutable envelope
@@ -763,7 +860,13 @@ impl<T: Transport> Node<T> {
                 }
             };
             entry.apply(OutEvent::RetryTimerFires).expect("RETRY→IN_FLIGHT");
-            match self.transport.send(&entry.to, Frame::Mote(env.det_cbor())) {
+            // Tier-aware re-dispatch (§20.1): a `fast` MOTE re-sends its identical sealed bytes; a
+            // `private` MOTE **re-onion-wraps** (fresh `α`) so its per-hop tags differ from the prior
+            // attempt and the first honest hop does not drop it as a replay (§4.4.6). `env` is unused
+            // for a re-wrapped private entry but kept as the defensive "sealed present" proof above.
+            let _ = &env;
+            let (dest, frame) = Self::wire_frame(&mut entry);
+            match self.transport.send(&dest, frame) {
                 Ok(()) => redispatched += 1,
                 Err(TransportError::Unreachable) => {
                     entry.apply(OutEvent::TierUnreachable).expect("IN_FLIGHT→RETRY");
@@ -790,7 +893,44 @@ impl<T: Transport> Node<T> {
         if !expired.is_empty() || gc {
             self.checkpoint(); // terminal transitions and/or GC removals — persist the queue.
         }
+        // Prune timed-out partial reassemblies (§4.4.1, §16.3) and stale PoW-budget bookkeeping
+        // (§16.5) — soft, non-durable state, so no checkpoint is owed.
+        let _ = self.reassembly.prune(self.now);
+        self.pow_gate.prune(self.now);
         expired
+    }
+
+    /// Accept one **peeled** `private`-tier fragment cell (its δ plaintext: fixed
+    /// [`SphinxFragmentHeader`](dmtap_core::sphinx::SphinxFragmentHeader) + fragment data) into the
+    /// bounded reassembly cache (§4.4.1 safety part, §16.3). Returns
+    /// [`Reassembled::Complete`](crate::reassembly::Reassembled::Complete) with the reconstructed MOTE
+    /// when the final missing cell arrives, [`Reassembled::Pending`](crate::reassembly::Reassembled::Pending)
+    /// while incomplete, or [`Reassembled::Rejected`](crate::reassembly::Reassembled::Rejected) on a
+    /// malformed / inconsistent / over-cap cell. A partial that never completes is evicted after the
+    /// reassembly timeout by [`tick_deadlines`](Self::tick_deadlines). Per-cell ARQ/FEC recovery is
+    /// the tracked follow-up (not in this pass).
+    pub fn accept_fragment(
+        &mut self,
+        hdr: &dmtap_core::sphinx::SphinxFragmentHeader,
+        data: &[u8],
+    ) -> Reassembled {
+        self.reassembly.accept(hdr, data, self.now)
+    }
+
+    /// The number of partial multi-cell MOTEs currently held in the reassembly cache (§4.4.1).
+    pub fn reassembly_pending(&self) -> usize {
+        self.reassembly.len()
+    }
+
+    /// Total memory-hard PoW verifications performed so far (§16.5) — observable proof the
+    /// per-connection budget held (over-budget cold MOTEs are deferred *without* verifying).
+    pub fn pow_verifications(&self) -> u64 {
+        self.pow_gate.verifications()
+    }
+
+    /// Reconfigure the per-connection memory-hard PoW verification budget (operator-tunable, §16.5).
+    pub fn set_pow_budget(&mut self, window_ms: u64, max_per_window: u32) {
+        self.pow_gate.set_budget(window_ms, max_per_window);
     }
 
     /// Garbage-collect terminal (`ACKED`/`EXPIRED`) outbound entries once their grace window has
@@ -927,6 +1067,36 @@ impl<T: Transport> Node<T> {
         let our_ik = self.ik.public();
         let seal_secret = self.seal_secret;
         let sender_is_known = self.contacts.contains(from);
+
+        // §9.4 / §16.5 (S3): a cold sender presenting a **memory-hard** Argon2id PoW forces a
+        // symmetric-cost verification, and this gate runs *before* any per-source cap can apply — so a
+        // flood of **bogus** PoW attachments is itself a memory/CPU DoS. Bound the number of PoW
+        // verifications per delivering connection: past the budget the MOTE is DEFERRED to the
+        // requests area **without** running Argon2id (never unbounded memory-hard work on
+        // unauthenticated input, never fail open). Cheap ARC / postage / vouch proofs are not gated
+        // here (they impose no symmetric-cost DoS surface, §9.3, §9.5).
+        if !sender_is_known {
+            if let Some(ChallengeResponse::Pow(sol)) = env.challenge.as_ref() {
+                match self.pow_gate.check(from, env.id.as_bytes(), &our_ik, sol, self.now) {
+                    // Past the per-connection budget: DEFER to the requests area (§2.7a) WITHOUT ever
+                    // running Argon2id — the flood tail costs the recipient no memory-hard work
+                    // (§9.4, §16.5). Not added to `seen`, so a redelivery is re-evaluated against a
+                    // fresh window rather than hitting the dedup-ack fast path. This is the only new
+                    // rejection S3 introduces.
+                    PowCheck::OverBudget => {
+                        self.store.deliver_mote(&placeholder_payload(from), REQUESTS_MAILBOX, env.ts);
+                        return InboundOutcome::Deferred { id: env.id.clone() };
+                    }
+                    // Within budget the memory-hard verification was *spent* (the cost this bound
+                    // exists to cap). Inbox acceptance itself still follows the core's reference limit
+                    // (§9.4: a *present* challenge is treated as meeting threshold) — the node does not
+                    // newly gate delivery on PoW *validity* here; it only bounds how much verification
+                    // work it performs. Fall through to full §2.7 validation either way.
+                    PowCheck::Verified | PowCheck::Failed => {}
+                }
+            }
+        }
+
         let ctx = RecipientCtx { our_ik: &our_ik, seal_secret: &seal_secret, sender_is_known };
         // `ctx` borrows only these locals (not `self`), so the accept path below is free to take
         // `&mut self`; NLL ends the borrow at this call. The per-contact `suite_ratchet` enforces the
@@ -1466,6 +1636,23 @@ impl NameChainClient for ClientRef<'_> {
     fn resolve(&self, name: &str) -> Option<Vec<u8>> {
         self.0.resolve(name)
     }
+}
+
+/// A fresh 32-byte seed for a `private`-tier onion wrap (the per-wrap `α`, §4.4.4). Drawn from the
+/// OS CSPRNG; a re-wrap MUST get a NEW seed, which is what makes a `RETRY` onion distinct from the
+/// prior attempt (§4.4.6). On the (practically impossible) RNG failure it falls back to a
+/// clock-derived seed so the value is still non-repeating rather than a fixed one that would defeat
+/// the whole re-wrap property.
+fn fresh_seed() -> [u8; 32] {
+    let mut s = [0u8; 32];
+    if getrandom::getrandom(&mut s).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        s[..16].copy_from_slice(&nanos.to_be_bytes());
+    }
+    s
 }
 
 /// Map a core [`MoteError`] to the node-level [`DropReason`] for the failure it represents.

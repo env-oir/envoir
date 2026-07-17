@@ -39,7 +39,10 @@ pub mod keystore;
 pub mod mixdir;
 pub mod naming;
 pub mod node;
+pub mod onion;
 pub mod outbound;
+pub mod pow;
+pub mod reassembly;
 pub mod seen;
 pub mod send_api;
 pub mod transport;
@@ -85,6 +88,18 @@ pub use dmtap_deniable;
 // Node-layer mix-directory anti-rollback (spec §4.4.2, §18.5.3): the per-authority monotonic
 // high-water-mark that rejects a replayed/stale mix-fleet snapshot at the node.
 pub use mixdir::{MixDirError, MixDirectoryTracker};
+
+// `private`-tier Sphinx onion wrapping (spec §4.4, §20.1): the sender-side wrap re-drawn per
+// (re)dispatch so a `private` RETRY is a fresh onion (distinct per-hop tags, §4.4.6), never a replay.
+pub use onion::{MixHop, MixPath, OnionError, OnionWrap};
+
+// Bounded memory-hard PoW verification (spec §9.4, §16.5): a per-connection budget in front of the
+// symmetric-cost Argon2id verifier, so a bogus-PoW flood cannot force unbounded verification work.
+pub use pow::{PowCheck, PowGate};
+
+// Bounded multi-cell reassembly (spec §4.4.1 safety part, §16.3): a timed-out, capped partial cache
+// so a lost fragment cannot pin recipient memory. Per-cell ARQ/FEC recovery is the follow-up.
+pub use reassembly::{Reassembled, ReassemblyCache};
 
 // The hosted-node **storage** seam (spec §12.2, §12.3, §12.4): the OSS half of the "node usage"
 // (hosted-mailbox storage) meter. Two traits — a `StorageQuota` Policy decision and an append-only

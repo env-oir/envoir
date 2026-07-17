@@ -38,7 +38,7 @@ use dmtap_core::mote::Envelope;
 use dmtap_core::ContentId;
 
 use crate::deniable::DeniableAdmissionSnapshot;
-use crate::outbound::{OutState, OutboundEntry};
+use crate::outbound::{OutState, OutboundEntry, Tier};
 
 /// The durable delivery + anti-rollback/anti-abuse state a node must survive restart with. Beyond
 /// the §19.3.3 outbound retry queue and the §2.6 dedup/ack set, this also carries the
@@ -114,6 +114,12 @@ pub struct PersistedEntry {
     /// so an older journal (no field) still loads and the node re-stamps it on the next GC pass.
     #[serde(default)]
     pub terminal_at: Option<u64>,
+    /// The privacy-tier discriminant (§4.6, [`Tier::as_u8`]). `default` (0 = `fast`) so an older
+    /// journal (no field) restores as `fast` — the tier every pre-tier entry was. A restored
+    /// `private` entry re-onion-wraps on its next retry (its path is re-drawn from the live mix
+    /// directory, not persisted; §20.1 `RETRY (private)`).
+    #[serde(default)]
+    pub tier: u8,
 }
 
 impl PersistedEntry {
@@ -128,6 +134,7 @@ impl PersistedEntry {
             delivered_late: e.delivered_late,
             sealed_cbor: e.sealed.as_ref().map(|env| env.det_cbor()),
             terminal_at: e.terminal_at,
+            tier: e.tier.as_u8(),
         }
     }
 
@@ -135,6 +142,7 @@ impl PersistedEntry {
     pub fn into_entry(self) -> Result<OutboundEntry, JournalError> {
         let state =
             OutState::from_u8(self.state).ok_or(JournalError::Corrupt("unknown outbound state"))?;
+        let tier = Tier::from_u8(self.tier).ok_or(JournalError::Corrupt("unknown outbound tier"))?;
         let sealed = match self.sealed_cbor {
             Some(bytes) => Some(
                 Envelope::from_det_cbor(&bytes)
@@ -162,6 +170,12 @@ impl PersistedEntry {
             attempts: self.attempts,
             deadline: self.deadline,
             delivered_late: self.delivered_late,
+            tier,
+            // The mixnet path and the last onion are transient (never persisted): a restored
+            // `private` entry re-draws its path from the live mix directory and re-onion-wraps on the
+            // next retry (§20.1 `RETRY (private)`); the inner sealed envelope above is what is retained.
+            mix_path: None,
+            last_onion: None,
             terminal_at: self.terminal_at,
         })
     }

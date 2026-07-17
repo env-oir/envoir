@@ -15,6 +15,41 @@
 use dmtap_core::mote::Envelope;
 use dmtap_core::{ContentId, TimestampMs};
 
+use crate::onion::{MixPath, OnionWrap};
+
+/// The privacy tier fixed for an outbound MOTE at seal time (§4.6). It governs the §20.1
+/// `RETRY → …` branch: `fast` MAY re-dispatch identical bytes, but `private` MUST re-onion-wrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tier {
+    /// Direct / low-hop mesh (§4.3, §20.4): a retry re-dispatches the *identical* sealed bytes — a
+    /// direct resend carries no per-hop mix tag, so it is just a retransmission (§20.1 `RETRY (fast)`).
+    #[default]
+    Fast,
+    /// Mixnet + cover traffic (§4.4): the MOTE is Sphinx onion-wrapped. A retry MUST **re-onion-wrap**
+    /// (fresh path/`α`/current-epoch keys) — re-sending the identical onion is dropped at the first
+    /// honest hop as a per-hop-tag replay (`0x030E`), so it could never deliver (§20.1 `RETRY (private)`).
+    Private,
+}
+
+impl Tier {
+    /// Stable discriminant for on-disk persistence (§19.3.3). The mapping is fixed forever.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Tier::Fast => 0,
+            Tier::Private => 1,
+        }
+    }
+
+    /// Inverse of [`as_u8`](Self::as_u8); `None` for an unknown discriminant (a corrupt journal).
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Tier::Fast),
+            1 => Some(Tier::Private),
+            _ => None,
+        }
+    }
+}
+
 /// The §16.1 retry deadline: 72 hours from `QUEUED` entry, after which an unacked MOTE `EXPIRED`s.
 pub const RETRY_DEADLINE_MS: u64 = 72 * 60 * 60 * 1000;
 /// How long a **terminal** (`ACKED`/`EXPIRED`) entry is retained after it is first observed terminal
@@ -149,6 +184,20 @@ pub struct OutboundEntry {
     pub deadline: TimestampMs,
     /// True once a late ack corrected an already-`EXPIRED` entry (UI hint, §20.1 fill).
     pub delivered_late: bool,
+    /// The privacy tier fixed for this MOTE (§4.6). Governs the §20.1 `RETRY` branch: `fast`
+    /// re-dispatches identical bytes, `private` MUST re-onion-wrap. Persisted (its discriminant) so a
+    /// restored entry re-wraps rather than replays. Defaults to [`Tier::Fast`].
+    pub tier: Tier,
+    /// For a `private`-tier entry, the drawn mixnet path the onion is wrapped over (§4.4.3). Retained
+    /// (alongside the inner [`sealed`](Self::sealed) envelope) so a `RETRY` can **re-onion-wrap** with
+    /// a fresh `α` over this path (§20.1 `RETRY (private)`). `None` for `fast`, or for a `private`
+    /// entry restored from the journal (the path is re-drawn from the live mix directory before the
+    /// next retry — not persisted). The inner envelope, never the outer onion, is what is retained.
+    pub mix_path: Option<MixPath>,
+    /// The most recent onion this entry was dispatched as (`private` only) — the fresh wrap from the
+    /// last (re)dispatch. Transient (never persisted): each (re)dispatch rebuilds it. Exposed so the
+    /// distinct-per-hop-tags property of a re-wrap is observable (§4.4.6).
+    pub last_onion: Option<OnionWrap>,
     /// When this entry was first observed in a terminal state (`ACKED`/`EXPIRED`), the start of its
     /// GC grace window ([`TERMINAL_GRACE_MS`]). `None` until then. Stamped lazily by the node's
     /// terminal-GC pass (not by the pure state machine, which carries no clock), so a restored terminal
@@ -178,6 +227,9 @@ impl OutboundEntry {
             attempts: 0,
             deadline,
             delivered_late: false,
+            tier: Tier::Fast,
+            mix_path: None,
+            last_onion: None,
             terminal_at: None,
         }
     }
@@ -327,6 +379,17 @@ mod tests {
         assert_eq!(e.deadline, 2000, "the smaller of expires and the 72h default governs");
         let e2 = OutboundEntry::enqueue(ContentId::of(b"m"), b"bob".to_vec(), 1000, None);
         assert_eq!(e2.deadline, 1000 + RETRY_DEADLINE_MS);
+    }
+
+    #[test]
+    fn tier_defaults_fast_and_discriminant_round_trips() {
+        let e = entry();
+        assert_eq!(e.tier, Tier::Fast, "a MOTE defaults to the fast tier unless made private");
+        assert!(e.mix_path.is_none() && e.last_onion.is_none());
+        for t in [Tier::Fast, Tier::Private] {
+            assert_eq!(Tier::from_u8(t.as_u8()), Some(t));
+        }
+        assert_eq!(Tier::from_u8(200), None, "an unknown discriminant is refused, not defaulted");
     }
 
     #[test]
