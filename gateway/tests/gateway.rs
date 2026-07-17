@@ -493,6 +493,23 @@ fn outbound_produces_a_verifiable_delegated_dkim_signature() {
 }
 
 #[test]
+fn outbound_refuses_crlf_header_injection_in_subject() {
+    // A CRLF in a sender-controlled header field must not smuggle extra headers into the DKIM-signed
+    // message — the gateway refuses fail-closed rather than sign an injected message.
+    let gw = OutboundGateway::new(
+        vec![dkim_key("alice-domain.com", "dmtap1")],
+        Box::new(FixedTls(TlsRequirement::Required)),
+        Box::new(ScriptedTransport::new(true, TransportResult::Delivered { code: 250 })),
+    );
+    let mut payload = sample_payload();
+    payload.headers.subject = Some("hi\r\nBcc: victim@example.com".into());
+    let err = gw
+        .translate_and_sign(&payload, "alice@alice-domain.com", "bob@gmail.com", NOW)
+        .unwrap_err();
+    assert!(matches!(err, OutboundError::HeaderInjection("Subject")), "got {err:?}");
+}
+
+#[test]
 fn outbound_refuses_to_sign_undelegated_domain() {
     let gw = OutboundGateway::new(
         vec![dkim_key("alice-domain.com", "dmtap1")], // only alice-domain.com is delegated

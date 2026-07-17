@@ -137,6 +137,8 @@ pub enum OutboundError {
     DestinationRejected { code: u16, text: String },
     #[error("no MX candidate host resolved for {0}; send aborted")]
     NoMxHost(String),
+    #[error("header field {0} contains a CR, LF, or NUL — refused to avoid header injection")]
+    HeaderInjection(&'static str),
 }
 
 impl OutboundGateway {
@@ -196,7 +198,7 @@ impl OutboundGateway {
             .dkim_key_for(from_domain)
             .ok_or_else(|| OutboundError::NotDelegated(from_domain.into()))?;
 
-        let message = render_rfc5322(payload, from_addr, to_addr, now);
+        let message = render_rfc5322(payload, from_addr, to_addr, now)?;
         let dkim_header = dkim::sign(key, &message, now / 1000);
 
         // Prepend the DKIM-Signature header (RFC 6376: it precedes the signed headers).
@@ -319,13 +321,30 @@ impl OutboundGateway {
 /// Render an outbound `mail` MOTE payload to RFC 5322 with the sender's real domain address in
 /// `From:` (the delegated-DKIM domain), CRLF line endings. A deterministic `Message-ID` from the
 /// body keeps re-renders stable.
-pub fn render_rfc5322(payload: &Payload, from_addr: &str, to_addr: &str, ts: TimestampMs) -> Vec<u8> {
+pub fn render_rfc5322(
+    payload: &Payload,
+    from_addr: &str,
+    to_addr: &str,
+    ts: TimestampMs,
+) -> Result<Vec<u8>, OutboundError> {
+    // A CR/LF/NUL in any interpolated header field would inject extra headers or a premature body
+    // separator into the message the gateway then DKIM-signs. Refuse fail-closed before rendering.
+    let no_inject = |field: &str, name: &'static str| -> Result<(), OutboundError> {
+        if field.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(OutboundError::HeaderInjection(name));
+        }
+        Ok(())
+    };
+    no_inject(from_addr, "From")?;
+    no_inject(to_addr, "To")?;
     let subject = payload.headers.subject.clone().unwrap_or_default();
+    no_inject(&subject, "Subject")?;
     let mime = payload
         .headers
         .mime
         .clone()
         .unwrap_or_else(|| "text/plain; charset=utf-8".into());
+    no_inject(&mime, "Content-Type")?;
     let date = format_rfc5322_date(ts);
     let mid = format!("<{}@{}>", b64_id(&payload.body), domain_of(from_addr).unwrap_or("dmtap.local"));
 
@@ -344,7 +363,7 @@ pub fn render_rfc5322(payload: &Payload, from_addr: &str, to_addr: &str, ts: Tim
     if !payload.body.ends_with(b"\n") {
         bytes.extend_from_slice(b"\r\n");
     }
-    bytes
+    Ok(bytes)
 }
 
 /// A short, URL-safe-ish stable token from the body's content address, for Message-ID.
