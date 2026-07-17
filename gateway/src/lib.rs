@@ -66,6 +66,7 @@ pub mod directory;
 pub mod dkim;
 pub mod dmarc;
 pub mod dns;
+pub mod forwarded_addr;
 pub mod inbound;
 pub mod inbound_tcp;
 pub mod mesh;
@@ -89,6 +90,7 @@ pub use dkim::{
     DkimKeyResolver, DkimVerdict, DnsDkimKeyResolver, StaticDkimKeys,
 };
 pub use directory::{DirectoryError, FileDirectory, InMemoryDirectory};
+pub use forwarded_addr::{decode as decode_forwarded, encode as encode_forwarded, ForwardedAddrError};
 pub use dmarc::{
     organizational_domain, DmarcDisposition, DmarcPolicy, DmarcRecord, DmarcTxtResolver,
     DmarcVerdict, DnsDmarcResolver, InMemoryDmarcResolver,
