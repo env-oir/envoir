@@ -80,6 +80,58 @@ impl<'de> Deserialize<'de> for Suite {
     }
 }
 
+// --- Suite negotiation / intersection (§1.1, §1.3) -----------------------------------------
+
+/// A [`negotiate_suite`] failure (`ERR_SUITE_INTERSECTION_EMPTY`, §21.3 `0x0102`).
+///
+/// Disposition per §21.3: `REJECT_NOTIFY` — the sender's and recipient's supported-suite sets do
+/// not intersect, so there is **no common suite** to encrypt/sign under. Delivery fails closed;
+/// there is **no silent downgrade** to a suite one side does not support (§1.3).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SuiteNegotiationError {
+    /// The sender's and recipient's supported-suite sets are disjoint — no suite both can use.
+    #[error(
+        "sender and recipient supported-suite sets do not intersect — no common suite \
+         (ERR_SUITE_INTERSECTION_EMPTY, §21.3 0x0102)"
+    )]
+    IntersectionEmpty,
+}
+
+impl SuiteNegotiationError {
+    /// The normative DMTAP wire error code (§21.3).
+    pub fn code(&self) -> u16 {
+        match self {
+            SuiteNegotiationError::IntersectionEmpty => 0x0102,
+        }
+    }
+}
+
+/// Select the negotiated cipher-suite for delivery from a `sender` and a `recipient`
+/// supported-suite set (spec §1.1, §1.3).
+///
+/// `suites` is a *set* (§1.3): the two argument lists are the sender's supported suites and the
+/// recipient's `Identity.suites`. The rule is normative — a **sender MUST use the highest suite
+/// both parties support** (the intersection). "Highest" is the strongest suite, i.e. the greatest
+/// [`Suite`] byte (`PqHybrid` `0x02` > `Classical` `0x01`), so a pair that has both migrated to the
+/// PQ suite negotiates it in preference to the classical one. Duplicate or unordered inputs do not
+/// matter — only set membership and the byte ordering do.
+///
+/// If the intersection is **empty** there is no common suite and this **fails closed** with
+/// [`SuiteNegotiationError::IntersectionEmpty`] (`0x0102`): delivery is refused rather than silently
+/// downgraded to a suite one side cannot validate (§1.1 "reject unknown suites, never guess";
+/// §1.3 "no silent downgrade").
+pub fn negotiate_suite(
+    sender: &[Suite],
+    recipient: &[Suite],
+) -> Result<Suite, SuiteNegotiationError> {
+    sender
+        .iter()
+        .filter(|s| recipient.contains(s))
+        .copied()
+        .max() // highest (strongest) suite both parties support
+        .ok_or(SuiteNegotiationError::IntersectionEmpty)
+}
+
 // --- Suite high-water-mark ratchet (§1.3, §2.7 step 8) -------------------------------------
 
 /// A [`SuiteRatchet`] downgrade rejection (`ERR_SUITE_DOWNGRADE`, §21.3 `0x020F`).
@@ -201,6 +253,42 @@ mod tests {
         // The MOTE envelope/payload layer implements both the classical and the PQ-hybrid suite.
         assert!(Suite::Classical.mote_supported());
         assert!(Suite::PqHybrid.mote_supported());
+    }
+
+    #[test]
+    fn negotiate_picks_highest_common_suite() {
+        // Both support both suites — pick the highest (PQ).
+        assert_eq!(
+            negotiate_suite(&[Suite::Classical, Suite::PqHybrid], &[Suite::Classical, Suite::PqHybrid]),
+            Ok(Suite::PqHybrid)
+        );
+        // Overlap is classical only (sender is PQ-capable, recipient classical-only) — pick classical.
+        assert_eq!(
+            negotiate_suite(&[Suite::Classical, Suite::PqHybrid], &[Suite::Classical]),
+            Ok(Suite::Classical)
+        );
+        // Order of the input lists is irrelevant; only set membership + strength ordering matter.
+        assert_eq!(
+            negotiate_suite(&[Suite::PqHybrid, Suite::Classical], &[Suite::PqHybrid]),
+            Ok(Suite::PqHybrid)
+        );
+    }
+
+    #[test]
+    fn negotiate_disjoint_sets_fail_closed() {
+        // Sender only PQ, recipient only classical — no common suite, fail closed 0x0102.
+        let err = negotiate_suite(&[Suite::PqHybrid], &[Suite::Classical]).unwrap_err();
+        assert_eq!(err, SuiteNegotiationError::IntersectionEmpty);
+        assert_eq!(err.code(), 0x0102);
+        // Empty recipient set (nothing published) also fails closed — never guess a suite.
+        assert_eq!(
+            negotiate_suite(&[Suite::Classical], &[]),
+            Err(SuiteNegotiationError::IntersectionEmpty)
+        );
+        assert_eq!(
+            negotiate_suite(&[], &[Suite::Classical]),
+            Err(SuiteNegotiationError::IntersectionEmpty)
+        );
     }
 
     #[test]

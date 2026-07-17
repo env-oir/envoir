@@ -211,6 +211,59 @@ pub enum Tier {
     Fast,
 }
 
+impl Tier {
+    /// Privacy **strength rank** — higher means stronger metadata privacy. `Private` (full mixnet +
+    /// cover, strong against a global passive adversary, §6.5) outranks `Fast` (direct/few-hop,
+    /// content-only). Used to compare tiers by privacy strength; note this is deliberately *not* a
+    /// derived `Ord` on the enum, since enum declaration order does not encode strength.
+    pub fn privacy_rank(self) -> u8 {
+        match self {
+            Tier::Private => 1,
+            Tier::Fast => 0,
+        }
+    }
+}
+
+/// A [`tier_enforce`] failure (`ERR_PRIVATE_TIER_DOWNGRADE_REFUSED`, §21.5 `0x0310`).
+///
+/// Disposition per §21.5/§4.4.9: `FAIL_CLOSED_BLOCK` — a message a party required at a given
+/// minimum privacy tier MUST NOT be silently demoted to a weaker one (`private → fast`). An
+/// adversary DoSing the mixnet can **delay** delivery but MUST NOT be able to strip the tier.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TierEnforcementError {
+    /// The offered/incoming tier is below the required minimum — a silent privacy downgrade.
+    #[error(
+        "offered privacy tier is below the required minimum — silent downgrade refused \
+         (ERR_PRIVATE_TIER_DOWNGRADE_REFUSED, §21.5 0x0310)"
+    )]
+    DowngradeRefused,
+}
+
+impl TierEnforcementError {
+    /// The normative DMTAP wire error code (§21.5).
+    pub fn code(&self) -> u16 {
+        match self {
+            TierEnforcementError::DowngradeRefused => 0x0310,
+        }
+    }
+}
+
+/// Enforce a **minimum privacy tier** (spec §4.4.9, §6.5): refuse to accept an `offered` tier that
+/// is weaker than the `required` floor.
+///
+/// A message flagged (by sender or recipient policy) to travel at least at `required` strength MUST
+/// NOT be silently routed over a weaker tier — that covert `private → fast` demotion is exactly what
+/// an adversary DoSing the mixnet tries to force (§4.4.9). An `offered` tier at or above `required`
+/// (compared by [`Tier::privacy_rank`]) is accepted and returned; a strictly-weaker one **fails
+/// closed** with [`TierEnforcementError::DowngradeRefused`] (`0x0310`). Downgrading is only ever a
+/// deliberate, user-surfaced choice, never an automatic reaction — so this helper never downgrades.
+pub fn tier_enforce(required: Tier, offered: Tier) -> Result<Tier, TierEnforcementError> {
+    if offered.privacy_rank() < required.privacy_rank() {
+        return Err(TierEnforcementError::DowngradeRefused);
+    }
+    Ok(offered)
+}
+
 // --- Anti-abuse challenge (§2.2b, §9) ------------------------------------------------------
 
 /// A cold-sender anti-abuse proof carried in the *envelope* so the recipient can evaluate
@@ -2028,6 +2081,25 @@ mod tests {
         assert_eq!(file_tier(1024), FileTier::Inline);
         assert_eq!(file_tier(2 * 1024 * 1024), FileTier::Normal);
         assert_eq!(file_tier(8 * 1024 * 1024), FileTier::Large);
+    }
+
+    #[test]
+    fn tier_enforce_allows_equal_or_stronger() {
+        // Equal tiers are always fine.
+        assert_eq!(tier_enforce(Tier::Private, Tier::Private), Ok(Tier::Private));
+        assert_eq!(tier_enforce(Tier::Fast, Tier::Fast), Ok(Tier::Fast));
+        // A stronger offer than required is accepted (over-delivering privacy is never a downgrade).
+        assert_eq!(tier_enforce(Tier::Fast, Tier::Private), Ok(Tier::Private));
+    }
+
+    #[test]
+    fn tier_enforce_refuses_downgrade_below_required() {
+        // Required Private but only Fast offered — a silent privacy downgrade, fail closed 0x0310.
+        let err = tier_enforce(Tier::Private, Tier::Fast).unwrap_err();
+        assert_eq!(err, TierEnforcementError::DowngradeRefused);
+        assert_eq!(err.code(), 0x0310);
+        // Private is strictly stronger than Fast per privacy_rank.
+        assert!(Tier::Private.privacy_rank() > Tier::Fast.privacy_rank());
     }
 
     // --- Delivery tiers (§5.5.1, §16.4) — the DURABILITY axis, orthogonal to `FileTier` --------

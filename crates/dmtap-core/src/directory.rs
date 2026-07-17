@@ -207,11 +207,68 @@ impl DomainDirectory {
 
     /// Verify the domain-authority signature (§18.9.3). The caller MUST additionally verify each
     /// entry's forward `name → ik` binding (the directory indexes, it does not attest).
+    ///
+    /// This is **self-consistency only**: it confirms the object is validly signed by *its own*
+    /// embedded `authority`, but not that that authority is the one the caller pinned. A directory
+    /// forged by an attacker's own authority key passes here. Pair it with [`verify_pinned`] to
+    /// additionally require a caller-pinned authority (§3.10.1), mirroring
+    /// [`Identity::verify`](crate::identity::Identity::verify)'s `pinned` argument.
     pub fn verify(&self) -> Result<(), IdentityError> {
         if !self.suite.is_supported() {
             return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
         }
         verify_domain(&self.authority, DOMAIN_DIRECTORY_DS, &self.signing_body(), &self.sig)
+    }
+
+    /// Verify the directory against a caller-**pinned** domain authority (spec §3.10.1, §3.10.3),
+    /// mirroring [`Identity::verify`](crate::identity::Identity::verify)'s `pinned` argument.
+    ///
+    /// This is the trustworthy path a member uses: it first runs the [`verify`](Self::verify)
+    /// self-consistency check (validly signed by the embedded `authority`), then **additionally**
+    /// requires that embedded `authority` to equal `pinned_authority` — the domain-authority key the
+    /// member pinned out of band / via DNS+KT (§3.10.1). A directory signed by a *different* key —
+    /// even one that is internally self-consistent (an attacker's own authority) — **fails closed**
+    /// with [`DomainDirectoryError::AuthorityMismatch`]; a directory whose embedded authority
+    /// matches the pin but whose signature does not verify fails with
+    /// [`DomainDirectoryError::SigInvalid`]. Both map to `ERR_DOMAIN_DIRECTORY_SIG_INVALID`
+    /// (`0x0113`) — "not validly signed by the domain's pinned authority key".
+    pub fn verify_pinned(&self, pinned_authority: &[u8]) -> Result<(), DomainDirectoryError> {
+        // Self-consistency: validly signed by its own embedded authority (§18.9.3).
+        self.verify().map_err(|_| DomainDirectoryError::SigInvalid)?;
+        // Pinned-authority: the embedded authority MUST be exactly the caller's pin (§3.10.1).
+        if self.authority.as_slice() != pinned_authority {
+            return Err(DomainDirectoryError::AuthorityMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// A [`DomainDirectory::verify_pinned`] failure, both carrying the §21.3 wire error code
+/// `ERR_DOMAIN_DIRECTORY_SIG_INVALID` (`0x0113`, §3.10.3 / §18.4.7) via [`DomainDirectoryError::code`].
+///
+/// Disposition per §21.3: `FAIL_CLOSED_BLOCK` — do not trust the directory; per-name resolution
+/// (§3.3) is unaffected. The two variants distinguish *why* the pinned-authority check failed (a bad
+/// signature vs. a valid signature by the wrong key), but both are the same normative wire code.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DomainDirectoryError {
+    /// The directory is not validly signed by its own embedded authority (§18.9.3).
+    #[error("domain directory signature invalid (ERR_DOMAIN_DIRECTORY_SIG_INVALID, §21.3 0x0113)")]
+    SigInvalid,
+    /// The directory is self-consistent but its authority key is **not** the caller-pinned one — a
+    /// directory signed by a different (possibly attacker) authority (§3.10.1).
+    #[error(
+        "domain directory signed by a non-pinned authority key \
+         (ERR_DOMAIN_DIRECTORY_SIG_INVALID, §21.3 0x0113)"
+    )]
+    AuthorityMismatch,
+}
+
+impl DomainDirectoryError {
+    /// The normative DMTAP wire error code (§21.3).
+    pub fn code(&self) -> u16 {
+        match self {
+            DomainDirectoryError::SigInvalid | DomainDirectoryError::AuthorityMismatch => 0x0113,
+        }
     }
 }
 
@@ -271,6 +328,61 @@ mod tests {
         );
         dir.entries.push(entry("evil@abc.com", 0x44, Custody::Sovereign, None));
         assert_eq!(dir.verify(), Err(IdentityError::BadSignature));
+    }
+
+    #[test]
+    fn verify_pinned_accepts_matching_authority() {
+        let authority = key(0x11);
+        let dir = DomainDirectory::issue(
+            &authority,
+            "abc.com",
+            3,
+            Visibility::Public,
+            vec![entry("alice@abc.com", 0x22, Custody::Sovereign, None)],
+            None,
+            1_700_000_000_000,
+        );
+        // Pinned to the real authority key — passes.
+        assert_eq!(dir.verify_pinned(&authority.public()), Ok(()));
+    }
+
+    #[test]
+    fn verify_pinned_rejects_non_pinned_authority_fail_closed() {
+        let attacker = key(0x99);
+        let pinned = key(0x11); // the authority the member actually pinned
+        // A directory the attacker validly signs with THEIR OWN authority key: self-consistent…
+        let forged = DomainDirectory::issue(
+            &attacker,
+            "abc.com",
+            3,
+            Visibility::Public,
+            vec![entry("alice@abc.com", 0x22, Custody::Sovereign, None)],
+            None,
+            1_700_000_000_000,
+        );
+        assert!(forged.verify().is_ok(), "forged directory is internally self-consistent");
+        // …but it is NOT signed by the pinned authority — fail closed 0x0113.
+        let err = forged.verify_pinned(&pinned.public()).unwrap_err();
+        assert_eq!(err, DomainDirectoryError::AuthorityMismatch);
+        assert_eq!(err.code(), 0x0113);
+    }
+
+    #[test]
+    fn verify_pinned_rejects_bad_signature() {
+        let authority = key(0x11);
+        let mut dir = DomainDirectory::issue(
+            &authority,
+            "abc.com",
+            1,
+            Visibility::MembersOnly,
+            vec![],
+            None,
+            1,
+        );
+        dir.version = 2; // signed body no longer matches sig
+        let err = dir.verify_pinned(&authority.public()).unwrap_err();
+        assert_eq!(err, DomainDirectoryError::SigInvalid);
+        assert_eq!(err.code(), 0x0113);
     }
 
     #[test]
