@@ -652,11 +652,12 @@ impl AliasAllocator {
     /// Idempotent; the value is lowercased for a case-insensitive match.
     pub fn reserve_localpart(&mut self, local_part: impl AsRef<str>) {
         let lp = local_part.as_ref().trim().to_ascii_lowercase();
-        // Purge any vanity already allocated at this local-part: a reservation added AFTER an
-        // allocation must still win, so a chosen vanity can never keep shadowing a real directory
-        // identity even if the reserve happens later (audit-5 #5). The vanity holder falls back to
+        // Purge any vanity already allocated at this local-part — from BOTH indexes — so a reservation
+        // added AFTER an allocation still wins, and a chosen vanity can never keep shadowing a real
+        // directory identity by allocate/reserve ordering (audit-5 #5). The vanity holder falls back to
         // its conflict-free key-derived alias.
         self.vanity.remove(&lp);
+        self.reverse.retain(|(_, v)| v != &lp);
         self.reserved.insert(lp);
     }
 
