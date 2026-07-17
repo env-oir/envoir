@@ -45,6 +45,54 @@ fn serve(cfg: &PersonalConfig) -> std::io::Result<()> {
     cfg.serve(&SHUTDOWN)
 }
 
+/// Run the multi-tenant PUBLIC gateway: bind the authenticated admin API over TLS and serve until
+/// shutdown. Fail-closed and off-by-default — refuses to start without an admin token AND a TLS
+/// cert/key pair (the token must never travel in cleartext, and an unauthenticated control surface is
+/// never brought up). Domains, keys, aliases, and quotas are all managed at runtime through the admin
+/// API (envoir-cloud drives it); the gateway itself serves no domain until one is added.
+fn serve_public() -> std::io::Result<()> {
+    use envoir_gateway::{AdminApi, AdminAuth, AdminServer, MultiDomainGateway, UsageMeter};
+    use std::sync::{Arc, Mutex};
+
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidInput, m.to_string());
+
+    let listen =
+        std::env::var("GATEWAY_ADMIN_LISTEN").unwrap_or_else(|_| "127.0.0.1:9443".to_string());
+    // Fail-closed: an empty/absent token means the admin API would refuse everything anyway, so we
+    // refuse to *start* rather than bring up an inert-but-listening control surface.
+    let token = std::env::var("GATEWAY_ADMIN_TOKEN").unwrap_or_default();
+    if token.trim().is_empty() {
+        return Err(bad(
+            "public mode requires GATEWAY_ADMIN_TOKEN (the admin API is fail-closed; refusing to \
+             start without a token)",
+        ));
+    }
+    // TLS is mandatory — the admin bearer token must never travel in cleartext.
+    let (Ok(cert_path), Ok(key_path)) =
+        (std::env::var("GATEWAY_TLS_CERT"), std::env::var("GATEWAY_TLS_KEY"))
+    else {
+        return Err(bad(
+            "public mode requires GATEWAY_TLS_CERT + GATEWAY_TLS_KEY — the admin API is HTTPS-only",
+        ));
+    };
+    let cert_pem = std::fs::read(&cert_path)?;
+    let key_pem = std::fs::read(&key_path)?;
+    let tls = envoir_gateway::server_config_from_pem(&cert_pem, &key_pem)?;
+
+    let gateway = Arc::new(Mutex::new(MultiDomainGateway::new()));
+    let meter = UsageMeter::new();
+    let api = AdminApi::new(gateway, meter, AdminAuth::with_token(token));
+    let server = AdminServer::bind(&listen, tls, api)?;
+    let bound = server.local_addr()?;
+
+    install_signal_handlers();
+    eprintln!(
+        "gateway[public]: multi-tenant admin API (HTTPS) on {bound} — serving 0 domains until added \
+         via the API. SIGINT/SIGTERM to stop."
+    );
+    server.serve_until(&SHUTDOWN)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
@@ -81,6 +129,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "public" => {
+            // The multi-tenant PUBLIC gateway "as a business" (spec §7): serve MANY domains, each
+            // added at runtime through the authenticated admin API (envoir-cloud drives it). Everything
+            // is fail-closed and off by default — this mode requires an admin token AND TLS, and serves
+            // no domain until one is added via the API. Configured from GATEWAY_ADMIN_* env vars.
+            if let Err(e) = serve_public() {
+                eprintln!("gateway: fatal: {e}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             println!(
                 "envoir-gateway — optional DMTAP <-> legacy SMTP bridge (reference)\n\
@@ -92,6 +150,9 @@ fn main() {
                  \x20 personal <config.toml>  run the daemon for YOUR OWN domain from a config file\n\
                  \x20                          (the single-operator personal gateway; see README)\n\
                  \x20 run                      run the daemon configured from GATEWAY_* env vars\n\
+                 \x20 public                   run the MULTI-TENANT public gateway: an authenticated\n\
+                 \x20                          admin API (HTTPS) manages many domains at runtime\n\
+                 \x20                          (GATEWAY_ADMIN_TOKEN + GATEWAY_TLS_CERT/KEY required)\n\
                  \x20 version                  print version\n\
                  \x20 help                     show this help\n\
                  \n\

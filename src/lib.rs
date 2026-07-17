@@ -59,6 +59,7 @@
 //! doubles remain for unit tests; the socket/DNS impls are the production leg (unit-tested via pure
 //! wire-format round-trips, not live network calls).
 
+pub mod admin;
 pub mod alias_map;
 pub mod attestation;
 pub mod authz;
@@ -74,6 +75,7 @@ pub mod inbound_tcp;
 pub mod legacy_net;
 pub mod mesh;
 pub mod mta_sts;
+pub mod multidomain;
 pub mod mx;
 pub mod net;
 pub mod outbound;
@@ -85,6 +87,7 @@ pub mod provenance;
 pub mod smtp_submission;
 pub mod spf;
 
+pub use admin::{AdminApi, AdminAuth, AdminRequest, AdminResponse, AdminServer};
 pub use alias_map::{
     random_alias_token, AliasTarget, GatewayAliasError, GatewayAliasMap, TOKEN_ENTROPY_BYTES,
 };
@@ -122,6 +125,10 @@ pub use mesh::{HttpMeshDelivery, MeshConfigError, NullMesh};
 pub use mta_sts::{
     DnsTxtResolver, HttpsPolicyFetcher, InMemoryPolicyFetcher, InMemoryTxtResolver,
     MtaStsTlsPolicy, PolicyFetcher, PolicyMode, StsParseError, StsPolicy, TxtResolver,
+};
+pub use multidomain::{
+    ChargeError, DomainTenant, DomainUsage, MultiDomainError, MultiDomainGateway, Recipient,
+    RouteError, UsageMeter,
 };
 pub use mx::{DnsMxResolver, InMemoryMxResolver, MxHost, MxResolver};
 pub use outbound::{

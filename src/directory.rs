@@ -51,6 +51,13 @@ impl InMemoryDirectory {
         self.entries.insert(email.as_ref().trim().to_ascii_lowercase(), key);
     }
 
+    /// Remove `email`'s mapping (case-insensitive). Returns whether an entry existed. Used by the
+    /// multi-tenant admin surface to de-provision a recipient; after removal the address resolves to
+    /// `None` (→ SMTP `550`), the fail-closed default.
+    pub fn remove(&mut self, email: impl AsRef<str>) -> bool {
+        self.entries.remove(&email.as_ref().trim().to_ascii_lowercase()).is_some()
+    }
+
     /// Number of configured recipients.
     pub fn len(&self) -> usize {
         self.entries.len()
