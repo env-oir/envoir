@@ -84,7 +84,7 @@ pub use attestation::{Attestation, AttestationError, AttestationKey, GwKeyResolv
 pub use authz::{
     key_derived_localpart, random_nonce, Admission, AdmissionError, AliasAllocator, AliasError,
     AuthzMode, Challenge, IdentityRegistry, Quota, QuotaError, QuotaLedger, RegisteredIdentity,
-    Usage,
+    Usage, RESERVED_ALIAS_PREFIX,
 };
 pub use dkim::{
     parse_public_key_txt, signing_domain_selector, verify_with_resolver, DkimError, DkimKey,
