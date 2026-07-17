@@ -876,7 +876,8 @@ fn val_bad_payload_sig() -> Result<(), String> {
         attach: vec![],
         expires: None,
     };
-    let hash = payload.signing_hash();
+    // §18.9.2 now binds the envelope context (kind/ts/to) into the payload hash.
+    let hash = payload.signing_hash(kind, ts, &to);
     payload.sig = sender.sign_domain(PAYLOAD_SIG_DS, &hash);
     payload.sig[0] ^= 0xff; // tamper AFTER signing correctly.
 

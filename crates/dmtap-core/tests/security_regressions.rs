@@ -238,13 +238,18 @@ fn untampered_known_sender_mote_is_accepted() {
 // Suite fail-closed / no silent downgrade (spec §1.1, §1.3, §18.1.4).
 // ================================================================================================
 
-/// FINDING: an unknown algorithm-suite byte is never guessed at — `Suite::from_u8` fails closed
-/// for every byte except the two currently-defined ids (§1.1, §18.1.4).
+/// FINDING: an UNREGISTERED algorithm-suite byte is never guessed at — `Suite::from_u8` fails
+/// closed for every byte outside the registered ids (§1.1, §18.1.4, §21.15). The three registered
+/// ids `0x01`/`0x02`/`0x03` decode (0x02/0x03 are RESERVED — known code points that fail closed on
+/// *use*, not on *decode*); every unregistered byte returns `None`.
 #[test]
 fn suite_from_u8_fails_closed_on_unknown_bytes() {
     assert_eq!(Suite::from_u8(0x01), Some(Suite::Classical));
     assert_eq!(Suite::from_u8(0x02), Some(Suite::PqHybrid));
-    for b in [0x00u8, 0x03, 0x04, 0x7f, 0xfe, 0xff] {
+    assert_eq!(Suite::from_u8(0x03), Some(Suite::ReservedAeadGcm));
+    // 0x03 is registered-but-unimplemented: it must not be usable at either layer.
+    assert!(!Suite::ReservedAeadGcm.is_supported() && !Suite::ReservedAeadGcm.mote_supported());
+    for b in [0x00u8, 0x04, 0x7f, 0xfe, 0xff] {
         assert_eq!(Suite::from_u8(b), None, "suite byte 0x{b:02x} must fail closed, never be guessed");
     }
 }

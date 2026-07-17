@@ -63,6 +63,19 @@ pub enum MoteError {
     MissingSenderKey,
     #[error("signature verification failed")]
     BadSignature,
+    /// The `Envelope`'s `kind`/`ts`/`to` do not equal the values **bound into `Payload.sig`**
+    /// (§18.9.2 now folds those three envelope fields into the identity-signature preimage). Because
+    /// the bare envelope `sender_sig` (§18.9.1) is minted by an anyone-can-mint ephemeral key, a
+    /// re-emitter of the sealed `ciphertext` could otherwise re-mint it over an altered
+    /// `kind`/`ts`/`to` — rewriting the displayed timestamp/causal order, or relabeling `kind`
+    /// (chat↔mail render/tier change, or → `0x0b` to force a silent decrypt-fail). The identity
+    /// signature now binds them, so at §2.7 step 8 the recipient recomputes `payload_hash` over the
+    /// **received** envelope's `kind`/`ts`/`to`; a `Payload.sig` that authenticates the payload but
+    /// is **not bound to this envelope's context** is rejected here rather than accepted
+    /// (`ERR_ENVELOPE_CONTEXT_MISMATCH`, `0x0211`, §21.4). DROP_SILENT.
+    #[error("envelope kind/ts/to do not match the context bound in Payload.sig \
+             (ERR_ENVELOPE_CONTEXT_MISMATCH, 0x0211)")]
+    EnvelopeContextMismatch,
     #[error("payload decryption failed")]
     DecryptFailed,
     #[error("payload sealing failed")]
@@ -111,6 +124,7 @@ impl MoteError {
     /// existing `0x080A` (`ERR_FILE_MANIFEST_INVALID`) — see that variant's note.
     pub fn code(&self) -> Option<u16> {
         match self {
+            MoteError::EnvelopeContextMismatch => Some(0x0211),
             MoteError::FileUnavailable => Some(0x0809),
             MoteError::FileManifestInvalid => Some(0x080A),
             MoteError::FileRetentionExpired => Some(0x080B),
@@ -681,15 +695,22 @@ impl Payload {
         cbor::encode(&self.to_cv(true))
     }
 
-    /// The §18.9.2 signing body: deterministic CBOR of the payload with `sig` (key 2) omitted.
+    /// The §18.9.2 signing body: deterministic CBOR of the payload with `sig` (key 2) omitted. This
+    /// is the *payload part* of the preimage; the envelope-context tail (`kind ‖ ts ‖ to`) is
+    /// appended by [`signing_hash`](Payload::signing_hash) / [`payload_hash`].
     fn signing_body(&self) -> Vec<u8> {
         cbor::encode(&self.to_cv(false))
     }
 
-    /// The §18.9.2 payload hash `BLAKE3-256(det_cbor(Payload ∖ {sig}))`, over which `sig` is
-    /// signed under the [`PAYLOAD_SIG_DS`] domain. Exposed for conformance vectors.
-    pub fn signing_hash(&self) -> [u8; 32] {
-        *blake3::hash(&self.signing_body()).as_bytes()
+    /// The §18.9.2 payload hash — now **binds the envelope routing context**:
+    /// `BLAKE3-256( det_cbor(Payload ∖ {sig}) ‖ u8(kind) ‖ u64be(ts) ‖ det_cbor(to) )`, over which
+    /// `sig` is signed under the [`PAYLOAD_SIG_DS`] domain. Folding the envelope's `kind`, `ts`, and
+    /// `to` into the *identity* signature (which the anyone-can-mint ephemeral `sender_sig` cannot
+    /// forge) closes the re-emit gap on the non-deniable path: a re-emitter of the sealed
+    /// `ciphertext` can re-mint `sender_sig` over an altered `kind`/`ts`/`to`, but cannot re-produce
+    /// this hash's binding without `Payload.from`'s secret. Exposed for conformance vectors.
+    pub fn signing_hash(&self, kind: Kind, ts: TimestampMs, to: &DeliveryTag) -> [u8; 32] {
+        payload_hash(self, kind, ts, &to.det_cbor())
     }
 
     /// Decode a payload from its canonical CBOR (§18.3.5), failing closed on any violation.
@@ -1458,8 +1479,25 @@ fn sender_authed_bytes(env: &Envelope) -> Vec<u8> {
     m
 }
 
-/// Canonical payload hash for signing (§18.9.2): `BLAKE3-256(det_cbor(Payload ∖ {sig}))`.
-fn payload_hash(payload: &Payload) -> [u8; 32] {
+/// Canonical payload hash for signing (§18.9.2), **binding the envelope routing context**:
+/// `BLAKE3-256( det_cbor(Payload ∖ {sig}) ‖ u8(kind) ‖ u64be(ts) ‖ det_cbor(to) )`. `to_cbor` is the
+/// deterministic CBOR of the envelope's [`DeliveryTag`] (already computed by the caller). The tail
+/// mirrors the AAD field order (`kind ‖ ts ‖ to`) so the same three envelope fields are covered by
+/// both the identity signature and the payload AEAD.
+fn payload_hash(payload: &Payload, kind: Kind, ts: TimestampMs, to_cbor: &[u8]) -> [u8; 32] {
+    let mut pre = payload.signing_body();
+    pre.push(kind.as_u8()); // Envelope field 7, 1 byte
+    pre.extend_from_slice(&ts.to_be_bytes()); // Envelope field 6, 8 bytes big-endian
+    pre.extend_from_slice(to_cbor); // Envelope field 4, det_cbor(DeliveryTag)
+    *blake3::hash(&pre).as_bytes()
+}
+
+/// The **pre-§18.9.2** payload hash `BLAKE3-256(det_cbor(Payload ∖ {sig}))` — the payload body with
+/// **no** envelope-context tail. Used at §2.7 step 8 only on the *failure* path to tell an
+/// unbound-context `Payload.sig` (a signature that authenticates the payload but binds no
+/// `kind`/`ts`/`to`) apart from a genuinely-forged/garbled one: the former is surfaced as
+/// [`MoteError::EnvelopeContextMismatch`] (`0x0211`), the latter as [`MoteError::BadSignature`].
+fn payload_hash_unbound(payload: &Payload) -> [u8; 32] {
     *blake3::hash(&payload.signing_body()).as_bytes()
 }
 
@@ -1482,6 +1520,10 @@ fn verify_sig_for_suite(
         Suite::PqHybrid => {
             verify_hybrid_domain(pk, domain, msg, sig).map_err(|_| MoteError::BadSignature)
         }
+        // `0x03` is a RESERVED, unimplemented code point (§1.1, §21.15): no AEAD/verifier exists, so
+        // fail closed. `validate` rejects it earlier at §2.7 step 1 (`!mote_supported()`), so this is
+        // an unreachable defensive arm — never accept an object under an unimplemented suite.
+        Suite::ReservedAeadGcm => Err(MoteError::UnsupportedSuite(suite.as_u8())),
     }
 }
 
@@ -1522,7 +1564,7 @@ pub fn build_mote(
         attach: draft.attach,
         expires: draft.expires,
     };
-    let ph = payload_hash(&payload);
+    let ph = payload_hash(&payload, draft.kind, draft.ts, &to_cbor);
     payload.sig = sender_ik.sign_domain(PAYLOAD_SIG_DS, &ph);
 
     // 2. Serialize (canonical §18 CBOR) + HPKE-seal the payload, binding it via AAD.
@@ -1594,7 +1636,7 @@ pub fn build_mote_hybrid(
         attach: draft.attach,
         expires: draft.expires,
     };
-    let ph = payload_hash(&payload);
+    let ph = payload_hash(&payload, draft.kind, draft.ts, &to_cbor);
     payload.sig = sender_hybrid.sign_domain(PAYLOAD_SIG_DS, &ph);
 
     // 2. Serialize (canonical §18 CBOR) + X-Wing-seal the payload, binding it via AAD.
@@ -1708,13 +1750,30 @@ pub fn validate(
     }
 
     // 7. Decrypt the payload (only now, after the anonymous gate).
-    let aad = aad_bytes(env.suite, env.kind, env.ts, &env.to.det_cbor());
+    let to_cbor = env.to.det_cbor();
+    let aad = aad_bytes(env.suite, env.kind, env.ts, &to_cbor);
     let pt = sealer.open(ctx.seal_secret, &aad, &env.ciphertext)?;
     let payload = Payload::from_det_cbor(&pt)?;
 
-    // 8. Verify Payload.sig under Payload.from — the authenticated sender identity.
-    let ph = payload_hash(&payload);
-    verify_sig_for_suite(env.suite, &payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig)?;
+    // 8. Verify Payload.sig under Payload.from — the authenticated sender identity — recomputing the
+    //    §18.9.2 hash over the **received** envelope's `kind`/`ts`/`to` (the context now folded into
+    //    the identity signature). A MOTE whose envelope `kind`/`ts`/`to` differ from the signed
+    //    context therefore fails here fail-closed (§2.7 step 8). To keep the diagnostic precise, a
+    //    signature that authenticates the payload but binds **no** envelope context is surfaced as
+    //    `ERR_ENVELOPE_CONTEXT_MISMATCH` (`0x0211`); a signature that does not authenticate the
+    //    payload at all remains `BadSignature` (`ERR_PAYLOAD_SIG_INVALID`, `0x0208`). Both discard
+    //    silently and do not `ack`.
+    let ph = payload_hash(&payload, env.kind, env.ts, &to_cbor);
+    if verify_sig_for_suite(env.suite, &payload.from, PAYLOAD_SIG_DS, &ph, &payload.sig).is_err() {
+        let ph_unbound = payload_hash_unbound(&payload);
+        if verify_sig_for_suite(env.suite, &payload.from, PAYLOAD_SIG_DS, &ph_unbound, &payload.sig)
+            .is_ok()
+        {
+            // Valid Payload.sig, but it binds none of this envelope's kind/ts/to context.
+            return Err(MoteError::EnvelopeContextMismatch);
+        }
+        return Err(MoteError::BadSignature);
+    }
 
     // 9. (Caller applies expires/refs/kind semantics + the step-8 suite pin — see
     //     `validate_pinned` — then stores and acks.)
@@ -1809,6 +1868,131 @@ mod tests {
             }
             Outcome::Deferred => panic!("a known-contact MOTE must be accepted"),
         }
+    }
+
+    /// Assemble a classical MOTE by hand with a **caller-chosen `Payload.sig`**, sealing with the
+    /// correct (envelope-context) AAD so decryption succeeds and validation reaches §2.7 step 8.
+    /// Returns `(envelope, recipient_ik, seal)`. Mirrors `build_mote` but lets a test inject the
+    /// exact payload signature it wants to exercise the step-8 branches.
+    fn manual_env_with_payload_sig(
+        kind: Kind,
+        sign_payload: impl FnOnce(&IdentityKey, &Payload, Kind, TimestampMs, &[u8]) -> Vec<u8>,
+    ) -> (Envelope, IdentityKey, SealKeypair) {
+        let sender = IdentityKey::generate();
+        let eph = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+        let ts: TimestampMs = 1_700_000_000_000;
+        let to = DeliveryTag::Key(recipient.public());
+        let to_cbor = to.det_cbor();
+
+        let mut payload = Payload {
+            from: sender.public(),
+            sig: Vec::new(),
+            headers: Headers::default(),
+            body: b"ctx-binding fixture".to_vec(),
+            refs: vec![],
+            attach: vec![],
+            expires: None,
+        };
+        payload.sig = sign_payload(&sender, &payload, kind, ts, &to_cbor);
+
+        let pt = payload.det_cbor();
+        let aad = aad_bytes(Suite::Classical, kind, ts, &to_cbor);
+        let ciphertext = Hpke.seal(seal.public(), &aad, &pt).unwrap();
+        let id = ContentId::of(&ciphertext);
+        let mut env = Envelope {
+            v: MOTE_VERSION,
+            suite: Suite::Classical,
+            id,
+            to,
+            epoch: None,
+            ts,
+            kind,
+            keypkg: None,
+            challenge: None,
+            ciphertext,
+            sender_sig: None,
+            sender_eph: Some(eph.public()),
+        };
+        env.sender_sig = Some(eph.sign_domain(ENVELOPE_SENDER_DS, &sender_authed_bytes(&env)));
+        (env, recipient, seal)
+    }
+
+    /// §18.9.2 / §2.7 step 8 (`0x0211`): a `Payload.sig` that authenticates the payload but does
+    /// **not** bind the envelope's `kind`/`ts`/`to` (the pre-change, unbound-context preimage) is
+    /// rejected as `EnvelopeContextMismatch`, not accepted — even though decryption succeeds.
+    #[test]
+    fn unbound_context_payload_sig_is_context_mismatch() {
+        let (env, recipient, seal) = manual_env_with_payload_sig(Kind::Mail, |sk, p, _k, _t, _to| {
+            // Sign only the payload body — the OLD preimage, binding no envelope context.
+            sk.sign_domain(PAYLOAD_SIG_DS, &payload_hash_unbound(p))
+        });
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        let err = validate(&Hpke, &env, &ctx).unwrap_err();
+        assert_eq!(err, MoteError::EnvelopeContextMismatch);
+        assert_eq!(err.code(), Some(0x0211));
+    }
+
+    /// The context-bound `Payload.sig` (built by `build_mote`) validates when the envelope's
+    /// `kind`/`ts`/`to` match what was signed — the positive control for the binding, and it proves
+    /// the recompute at step 8 uses the received envelope's context.
+    #[test]
+    fn context_bound_payload_sig_validates() {
+        let (env, recipient, seal) = manual_env_with_payload_sig(Kind::Chat, |sk, p, k, t, to_cbor| {
+            sk.sign_domain(PAYLOAD_SIG_DS, &payload_hash(p, k, t, to_cbor))
+        });
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert!(matches!(validate(&Hpke, &env, &ctx), Ok(Outcome::Accepted(_))));
+    }
+
+    /// A genuinely corrupt `Payload.sig` (random bytes over the correct context) stays
+    /// `BadSignature` (`ERR_PAYLOAD_SIG_INVALID`, `0x0208`) — the step-8 diagnostic keeps a
+    /// forged/garbled signature distinct from a context mismatch (`0x0211`).
+    #[test]
+    fn tampered_payload_sig_bytes_stay_bad_signature() {
+        let (env, recipient, seal) = manual_env_with_payload_sig(Kind::Mail, |sk, p, k, t, to_cbor| {
+            let mut sig = sk.sign_domain(PAYLOAD_SIG_DS, &payload_hash(p, k, t, to_cbor));
+            sig[0] ^= 0xff; // corrupt AFTER signing over the correct context
+            sig
+        });
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert_eq!(validate(&Hpke, &env, &ctx), Err(MoteError::BadSignature));
+    }
+
+    /// A re-emitter alters the envelope's `kind` after the payload was signed+sealed. The envelope
+    /// AEAD binds `kind`/`ts`/`to` (`aad_bytes`), so the altered context fails to decrypt — the
+    /// alteration is caught fail-closed (defense in depth alongside the §18.9.2 `Payload.sig`
+    /// binding). Never accepted with the rewritten `kind`.
+    #[test]
+    fn wire_kind_alteration_is_rejected_fail_closed() {
+        let (mut env, recipient, seal) = round(Kind::Mail);
+        env.kind = Kind::Chat; // relabel mail→chat after signing+sealing
+        env.id = ContentId::of(&env.ciphertext); // keep step 2 valid (ciphertext untouched)
+        // Re-mint sender_sig under a FRESH ephemeral key over the altered context — the ephemeral
+        // key is anyone-can-mint, so §2.7 step 3 passes; the payload AEAD (which binds kind/ts/to)
+        // then rejects the object at step 7. Set the key first, then sign over the new context.
+        let attacker_eph = IdentityKey::from_seed(&[9u8; 32]);
+        env.sender_eph = Some(attacker_eph.public());
+        env.sender_sig = Some(attacker_eph.sign_domain(ENVELOPE_SENDER_DS, &sender_authed_bytes(&env)));
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: true,
+        };
+        assert_eq!(validate(&Hpke, &env, &ctx), Err(MoteError::DecryptFailed));
     }
 
     // --- Suite 0x02 (PQ hybrid) envelope-level tests -------------------------------------

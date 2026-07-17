@@ -275,18 +275,18 @@
       "expected": {
         "accepted": false
       },
-      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+      "note": "an unregistered suite byte MUST fail to decode (never guess; fail closed)"
     },
     {
-      "name": "suite_reject_0x03",
+      "name": "suite_reject_0x04",
       "operation": "suite_decode",
       "input": {
-        "cbor_hex": "03"
+        "cbor_hex": "04"
       },
       "expected": {
         "accepted": false
       },
-      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+      "note": "an unregistered suite byte MUST fail to decode (never guess; fail closed)"
     },
     {
       "name": "suite_reject_0x05",
@@ -297,7 +297,7 @@
       "expected": {
         "accepted": false
       },
-      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+      "note": "an unregistered suite byte MUST fail to decode (never guess; fail closed)"
     },
     {
       "name": "suite_reject_0xff",
@@ -308,7 +308,7 @@
       "expected": {
         "accepted": false
       },
-      "note": "an unknown suite byte MUST fail to decode (never guess; fail closed)"
+      "note": "an unregistered suite byte MUST fail to decode (never guess; fail closed)"
     },
     {
       "name": "suite_accept_0x01",
@@ -319,7 +319,7 @@
       "expected": {
         "accepted": true
       },
-      "note": "0x01 (classical) and 0x02 (reserved PQ) are known suite ids and decode"
+      "note": "0x01 (classical), 0x02 (reserved PQ), and 0x03 (reserved AEAD-diverse) are known suite ids and decode"
     },
     {
       "name": "suite_accept_0x02",
@@ -330,7 +330,18 @@
       "expected": {
         "accepted": true
       },
-      "note": "0x01 (classical) and 0x02 (reserved PQ) are known suite ids and decode"
+      "note": "0x01 (classical), 0x02 (reserved PQ), and 0x03 (reserved AEAD-diverse) are known suite ids and decode"
+    },
+    {
+      "name": "suite_accept_0x03",
+      "operation": "suite_decode",
+      "input": {
+        "cbor_hex": "03"
+      },
+      "expected": {
+        "accepted": true
+      },
+      "note": "0x01 (classical), 0x02 (reserved PQ), and 0x03 (reserved AEAD-diverse) are known suite ids and decode"
     },
     {
       "name": "mote_content_address_ok",
@@ -389,15 +400,18 @@
       "operation": "ed25519_sign",
       "input": {
         "domain_hex": "444d5441502d76302f7061796c6f616400",
-        "msg_hex": "11c2d36c9cee6fad59624184af7e8afdb372ddbee0defec77b94d5691d6f76be",
-        "payload_hash_hex": "11c2d36c9cee6fad59624184af7e8afdb372ddbee0defec77b94d5691d6f76be",
-        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+        "kind": 0,
+        "msg_hex": "7fa1bf4a8dbf36f24e29700a7b8278d199962147698ceedce478df9de2531737",
+        "payload_hash_hex": "7fa1bf4a8dbf36f24e29700a7b8278d199962147698ceedce478df9de2531737",
+        "seed_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "to_cbor_hex": "a20001015820a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+        "ts": 1700000000000
       },
       "expected": {
         "pubkey_hex": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
-        "sig_hex": "38350f0b682ae7ab9d6f2497c83db330b95144a7b6014dc36e37068dbf9a9b45c675dc03df2f1fc3531f9da7a361b5d67bbae7bb1250a6af54ae63d781f14f05"
+        "sig_hex": "4b8ced5c93b6a2dc39edfc8a5585672946c2646c6101f0196dca999f028f90764918dd9dd1dcded716dfda3707469304b41a8ccf586f7edf517b842b4f068b01"
       },
-      "note": "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig})) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32"
+      "note": "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig}) ‖ u8(kind) ‖ u64be(ts) ‖ det_cbor(to)) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32; kind/ts/to from the fixed envelope"
     },
     {
       "name": "cbor_mix_descriptor",

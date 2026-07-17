@@ -929,6 +929,262 @@ pub fn authorize_recovery_change(
     Ok(())
 }
 
+// --- Key rotation (§1.5, §18.4.5) ----------------------------------------------------------
+
+/// DS tag for the `KeyRotation` continuity signature (`sig`, key 7) by `old_ik` (§18.9.3).
+const KEY_ROTATION_DS: &[u8] = b"DMTAP-v0/key-rotation\x00";
+/// DS tag a recovery guardian signs to **co-sign** (approve) a quorum-backed rotation, over the
+/// rotation body `det_cbor(KeyRotation ∖ {7,8})` (§18.4.5 path (a)). Distinct from the recovery
+/// approval/veto tags so a rotation co-signature can never be replayed as a policy-change approval.
+const KEY_ROTATION_QUORUM_DS: &[u8] = b"DMTAP-v0/key-rotation-quorum\x00";
+/// DS tag a recovery guardian signs to **veto** a published-and-delayed rotation (§1.5 path (b)),
+/// over the same rotation body.
+const KEY_ROTATION_VETO_DS: &[u8] = b"DMTAP-v0/key-rotation-veto\x00";
+
+/// A [`authorize_key_rotation`] failure. Carries its §21.3 wire code via [`KeyRotationError::code`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum KeyRotationError {
+    /// A `KeyRotation` for an identity that has a published [`RecoveryPolicy`] (§1.4) is signed by
+    /// `old_ik` **alone** — it carries **neither** a valid `rotate_threshold` co-signature
+    /// (`rotate_quorum`, path (a)) **nor** has it been published to KT and passed its §16.8
+    /// veto/delay window (path (b)). Installing a new authoritative `IK` is at least as powerful as
+    /// a recovery-weakening change (§1.4 rule 3), so `old_ik` alone MUST NOT effect it — this closes
+    /// the stolen-`IK` un-vetoable eviction and the `recover_threshold`-only-reconstruct-then-rotate
+    /// takeover (`ERR_KEYROTATION_UNAUTHORIZED`, `0x0121`, §1.5, §18.4.5). FAIL_CLOSED_BLOCK: reject
+    /// or hold; MUST NOT advance the pin to `new_ik`.
+    #[error("key rotation is signed by old_ik alone but the identity has a published RecoveryPolicy \
+             — needs a rotate_threshold quorum or the elapsed veto window \
+             (ERR_KEYROTATION_UNAUTHORIZED, 0x0121)")]
+    Unauthorized,
+}
+
+impl KeyRotationError {
+    /// The normative DMTAP wire error code (§21.3).
+    pub fn code(&self) -> u16 {
+        match self {
+            KeyRotationError::Unauthorized => 0x0121,
+        }
+    }
+}
+
+/// A cross-signed record authorizing a new authoritative `IK` (spec §1.5, §18.4.5). `old_ik` signs
+/// `new_ik` + `reason` + `ts` (continuity, key 7). When the identity has a published
+/// [`RecoveryPolicy`], installing the new key additionally requires either the `rotate_threshold`
+/// quorum (`rotate_quorum`, key 8 — path (a), immediate) or publication + the §16 veto window
+/// (path (b)); see [`authorize_key_rotation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRotation {
+    pub suite: Suite,
+    /// The retiring root key; MUST be the currently-pinned `IK`.
+    pub old_ik: Vec<u8>,
+    /// The incoming root key.
+    pub new_ik: Vec<u8>,
+    pub reason: String,
+    pub ts: TimestampMs,
+    pub prev: Option<ContentId>,
+    /// Key 7: continuity signature by `old_ik` over `det_cbor(KeyRotation ∖ {7})` (§18.9.3).
+    pub sig: Vec<u8>,
+    /// Key 8 (OPTIONAL): a `rotate_threshold` quorum co-signature over the body
+    /// `det_cbor(KeyRotation ∖ {7,8})`, authorizing the rotation under §1.5 **path (a)** (immediate
+    /// effect). Present iff the rotation claims quorum backing. In the reference core the aggregate
+    /// FROST/threshold signature is not reconstructed; the quorum is verified from the individual
+    /// guardian co-signatures supplied to [`authorize_key_rotation`] (the same model as
+    /// [`authorize_recovery_change`]). Absent for an identity with no published `RecoveryPolicy`,
+    /// where `old_ik` alone suffices.
+    pub rotate_quorum: Option<Vec<u8>>,
+}
+
+impl KeyRotation {
+    /// Integer-keyed canonical map (§18.4.5). `include_sig` gates key 7; `include_quorum` gates
+    /// key 8. The three signing preimages are: continuity sig (k7) over `(false, true)`; quorum
+    /// co-signature (k8) over `(false, false)`; full wire object over `(true, true)`.
+    fn to_cv(&self, include_sig: bool, include_quorum: bool) -> Cv {
+        let mut m = vec![
+            (1u64, Cv::U64(self.suite.as_u8() as u64)),
+            (2, Cv::Bytes(self.old_ik.clone())),
+            (3, Cv::Bytes(self.new_ik.clone())),
+            (4, Cv::Text(self.reason.clone())),
+            (5, Cv::U64(self.ts)),
+        ];
+        if let Some(p) = &self.prev {
+            m.push((6, hash_cv(p)));
+        }
+        if include_sig {
+            m.push((7, Cv::Bytes(self.sig.clone())));
+        }
+        if include_quorum {
+            if let Some(q) = &self.rotate_quorum {
+                m.push((8, Cv::Bytes(q.clone())));
+            }
+        }
+        Cv::Map(m)
+    }
+
+    /// The §18.9.3 continuity-signature body: `det_cbor(KeyRotation ∖ {7})` (covers key 8).
+    fn signing_body(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv(false, true))
+    }
+
+    /// The §18.4.5 quorum-co-signature body: `det_cbor(KeyRotation ∖ {7,8})`.
+    fn quorum_body(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv(false, false))
+    }
+
+    /// The exact wire bytes: §18-canonical integer-keyed CBOR.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_cv(true, true))
+    }
+
+    /// Decode from canonical CBOR (§18.4.5), failing closed on any violation.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, IdentityError> {
+        let mut f = Fields::from_cv(cbor::decode(bytes)?)?;
+        let suite = suite_from_cv(f.req(1)?)?;
+        let old_ik = as_bytes(f.req(2)?)?;
+        let new_ik = as_bytes(f.req(3)?)?;
+        let reason = as_text(f.req(4)?)?;
+        let ts = as_u64(f.req(5)?)?;
+        let prev = f.take(6).map(as_bytes).transpose()?.map(ContentId);
+        let sig = as_bytes(f.req(7)?)?;
+        let rotate_quorum = f.take(8).map(as_bytes).transpose()?;
+        f.deny_unknown()?;
+        Ok(KeyRotation { suite, old_ik, new_ik, reason, ts, prev, sig, rotate_quorum })
+    }
+
+    /// Sign the continuity signature (key 7) with `old_ik`. If a `rotate_quorum` (key 8) is to be
+    /// attached, set it **before** calling this — key 7 covers key 8 (§18.9.3).
+    pub fn sign(&mut self, old_ik: &IdentityKey) {
+        self.sig = old_ik.sign_domain(KEY_ROTATION_DS, &self.signing_body());
+    }
+
+    /// Verify the continuity signature (key 7) under `old_ik` (§18.9.3, structural chain link). This
+    /// does **not** by itself authorize installing `new_ik` when a [`RecoveryPolicy`] exists — that
+    /// is [`authorize_key_rotation`].
+    pub fn verify(&self) -> Result<(), IdentityError> {
+        if !self.suite.is_supported() {
+            return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
+        }
+        verify_domain(&self.old_ik, KEY_ROTATION_DS, &self.signing_body(), &self.sig)
+    }
+
+    /// Content address of this rotation record (`0x1e ‖ BLAKE3-256(det_cbor(rotation))`).
+    pub fn content_id(&self) -> ContentId {
+        ContentId::of(&self.det_cbor())
+    }
+}
+
+/// Produce a guardian's **approval** co-signature for a quorum-backed rotation (path (a)), over the
+/// rotation body `det_cbor(KeyRotation ∖ {7,8})`.
+pub fn sign_key_rotation_approval(guardian: &IdentityKey, rotation: &KeyRotation) -> GuardianApproval {
+    GuardianApproval {
+        guardian: guardian.public(),
+        sig: guardian.sign_domain(KEY_ROTATION_QUORUM_DS, &rotation.quorum_body()),
+    }
+}
+
+/// Produce a guardian's **veto** co-signature aborting a published-and-delayed rotation (path (b)).
+pub fn sign_key_rotation_veto(guardian: &IdentityKey, rotation: &KeyRotation) -> GuardianApproval {
+    GuardianApproval {
+        guardian: guardian.public(),
+        sig: guardian.sign_domain(KEY_ROTATION_VETO_DS, &rotation.quorum_body()),
+    }
+}
+
+/// The guardians named by a policy's `Social` recovery methods (the quorum's signing set).
+fn policy_guardians(policy: &RecoveryPolicy) -> Vec<Vec<u8>> {
+    policy
+        .methods
+        .iter()
+        .flat_map(|m| match m {
+            RecoveryMethod::Social { guardians, .. } => guardians.clone(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// The `rotate_threshold` quorum bar for a rotation: the STRONGER of a strict `> n/2` majority and
+/// the policy's own configured `rotate_threshold` minimum (mirrors [`authorize_recovery_change`]).
+fn required_rotate_quorum(policy: &RecoveryPolicy, n: usize) -> u32 {
+    let majority_min = (n as u32) / 2 + 1;
+    majority_min.max(threshold_min(&policy.rotate_threshold))
+}
+
+/// Whether `rotation` satisfies §1.5 **path (a)** — it carries a `rotate_quorum` (key 8) AND the
+/// supplied guardian `approvals` reach the policy's `rotate_threshold` over the rotation body. This
+/// is the "quorum-backed" predicate used both to authorize immediately and to resolve forks.
+pub fn key_rotation_is_quorum_backed(
+    rotation: &KeyRotation,
+    policy: &RecoveryPolicy,
+    approvals: &[GuardianApproval],
+) -> bool {
+    if rotation.rotate_quorum.is_none() {
+        return false;
+    }
+    let guardians = policy_guardians(policy);
+    let q = count_quorum(&guardians, approvals, KEY_ROTATION_QUORUM_DS, &rotation.quorum_body());
+    (q as u32) >= required_rotate_quorum(policy, guardians.len())
+}
+
+/// Authorize installing `new_ik` from a `KeyRotation` under the §1.5 stolen-`IK` takeover defense.
+/// Clock and veto-window are **explicit parameters** — this core never reads a wall clock (§16.1).
+///
+/// - **No published `RecoveryPolicy`** (`policy == None`) ⇒ `old_ik` alone suffices; the continuity
+///   signature ([`KeyRotation::verify`]) is the only bar (§1.5). Returns `Ok`.
+/// - **A published `RecoveryPolicy` exists** ⇒ the rotation MUST satisfy **one** of:
+///   - **(a) Quorum-backed** — [`key_rotation_is_quorum_backed`] holds (a `rotate_quorum` plus a
+///     `rotate_threshold` guardian majority over the rotation body). Takes effect immediately; or
+///   - **(b) Published-and-delayed** — no quorum, but the record has been published and its §16.8
+///     veto window (`announced_at + `[`RECOVERY_VETO_WINDOW_MS`]) has elapsed at `now` with **no**
+///     `rotate_threshold`-backed veto present.
+///   Satisfying neither is [`KeyRotationError::Unauthorized`] (`0x0121`) — reject or hold, never
+///   advance the pin.
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_key_rotation(
+    rotation: &KeyRotation,
+    policy: Option<&RecoveryPolicy>,
+    approvals: &[GuardianApproval],
+    vetoes: &[GuardianApproval],
+    announced_at: TimestampMs,
+    now: TimestampMs,
+) -> Result<(), KeyRotationError> {
+    let policy = match policy {
+        None => return Ok(()), // §1.5: no policy published ⇒ old_ik alone remains sufficient
+        Some(p) => p,
+    };
+    // Path (a): immediate, quorum-backed.
+    if key_rotation_is_quorum_backed(rotation, policy, approvals) {
+        return Ok(());
+    }
+    // Path (b): published-and-delayed. Only an old_ik-alone (no rotate_quorum) record travels this
+    // route; a rotate_threshold-backed veto aborts it, and the window must have fully elapsed.
+    if rotation.rotate_quorum.is_none() {
+        let guardians = policy_guardians(policy);
+        let veto_q = count_quorum(&guardians, vetoes, KEY_ROTATION_VETO_DS, &rotation.quorum_body());
+        let vetoed = veto_q * 2 > guardians.len(); // strict `> n/2` rotate_threshold-backed veto
+        if !vetoed && now >= announced_at.saturating_add(RECOVERY_VETO_WINDOW_MS) {
+            return Ok(());
+        }
+    }
+    Err(KeyRotationError::Unauthorized)
+}
+
+/// Fork resolution (§1.5): given two competing `KeyRotation` branches at the same chain position,
+/// **prefer the `rotate_threshold`-backed branch** (path (a)) over an `old_ik`-alone branch. A bare
+/// `old_ik`-alone branch **never** wins against a quorum-backed one. Two quorum-backed branches, or
+/// two bare branches, competing at the same position is an equivocation/takeover — surfaced as
+/// [`IdentityError::BrokenChain`] (HALT_ALERT, `ERR_IDENTITY_CHAIN_BROKEN` `0x0104`, §1.5).
+pub fn prefer_rotation_fork<'a>(
+    a: &'a KeyRotation,
+    a_quorum_backed: bool,
+    b: &'a KeyRotation,
+    b_quorum_backed: bool,
+) -> Result<&'a KeyRotation, IdentityError> {
+    match (a_quorum_backed, b_quorum_backed) {
+        (true, false) => Ok(a),
+        (false, true) => Ok(b),
+        _ => Err(IdentityError::BrokenChain),
+    }
+}
+
 // --- Name migration (§1.6) -----------------------------------------------------------------
 
 /// Rebinds the human name while preserving the key (spec §1.6). Contacts route by key and
@@ -1447,5 +1703,157 @@ mod tests {
         let four: Vec<GuardianApproval> =
             guardian_keys[..4].iter().map(|g| sign_recovery_approval(g, &next)).collect();
         assert!(authorize_recovery_change(&prev, &next, &guardians, &four, &[], announced, after_window).is_ok());
+    }
+
+    // --- Key rotation (§1.5, §18.4.5) authorization ----------------------------------------
+
+    /// Build a `Social`-guardian recovery policy over `guardians` with a `Guardians(m)`
+    /// rotate_threshold, signed by `ik`.
+    fn social_policy(ik: &IdentityKey, guardians: &[Vec<u8>], m: u8, ver: u64) -> RecoveryPolicy {
+        policy(
+            ik,
+            vec![RecoveryMethod::Social { guardians: guardians.to_vec(), threshold: m }],
+            Threshold { any_of: vec![MethodPredicate::Guardians(m)] },
+            Threshold { any_of: vec![MethodPredicate::Guardians(m)] },
+            ver,
+        )
+    }
+
+    fn make_rotation(old_ik: &IdentityKey, new_ik: &IdentityKey, quorum: Option<Vec<u8>>) -> KeyRotation {
+        let mut r = KeyRotation {
+            suite: Suite::Classical,
+            old_ik: old_ik.public(),
+            new_ik: new_ik.public(),
+            reason: "pq-migration".into(),
+            ts: 42,
+            prev: None,
+            rotate_quorum: quorum, // set BEFORE sign — key 7 covers key 8
+            sig: vec![],
+        };
+        r.sign(old_ik);
+        r
+    }
+
+    #[test]
+    fn key_rotation_wire_round_trip_and_continuity_sig() {
+        let old = IdentityKey::generate();
+        let new = IdentityKey::generate();
+        // Without a quorum (key 8 absent).
+        let bare = make_rotation(&old, &new, None);
+        assert!(bare.verify().is_ok());
+        assert_eq!(KeyRotation::from_det_cbor(&bare.det_cbor()).unwrap(), bare);
+        // With a rotate_quorum (key 8 present) — still continuity-valid, and key 7 covers key 8.
+        let quorum = make_rotation(&old, &new, Some(vec![0xAB; 8]));
+        assert!(quorum.verify().is_ok());
+        assert_eq!(KeyRotation::from_det_cbor(&quorum.det_cbor()).unwrap(), quorum);
+        // Tampering old_ik's continuity signature fails closed.
+        let mut forged = bare.clone();
+        forged.new_ik = IdentityKey::generate().public();
+        assert_eq!(forged.verify(), Err(IdentityError::BadSignature));
+    }
+
+    #[test]
+    fn no_recovery_policy_means_old_ik_alone_authorizes() {
+        let old = IdentityKey::generate();
+        let new = IdentityKey::generate();
+        let bare = make_rotation(&old, &new, None);
+        // §1.5: an identity that never published a RecoveryPolicy — old_ik alone suffices.
+        assert!(authorize_key_rotation(&bare, None, &[], &[], 0, 0).is_ok());
+    }
+
+    #[test]
+    fn old_ik_alone_rotation_rejected_when_recovery_policy_present() {
+        let old = IdentityKey::generate();
+        let new = IdentityKey::generate();
+        let guardians: Vec<Vec<u8>> = (0..3u8).map(|s| IdentityKey::from_seed(&[s; 32]).public()).collect();
+        let pol = social_policy(&old, &guardians, 2, 1);
+        let bare = make_rotation(&old, &new, None); // old_ik alone, no rotate_quorum
+
+        let announced = 1_000_000u64;
+        // Inside the veto window (path (b) not yet satisfied), no quorum ⇒ 0x0121, held/rejected.
+        let err = authorize_key_rotation(&bare, Some(&pol), &[], &[], announced, announced).unwrap_err();
+        assert_eq!(err, KeyRotationError::Unauthorized);
+        assert_eq!(err.code(), 0x0121);
+        assert!(!key_rotation_is_quorum_backed(&bare, &pol, &[]));
+    }
+
+    #[test]
+    fn quorum_backed_rotation_is_accepted_immediately() {
+        let old = IdentityKey::generate();
+        let new = IdentityKey::generate();
+        let guardian_keys: Vec<IdentityKey> = (0..3u8).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+        let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+        let pol = social_policy(&old, &guardians, 2, 1);
+
+        // A 2-of-3 rotate_threshold quorum co-signs the rotation body; key 8 carries the proof.
+        let rot = make_rotation(&old, &new, Some(vec![0x01; 8]));
+        let approvals: Vec<GuardianApproval> =
+            guardian_keys[..2].iter().map(|g| sign_key_rotation_approval(g, &rot)).collect();
+
+        assert!(key_rotation_is_quorum_backed(&rot, &pol, &approvals));
+        // Immediate effect — announced_at/now irrelevant on path (a).
+        assert!(authorize_key_rotation(&rot, Some(&pol), &approvals, &[], 0, 0).is_ok());
+
+        // A sub-quorum (1 of 3, below the Guardians(2) bar) does NOT authorize — 0x0121.
+        let one: Vec<GuardianApproval> = vec![sign_key_rotation_approval(&guardian_keys[0], &rot)];
+        assert!(!key_rotation_is_quorum_backed(&rot, &pol, &one));
+        assert_eq!(
+            authorize_key_rotation(&rot, Some(&pol), &one, &[], 0, 0),
+            Err(KeyRotationError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn published_and_delayed_path_b_authorizes_after_window() {
+        let old = IdentityKey::generate();
+        let new = IdentityKey::generate();
+        let guardian_keys: Vec<IdentityKey> = (0..3u8).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+        let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+        let pol = social_policy(&old, &guardians, 2, 1);
+        let bare = make_rotation(&old, &new, None); // old_ik-alone, published (path b)
+        let announced = 1_000_000u64;
+        let after = announced + RECOVERY_VETO_WINDOW_MS;
+
+        // Past the window, no veto ⇒ authorized.
+        assert!(authorize_key_rotation(&bare, Some(&pol), &[], &[], announced, after).is_ok());
+
+        // A rotate_threshold-backed veto (2 of 3) aborts it even past the window ⇒ 0x0121.
+        let vetoes: Vec<GuardianApproval> =
+            guardian_keys[..2].iter().map(|g| sign_key_rotation_veto(g, &bare)).collect();
+        assert_eq!(
+            authorize_key_rotation(&bare, Some(&pol), &[], &vetoes, announced, after),
+            Err(KeyRotationError::Unauthorized)
+        );
+    }
+
+    #[test]
+    fn fork_resolution_prefers_quorum_backed_branch() {
+        let old = IdentityKey::generate();
+        let honest_new = IdentityKey::generate();
+        let attacker_new = IdentityKey::generate();
+        let guardian_keys: Vec<IdentityKey> = (0..3u8).map(|s| IdentityKey::from_seed(&[s; 32])).collect();
+        let guardians: Vec<Vec<u8>> = guardian_keys.iter().map(|g| g.public()).collect();
+        let pol = social_policy(&old, &guardians, 2, 1);
+
+        // Branch A: attacker's old_ik-alone rotation (e.g. a stolen IK) — NOT quorum-backed.
+        let attacker_branch = make_rotation(&old, &attacker_new, None);
+        // Branch B: the owner's genuine rotate_threshold-backed rotation.
+        let honest_branch = make_rotation(&old, &honest_new, Some(vec![0x02; 8]));
+        let approvals: Vec<GuardianApproval> =
+            guardian_keys[..2].iter().map(|g| sign_key_rotation_approval(g, &honest_branch)).collect();
+
+        let a_backed = key_rotation_is_quorum_backed(&attacker_branch, &pol, &[]);
+        let b_backed = key_rotation_is_quorum_backed(&honest_branch, &pol, &approvals);
+        assert!(!a_backed && b_backed);
+
+        let winner =
+            prefer_rotation_fork(&attacker_branch, a_backed, &honest_branch, b_backed).unwrap();
+        assert_eq!(winner.new_ik, honest_new.public(), "quorum branch must win over old_ik-alone");
+
+        // Two competing old_ik-alone branches at the same position ⇒ HALT_ALERT (chain broken).
+        assert_eq!(
+            prefer_rotation_fork(&attacker_branch, false, &honest_branch, false),
+            Err(IdentityError::BrokenChain)
+        );
     }
 }

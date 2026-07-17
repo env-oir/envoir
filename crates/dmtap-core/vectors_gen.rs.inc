@@ -453,10 +453,10 @@ fn build_all() -> VectorFile {
         ));
     }
 
-    // === 6. Suite fail-closed — unknown suite byte MUST be rejected (spec §1.1, §18.1.4) =====
+    // === 6. Suite fail-closed — an UNREGISTERED suite byte MUST be rejected (spec §1.1, §18.1.4) =
     for (name, byte) in [
         ("suite_reject_0x00", 0x00u8),
-        ("suite_reject_0x03", 0x03u8),
+        ("suite_reject_0x04", 0x04u8),
         ("suite_reject_0x05", 0x05u8),
         ("suite_reject_0xff", 0xffu8),
     ] {
@@ -466,18 +466,23 @@ fn build_all() -> VectorFile {
             "suite_decode",
             json!({ "cbor_hex": hex(&cbor_bytes) }),
             json!({ "accepted": false }),
-            "an unknown suite byte MUST fail to decode (never guess; fail closed)",
+            "an unregistered suite byte MUST fail to decode (never guess; fail closed)",
         ));
     }
-    // Positive controls: 0x01 and 0x02 decode as suite ids (0x02 is reserved but a known id).
-    for (name, byte) in [("suite_accept_0x01", 0x01u8), ("suite_accept_0x02", 0x02u8)] {
+    // Positive controls: 0x01/0x02/0x03 decode as KNOWN suite ids (0x02 reserved-PQ, 0x03
+    // reserved AEAD-diverse — both known code points, §21.15; unimplemented ⇒ fail closed on USE).
+    for (name, byte) in [
+        ("suite_accept_0x01", 0x01u8),
+        ("suite_accept_0x02", 0x02u8),
+        ("suite_accept_0x03", 0x03u8),
+    ] {
         let cbor_bytes = cbor(&byte);
         vectors.push(v(
             name,
             "suite_decode",
             json!({ "cbor_hex": hex(&cbor_bytes) }),
             json!({ "accepted": true }),
-            "0x01 (classical) and 0x02 (reserved PQ) are known suite ids and decode",
+            "0x01 (classical), 0x02 (reserved PQ), and 0x03 (reserved AEAD-diverse) are known suite ids and decode",
         ));
     }
 
@@ -533,10 +538,11 @@ fn build_all() -> VectorFile {
         ));
     }
     // (c) payload_sig KAT (§2.7 step 8, §18.9.2) — Ed25519 over the DS-tag ‖
-    //     BLAKE3-256(det_cbor(Payload ∖ {sig})).
+    //     BLAKE3-256( det_cbor(Payload ∖ {sig}) ‖ u8(kind) ‖ u64be(ts) ‖ det_cbor(to) ). The
+    //     envelope-context tail (kind/ts/to) is taken from the fixed `envelope` above.
     {
         let sk = IdentityKey::from_seed(&SEED_A);
-        let ph = payload.signing_hash();
+        let ph = payload.signing_hash(envelope.kind, envelope.ts, &envelope.to);
         let sig = sk.sign_domain(PAYLOAD_SIG_DOMAIN, &ph);
         vectors.push(v(
             "mote_payload_sig",
@@ -546,9 +552,12 @@ fn build_all() -> VectorFile {
                 "domain_hex": hex(PAYLOAD_SIG_DOMAIN),
                 "msg_hex": hex(&ph),
                 "payload_hash_hex": hex(&ph),
+                "kind": envelope.kind.as_u8(),
+                "ts": envelope.ts,
+                "to_cbor_hex": hex(&envelope.to.det_cbor()),
             }),
             json!({ "pubkey_hex": hex(&sk.public_array()), "sig_hex": hex(&sig) }),
-            "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig})) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32",
+            "§18.9.2 payload signature: BLAKE3-256(det_cbor(Payload ∖ {sig}) ‖ u8(kind) ‖ u64be(ts) ‖ det_cbor(to)) under DS-tag 'DMTAP-v0/payload\\0'; IK seed 0x11*32; kind/ts/to from the fixed envelope",
         ));
     }
 

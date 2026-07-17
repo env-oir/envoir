@@ -91,13 +91,15 @@ fn key(seed: u8) -> IdentityKey {
 // §10.7.1 — Version, suite & capability downgrades
 // ================================================================================================
 
-/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" (§10.1, §1.1): every byte other than the two
-/// currently-defined suite ids MUST fail closed, never be guessed at.
+/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" (§10.1, §1.1, §21.15): every UNREGISTERED byte MUST
+/// fail closed, never be guessed at. The registered ids `0x01`/`0x02`/`0x03` decode (`0x02`/`0x03`
+/// are RESERVED — known code points that fail closed on *use*, not on *decode*, §1.1).
 #[test]
 fn unknown_suite_byte_fails_closed() {
     assert_eq!(Suite::from_u8(0x01), Some(Suite::Classical));
     assert_eq!(Suite::from_u8(0x02), Some(Suite::PqHybrid));
-    for b in [0x00u8, 0x03, 0x04, 0x0f, 0x7f, 0xfe, 0xff] {
+    assert_eq!(Suite::from_u8(0x03), Some(Suite::ReservedAeadGcm));
+    for b in [0x00u8, 0x04, 0x0f, 0x7f, 0xfe, 0xff] {
         assert_eq!(Suite::from_u8(b), None, "suite byte 0x{b:02x} must fail closed, never guessed");
     }
 }
@@ -126,12 +128,12 @@ fn identity_declaring_only_unsupported_suite_is_rejected_not_downgraded() {
     assert_eq!(id.verify(None), Err(IdentityError::UnsupportedSuite(0x02)));
 }
 
-/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" at the MOTE envelope layer (§2.7 step 1). Now that
-/// the PQ suite (`0x02`) is a real, supported suite (`Suite::mote_supported`), every *representable*
-/// `Suite` is valid at the MOTE layer — so an *unsupported* suite is rejected even earlier and more
-/// strongly than before: an unknown suite byte can never decode into an `Envelope` at all, failing
-/// closed at the wire before `validate()` is ever reached (`Suite::from_u8` fails closed on any byte
-/// outside {0x01, 0x02}). This is the correct home for the "reject before any other check" invariant.
+/// LOCKS §10.7.1 "Unknown `v`/`suite` → reject" at the MOTE envelope layer (§2.7 step 1). An
+/// UNREGISTERED suite byte can never decode into an `Envelope` at all, failing closed at the wire
+/// before `validate()` is ever reached (`Suite::from_u8` fails closed on any byte outside the
+/// registered ids {0x01, 0x02, 0x03}). `0x04` is used here as a representative unregistered byte;
+/// the reserved-but-unimplemented `0x03` decodes but is instead rejected at `validate()` step 1
+/// (`!mote_supported()`). This is the correct home for the "reject before any other check" invariant.
 #[test]
 fn mote_decode_rejects_an_unsupported_suite_byte_before_any_other_check() {
     let sender = IdentityKey::generate();
@@ -143,24 +145,25 @@ fn mote_decode_rejects_an_unsupported_suite_byte_before_any_other_check() {
     let env = build_mote(&Hpke, &sender, &eph, &recipient.public(), seal.public(), draft)
         .expect("build_mote must succeed");
 
-    // Patch ONLY the suite field (integer key 2, §18.3.1) to an unknown byte 0x03 — everything else
-    // (content address, structure) stays valid, so any decode failure is attributable to the suite.
+    // Patch ONLY the suite field (integer key 2, §18.3.1) to an UNREGISTERED byte 0x04 — everything
+    // else (content address, structure) stays valid, so any decode failure is attributable to the
+    // suite. (0x03 is now a registered reserved id that WOULD decode; use an unregistered byte.)
     let mut m = match cbor::decode(&env.det_cbor()).unwrap() {
         Cv::Map(m) => m,
         _ => unreachable!(),
     };
     for kv in m.iter_mut() {
         if kv.0 == 2 {
-            kv.1 = Cv::U64(0x03);
+            kv.1 = Cv::U64(0x04);
         }
     }
     let bogus = cbor::encode(&Cv::Map(m));
 
-    // Fail closed at the decoder — the unknown suite byte never becomes an Envelope, so no
+    // Fail closed at the decoder — the unregistered suite byte never becomes an Envelope, so no
     // content-address / signature / decryption work is ever attempted.
     assert!(
         Envelope::from_det_cbor(&bogus).is_err(),
-        "an unknown suite byte (0x03) must fail closed at the decoder"
+        "an unregistered suite byte (0x04) must fail closed at the decoder"
     );
 }
 
@@ -380,7 +383,8 @@ fn build_manual(corrupt_payload_sig: bool) -> (Envelope, IdentityKey, SealKeypai
         attach: vec![],
         expires: None,
     };
-    let hash = payload.signing_hash();
+    // §18.9.2: the payload hash now binds the envelope context (kind/ts/to).
+    let hash = payload.signing_hash(kind, ts, &to);
     payload.sig = sender.sign_domain(PAYLOAD_SIG_DS, &hash);
     if corrupt_payload_sig {
         payload.sig[0] ^= 0xff; // forge AFTER computing the real hash/signature

@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// |--------:|------|-----|------|------|--------|
 /// | `0x01`  | Ed25519 | X25519 (HPKE) | ChaCha20-Poly1305 | BLAKE3-256 | v0 REQUIRED |
 /// | `0x02`  | Ed25519+ML-DSA-65 | X-Wing (X25519+ML-KEM-768) | ChaCha20-Poly1305 | BLAKE3-256 | RESERVED (PQ) |
+/// | `0x03`  | Ed25519+ML-DSA-65 | X-Wing (X25519+ML-KEM-768) | **AES-256-GCM** | BLAKE3-256 | RESERVED (AEAD-diverse emergency target) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum Suite {
@@ -28,15 +29,31 @@ pub enum Suite {
     /// [`is_supported`](Suite::is_supported) returns `false` and a `0x02`-only `Identity` fails
     /// closed (see [`crate::identity::Identity::verify`]).
     PqHybrid = 0x02,
+    /// **RESERVED, not yet implemented** (spec §1.1, §21.15, §16.7): the AEAD-diverse emergency
+    /// target — suite `0x02`'s PQ-hybrid Ed25519+ML-DSA-65 signature and X-Wing KEM, but with
+    /// **AES-256-GCM** instead of ChaCha20-Poly1305. It exists so that a break of the ChaCha20/
+    /// Poly1305 monoculture shared by `0x01`/`0x02` can be answered by migrating to a
+    /// different-AEAD suite through the ordinary multi-suite mechanism (§1.3), without a flag day.
+    ///
+    /// This is a **registered-but-unimplemented reserved code point**: [`from_u8`](Suite::from_u8)
+    /// recognizes `0x03` as a known suite id (so it round-trips through the wire decoder like
+    /// `0x02`), but neither [`is_supported`](Suite::is_supported) nor
+    /// [`mote_supported`](Suite::mote_supported) returns `true` for it — the AEAD is **not**
+    /// implemented, so any attempt to seal/sign/validate under it **fails closed** (`0x0101` /
+    /// `0x0201`). Do not add the AES-256-GCM machinery here without also updating those predicates.
+    ReservedAeadGcm = 0x03,
 }
 
 impl Suite {
-    /// Decode a suite byte, **failing closed** on any unknown value (spec §1.1).
+    /// Decode a suite byte, **failing closed** on any unknown value (spec §1.1). Registered reserved
+    /// code points (`0x02` PQ, `0x03` AEAD-diverse) decode as known ids; an *unregistered* byte
+    /// still returns `None` (reject, never guess).
     pub fn from_u8(b: u8) -> Option<Self> {
         match b {
             0x01 => Some(Suite::Classical),
             0x02 => Some(Suite::PqHybrid),
-            _ => None, // unknown suite — reject, never guess
+            0x03 => Some(Suite::ReservedAeadGcm), // RESERVED, unimplemented — see the variant docs
+            _ => None,                            // unknown suite — reject, never guess
         }
     }
 
@@ -226,10 +243,29 @@ mod tests {
     fn from_u8_fails_closed() {
         assert_eq!(Suite::from_u8(0x01), Some(Suite::Classical));
         assert_eq!(Suite::from_u8(0x02), Some(Suite::PqHybrid));
-        // Every other byte MUST be rejected.
-        for b in [0x00u8, 0x03, 0x7f, 0xff] {
+        // 0x03 is a REGISTERED reserved code point (§1.1, §21.15): it decodes as a known id (so the
+        // wire decoder round-trips it) but is not implemented — see `reserved_0x03_is_known_but_unusable`.
+        assert_eq!(Suite::from_u8(0x03), Some(Suite::ReservedAeadGcm));
+        // Every *unregistered* byte MUST still be rejected (never guess).
+        for b in [0x00u8, 0x04, 0x7f, 0xff] {
             assert_eq!(Suite::from_u8(b), None, "byte 0x{b:02x} must fail closed");
         }
+    }
+
+    #[test]
+    fn reserved_0x03_is_known_but_unusable() {
+        // `0x03` decodes as a known suite id (like `0x02`) ...
+        let s = Suite::from_u8(0x03).expect("0x03 is a registered reserved code point");
+        assert_eq!(s, Suite::ReservedAeadGcm);
+        assert_eq!(s.as_u8(), 0x03);
+        // ... but is NOT implemented at either layer — every attempted use fails closed.
+        assert!(!s.is_supported(), "reserved 0x03 must not be Identity-supported");
+        assert!(!s.mote_supported(), "reserved 0x03 must not be MOTE-supported");
+        // It round-trips through the CBOR suite decoder (a known id), unlike an unregistered byte.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&3u8, &mut buf).unwrap();
+        let r: Result<Suite, _> = ciborium::from_reader(&buf[..]);
+        assert_eq!(r.ok(), Some(Suite::ReservedAeadGcm));
     }
 
     #[test]
@@ -246,13 +282,16 @@ mod tests {
         // Identity-object (multi-suite) support is classical-only.
         assert!(Suite::Classical.is_supported());
         assert!(!Suite::PqHybrid.is_supported());
+        assert!(!Suite::ReservedAeadGcm.is_supported());
     }
 
     #[test]
     fn both_suites_are_mote_supported() {
-        // The MOTE envelope/payload layer implements both the classical and the PQ-hybrid suite.
+        // The MOTE envelope/payload layer implements both the classical and the PQ-hybrid suite,
+        // but NOT the reserved-unimplemented 0x03.
         assert!(Suite::Classical.mote_supported());
         assert!(Suite::PqHybrid.mote_supported());
+        assert!(!Suite::ReservedAeadGcm.mote_supported());
     }
 
     #[test]

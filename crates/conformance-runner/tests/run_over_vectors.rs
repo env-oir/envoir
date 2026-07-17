@@ -83,10 +83,19 @@ fn suite_json_cross_reference_matches_known_state() {
     // GAPS CLOSED: dmtap-core's low-level `cbor::decode` now enforces the full §18.1.1 canonical
     // ruleset on input — shortest-form integers/lengths, definite-length only, strictly ascending
     // map-key order (by encoded bytes), no duplicates — so the three previously-failing
-    // self-contained MUST-reject cases (DMTAP-CBOR-05/06/07) now correctly REJECT and pass. The
-    // expected gap set is therefore empty; if a NEW case starts failing, this assertion catches it
-    // immediately as a regression.
-    let expected_gap_ids: Vec<&str> = vec![];
+    // self-contained MUST-reject cases (DMTAP-CBOR-05/06/07) now correctly REJECT and pass.
+    //
+    // KNOWN SPEC-REPO STALE REFERENCE: `DMTAP-SUITE-02` in the sibling spec repo's `suite.json`
+    // (`../../../dmtap/conformance/suite.json`) still asserts "unknown suite 0x03 rejected" against
+    // a vector named `suite_reject_0x03`, expecting `0x0101 ERR_UNKNOWN_SUITE`. Suite `0x03` is now
+    // a **registered reserved code point** (AES-256-GCM AEAD-diverse PQ-hybrid, §1.1/§21.15): it
+    // DECODES as a known id (unimplemented ⇒ fails closed on *use*), so this monorepo's
+    // `vectors.json` replaced `suite_reject_0x03` with `suite_accept_0x03` + `suite_reject_0x04`.
+    // The spec-repo case+vector must be regenerated there (out of scope for this crate — we MUST NOT
+    // edit the spec repo); until then the dangling `vector` reference surfaces here as the single
+    // expected gap. Remove this entry once the spec repo's `DMTAP-SUITE-02` is updated to a
+    // reserved-suite `suite_decode`/`accept` case.
+    let expected_gap_ids: Vec<&str> = vec!["DMTAP-SUITE-02"];
     let actual_gap_ids: Vec<&str> = fails.iter().map(|(id, _)| id.as_str()).collect();
     let mut sorted_actual = actual_gap_ids.clone();
     sorted_actual.sort_unstable();

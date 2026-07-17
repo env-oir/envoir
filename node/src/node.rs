@@ -1486,7 +1486,11 @@ fn drop_reason(e: MoteError) -> DropReason {
         // Sealing/encoding errors, and the §5.5 file-tier / durability / spool failures (raised at
         // MOTE construction and by the file-durability helpers, not by this decode+validate path),
         // cannot arise here but map defensively to Malformed.
-        MoteError::SealFailed
+        // A §2.7-step-8 envelope-context mismatch (`0x0211`): the envelope `kind`/`ts`/`to` were
+        // altered after `Payload.sig` was signed (a re-emit of the sealed ciphertext). Like the
+        // other decode/authenticity failures it drops silently; map it defensively to Malformed.
+        MoteError::EnvelopeContextMismatch
+        | MoteError::SealFailed
         | MoteError::BadEncoding(_)
         | MoteError::FileManifestInvalid
         | MoteError::FileRetentionExpired
