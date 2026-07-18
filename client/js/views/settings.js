@@ -112,6 +112,8 @@ export function render(root) {
       <label class="cfield"><span>Node base URL</span><input id="nodeurl" placeholder="http://127.0.0.1:4700" value="${esc(s.node.baseUrl || '')}" autocomplete="off" spellcheck="false"></label>
       <label class="cfield"><span>Username (account)</span><input id="nodeuser" placeholder="you@your-node" value="${esc(s.node.username || '')}" autocomplete="off" spellcheck="false"></label>
       <label class="cfield"><span>App-password</span><input id="nodepw" type="password" placeholder="node-issued app-password" value="${esc(s.node.appPassword || '')}" autocomplete="off" spellcheck="false"></label>
+      <label class="cfield"><span>Send token</span><input id="nodesendtoken" type="password" placeholder="node-issued send capability (POST /v1/send)" value="${esc(s.node.sendToken || '')}" autocomplete="off" spellcheck="false"></label>
+      <p class="set-hint">The <b>send token</b> is a separate, scoped, revocable send capability (spec §13.5.1) that authorizes <b>real outbound send</b> over the node's Envoir Send API — mint one on your node with an admin token. Without it, connecting still syncs and reads your real mailbox, but compose stays honest: it will <b>not</b> fake a send.</p>
       <div class="set-row">
         <button class="btn primary" id="nodeconnect">${icon('network')} Connect &amp; sync</button>
         <button class="btn ghost" id="nodedisconnect" ${state.net.mode === 'real' ? '' : 'disabled'}>Disconnect</button>
@@ -217,6 +219,7 @@ function wireNode(root) {
     s.node.baseUrl = root.querySelector('#nodeurl').value.trim();
     s.node.username = root.querySelector('#nodeuser').value.trim();
     s.node.appPassword = root.querySelector('#nodepw').value;
+    s.node.sendToken = root.querySelector('#nodesendtoken').value.trim();
   };
   root.querySelector('#nodeconnect').onclick = async () => {
     read();

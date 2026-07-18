@@ -25,8 +25,10 @@ const defaultSettings = {
   // Node connection (real JMAP sync, spec §8.1). Empty by default → the client runs as the
   // clearly-labeled SIMULATION. Filled in (Settings → Node) or injected by a Tauri shell, it
   // upgrades the client to REAL mode against the user's own node. The app-password (spec §8.2)
-  // is a node-issued secret, not the identity key.
-  node: { enabled: false, baseUrl: 'http://127.0.0.1:4700', username: '', appPassword: '' },
+  // is a node-issued secret, not the identity key. The `sendToken` is a SEPARATE node-issued send
+  // capability (spec §13.5.1) that authorizes real outbound send over POST /v1/send; without it the
+  // client stays honest and won't fake a send (net/send.js).
+  node: { enabled: false, baseUrl: 'http://127.0.0.1:4700', username: '', appPassword: '', sendToken: '' },
 };
 
 export const state = {
@@ -60,8 +62,8 @@ export function setNetStatus(patch) {
 }
 
 // Resolve the node connection config: a Tauri/host-injected `window.__ENVOIR_NODE__` wins (the
-// shell will inject base URL + app-password there), otherwise the saved Settings → Node config.
-// Returns `{ enabled, baseUrl, username, appPassword }`.
+// shell will inject base URL + app-password + send token there), otherwise the saved Settings →
+// Node config. Returns `{ enabled, baseUrl, username, appPassword, sendToken }`.
 export function resolveNodeConfig() {
   const injected = (typeof globalThis !== 'undefined' && globalThis.__ENVOIR_NODE__) || null;
   if (injected && injected.baseUrl && injected.username && injected.appPassword) {
@@ -70,6 +72,7 @@ export function resolveNodeConfig() {
       baseUrl: injected.baseUrl,
       username: injected.username,
       appPassword: injected.appPassword,
+      sendToken: injected.sendToken || '',
     };
   }
   const n = state.settings.node || {};
@@ -78,6 +81,7 @@ export function resolveNodeConfig() {
     baseUrl: n.baseUrl || 'http://127.0.0.1:4700',
     username: n.username || '',
     appPassword: n.appPassword || '',
+    sendToken: n.sendToken || '',
   };
 }
 

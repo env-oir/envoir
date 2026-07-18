@@ -7,6 +7,7 @@
 import { openModal, closeModal, toast, icon, esc, avatar, showInspector, litHop, sanitizeHtml, trustPill } from './ui.js';
 import { buildMote, KIND } from './mote.js';
 import { planDelivery, animatePath } from './mesh-sim.js';
+import { sendMail, sendMode } from './net/send.js';
 import { currentIdentity, displayAddress, selfPerson } from './identity.js';
 import { state, thread, uid, stripHtml } from './store.js';
 import { person, PEOPLE, fmtBytes } from './seed.js';
@@ -17,6 +18,17 @@ const UNDO_MS = 5000;
 
 // plaintext (with \n) → simple HTML for the contentEditable editor
 function textToHtml(s) { return esc(s || '').replace(/\n/g, '<br>'); }
+
+// The honest footer note, keyed to how THIS message will actually go out (net/send.js sendMode):
+//   real → delivered by the node's Send API   seam → live node but send not provisioned
+//   sim  → the labeled simulation (no real delivery)
+function composeNote() {
+  switch (sendMode()) {
+    case 'real': return 'sealed · signed with your real key · delivered by your node';
+    case 'seam': return 'sealed · signed with your real key · add a send token in Settings → Node to deliver for real';
+    default: return 'sealed · signed with your real key · simulated delivery — connect your node to send for real';
+  }
+}
 
 export function openCompose(opts = {}) {
   const id = currentIdentity();
@@ -67,7 +79,7 @@ export function openCompose(opts = {}) {
         <button class="icon-btn" id="csig" title="Insert signature">${icon('edit')}</button>
         <input type="file" id="cfile" class="hidden" multiple>
       </div>
-      <div class="compose-note"><span class="sim-tag">sealed · signed with your real key · no remote content is fetched</span></div>
+      <div class="compose-note"><span class="sim-tag">${composeNote()}</span></div>
       <div id="csched-row" class="sched-row hidden"></div>
     </div>`, { compose: true, sticky: true });
 
@@ -240,11 +252,69 @@ function doSendWithUndo(draft) {
   _pending.timer = setTimeout(() => { _pending = null; commitSend(draft); }, UNDO_MS);
 }
 
+// Dispatch, honestly, by how this session can actually send (net/send.js):
+//   real → POST /v1/send genuinely seals + dispatches a MOTE on the node    (commitSendReal)
+//   seam → live node but no send token: NEVER fake a send, keep it as a draft (commitSendSeam)
+//   sim  → the labeled mesh-sim animation over a real, locally-signed MOTE   (commitSendSim)
 async function commitSend(draft) {
+  switch (sendMode()) {
+    case 'real': return commitSendReal(draft);
+    case 'seam': return commitSendSeam(draft);
+    default: return commitSendSim(draft);
+  }
+}
+
+// Build the client-side "sent" thread object for a just-sent message (shared by real + sim paths).
+function sentThread(draft, sentMsg) {
+  const to0 = splitRecips(draft.to)[0] || draft.to;
+  const recip = person(to0);
+  return { id: uid('t'), subject: draft.subject || '(no subject)', labels: [], folder: 'sent', read: true, starred: false, snoozeUntil: null, tier: draft.tier, verified: recip.trust === 'verified', legacy: recip.trust === 'legacy', msgs: [sentMsg] };
+}
+const composedText = (draft) => draft._text || stripHtml(draft.body);
+
+// REAL send over the node's Send API. On success the message lands in Sent with the node's real
+// content-id; on ANY failure it is surfaced verbatim and the message is kept in Drafts — never a
+// fake "Delivered".
+async function commitSendReal(draft) {
+  const to0 = splitRecips(draft.to)[0] || draft.to;
+  const text = composedText(draft);
+  toast(`${icon('send')} Sending via your node…`, { ms: 2200 });
+  let receipt;
+  try {
+    receipt = await sendMail({ to: to0, subject: draft.subject, body: text });
+  } catch (err) {
+    const reason = (err && err.message) ? err.message : 'send failed';
+    upsertDraft(draft, text);
+    bus.rerender(); bus.refreshChrome();
+    toast(`${icon('shield')} Send failed: ${esc(reason)} — kept in Drafts.`, { ms: 6500 });
+    return;
+  }
+  const sentMsg = { id: uid('m'), from: 'you', me: true, to: splitRecips(draft.to), time: Date.now(), tier: draft.tier, body: draft.body, html: true, text, attach: draft.attach.slice() };
+  if (draft.replyThread) {
+    const t = thread(draft.replyThread);
+    if (t) { t.msgs.push(sentMsg); t.read = true; } else state.mail.unshift(sentThread(draft, sentMsg));
+  } else {
+    state.mail.unshift(sentThread(draft, sentMsg));
+  }
+  bus.rerender(); bus.refreshChrome();
+  const idShort = receipt.id ? esc(receipt.id.slice(0, 16)) + '…' : '';
+  const via = receipt.transport ? ` · ${esc(receipt.transport)}` : '';
+  toast(`${icon('check')} Sent via your node${via}${idShort ? ' · ' + idShort : ''}`, { ms: 4600 });
+}
+
+// Live node, but no send token provisioned. Do NOT simulate a send in real mode: hold the message
+// as a draft and tell the user exactly what's missing (the send-token seam).
+function commitSendSeam(draft) {
+  upsertDraft(draft, composedText(draft));
+  bus.rerender(); bus.refreshChrome();
+  toast(`${icon('shield')} Real send needs a send token — add one in Settings → Node. Saved to Drafts.`, { ms: 7000 });
+}
+
+// SIMULATION: build a real, locally-signed MOTE and animate its delivery through the inspector.
+async function commitSendSim(draft) {
   const to0 = splitRecips(draft.to)[0] || draft.to;
   const group = state.groups.find(g => g.address === to0 || g.handle === to0);
-  const recip = person(to0);
-  const mote = await buildMote({ to: to0, kind: group ? KIND.group : KIND.mail, subject: draft.subject, body: draft._text || stripHtml(draft.body), tier: draft.tier, group: group || null });
+  const mote = await buildMote({ to: to0, kind: group ? KIND.group : KIND.mail, subject: draft.subject, body: composedText(draft), tier: draft.tier, group: group || null });
   const plan = planDelivery(mote, to0);
 
   const sentMsg = { id: uid('m'), from: 'you', me: true, to: splitRecips(draft.to), time: Date.now(), tier: draft.tier, body: draft.body, html: true, text: draft._text, attach: draft.attach.slice() };
@@ -252,13 +322,13 @@ async function commitSend(draft) {
     const t = thread(draft.replyThread);
     if (t) { t.msgs.push(sentMsg); t.read = true; }
   } else {
-    state.mail.unshift({ id: uid('t'), subject: draft.subject || '(no subject)', labels: [], folder: 'sent', read: true, starred: false, snoozeUntil: null, tier: draft.tier, verified: recip.trust === 'verified', legacy: recip.trust === 'legacy', msgs: [sentMsg] });
+    state.mail.unshift(sentThread(draft, sentMsg));
   }
   bus.rerender(); bus.refreshChrome();
   showInspector(mote, plan);
   toast(plan.kind === 'mixnet' ? 'Routing through the mixnet…' : plan.kind === 'legacy' ? 'Bridging to legacy via gateway…' : plan.kind === 'group' ? 'Fanning out to group members…' : 'Delivering direct…');
   await animatePath(plan, (i) => litHop(i));
-  toast(`${icon('check')} Delivered · MOTE ${esc(mote.contentId.slice(0, 16))}…`);
+  toast(`${icon('check')} Delivered (simulated) · MOTE ${esc(mote.contentId.slice(0, 16))}…`);
 }
 
 function doSchedule(draft) {
