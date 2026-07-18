@@ -127,10 +127,26 @@ impl<A: Authenticator> SmtpSession<A> {
     }
 
     /// Feed one line (without CRLF). Returns the reply (possibly multi-line).
+    ///
+    /// Compatibility wrapper over [`Self::feed_line_bytes`] — prefer that for a real socket: a
+    /// `&str` can only exist post-UTF-8-validation, so an 8-bit-CTE ISO-8859-x/GB18030 DATA line
+    /// has already been rejected or lossy-mangled by the time it is a `&str`.
     pub fn feed_line(&mut self, line: &str) -> String {
+        self.feed_line_bytes(line.as_bytes())
+    }
+
+    /// Feed one **raw** line (without CRLF). This is the lossless entry point: while we advertise
+    /// 8BITMIME, DATA lines must be buffered byte-exact — decoding them through UTF-8 first turns
+    /// every legacy 8-bit body (ISO-8859-x, GB18030, Shift_JIS…) into U+FFFD soup before any
+    /// parser ever sees it. Command lines (the non-DATA phase) are ASCII per RFC 5321, with
+    /// SMTPUTF8 (RFC 6531) arguments as valid UTF-8 — both decode losslessly below; genuinely
+    /// undecodable command bytes can only come from a broken client and at worst mis-spell its
+    /// own 500 reply.
+    pub fn feed_line_bytes(&mut self, line: &[u8]) -> String {
         if self.phase == Phase::Data {
             return self.feed_data_line(line);
         }
+        let line: &str = &String::from_utf8_lossy(line);
         if let Some(p) = self.pending_auth.take() {
             return self.continue_auth(p, line);
         }
@@ -287,8 +303,8 @@ impl<A: Authenticator> SmtpSession<A> {
         "354 End data with <CR><LF>.<CR><LF>\r\n".into()
     }
 
-    fn feed_data_line(&mut self, line: &str) -> String {
-        if line == "." {
+    fn feed_data_line(&mut self, line: &[u8]) -> String {
+        if line == b"." {
             // End of data.
             self.phase = Phase::Command;
             // Enforce the advertised SIZE limit (RFC 1870): refuse an over-limit message rather
@@ -310,12 +326,12 @@ impl<A: Authenticator> SmtpSession<A> {
             self.submissions.push(sub);
             return "250 2.0.0 OK: queued as MOTE\r\n".into();
         }
-        // Dot-unstuffing (RFC 5321 §4.5.2).
-        let content = line.strip_prefix('.').unwrap_or(line);
+        // Dot-unstuffing (RFC 5321 §4.5.2) — on the raw bytes, so 8-bit content is untouched.
+        let content = line.strip_prefix(b".").unwrap_or(line);
         // Track the total size but stop buffering once over the limit (bounded memory even for a
         // hostile stream); the terminating `.` then returns 552.
         if self.data_buf.len() <= self.max_size {
-            self.data_buf.extend_from_slice(content.as_bytes());
+            self.data_buf.extend_from_slice(content);
             self.data_buf.extend_from_slice(b"\r\n");
         }
         if self.data_buf.len() > self.max_size {
@@ -367,7 +383,9 @@ pub fn build_mote_draft(data: &[u8], ts: TimestampMs) -> MoteDraft {
     let mut draft = MoteDraft::new(Kind::Mail, ts, parsed.body.clone());
     draft.headers = Headers {
         thread: None,
-        subject: parsed.header("Subject").map(str::to_string),
+        // MOTE headers are native UTF-8 (spec §2.4): lift the subject through RFC 2047 decode so a
+        // `=?UTF-8?B?…?=` (or ISO-8859-1/Q) legacy subject becomes real text, not wire gibberish.
+        subject: parsed.header("Subject").map(crate::mime::decode_encoded_words),
         mime: parsed.header("Content-Type").map(str::to_string),
         cc: Vec::new(),
     };
@@ -633,6 +651,45 @@ mod tests {
         let draft = build_mote_draft(b"Subject: Test\r\n\r\nbody", 42);
         assert_eq!(draft.headers.subject.as_deref(), Some("Test"));
         assert_eq!(draft.body, b"body");
+    }
+
+    #[test]
+    fn builds_mote_draft_decodes_rfc2047_subject() {
+        // A legacy sender's encoded subject must land in the MOTE as real text, not `=?UTF-8?B?…`.
+        let draft = build_mote_draft(
+            b"Subject: =?UTF-8?B?0J/RgNC40LLQtdGC?= =?ISO-8859-1?Q?Gr=FC=DFe?=\r\n\r\nbody",
+            42,
+        );
+        assert_eq!(draft.headers.subject.as_deref(), Some("ПриветGrüße"));
+    }
+
+    #[test]
+    fn eight_bit_data_survives_byte_exact() {
+        // We advertise 8BITMIME: a Latin-1 (or any 8-bit) DATA payload must reach the Submission
+        // byte-for-byte — no UTF-8 validation, no U+FFFD replacement — and parse with the body
+        // untouched.
+        let mut s = authed_session();
+        s.feed_line("EHLO c");
+        let cred = base64_encode(b"\0alice\0pw");
+        s.feed_line(&format!("AUTH PLAIN {cred}"));
+        s.feed_line("MAIL FROM:<alice@dmtap.local> BODY=8BITMIME");
+        s.feed_line("RCPT TO:<bob@example.net>");
+        s.feed_line("DATA");
+        s.feed_line_bytes(b"Content-Type: text/plain; charset=iso-8859-1");
+        s.feed_line_bytes(b"Content-Transfer-Encoding: 8bit");
+        s.feed_line_bytes(b"");
+        s.feed_line_bytes(b"Gr\xfc\xdfe aus M\xfcnchen");
+        // Dot-unstuffing must also be byte-safe for 8-bit lines.
+        s.feed_line_bytes(b".\xe9 dot-stuffed latin-1");
+        assert!(s.feed_line_bytes(b".").starts_with("250"));
+        let sub = s.take_submissions().pop().unwrap();
+        let expected: &[u8] = b"Content-Type: text/plain; charset=iso-8859-1\r\n\
+                                Content-Transfer-Encoding: 8bit\r\n\r\n\
+                                Gr\xfc\xdfe aus M\xfcnchen\r\n\xe9 dot-stuffed latin-1\r\n";
+        assert_eq!(sub.data, expected, "8-bit DATA must survive byte-exact");
+        // And the parser must keep those body bytes untouched too.
+        let parsed = ParsedMessage::parse(&sub.data);
+        assert_eq!(parsed.body, b"Gr\xfc\xdfe aus M\xfcnchen\r\n\xe9 dot-stuffed latin-1\r\n");
     }
 
     /// Drive a full submission that declares DSN parameters, then generate the failure DSN.

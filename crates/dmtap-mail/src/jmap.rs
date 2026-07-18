@@ -373,6 +373,10 @@ fn email_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
         match parse_email_id(id).and_then(|(mb, uid)| store.mailbox(&mb).and_then(|m| m.by_uid(uid)).map(|msg| (mb, msg))) {
             Some((mailbox, msg)) => {
                 let parsed = ParsedMessage::parse(&msg.raw);
+                // Display text goes through the crate's one i18n path: RFC 2047 for headers,
+                // CTE+charset for the body — with the honest problem flag, never a hardcoded
+                // `false` over U+FFFD soup (a GB18030 body IS an encoding problem for us).
+                let (body_text, encoding_problem) = crate::mime::decoded_body_text(&parsed);
                 let keywords: serde_json::Map<String, Value> = msg
                     .flags
                     .iter()
@@ -387,7 +391,7 @@ fn email_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
                     "keywords": keywords,
                     "size": msg.size(),
                     "receivedAt": crate::mime::format_rfc5322_date(msg.internal_date),
-                    "subject": parsed.header("Subject").unwrap_or(""),
+                    "subject": crate::mime::decode_encoded_words(parsed.header("Subject").unwrap_or("")),
                     "from": jmap_addresses(&parsed, "From"),
                     "to": jmap_addresses(&parsed, "To"),
                     "cc": jmap_addresses(&parsed, "Cc"),
@@ -395,7 +399,7 @@ fn email_get<S: MailStore>(store: &S, account: &str, args: &Value) -> Value {
                     "preview": preview(&parsed),
                     "hasAttachment": matches!(parsed.structure, crate::mime::BodyPart::Multipart{..}),
                     "bodyValues": {
-                        "1": { "value": String::from_utf8_lossy(&parsed.body), "isEncodingProblem": false, "isTruncated": false }
+                        "1": { "value": body_text, "isEncodingProblem": encoding_problem, "isTruncated": false }
                     },
                     "textBody": [ { "partId": "1", "type": "text/plain" } ]
                 }));
@@ -425,7 +429,9 @@ fn jmap_addresses(p: &ParsedMessage, header: &str) -> Value {
                     (Some(m), None) => m,
                     _ => String::new(),
                 };
-                json!({ "name": a.name, "email": email })
+                // Display-names arrive RFC-2047-encoded from legacy senders; decode at this JMAP
+                // boundary (the IMAP ENVELOPE keeps the raw form — those clients self-decode).
+                json!({ "name": a.name.map(|n| crate::mime::decode_encoded_words(&n)), "email": email })
             })
             .collect(),
     )
@@ -438,7 +444,8 @@ fn thread_id(p: &ParsedMessage, uid: u32) -> String {
 }
 
 fn preview(p: &ParsedMessage) -> String {
-    let text = String::from_utf8_lossy(&p.body);
+    // Same decode as bodyValues, so the preview shows text, not base64/mojibake, for legacy mail.
+    let (text, _) = crate::mime::decoded_body_text(p);
     text.chars().take(200).collect()
 }
 
@@ -555,7 +562,12 @@ fn compose_email<S: MailStore>(store: &mut S, obj: &Value) -> Result<(String, u3
                 .filter_map(|a| {
                     let email = sanitize_header(a.get("email").and_then(Value::as_str)?);
                     Some(match a.get("name").and_then(Value::as_str) {
-                        Some(n) if !n.is_empty() => format!("{} <{email}>", sanitize_header(n)),
+                        // Encode the display-name for the wire (RFC 2047 for non-ASCII, quoting
+                        // for phrase specials) — a raw 8-bit name would be mangled downstream.
+                        Some(n) if !n.is_empty() => format!(
+                            "{} <{email}>",
+                            crate::mime::encode_display_name(&sanitize_header(n))
+                        ),
                         _ => email,
                     })
                 })
@@ -569,7 +581,12 @@ fn compose_email<S: MailStore>(store: &mut S, obj: &Value) -> Result<(String, u3
     addr_header("to", "To", &mut headers);
     addr_header("cc", "Cc", &mut headers);
     if let Some(subject) = obj.get("subject").and_then(Value::as_str) {
-        headers.push_str(&format!("Subject: {}\r\n", sanitize_header(subject)));
+        // RFC 2047-encode non-ASCII subjects at compose time so the stored message is already
+        // legacy-wire-legal (Email/get decodes it back, so the round trip is display-lossless).
+        headers.push_str(&format!(
+            "Subject: {}\r\n",
+            crate::mime::encode_header_value(&sanitize_header(subject))
+        ));
     }
     headers.push_str(&format!("Date: {}\r\n", crate::mime::format_rfc5322_date(0)));
     headers.push_str("MIME-Version: 1.0\r\n");
@@ -874,7 +891,8 @@ fn search_snippet_get<S: MailStore>(store: &S, account: &str, args: &Value) -> V
             Some(m) => {
                 let p = ParsedMessage::parse(&m.raw);
                 (
-                    highlight(p.header("Subject").unwrap_or(""), &terms),
+                    // Snippets highlight what the user sees — the decoded subject, not raw 2047.
+                    highlight(&crate::mime::decode_encoded_words(p.header("Subject").unwrap_or("")), &terms),
                     highlight(&preview(&p), &terms),
                 )
             }
@@ -1157,6 +1175,93 @@ mod tests {
         );
         assert!(r["updated"].get(&id).is_some());
         assert!(s.mailbox("INBOX").unwrap().by_uid(1).unwrap().has_flag(&Flag::Seen));
+    }
+
+    #[test]
+    fn email_get_decodes_rfc2047_and_base64_body() {
+        let mut s = MemoryStore::empty();
+        s.deliver_raw(
+            "INBOX",
+            b"From: =?UTF-8?B?0JDQu9C40YHQsA==?= <alice@example.ru>\r\n\
+              Subject: =?UTF-8?B?0J/RgNC40LLQtdGC?=\r\n\
+              Content-Type: text/plain; charset=utf-8\r\n\
+              Content-Transfer-Encoding: base64\r\n\r\n\
+              0J/RgNC40LLQtdGCLCDQvNC40YAh"
+                .to_vec(),
+            vec![],
+            1_752_000_000_000,
+        );
+        let g = call(&mut s, "Email/get", json!({ "accountId": "acct1", "ids": [email_id("INBOX", 1)] }));
+        let email = &g["list"][0];
+        // Headers surface decoded, not as =?UTF-8?B?…?= gibberish.
+        assert_eq!(email["subject"], json!("Привет"));
+        assert_eq!(email["from"][0]["name"], json!("Алиса"));
+        // The base64 body is decoded for display, and honestly not-a-problem.
+        let bv = &email["bodyValues"]["1"];
+        assert_eq!(bv["value"].as_str().unwrap().trim_end(), "Привет, мир!");
+        assert_eq!(bv["isEncodingProblem"], json!(false));
+        // Preview shows the same decoded text.
+        assert!(email["preview"].as_str().unwrap().starts_with("Привет"), "{email}");
+    }
+
+    #[test]
+    fn email_get_flags_undecodable_charset_honestly() {
+        let mut s = MemoryStore::empty();
+        s.deliver_raw(
+            "INBOX",
+            b"Subject: nihao\r\nContent-Type: text/plain; charset=gb18030\r\n\
+              Content-Transfer-Encoding: 8bit\r\n\r\n\xc4\xe3\xba\xc3"
+                .to_vec(),
+            vec![],
+            1_752_000_000_000,
+        );
+        let g = call(&mut s, "Email/get", json!({ "accountId": "acct1", "ids": [email_id("INBOX", 1)] }));
+        let bv = &g["list"][0]["bodyValues"]["1"];
+        // We don't ship GB18030 tables (std-only): the decode is lossy and MUST say so, never
+        // assert `isEncodingProblem: false` over U+FFFD soup.
+        assert_eq!(bv["isEncodingProblem"], json!(true), "{bv}");
+    }
+
+    #[test]
+    fn email_set_create_encodes_non_ascii_headers_for_the_wire() {
+        let mut s = store_with_mail();
+        let r = call(
+            &mut s,
+            "Email/set",
+            json!({ "accountId": "acct1", "create": { "c": {
+                "mailboxIds": { "INBOX": true },
+                "subject": "Привет, мир",
+                "from": [{ "name": "Алиса", "email": "alice@dmtap.local" }],
+                "bodyValues": { "1": { "value": "b" } },
+                "textBody": [{ "partId": "1", "type": "text/plain" }]
+            } } }),
+        );
+        let id = r["created"]["c"]["id"].as_str().unwrap();
+        let (mb, uid) = parse_email_id(id).unwrap();
+        let raw = s.mailbox(&mb).unwrap().by_uid(uid).unwrap().raw.clone();
+        // Stored header block is wire-legal ASCII (2047-encoded), and the JMAP view round-trips.
+        let (hdr, _) = crate::mime::header_and_body(&raw);
+        assert!(hdr.is_ascii(), "compose leaked raw 8-bit headers: {:?}", String::from_utf8_lossy(&hdr));
+        let g = call(&mut s, "Email/get", json!({ "accountId": "acct1", "ids": [id] }));
+        assert_eq!(g["list"][0]["subject"], json!("Привет, мир"));
+        assert_eq!(g["list"][0]["from"][0]["name"], json!("Алиса"));
+    }
+
+    #[test]
+    fn search_snippet_highlights_decoded_subject() {
+        let mut s = MemoryStore::empty();
+        s.deliver_raw(
+            "INBOX",
+            b"Subject: =?UTF-8?B?0J/RgNC40LLQtdGC?=\r\n\r\nbody".to_vec(),
+            vec![],
+            1_752_000_000_000,
+        );
+        let r = call(
+            &mut s,
+            "SearchSnippet/get",
+            json!({ "accountId": "acct1", "filter": { "subject": "привет" }, "emailIds": [email_id("INBOX", 1)] }),
+        );
+        assert_eq!(r["list"][0]["subject"], json!("<mark>Привет</mark>"), "{r}");
     }
 
     #[test]

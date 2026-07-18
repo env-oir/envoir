@@ -71,37 +71,48 @@ impl<S: MailStore, A: Authenticator> Pop3Session<S, A> {
     }
 
     /// Feed one command line (without CRLF). Returns the reply (possibly multi-line).
+    ///
+    /// Compatibility wrapper over [`Self::feed_line_raw`]: RETR/TOP replies embed the stored
+    /// message bytes, which may legitimately be 8-bit (ISO-8859-x/GB18030 bodies) — this `String`
+    /// form lossy-decodes them. Anything driving a real socket should use `feed_line_raw`.
     pub fn feed_line(&mut self, line: &str) -> String {
+        String::from_utf8_lossy(&self.feed_line_raw(line)).into_owned()
+    }
+
+    /// Feed one command line (without CRLF), returning the reply as **raw bytes** so RETR/TOP
+    /// deliver the stored message byte-exact. Commands themselves are ASCII (RFC 1939), so the
+    /// `&str` input side loses nothing.
+    pub fn feed_line_raw(&mut self, line: &str) -> Vec<u8> {
         if let Some(step) = self.pending_sasl.take() {
-            return self.continue_sasl(step, line);
+            return self.continue_sasl(step, line).into_bytes();
         }
         let (verb, rest) = match line.split_once(' ') {
             Some((v, r)) => (v.to_ascii_uppercase(), r.trim().to_string()),
             None => (line.trim().to_ascii_uppercase(), String::new()),
         };
         match (self.state, verb.as_str()) {
-            (_, "CAPA") => self.capa(),
-            (_, "QUIT") => self.quit(),
-            (_, "NOOP") => "+OK\r\n".into(),
+            (_, "CAPA") => self.capa().into_bytes(),
+            (_, "QUIT") => self.quit().into_bytes(),
+            (_, "NOOP") => b"+OK\r\n".to_vec(),
             (State::Authorization, "STLS") => {
                 self.tls = true;
-                "+OK Begin TLS\r\n".into()
+                b"+OK Begin TLS\r\n".to_vec()
             }
             (State::Authorization, "USER") => {
                 self.user = Some(rest);
-                "+OK send PASS\r\n".into()
+                b"+OK send PASS\r\n".to_vec()
             }
-            (State::Authorization, "PASS") => self.pass(&rest),
-            (State::Authorization, "APOP") => self.apop(&rest),
-            (State::Authorization, "AUTH") => self.auth_cmd(&rest),
-            (State::Transaction, "STAT") => self.stat(),
-            (State::Transaction, "LIST") => self.list(&rest),
-            (State::Transaction, "UIDL") => self.uidl(&rest),
+            (State::Authorization, "PASS") => self.pass(&rest).into_bytes(),
+            (State::Authorization, "APOP") => self.apop(&rest).into_bytes(),
+            (State::Authorization, "AUTH") => self.auth_cmd(&rest).into_bytes(),
+            (State::Transaction, "STAT") => self.stat().into_bytes(),
+            (State::Transaction, "LIST") => self.list(&rest).into_bytes(),
+            (State::Transaction, "UIDL") => self.uidl(&rest).into_bytes(),
             (State::Transaction, "RETR") => self.retr(&rest),
             (State::Transaction, "TOP") => self.top(&rest),
-            (State::Transaction, "DELE") => self.dele(&rest),
-            (State::Transaction, "RSET") => self.rset(),
-            _ => "-ERR command not permitted in this state\r\n".into(),
+            (State::Transaction, "DELE") => self.dele(&rest).into_bytes(),
+            (State::Transaction, "RSET") => self.rset().into_bytes(),
+            _ => b"-ERR command not permitted in this state\r\n".to_vec(),
         }
     }
 
@@ -235,19 +246,19 @@ impl<S: MailStore, A: Authenticator> Pop3Session<S, A> {
         }
     }
 
-    fn retr(&self, rest: &str) -> String {
+    fn retr(&self, rest: &str) -> Vec<u8> {
         match self.slot_of(rest) {
             Some((_, slot)) => {
-                let mut out = format!("+OK {} octets\r\n", slot.raw.len());
-                out.push_str(&dot_stuff(&slot.raw));
-                out.push_str(".\r\n");
+                let mut out = format!("+OK {} octets\r\n", slot.raw.len()).into_bytes();
+                out.extend_from_slice(&dot_stuff(&slot.raw));
+                out.extend_from_slice(b".\r\n");
                 out
             }
-            None => "-ERR no such message\r\n".into(),
+            None => b"-ERR no such message\r\n".to_vec(),
         }
     }
 
-    fn top(&self, rest: &str) -> String {
+    fn top(&self, rest: &str) -> Vec<u8> {
         let mut it = rest.split_whitespace();
         let num = it.next().unwrap_or("");
         let lines: usize = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -255,15 +266,15 @@ impl<S: MailStore, A: Authenticator> Pop3Session<S, A> {
             Some((_, slot)) => {
                 let (headers, body) = crate::mime::header_and_body(&slot.raw);
                 let mut top = headers;
-                for l in String::from_utf8_lossy(&body).split_inclusive('\n').take(lines) {
-                    top.extend_from_slice(l.as_bytes());
+                for l in body.split_inclusive(|&b| b == b'\n').take(lines) {
+                    top.extend_from_slice(l);
                 }
-                let mut out = String::from("+OK\r\n");
-                out.push_str(&dot_stuff(&top));
-                out.push_str(".\r\n");
+                let mut out = b"+OK\r\n".to_vec();
+                out.extend_from_slice(&dot_stuff(&top));
+                out.extend_from_slice(b".\r\n");
                 out
             }
-            None => "-ERR no such message\r\n".into(),
+            None => b"-ERR no such message\r\n".to_vec(),
         }
     }
 
@@ -321,17 +332,19 @@ impl<S: MailStore, A: Authenticator> Pop3Session<S, A> {
 }
 
 /// RFC 1939 §3 byte-stuffing: lines beginning with `.` get an extra leading `.`.
-fn dot_stuff(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let mut out = String::new();
-    for line in text.split_inclusive('\n') {
-        if line.starts_with('.') {
-            out.push('.');
+fn dot_stuff(raw: &[u8]) -> Vec<u8> {
+    // Operates on raw bytes: stuffing is a per-line ASCII `.` check, so the stored message —
+    // including any 8-bit ISO-8859-x/GB18030 content — passes through byte-exact (a UTF-8-lossy
+    // pass here would silently corrupt every non-UTF-8 legacy message a client downloads).
+    let mut out = Vec::with_capacity(raw.len() + 2);
+    for line in raw.split_inclusive(|&b| b == b'\n') {
+        if line.first() == Some(&b'.') {
+            out.push(b'.');
         }
-        out.push_str(line);
+        out.extend_from_slice(line);
     }
-    if !out.ends_with('\n') {
-        out.push_str("\r\n");
+    if out.last() != Some(&b'\n') {
+        out.extend_from_slice(b"\r\n");
     }
     out
 }
@@ -383,6 +396,30 @@ mod tests {
         let bad = "0".repeat(good.len());
         assert!(s.feed_line(&format!("APOP alice {bad}")).contains("digest mismatch"));
         assert!(!s.is_authenticated());
+    }
+
+    #[test]
+    fn retr_delivers_eight_bit_message_byte_exact() {
+        // A stored 8-bit (ISO-8859-1) message must reach the client byte-for-byte via the raw
+        // reply path — the String `feed_line` form would U+FFFD every non-UTF-8 byte.
+        let mut store = MemoryStore::empty();
+        let raw: &[u8] = b"Subject: Gr\xfc\xdfe\r\n\r\nM\xfcnchen ist sch\xf6n\r\n";
+        store.deliver_raw("INBOX", raw.to_vec(), vec![], 0);
+        let mut auth = StaticAuthenticator::new();
+        auth.issue("alice", "pw", vec![1], "test");
+        let mut s = Pop3Session::new(store, auth, true);
+        s.feed_line("USER alice");
+        s.feed_line("PASS pw");
+        let reply = s.feed_line_raw("RETR 1");
+        assert!(
+            reply.windows(raw.len()).any(|w| w == raw),
+            "8-bit message bytes must appear unmodified in the RETR reply"
+        );
+        assert!(!reply.windows(3).any(|w| w == "\u{FFFD}".as_bytes()), "no replacement chars");
+        // TOP keeps the 8-bit header bytes intact too.
+        let top = s.feed_line_raw("TOP 1 1");
+        let needle: &[u8] = b"Gr\xfc\xdfe";
+        assert!(top.windows(needle.len()).any(|w| w == needle), "TOP must keep raw header bytes");
     }
 
     #[test]

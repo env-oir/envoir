@@ -1477,7 +1477,10 @@ fn parse_date_ymd(date: &str) -> Option<(i64, i64, i64)> {
 /// The RFC 5256 "base subject": the subject lowercased with leading `Re:`/`Fwd:` and surrounding
 /// whitespace stripped, so a reply threads/sorts next to its parent.
 fn base_subject(m: &Message) -> String {
-    let raw = m.parsed_cached().header("Subject").unwrap_or("").to_ascii_lowercase();
+    // Decode RFC 2047 first (an encoded reply must thread next to its plain parent), and lowercase
+    // with full Unicode folding — ASCII-only lowercasing sorts every non-English subject wrong.
+    let raw = mime::decode_encoded_words(m.parsed_cached().header("Subject").unwrap_or(""))
+        .to_lowercase();
     let mut s = raw.trim().to_string();
     loop {
         let t = s.trim_start();
@@ -1498,13 +1501,13 @@ fn base_subject(m: &Message) -> String {
 fn addr_sort_key(m: &Message, header: &str, display: bool) -> String {
     let addrs = m.parsed_cached().addresses(header);
     match addrs.first() {
-        Some(a) if display => a
-            .name
-            .clone()
-            .or_else(|| a.mailbox.clone())
-            .unwrap_or_default()
-            .to_ascii_lowercase(),
-        Some(a) => a.mailbox.clone().unwrap_or_default().to_ascii_lowercase(),
+        // DISPLAY sort keys are the *rendered* name: RFC 2047-decode it (RFC 5957 sorts what the
+        // user reads, not the wire spelling) and Unicode-lowercase for a language-blind order.
+        Some(a) if display => mime::decode_encoded_words(
+            a.name.as_deref().or(a.mailbox.as_deref()).unwrap_or_default(),
+        )
+        .to_lowercase(),
+        Some(a) => a.mailbox.clone().unwrap_or_default().to_lowercase(),
         None => String::new(),
     }
 }

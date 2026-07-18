@@ -258,9 +258,13 @@ pub fn eval_saved(key: &SearchKey, c: &SearchCtx, saved_uids: &[u32]) -> bool {
         Cc(v) => hdr_contains(c, "Cc", v),
         Bcc(v) => hdr_contains(c, "Bcc", v),
         Subject(v) => hdr_contains(c, "Subject", v),
-        Header(f, v) => c.parsed().header(f).map(|h| icontains(h, v)).unwrap_or(v.is_empty()),
+        Header(f, v) => c
+            .parsed()
+            .header(f)
+            .map(|h| icontains(&mime::decode_encoded_words(h), v))
+            .unwrap_or(v.is_empty()),
         Body(v) => body_contains(c, v),
-        Text(v) => icontains(&String::from_utf8_lossy(&c.msg.raw), v),
+        Text(v) => text_contains(c, v),
         Larger(n) => c.msg.size() > *n,
         Smaller(n) => c.msg.size() < *n,
         Uid(set) => set.contains(c.uid, c.max_uid),
@@ -280,18 +284,42 @@ fn has(c: &SearchCtx, f: &Flag) -> bool {
 }
 
 fn hdr_contains(c: &SearchCtx, name: &str, needle: &str) -> bool {
-    c.parsed().header(name).map(|h| icontains(h, needle)).unwrap_or(false)
+    // Match against the RFC-2047-DECODED value: users search for "München", the wire header says
+    // `=?UTF-8?B?TcO8bmNoZW4=?=` — searching the encoded form would miss every non-English sender.
+    c.parsed()
+        .header(name)
+        .map(|h| icontains(&mime::decode_encoded_words(h), needle))
+        .unwrap_or(false)
 }
 
 fn body_contains(c: &SearchCtx, needle: &str) -> bool {
-    icontains(&String::from_utf8_lossy(&c.parsed().body), needle)
+    // Search the same CTE+charset-decoded text a user sees (a base64 body must match its words,
+    // not its base64 spelling).
+    icontains(&mime::decoded_body_text(c.parsed()).0, needle)
+}
+
+/// TEXT (RFC 9051): header + body. Both sides in their user-visible (decoded) form, so TEXT is
+/// consistent with SUBJECT/FROM/BODY rather than matching raw transfer encodings.
+fn text_contains(c: &SearchCtx, needle: &str) -> bool {
+    let p = c.parsed();
+    let mut hay = String::new();
+    for (name, val) in &p.headers {
+        hay.push_str(name);
+        hay.push_str(": ");
+        hay.push_str(&mime::decode_encoded_words(val));
+        hay.push('\n');
+    }
+    hay.push_str(&mime::decoded_body_text(p).0);
+    icontains(&hay, needle)
 }
 
 fn icontains(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    // Full Unicode case folding via std (`char::to_lowercase` under `str::to_lowercase`) — ASCII
+    // lowercasing makes case-insensitivity English-only ("алиса" would never match "Алиса").
+    haystack.to_lowercase().contains(&needle.to_lowercase())
 }
 
 /// Parse an IMAP `date` (`d-Mon-yyyy`, e.g. `15-Jul-2026`) into (year, month, day).
@@ -380,5 +408,56 @@ mod tests {
         assert!(eval(&key("SINCE 1-Jan-2020"), &ctx));
         assert!(eval(&key("BEFORE 1-Jan-2030"), &ctx));
         assert!(!eval(&key("LARGER 100000"), &ctx));
+    }
+
+    /// Build a search key with a literal (non-tokenizer-safe) argument.
+    fn subject_key(needle: &str) -> SearchKey {
+        SearchKey::Subject(needle.to_string())
+    }
+
+    #[test]
+    fn unicode_case_insensitive_matching() {
+        // Searching "алиса" must find "Алиса" — ASCII lowercasing is English-only.
+        let raw = "From: Алиса <alice@example.ru>\r\nSubject: Отчёт за Июль\r\n\r\nПривет, Боб\r\n"
+            .as_bytes()
+            .to_vec();
+        let msg = Message::new(1, vec![], 1_752_537_600_000, 1, raw);
+        let ctx = SearchCtx::new(1, 1, 1, 1, &msg);
+        assert!(eval(&SearchKey::From("алиса".into()), &ctx));
+        assert!(eval(&subject_key("отчёт"), &ctx));
+        assert!(eval(&SearchKey::Body("привет".into()), &ctx));
+        assert!(eval(&SearchKey::Text("боб".into()), &ctx));
+        assert!(!eval(&subject_key("август"), &ctx));
+    }
+
+    #[test]
+    fn search_matches_rfc2047_decoded_headers() {
+        // The wire says `=?UTF-8?B?…?=`; the user searches for what they read.
+        let raw = b"From: =?UTF-8?B?0JDQu9C40YHQsA==?= <alice@example.ru>\r\n\
+                    Subject: =?ISO-8859-1?Q?Gr=FC=DFe_aus_M=FCnchen?=\r\n\r\nbody\r\n"
+            .to_vec();
+        let msg = Message::new(1, vec![], 1_752_537_600_000, 1, raw);
+        let ctx = SearchCtx::new(1, 1, 1, 1, &msg);
+        assert!(eval(&subject_key("münchen"), &ctx));
+        assert!(eval(&subject_key("grüße"), &ctx));
+        assert!(eval(&SearchKey::From("алиса".into()), &ctx));
+        assert!(eval(&SearchKey::Header("Subject".into(), "münchen".into()), &ctx));
+        // TEXT covers decoded headers too.
+        assert!(eval(&SearchKey::Text("алиса".into()), &ctx));
+        // The raw encoded spelling is NOT what users see; it no longer needs to match.
+        assert!(!eval(&subject_key("Gr=FC=DFe"), &ctx));
+    }
+
+    #[test]
+    fn search_matches_cte_decoded_body() {
+        // "Привет, мир!" as base64 — BODY/TEXT match the decoded words, not the base64 blob.
+        let raw = b"Subject: x\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                    Content-Transfer-Encoding: base64\r\n\r\n0J/RgNC40LLQtdGCLCDQvNC40YAh\r\n"
+            .to_vec();
+        let msg = Message::new(1, vec![], 1_752_537_600_000, 1, raw);
+        let ctx = SearchCtx::new(1, 1, 1, 1, &msg);
+        assert!(eval(&SearchKey::Body("мир".into()), &ctx));
+        assert!(eval(&SearchKey::Text("привет".into()), &ctx));
+        assert!(!eval(&SearchKey::Body("0J/RgNC4".into()), &ctx));
     }
 }

@@ -164,16 +164,20 @@ where
             let mut writer = stream;
             let _ = writer.write_all(session.greeting().as_bytes());
             let _ = writer.flush();
-            let mut line = String::new();
+            // Byte-based line loop: `read_line` would *error out* the whole connection on any
+            // non-UTF-8 byte. Commands are ASCII, so the lossy decode below never alters a valid
+            // command, and RETR/TOP replies go out via `feed_line_raw` byte-exact.
+            let mut line: Vec<u8> = Vec::new();
             loop {
                 line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                if reader.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
                     break;
                 }
-                let cmd = line.trim_end_matches(['\r', '\n']);
+                strip_crlf(&mut line);
+                let cmd = String::from_utf8_lossy(&line).into_owned();
                 let quit = cmd.eq_ignore_ascii_case("QUIT");
-                let resp = session.feed_line(cmd);
-                if writer.write_all(resp.as_bytes()).is_err() {
+                let resp = session.feed_line_raw(&cmd);
+                if writer.write_all(&resp).is_err() {
                     break;
                 }
                 let _ = writer.flush();
@@ -202,15 +206,19 @@ where
             let mut writer = stream;
             let _ = writer.write_all(session.greeting().as_bytes());
             let _ = writer.flush();
-            let mut line = String::new();
+            // DATA must be carried as raw bytes end-to-end: we advertise 8BITMIME, and the old
+            // `read_line` path *refused the connection* at the first non-UTF-8 byte (and any
+            // lossy variant corrupts ISO-8859-x/GB18030/Shift_JIS bodies to U+FFFD before the
+            // parser ever sees them). `read_until` + `feed_line_bytes` is lossless.
+            let mut line: Vec<u8> = Vec::new();
             loop {
                 line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                if reader.read_until(b'\n', &mut line).unwrap_or(0) == 0 {
                     break;
                 }
-                let cmd = line.trim_end_matches(['\r', '\n']);
-                let quit = cmd.eq_ignore_ascii_case("QUIT");
-                let resp = session.feed_line(cmd);
+                strip_crlf(&mut line);
+                let quit = line.eq_ignore_ascii_case(b"QUIT");
+                let resp = session.feed_line_bytes(&line);
                 if !resp.is_empty() && writer.write_all(resp.as_bytes()).is_err() {
                     break;
                 }
@@ -222,6 +230,18 @@ where
         });
     }
     Ok(())
+}
+
+/// Remove one trailing CRLF (or bare LF) in place — the byte-level equivalent of the old
+/// `trim_end_matches(['\r','\n'])`, restricted to a single terminator so a line legitimately
+/// ending in `\r` bytes deeper in DATA content is not over-trimmed.
+fn strip_crlf(line: &mut Vec<u8>) {
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    }
 }
 
 #[cfg(test)]
