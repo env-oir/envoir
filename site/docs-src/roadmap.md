@@ -46,9 +46,9 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v1 key-transparency hardening** (federated multi-log gossip, quorum-audited bindings,
   equivocation halt) — v0's single-log, TOFU+pinning model is what's implemented; see
   [privacy.md](privacy.md#what-this-project-does-not-claim).
-- **8 of 124 conformance cases** carry an exact construction recipe and expected error code but
-  aren't yet executed here (mostly mixnet, MLS handshake bytes, and auth subsystems not yet reduced
-  to a fixed-input known-answer test) — see [security.md](security.md#conformance-suite).
+- **40 of 157 conformance cases** aren't yet executed here (mixnet, MLS handshake bytes, auth,
+  and the spec's new §22/§23 public-objects suite — 12 of those are listed gaps pending a
+  public-objects implementation) — see [security.md](security.md#conformance-suite).
 - **Real TLS, JMAP push transport, and DEFLATE compression** in the mail-protocol layer —
   explicitly out of scope for the std-only protocol core, deferred to the node binary's transport
   layer.

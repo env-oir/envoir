@@ -89,8 +89,20 @@ fn suite_json_cross_reference_matches_known_state() {
     // `DMTAP-SUITE-02` to a reserved-suite `suite_accept_0x03` decode (0x03 is a registered reserved
     // code point — AES-256-GCM AEAD-diverse PQ-hybrid, §1.1/§21.15 — that DECODES as a known id but
     // fails closed on *use*) and added `DMTAP-SUITE-07`/`suite_reject_0x04` for the still-
-    // unregistered 0x04, matching this crate's `vectors.json`. No known gaps remain.
-    let expected_gap_ids: Vec<&str> = vec![];
+    // unregistered 0x04, matching this crate's `vectors.json`.
+    //
+    // KNOWN GAPS (2026-07-18): the spec repo added §22 "public objects" + the §23 CAD artifact
+    // profile with 21 new DMTAP-PUB cases. The 12 `vectored` ones reference `pub_*` vectors this
+    // crate cannot generate yet — no crate in this workspace implements §22 (public manifests,
+    // pub_announce, feeds) — so they are honest, listed gaps rather than silent skips. The 8
+    // `construction-todo` PUB cases skip with per-case reasons and the 1 `manual-attestation`
+    // case skips by status. Closing these means implementing §22 in dmtap-core and regenerating
+    // vectors.json.
+    let expected_gap_ids: Vec<&str> = vec![
+        "DMTAP-PUB-01", "DMTAP-PUB-02", "DMTAP-PUB-03", "DMTAP-PUB-04", "DMTAP-PUB-05",
+        "DMTAP-PUB-06", "DMTAP-PUB-07", "DMTAP-PUB-08", "DMTAP-PUB-13", "DMTAP-PUB-14",
+        "DMTAP-PUB-15", "DMTAP-PUB-16",
+    ];
     let actual_gap_ids: Vec<&str> = fails.iter().map(|(id, _)| id.as_str()).collect();
     let mut sorted_actual = actual_gap_ids.clone();
     sorted_actual.sort_unstable();

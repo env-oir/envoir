@@ -84,21 +84,23 @@ ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the sam
 machine-readable data (`suite.json`), and byte-exact known-answer vectors
 (`vectors/vectors.json`).
 
-- **124 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
-  Clients, Auth) — mirrored against the spec's own catalog of **132 registered error codes**
+- **157 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
+  Clients, Auth, Public Objects) — mirrored against the spec's registered error-code catalog
   (§21.3–§21.11).
-- **116 execute and pass today** — 67 backed by committed byte-exact vectors (content addressing,
+- **117 execute and pass today** — 68 backed by committed byte-exact vectors (content addressing,
   the key-name checksum, safety numbers, Ed25519 sign/verify with two RFC 8032 cross-checks,
   canonical CBOR of the four core signed objects, suite fail-closed behavior, and the MOTE
-  content-address + signature validation order) plus 49 more exercised directly against
+  content-address + signature validation order) plus the rest exercised directly against
   `dmtap-core`'s (and `dmtap-naming`'s) public API — including the pluggable resolver-type
   dispatch, the `name-chain` bidirectional-binding guardrail, and canonical-CBOR's rejection of
   non-shortest integers, indefinite-length items, and out-of-order map keys. Zero failures.
-- **8 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
+- **28 are skipped with a documented, per-case reason** — an exact pointer to what's missing (e.g.
   "no Profile/avatar module in `dmtap-core`," "TOFU-pin comparison is caller policy") rather than
   a silent gap — covering mixnet freshness/replay and cover-traffic cases, MLS/group handshake
-  bytes, and client/organization cases not yet reduced to a fixed-input known-answer test in this
-  crate. `cargo run -p conformance-runner` prints every skip and its reason verbatim.
+  bytes, client/organization cases, and the §22/§23 public-objects construction recipes not yet
+  reduced to a fixed-input known-answer test in this workspace; **12 more are honest, listed
+  gaps**: the spec's new §22 `vectored` cases, blocked on a public-objects implementation in
+  `dmtap-core`. `cargo run -p conformance-runner` prints every skip and its reason verbatim.
 
 [`crates/conformance-runner`](../crates/conformance-runner) is the reference runner: it drives the
 vector-dispatch loop plus a **drift guard** that fails the build if the committed vectors and what

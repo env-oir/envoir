@@ -564,6 +564,14 @@ pub fn run_suite_case(case: &SuiteCase, results: &BTreeMap<String, Verdict>) -> 
         "construction-todo" => construction::run_construction_case(case),
         "vectored" => run_vectored_case(case, results),
         "self-contained" => run_self_contained_case(case),
+        // §22.7-style client-UX/process MUSTs with no wire bytes to recompute (the suite defines
+        // this status as "verified by implementer/reviewer attestation, not by a byte-level
+        // runner") — honestly skipped here, never counted as executed.
+        "manual-attestation" => CaseOutcome::Skipped(
+            "suite.json marks this case `manual-attestation`: a process/UX MUST verified by \
+             implementer attestation, with no bytes for a runner to recompute"
+                .into(),
+        ),
         other => CaseOutcome::Fail(format!("unknown suite.json status `{other}`")),
     }
 }

@@ -52,8 +52,8 @@ quantified version of this answer; don't trust a shorter one, including this one
 **Is this audited?**
 Not yet. Six machine-checked ProVerif models cover the deniable-1:1 handshake, DMTAP-Auth
 sign-in, MLS group keys, key-transparency append-only logs, and mixnet unlinkability; every wire
-decoder is fuzzed; a 124-case conformance suite exists (drawn against the spec's own catalog of
-132 registered error codes), with 116 cases executing and passing today; and
+decoder is fuzzed; a 157-case conformance suite exists (drawn against the spec's own registered
+error-code catalog), with 117 cases executing and passing today; and
 `cargo test --workspace` runs 771 passing tests — but none of that substitutes for the independent
 external audit the project treats as a hard gate before any production deployment. See
 [security.md](security.md).
