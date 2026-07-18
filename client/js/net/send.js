@@ -16,7 +16,8 @@
 //
 // The transport (SendClient) is DELIBERATELY DOM-FREE and state-free — it depends only on `fetch` —
 // so it smoke-tests under Node against a mock emitting the node's exact wire shapes, exactly like
-// net/jmap.js. The app-facing `sendMail()` / `sendMode()` helpers below read the saved node config.
+// net/jmap.js (client/test/net.test.mjs, run via `npm run test:client`). The app-facing
+// `sendMail()` / `sendMode()` helpers below read the saved node config.
 
 import { state, resolveNodeConfig } from '../store.js';
 

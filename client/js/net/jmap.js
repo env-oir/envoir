@@ -7,8 +7,9 @@
 //
 // DELIBERATELY DOM-FREE. This module depends only on `fetch`, `TextEncoder`, and a base64
 // primitive — no `document`, no `localStorage`, no app state — so it runs unchanged in the
-// browser, in a Tauri shell, and under Node (which is how it is smoke-tested against a live
-// node). Everything app-facing (state, mapping to the UI's thread shape, mode switching) lives
+// browser, in a Tauri shell, and under Node, where it is smoke-tested against mocks emitting
+// the node's exact wire shapes (client/test/net.test.mjs, run via `npm run test:client`).
+// Everything app-facing (state, mapping to the UI's thread shape, mode switching) lives
 // one layer up in net/sync.js.
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:4700';

@@ -5,6 +5,7 @@
   "description": "Envoir monorepo tooling. See docs/SCREENSHOTS.md for the screenshotter.",
   "type": "module",
   "scripts": {
-    "screenshotter": "node docs/capture-screenshots.mjs"
+    "screenshotter": "node docs/capture-screenshots.mjs",
+    "test:client": "node --test 'client/test/**/*.test.mjs'"
   }
 }
