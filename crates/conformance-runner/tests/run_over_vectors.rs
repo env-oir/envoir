@@ -199,7 +199,7 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
         executed.len() >= 77,
         "expected at least 77 construction-todo cases to be actually executed (against dmtap-core \
          directly, plus more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/dmtap-clustersync/ \
-         envoir-gateway — see the Cargo.toml comment; this floor rose from 72 when the suite- \
+         envoir-gateway — see the Cargo.toml comment; this floor rose from 71 when the suite- \
          negotiation, tier-enforcement, mix-descriptor-freshness, pinned-domain-directory and \
          random-mode gateway-alias cases were wired), got {} ({executed:?}) — did \
          construction::run_construction_case regress?",

@@ -15,7 +15,7 @@
 # `envoir-gateway` binary (gateway/src/main.rs) with no invented flags or features.
 #
 # Builder pin: see deploy/Dockerfile.node for why 1.90 (not the crates' declared rust-version
-# 1.75) — with no Cargo.lock committed upstream, cargo resolves a transitive dep
+# 1.75) — the committed workspace Cargo.lock (repo root, copied in below) pins a transitive dep
 # (`zeroize_derive`) that needs the edition2024 feature (stable since 1.85); 1.90-slim-bookworm
 # was verified end-to-end with `docker build`.
 
@@ -25,13 +25,16 @@ WORKDIR /src
 # See Dockerfile.node for why every one of these paths is required even though only the
 # gateway's own dependency subset (dmtap-core, dmtap-mail, plus its TLS/DKIM deps) gets compiled.
 COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 COPY node ./node
 COPY gateway ./gateway
 COPY crates ./crates
 COPY integration ./integration
 
-# No Cargo.lock is committed upstream — see deploy/README.md.
-RUN cargo build --release -p envoir-gateway
+# --locked: the root Cargo.lock is the workspace's authoritative, tested dependency resolution
+# (gateway/Dockerfile builds with it too) — fail the build rather than silently re-resolving, so
+# the image can never drift from the dependency set the test suite ran against.
+RUN cargo build --release --locked -p envoir-gateway
 
 # ---------------------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

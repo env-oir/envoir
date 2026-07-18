@@ -21,7 +21,11 @@
 //! 5. Creates the main window with an initialization script that injects `window.__ENVOIR_NODE__`
 //!    — the exact shape `client/js/store.js::resolveNodeConfig()` reads — so `js/net/sync.js`
 //!    auto-connects in REAL mode, with real send, with no user configuration.
-//! 6. Kills the sidecar on app exit (`RunEvent::Exit`).
+//! 6. Guarantees the sidecar never outlives the app via three layered mechanisms (see
+//!    [`NODE_CHILD`] for why each exists and exactly which exit path it covers): an explicit kill
+//!    on `RunEvent::Exit` (normal quit), a panic hook that kills-then-aborts (setup failure / any
+//!    panic), and stdin-EOF supervision (`ENVOIR_SUPERVISED=1`) as the kernel-level backstop for
+//!    paths where no in-process code can run at all (SIGKILL, hard crash).
 //!
 //! The node's JMAP listener is loopback-bound and app-password gated; a small CORS allowance on that
 //! listener (see `node/src/jmap_api.rs`) lets the `tauri://` webview origin reach it. CORS is not the
@@ -61,19 +65,69 @@ const SEND_TOKEN_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// Per-request socket budget (connect + read + write) for the one-shot loopback HTTP calls.
 const SEND_API_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Holds the running sidecar child so it can be killed on exit.
-#[derive(Default)]
-struct NodeProcess(Mutex<Option<CommandChild>>);
+/// Holds the running sidecar child so it can be killed from any teardown path.
+///
+/// This is a process-global (not Tauri managed state) **on purpose** — a `Drop`-based guard in
+/// `app.manage(...)` state provably never runs, on ANY exit path, in the versions we build
+/// against, so it cannot be the kill mechanism:
+///   - tauri-plugin-shell 2.3.5 does `app.manage(Shell { app: AppHandle, .. })`, which is a strong
+///     Arc cycle (`AppManager → StateManager → Shell → AppHandle → AppManager`) — managed state is
+///     never dropped even when the `App` unwinds cleanly;
+///   - on the normal-exit path tao's `EventLoop::run` ends in `std::process::exit`, which skips
+///     every destructor anyway (tauri 2.11.5 emits `RunEvent::Exit` from the event-loop callback
+///     just before that — the ONLY reliable in-process hook on a normal quit).
+///
+/// Holding the child here is load-bearing twice over:
+///   1. **kill capability** for the two in-process teardown paths (`RunEvent::Exit`, panic hook);
+///   2. **stdin supervision**: tauri-plugin-shell always spawns sidecars with a *piped* stdin
+///      (`process/mod.rs`: `pipe()`; the read end becomes the child's fd 0) and the CommandChild
+///      owns the pipe's ONLY write end (`stdin_writer`; both ends are CLOEXEC, so no other child
+///      inherits a copy). Keeping the child alive for the whole app lifetime keeps the node's
+///      stdin open; the kernel closes it when this process dies *for any reason whatsoever* —
+///      including SIGKILL and hard crashes, where no in-process code can run — and the node, run
+///      with `ENVOIR_SUPERVISED=1` (see [`node_env`]), treats that EOF as "my supervisor is gone"
+///      and shuts down gracefully. That is the backstop layer no userspace mechanism can provide.
+static NODE_CHILD: Mutex<Option<CommandChild>> = Mutex::new(None);
+
+/// Kill the sidecar if it is still running. Idempotent, panic-free (a poisoned lock still yields
+/// the child — this must work *inside the panic hook*), and consuming: `CommandChild::kill` also
+/// drops the stdin write end, so even if the SIGKILL itself raced a PID reuse the node would see
+/// EOF and exit via the supervised path.
+fn kill_node() {
+    let child = NODE_CHILD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(child) = child {
+        let _ = child.kill();
+    }
+}
 
 /// Entry point invoked from `main.rs`.
 pub fn run() {
+    // Panic hook: kill the node, report the panic, then abort. This — not a Drop guard — is the
+    // panic-path cleanup, because Tauri's state teardown provably never drops managed state (see
+    // [`NODE_CHILD`]). In particular a setup failure (e.g. the window build in
+    // `start_node_and_window` failing AFTER the node was spawned) surfaces as tauri's own
+    // `panic!("Failed to setup app: ..")` inside the tao event-loop `Ready` callback — this hook
+    // is the only code guaranteed to run there. The trailing abort() is deliberate: it makes every
+    // panic fatal (no half-torn-down app lingering with its node already killed), and process
+    // death closes the sidecar's stdin write end, so the supervised-EOF backstop fires even if the
+    // kill itself failed.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        kill_node();
+        previous_hook(info); // keep the default panic report (message + backtrace)
+        std::process::abort();
+    }));
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(NodeProcess::default())
         .setup(|app| {
             let handle = app.handle().clone();
             if let Err(e) = start_node_and_window(&handle) {
                 // Fail loudly: without the node the client would silently fall back to SIMULATION.
+                // The Err makes tauri panic in its Ready handler → the hook above kills the node.
                 eprintln!("envoir-desktop: fatal — could not start the local node: {e}");
                 return Err(e);
             }
@@ -82,18 +136,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building the Envoir desktop app");
 
-    app.run(|app_handle, event| {
+    app.run(|_app_handle, event| {
         if let RunEvent::Exit = event {
-            // Kill the managed node so it never outlives the app (no orphaned loopback listener).
-            if let Some(child) = app_handle
-                .state::<NodeProcess>()
-                .0
-                .lock()
-                .expect("node process lock poisoned")
-                .take()
-            {
-                let _ = child.kill();
-            }
+            // Normal-quit path: kill the managed node so it never outlives the app. This cannot be
+            // left to destructors — tao follows this callback with std::process::exit (see
+            // [`NODE_CHILD`]), so this is the last in-process code that runs on a clean exit.
+            kill_node();
         }
     });
 }
@@ -119,12 +167,13 @@ fn start_node_and_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::erro
         run_node_init(app, &env)?;
     }
 
-    // Spawn the long-lived daemon and keep the child so we can kill it on exit.
+    // Spawn the long-lived daemon and park the child in the global holder: kill capability for
+    // exit/panic teardown AND the open stdin write end the supervised node watches for EOF (both
+    // documented at [`NODE_CHILD`] — do not drop this child early).
     let child = spawn_node_run(app, &env)?;
-    app.state::<NodeProcess>()
-        .0
+    NODE_CHILD
         .lock()
-        .expect("node process lock poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .replace(child);
 
     // Provision the send capability token (spec §13.5.1) against the just-spawned daemon: reuse the
@@ -170,6 +219,11 @@ fn node_env(node_dir: &Path, app_password: &str, send_admin_token: &str) -> Hash
     env.insert("ENVOIR_SEND_API".into(), "1".into());
     env.insert("ENVOIR_SEND_API_BIND".into(), SEND_API_BIND.into());
     env.insert("ENVOIR_SEND_ADMIN_TOKEN".into(), send_admin_token.into());
+    // Supervised mode: the node treats EOF on its (always-piped, see [`NODE_CHILD`]) stdin as
+    // "supervisor died — shut down gracefully". The kernel delivers that EOF on ANY death of this
+    // process, so this covers the paths where no desktop-side code can run (SIGKILL, hard crash).
+    // Harmless for the one-shot `init` run, which never reads stdin.
+    env.insert("ENVOIR_SUPERVISED".into(), "1".into());
     env
 }
 
@@ -238,11 +292,11 @@ fn provision_send_token(app_data: &Path, admin_token: &str) -> Option<String> {
                     eprintln!("envoir-desktop: /v1/keys returned 200 without a secret: {v}");
                     return None;
                 };
-                // Persist for the next launch's reuse attempt; a write failure is not fatal — the
-                // in-memory token still serves this run.
-                match std::fs::write(&token_path, secret) {
-                    Ok(()) => restrict_permissions(&token_path),
-                    Err(e) => eprintln!("envoir-desktop: could not persist the send token: {e}"),
+                // Persist for the next launch's reuse attempt (0600 from creation — see
+                // write_secret_file); a write failure is not fatal — the in-memory token still
+                // serves this run.
+                if let Err(e) = write_secret_file(&token_path, secret.as_bytes()) {
+                    eprintln!("envoir-desktop: could not persist the send token: {e}");
                 }
                 return Some(secret.to_string());
             }
@@ -313,6 +367,10 @@ fn parse_http_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
 }
 
 /// Run `envoir-node init` once and wait for it to finish, draining its output to the log.
+///
+/// The exit status is checked, not just awaited: a failed init means there is no keystore, and
+/// proceeding would spawn a keystore-less daemon that can never join the mesh — fail setup loudly
+/// instead (the caller treats any Err as fatal, see `run()`).
 fn run_node_init(
     app: &tauri::AppHandle,
     env: &HashMap<String, String>,
@@ -320,18 +378,33 @@ fn run_node_init(
     let cmd = app.shell().sidecar(SIDECAR)?.args(["init"]).envs(env.clone());
     let (mut rx, _child) = cmd.spawn()?;
     // Block until the init process terminates (setup() is synchronous; this is a one-shot).
-    tauri::async_runtime::block_on(async {
+    // `status` stays None only if the event channel closes without a Terminated event — treated as
+    // a failure below, since "unknown outcome" must not be promoted to "keystore exists".
+    let status = tauri::async_runtime::block_on(async {
+        let mut status: Option<Option<i32>> = None;
         while let Some(event) = rx.recv().await {
             match event {
                 CommandEvent::Stdout(line) | CommandEvent::Stderr(line) => {
                     log_node("init", &line);
                 }
-                CommandEvent::Terminated(_) => break,
+                CommandEvent::Terminated(payload) => {
+                    status = Some(payload.code);
+                    break;
+                }
                 _ => {}
             }
         }
+        status
     });
-    Ok(())
+    match status {
+        Some(Some(0)) => Ok(()),
+        Some(code) => {
+            // `code` is None when the process died to a signal (no exit code on unix).
+            let what = code.map_or_else(|| "killed by a signal".into(), |c| format!("exit code {c}"));
+            Err(format!("`envoir-node init` failed ({what}) — no identity keystore was created").into())
+        }
+        None => Err("`envoir-node init` ended without reporting an exit status".into()),
+    }
 }
 
 /// Spawn `envoir-node run` as the managed daemon, draining stdout/stderr to the log on a task.
@@ -366,19 +439,43 @@ fn log_node(phase: &str, line: &[u8]) {
 }
 
 /// Load a persisted secret from `path`, or generate a fresh 32-byte CSPRNG secret (base64url,
-/// unpadded), persist it (0600 on unix), and return it. Reused across restarts so the client's
-/// injected credentials stay stable.
+/// unpadded), persist it (0600 on unix, from creation — see [`write_secret_file`]), and return it.
+/// Reused across restarts so the client's injected credentials stay stable.
 fn load_or_create_secret(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim();
         if !trimmed.is_empty() {
+            // Reuse path: also tighten — a file created by an older build (post-hoc chmod) or
+            // hand-edited by the user may still carry group/other bits.
+            restrict_permissions(path);
             return Ok(trimmed.to_string());
         }
     }
     let secret = random_secret();
-    std::fs::write(path, &secret)?;
-    restrict_permissions(path);
+    write_secret_file(path, secret.as_bytes())?;
     Ok(secret)
+}
+
+/// Write a secret to `path` with owner-only permissions from the very first byte: on unix the
+/// 0600 mode is passed to `open(2)` itself (`OpenOptions::mode`), so there is no window where the
+/// file exists with default-umask (typically world-readable) permissions — the flaw of a
+/// write-then-chmod sequence. `mode()` only applies when the file is *created*; for the
+/// pre-existing-file case (e.g. an empty file left by an interrupted earlier run) the trailing
+/// [`restrict_permissions`] tightens it after the write. Non-unix keeps that same best-effort
+/// post-write tightening only.
+fn write_secret_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents)?;
+    restrict_permissions(path);
+    Ok(())
 }
 
 /// 32 random bytes from the OS CSPRNG, base64url-encoded without padding (URL/JS/Basic-auth safe).
@@ -464,6 +561,77 @@ mod tests {
         // Every bind is loopback — nothing exposed off the machine.
         assert!(env["ENVOIR_NODE_BIND"].starts_with("127.0.0.1"));
         assert!(env["ENVOIR_SEND_API_BIND"].starts_with("127.0.0.1"));
+        // Supervised mode is load-bearing for orphan prevention: it is what makes the node treat
+        // stdin EOF (kernel-delivered on ANY death of the desktop process, incl. SIGKILL) as a
+        // shutdown signal. See NODE_CHILD.
+        assert_eq!(env["ENVOIR_SUPERVISED"], "1");
+    }
+
+    /// Fresh per-test scratch dir (temp_dir + pid + test name keeps parallel tests apart).
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("envoir-desktop-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn secret_file_is_created_owner_only_and_reused() {
+        let path = test_dir("secret-create").join("app-password");
+        let first = load_or_create_secret(&path).unwrap();
+        assert_eq!(first.len(), 43); // fresh 32-byte CSPRNG secret
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600, "must be 0600 from creation, no umask window");
+        // Second load reuses (stable credentials across restarts), and stays tight.
+        assert_eq!(load_or_create_secret(&path).unwrap(), first);
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preexisting_loose_secret_is_reused_but_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        // A file from an older build (post-hoc chmod era) or a hand-edit may be world-readable:
+        // the reuse path must keep the value but close the permission hole.
+        let path = test_dir("secret-tighten").join("send-token");
+        std::fs::write(&path, "keep-this-value\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_or_create_secret(&path).unwrap(), "keep-this-value");
+        assert_eq!(mode_of(&path), 0o600, "reuse path must tighten pre-existing perms");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_secret_file_tightens_an_existing_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        // OpenOptions::mode only applies on create; overwriting an existing loose file (e.g. an
+        // empty one left by an interrupted run) must still end 0600 — the post-write tighten.
+        let path = test_dir("secret-overwrite").join("send-token");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        write_secret_file(&path, b"newsecret").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newsecret");
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn empty_preexisting_secret_file_is_replaced_with_a_fresh_secret() {
+        // An empty file (crash between create and write in some ancient run) must not yield an
+        // empty credential — it is treated as absent and regenerated.
+        let path = test_dir("secret-empty").join("app-password");
+        std::fs::write(&path, "  \n").unwrap();
+        let secret = load_or_create_secret(&path).unwrap();
+        assert_eq!(secret.len(), 43);
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600);
     }
 
     #[test]
