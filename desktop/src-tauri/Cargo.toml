@@ -1,0 +1,45 @@
+# Envoir desktop — a Tauri v2 app that bundles the Envoir static client (webview) and runs the
+# real `envoir-node` as a managed sidecar, so the whole node runs on the user's machine and the
+# client talks to it in REAL mode over the node's loopback JMAP surface (spec §8.1).
+#
+# This is its OWN workspace (the `[workspace]` table below): the Envoir monorepo Cargo workspace
+# (../../Cargo.toml) intentionally does NOT list `desktop/` as a member, so this crate declaring
+# itself a workspace root keeps the heavy Tauri/webview dependency graph out of the monorepo build
+# and `cargo test --workspace`. The sidecar binary it bundles is built from the monorepo
+# (`cargo build --release -p envoir-node`) and copied into `binaries/` — see README.md.
+[workspace]
+
+[package]
+name = "envoir-desktop"
+version = "0.1.0"
+description = "Envoir desktop — the sovereign client with a managed local node"
+edition = "2021"
+rust-version = "1.77"
+license = "MIT"
+
+[lib]
+# The app logic (sidecar lifecycle + config injection) lives in lib.rs::run(); main.rs calls it.
+# The staticlib/cdylib crate types keep the door open for `tauri android`/`ios` later; the desktop
+# binary uses the plain rlib.
+name = "envoir_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Cross-platform CSPRNG for the first-run app-password (32 random bytes → base64url).
+getrandom = "0.2"
+
+[features]
+# Present so `cargo tauri` can toggle it; no custom protocol config is needed here.
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

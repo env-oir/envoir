@@ -135,6 +135,16 @@ impl JmapApi {
     /// Route + serve one parsed request against the live `node`. The whole surface: auth gate first
     /// (fail-closed), then the JMAP routes over the node's live store. Synchronous + unit-testable.
     pub fn handle<T: Transport>(&self, node: &mut Node<T>, req: &HttpRequest) -> JmapResponse {
+        // CORS preflight (spec-neutral, transport concern): a browser/webview client on a different
+        // origin (a Tauri app is `tauri://localhost`) sends an `OPTIONS` preflight before the real
+        // `Authorization`-bearing request. Preflights **never** carry credentials — the browser strips
+        // the Authorization header — so this MUST be answered before the auth gate, and it is
+        // fail-safe to do so: this listener is loopback-only and every real route is still
+        // app-password gated, so CORS is not the security boundary — the app-password is. See
+        // [`JmapResponse`]'s CORS headers (added on every response).
+        if req.method.eq_ignore_ascii_case("OPTIONS") {
+            return JmapResponse::preflight();
+        }
         if !self.authorized(req) {
             return JmapResponse::unauthorized();
         }
@@ -279,6 +289,15 @@ impl JmapResponse {
         JmapResponse::json_value(status, value)
     }
 
+    /// A CORS preflight (`OPTIONS`) reply: `204 No Content` with an empty body. The permissive CORS
+    /// headers themselves are emitted by [`Self::header_block`] on **every** response, so a browser
+    /// client (a Tauri webview at `tauri://localhost`) may then issue its real, app-password
+    /// authenticated request. This is not an auth bypass: the preflight carries no credentials and
+    /// unlocks nothing — the subsequent request still passes the fail-closed auth gate.
+    fn preflight() -> Self {
+        JmapResponse::raw(204, "text/plain", Vec::new())
+    }
+
     /// The fail-closed `401` with a Basic challenge — every unauthenticated request lands here.
     fn unauthorized() -> Self {
         let mut r = JmapResponse::json(
@@ -289,8 +308,9 @@ impl JmapResponse {
         r
     }
 
-    /// Write this response as an HTTP/1.1 `Connection: close` reply.
-    async fn write(&self, stream: &mut TcpStream) -> io::Result<()> {
+    /// Build the HTTP/1.1 response head (status line + headers, terminated by the blank line). Split
+    /// out from [`Self::write`] so the CORS + auth headers are unit-testable without a socket.
+    fn header_block(&self) -> String {
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
             self.status,
@@ -298,11 +318,27 @@ impl JmapResponse {
             self.content_type,
             self.body.len(),
         );
+        // Permissive CORS for the loopback JMAP listener. `*` is correct and safe here: the client
+        // fetch sets `Authorization` explicitly rather than `credentials: 'include'`, so the request
+        // is NOT credentialed in the CORS sense and a wildcard origin is honoured. Security is
+        // unaffected — the listener is loopback-bound and every route is app-password gated (CORS is
+        // not the boundary). The preflight must advertise the `authorization`/`content-type` headers
+        // the JMAP client sends, else the browser blocks the real request.
+        head.push_str("Access-Control-Allow-Origin: *\r\n");
+        head.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        head.push_str("Access-Control-Allow-Headers: authorization, content-type, accept\r\n");
+        head.push_str("Access-Control-Max-Age: 600\r\n");
+        head.push_str("Vary: Origin\r\n");
         if self.www_authenticate {
             head.push_str("WWW-Authenticate: Basic realm=\"dmtap-jmap\"\r\n");
         }
         head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).await?;
+        head
+    }
+
+    /// Write this response as an HTTP/1.1 `Connection: close` reply.
+    async fn write(&self, stream: &mut TcpStream) -> io::Result<()> {
+        stream.write_all(self.header_block().as_bytes()).await?;
         stream.write_all(&self.body).await?;
         stream.flush().await
     }
@@ -555,6 +591,41 @@ mod tests {
         let a = api(&ik_pub);
         let r = a.handle(&mut node, &req("GET", "/jmap/bogus", Some(basic("user@dmtap.local", "app-pw")), json!({})));
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn options_preflight_is_answered_without_credentials() {
+        let (mut node, ik_pub) = node_with_mail();
+        let a = api(&ik_pub);
+        // A preflight carries NO Authorization header (the browser strips it) — it must still be
+        // answered (204), never a fail-closed 401, so the real authenticated request can follow.
+        let r = a.handle(&mut node, &req("OPTIONS", "/jmap/api/", None, json!({})));
+        assert_eq!(r.status, 204);
+        assert!(!r.www_authenticate, "a preflight is not an auth challenge");
+        assert!(r.body.is_empty());
+    }
+
+    #[test]
+    fn every_response_carries_permissive_cors_headers() {
+        let (mut node, ik_pub) = node_with_mail();
+        let a = api(&ik_pub);
+        // The preflight advertises the headers the JMAP client sends.
+        let pre = a.handle(&mut node, &req("OPTIONS", "/jmap/api/", None, json!({})));
+        let head = pre.header_block();
+        assert!(head.contains("Access-Control-Allow-Origin: *"));
+        assert!(head.to_ascii_lowercase().contains("access-control-allow-headers: authorization"));
+        assert!(head.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
+        // A real (authenticated) response ALSO carries the allow-origin header, else the browser
+        // discards the body.
+        let ok = a.handle(&mut node, &req("GET", "/jmap/session", Some(basic("user@dmtap.local", "app-pw")), json!({})));
+        assert_eq!(ok.status, 200);
+        assert!(ok.header_block().contains("Access-Control-Allow-Origin: *"));
+        // Even the 401 carries CORS (so the browser surfaces the status instead of a CORS error).
+        let no = a.handle(&mut node, &req("GET", "/jmap/session", None, json!({})));
+        assert_eq!(no.status, 401);
+        let nohead = no.header_block();
+        assert!(nohead.contains("Access-Control-Allow-Origin: *"));
+        assert!(nohead.contains("WWW-Authenticate: Basic"));
     }
 
     #[test]
