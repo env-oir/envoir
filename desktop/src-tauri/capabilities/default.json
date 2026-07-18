@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core webview access plus permission to spawn/kill the bundled envoir-node sidecar. The node is spawned from Rust (setup), so these scoped grants are defense-in-depth and document the sidecar contract.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-kill",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "envoir-node", "sidecar": true, "args": ["init"] },
+        { "name": "envoir-node", "sidecar": true, "args": ["run"] }
+      ]
+    }
+  ]
+}

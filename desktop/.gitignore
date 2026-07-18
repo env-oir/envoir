@@ -1,0 +1,7 @@
+# Build artifacts of the desktop app's own cargo workspace (not a monorepo member).
+src-tauri/target/
+# The bundled envoir-node sidecar is a build artifact, produced from the monorepo by
+# scripts/prepare-sidecar.sh (see README.md) — never committed.
+src-tauri/binaries/
+# Tauri regenerates the capability schemas on every build.
+src-tauri/gen/schemas/
