@@ -10,7 +10,7 @@
 //!
 //! Three are new in the substrate, completing the algebra:
 //!
-//! * [`PnCounter`] — positive/negative counter, per-author `P`/`N` maps joined by max (§4.6),
+//! * [`PnCounter`] — positive/negative counter, per-author op-id-keyed deltas joined by union (§4.6),
 //! * [`RgaSeq`] — replicated growable array: an ordered sequence with newer-first sibling order (§4.7),
 //! * [`Tree`] — cycle-safe movable tree, resolved by deterministic HLC-ordered replay (§4.8).
 //!
@@ -495,22 +495,27 @@ impl DeathReg {
 /// An author may only advance its **own** entries; a signed op from `a` that would mutate `P[b]` is
 /// `ERR_SYNC_COUNTER_FOREIGN` ([`check_counter_entry`]).
 ///
-/// ## Why the join is a per-author **union of op-ids**, not §4.6's literal per-author `max`
+/// ## The join is the per-author **union of op-ids** — normative since §4.6 C-01
 ///
-/// §4.6 specifies the merge as per-author `max` of `P` and `N` — the classical *state-based*
-/// PN-counter join, which is sound when `P[a]` is a cumulative value each replica derives from the
-/// **whole** of `a`'s op prefix. The substrate's op, however, carries a **delta** (§4.2 kind 5), so
+/// §4.6 originally specified the merge as per-author `max` of `P` and `N` (the classical
+/// *state-based* PN-counter join, sound only when `P[a]` is a cumulative value each replica derives
+/// from the **whole** of `a`'s op prefix). The substrate's op carries a **delta** (§4.2 kind 5), so
 /// two replicas can legitimately hold *different subsets* of one author's deltas (partition, sparse
-/// backfill, snapshot fast-join). Under `max` those two partial states merge to the larger subtotal
-/// and the other subset's deltas are **silently lost** — the merge would not be a join, and
+/// backfill, snapshot fast-join); under `max` those partial states merge to the larger subtotal and
+/// the other subset's deltas are **silently lost** — the merge is not a join, and
 /// `(A∪B)∪C ≠ A∪(B∪C)`.
 ///
-/// Keying each delta by its globally-unique `op-id` makes the merge a **set union**: commutative,
-/// associative, and idempotent, so a redelivered delta still cannot double-count (the property
-/// §4.6 wants from `max`) *and* no delta is lost when partial states merge. For any two replicas
-/// holding complete op sets — the case §4.6 describes — the two rules agree exactly on `P`, `N`,
-/// and the total, so this is a strictly stronger implementation of the same semantics, not a
-/// different CRDT.
+/// This implementation reported that, and §4.6 was corrected (`SYNC.md` §14 C-01) to specify
+/// exactly what is implemented here: state is per `(target, field)`, per author `a`, a map
+/// `D[a]: op-id → int`, with `P[a]`/`N[a]` **derived** as the sums of the positive deltas and the
+/// magnitudes of the negative ones, merged by per-author **union**. Associativity is now an
+/// explicit REQUIREMENT of the section. Keying each delta by its globally-unique `op-id` makes the
+/// merge a set union: commutative, associative and idempotent, so a redelivered delta cannot
+/// double-count and no delta is lost when partial states merge.
+///
+/// (`max` survives in one place: §4.6's compaction note reinstates it for the *below-stability-cut*
+/// aggregate, which is safe precisely because §6.2's cut gives the completeness guarantee `max`
+/// needs — every replica has seen every op below it.)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PnCounter {
     /// `(target, field)` → author → `op-id` → signed delta.
@@ -715,6 +720,12 @@ impl RgaSeq {
             .filter(|id| !self.tombstones.contains(id))
             .filter_map(|id| self.atoms.get(&id).map(|a| a.value.clone()))
             .collect()
+    }
+
+    /// The value of the atom named by `id`, tombstoned or not — the accessor needed to render the
+    /// full atom order (tombstones included) rather than only the live sequence.
+    pub fn atom_value(&self, id: &Hlc) -> Option<&SVal> {
+        self.atoms.get(id).map(|a| &a.value)
     }
 
     /// Whether `id` is tombstoned.

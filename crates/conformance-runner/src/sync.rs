@@ -511,12 +511,32 @@ fn rga_tombstone_origin(v: &Vector) -> Result<Verdict, String> {
         .collect();
     eq("visible_sequence", &visible, &want_visible)?;
 
-    // `atom_order_incl_tombstones` is a LABEL list, not bytes: it names two atoms — the tombstoned
-    // "x" and the live "Z". Its *membership* is checked here. Its stated sequence is not, because
-    // the same vector's own note says "Z sorts immediately after x's (tombstoned) position", which
-    // is the §4.7 insert-after rule and the opposite of the array's ["Z", "x(tombstoned)"] order.
-    // See the discrepancy note in tests/sync_vectors.rs; the implementation follows §4.7.
-    eq("atom count incl. tombstones", seq.order().len(), arr(&v.expected, "atom_order_incl_tombstones")?.len())?;
+    // `atom_order_incl_tombstones` is a human-readable LABEL list, not normative bytes (the vector
+    // now says so itself), and since SYNC.md §14 C-03 corrected it to ["x(tombstoned)", "Z"] it
+    // agrees with §4.7's insert-after rule and with the vector's own note — so it is asserted AS
+    // GIVEN rather than reduced to a length check. Labels are rendered from the actual atom order:
+    // each atom's value text, suffixed "(tombstoned)" when the atom is tombstoned.
+    let labels: Vec<String> = seq
+        .order()
+        .iter()
+        .map(|id| {
+            let text = seq
+                .atom_value(id)
+                .and_then(|v| v.as_text().map(str::to_string))
+                .unwrap_or_default();
+            if seq.is_tombstoned(id) {
+                format!("{text}(tombstoned)")
+            } else {
+                text
+            }
+        })
+        .collect();
+    let want_labels: Vec<String> = arr(&v.expected, "atom_order_incl_tombstones")?
+        .iter()
+        .map(|e| e.as_str().unwrap_or_default().to_string())
+        .collect();
+    eq("atom_order_incl_tombstones", &labels, &want_labels)?;
+    // …and the ids behind those labels are the two ops the vector supplied, in that order.
     let order = seq.order();
     eq("x precedes Z (§4.7 insert-after)", (order[0] == insert_x.hlc, order[1] == insert_y.hlc), (true, true))?;
     Ok(Verdict::Pass)

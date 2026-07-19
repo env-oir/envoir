@@ -46,20 +46,13 @@ pub mod sync;
 /// document and an implementation disagree, **the document governs**.
 ///
 /// Each entry is `(vector name, why it cannot pass as written)`.
-pub const SYNC_KNOWN_DISCREPANCIES: &[(&str, &str)] = &[(
-    "sync_pn_counter_convergence",
-    "SYNC-PN-01 expects P[A]=5 / total=3 after three ops, calling the third a \"replay of author \
-     A's own contribution\" — but that third op carries hlc.counter=1 where the first carries 0, \
-     so its det_cbor (and therefore its op-id, SYNC.md §4.1) DIFFERS: it is a distinct op, not a \
-     replay. §4.6 says a `counter` op's value is a signed delta and \"a positive delta d sets \
-     P[author] += d\", so two distinct +5 ops from A give P[A]=10 and total=8. The expectation \
-     holds only under a reading in which an op's value is the author's cumulative running total \
-     folded by max, which §4.2/§4.6 explicitly reject (\"value = signed delta\"). MINIMAL FIX in \
-     the dmtap repo: give the replayed op the SAME hlc as the first (counter 0) so it is genuinely \
-     the same op; the reference then reproduces P[A]=5, N[B]=2, total=3 exactly, because ingest \
-     dedups by op-id and a true replay is a no-op. The runner proves this: it applies the \
-     true-replay variant and asserts the vector's own expected P/N/total.",
-)];
+///
+/// **Currently empty.** Its one entry — `sync_pn_counter_convergence` (SYNC-PN-01, whose "replay"
+/// op carried a different HLC and was therefore a distinct op, not a replay) — was fixed upstream
+/// (`SYNC.md` §14 C-02) and removed here. The vector set is 20/20. The symmetric assertion in
+/// `tests/sync_vectors.rs` is what surfaced the fix: it fails when an allowlisted vector starts
+/// passing, so the allowlist cannot rot.
+pub const SYNC_KNOWN_DISCREPANCIES: &[(&str, &str)] = &[];
 
 use dmtap_core::capability::{CapabilityRevocation, CapabilityToken};
 use dmtap_core::cbor::{self, Cv};

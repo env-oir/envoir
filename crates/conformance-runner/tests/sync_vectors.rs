@@ -3,9 +3,11 @@
 //! the `dmtap-sync` reference crate.
 //!
 //! The counts are asserted **exactly**, in both directions: a regression in `dmtap-sync` fails
-//! here, and so does an upstream fix to the one vector whose committed expectation contradicts the
-//! specification text (that would make it pass, which this test also notices, so the allowlist
-//! entry gets removed rather than rotting).
+//! here, and so does an upstream *fix* to an allowlisted vector (that makes it pass, which this
+//! test also notices, so the allowlist cannot rot). That second direction has now fired for real:
+//! SYNC-PN-01 was corrected upstream (`SYNC.md` §14 C-02), this test failed because the
+//! allowlisted vector had started passing, and the entry was deleted. The allowlist is empty and
+//! all **20/20** vectors pass.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +17,8 @@ fn sync_vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/sync_vectors.json")
 }
 
-/// Every Sync vector except the documented spec/vector discrepancy passes byte-exactly.
+/// Every Sync vector passes byte-exactly (the discrepancy allowlist is currently empty, so this is
+/// a 20/20 assertion).
 #[test]
 fn sync_vectors_pass_except_the_documented_discrepancy() {
     let path = sync_vectors_path();
