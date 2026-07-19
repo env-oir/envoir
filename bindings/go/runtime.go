@@ -64,6 +64,7 @@ import (
 type Runtime struct {
 	rt       wazero.Runtime
 	compiled wazero.CompiledModule
+	cache    wazero.CompilationCache
 
 	mu     sync.Mutex
 	closed bool
@@ -71,22 +72,83 @@ type Runtime struct {
 	seq uint64
 }
 
+// Option configures a [Runtime]. See [WithCompilationCacheDir].
+type Option func(*options)
+
+type options struct {
+	cacheDir string
+}
+
+// WithCompilationCacheDir persists compiled machine code under dir, so a process that starts,
+// syncs and exits does not pay the compile again.
+//
+// # Which cost this removes, and which it does not
+//
+// New has two costs and they behave differently. Instantiating a Runtime from an already-compiled
+// module is ~90 µs and never worth caching. Compiling the ~420 KiB module to native code is a few
+// hundred milliseconds, once per process — invisible to a long-lived daemon, and the dominant cost
+// for anything invoked on demand.
+//
+// With a cache directory the second and later processes reuse the first one's output. Measured on
+// an M-series laptop across separate process launches, which is the case that matters — a
+// benchmark loop recompiling inside one process reports worse and less meaningful numbers:
+//
+//	no cache      205-424 ms   every process, every time
+//	cache, cold       195 ms   first process — the compile, plus writing it out
+//	cache, warm         9 ms   every process after that (~24x)
+//
+// So: a daemon (flowstock, syncing on a timer) can ignore this entirely — it compiles once at
+// startup and amortizes it over the process lifetime. A CLI or an on-demand path (the OS reaching
+// for sync when a user acts) should pass a cache dir, because there it is a fifth of a second on
+// the critical path of every single invocation.
+//
+// dir is created if it does not exist. wazero keys entries by module content and by its own
+// version, so a rebuilt engine or an upgraded wazero misses the cache rather than loading stale
+// code — the directory is a cache in the strict sense and is always safe to delete. Do not point
+// two products at one directory unless they are happy to share a filesystem lock.
+func WithCompilationCacheDir(dir string) Option {
+	return func(o *options) { o.cacheDir = dir }
+}
+
 // New compiles the embedded sync engine.
 //
 // The module is instantiated with no host functions, no WASI, no filesystem, no clock and no
 // network — it cannot reach anything outside its own linear memory, which is both a security
 // property worth having and the reason instantiation is as cheap as it is.
-func New(ctx context.Context) (*Runtime, error) {
+//
+// Compiling is the expensive step and is meant to happen once: hold the Runtime for the life of
+// the process and take an [Instance] per unit of work. If your process is short-lived, see
+// [WithCompilationCacheDir].
+func New(ctx context.Context, opts ...Option) (*Runtime, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// The interpreter is not chosen here: wazero picks its optimizing compiler on amd64/arm64 and
 	// falls back to the interpreter elsewhere, which is the right default. NewRuntimeConfig()
 	// keeps that choice.
-	rt := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfig().WithCloseOnContextDone(true))
+	cfg := wazero.NewRuntimeConfig().WithCloseOnContextDone(true)
+
+	var cache wazero.CompilationCache
+	if o.cacheDir != "" {
+		var err error
+		if cache, err = wazero.NewCompilationCacheWithDir(o.cacheDir); err != nil {
+			return nil, fmt.Errorf("dmtapsync: opening the compilation cache in %s: %w", o.cacheDir, err)
+		}
+		cfg = cfg.WithCompilationCache(cache)
+	}
+
+	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
 	compiled, err := rt.CompileModule(ctx, engineWasm)
 	if err != nil {
 		_ = rt.Close(ctx)
+		if cache != nil {
+			_ = cache.Close(ctx)
+		}
 		return nil, fmt.Errorf("dmtapsync: compiling the embedded engine: %w", err)
 	}
-	return &Runtime{rt: rt, compiled: compiled}, nil
+	return &Runtime{rt: rt, compiled: compiled, cache: cache}, nil
 }
 
 // Close releases the runtime and every instance created from it.
@@ -97,7 +159,16 @@ func (r *Runtime) Close(ctx context.Context) error {
 		return nil
 	}
 	r.closed = true
-	return r.rt.Close(ctx)
+	err := r.rt.Close(ctx)
+	// The cache is flushed after the runtime, so anything compiled during this process is on disk
+	// for the next one. Its error is reported only if the runtime itself closed cleanly — a
+	// failure to close the runtime is the more useful thing to surface.
+	if r.cache != nil {
+		if cerr := r.cache.Close(ctx); cerr != nil && err == nil {
+			err = fmt.Errorf("dmtapsync: closing the compilation cache: %w", cerr)
+		}
+	}
+	return err
 }
 
 // Instance creates an independent replica-side instance of the engine.
