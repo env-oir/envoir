@@ -221,7 +221,7 @@ functional standalone — the operator seam and any hosted operator are optional
 |---|---|
 | [`node/`](node) | **envoir-node** — the whole client side: identity, mailbox, mesh, messaging, files, and the IMAP/POP3/SMTP-submission/JMAP client servers |
 | [`gateway/`](gateway) | **envoir-gateway** — the optional legacy SMTP bridge; the only component that isn't content-blind; lives here by design, kept loosely coupled for a future split into its own repo (see [`gateway/SEPARATION.md`](gateway/SEPARATION.md)) |
-| [`crates/dmtap-core`](crates/dmtap-core) | Identity, MOTE, content addressing, canonical CBOR, delegated capability tokens — the shared primitives |
+| [`crates/dmtap-core`](crates/dmtap-core) | Identity, MOTE, content addressing, canonical CBOR, delegated capability tokens, DMTAP-PUB public objects (§22) + the CAD/artifact profile (§23) — the shared primitives |
 | [`crates/dmtap-auth`](crates/dmtap-auth) | DMTAP-Auth — decentralized, key-based sign-in |
 | [`crates/dmtap-deniable`](crates/dmtap-deniable) | Deniable 1:1 messaging (X3DH + Double Ratchet) |
 | [`crates/dmtap-mls`](crates/dmtap-mls) | MLS group messaging |
@@ -285,7 +285,7 @@ naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance
 registry of **132 error codes** (§21.3–§21.11), grounded against current standards, plus a
 compiled **`dmtap.pdf`**. This repo is one implementation of that spec; conformance is checked
 mechanically by [`crates/conformance-runner`](crates/conformance-runner) against the spec's own
-**124-case conformance catalog** — see [Security & honesty](#security--honesty).
+**157-case conformance catalog** — see [Security & honesty](#security--honesty).
 
 ## Security & honesty
 
@@ -299,8 +299,8 @@ machine-checked **ProVerif symbolic models** in [`formal/`](formal) (secrecy, mu
 authentication, forward secrecy, deniability, replay/origin-binding, post-compromise security,
 inclusion/no-rollback/split-view soundness — see its README for exact property statements and
 honest limitations); the wire-format
-decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **124-case conformance
-suite** runs 110 cases to a pass today (0 failures, the other 14 each skipped with a documented
+decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **157-case conformance
+suite** runs 148 cases to a pass today (0 failures, the other 9 each skipped with a documented
 reason) via [`crates/conformance-runner`](crates/conformance-runner); the node's anti-rollback/anti-abuse state
 survives a restart instead of resetting to a weaker baseline; and `cargo test --workspace` runs
 **771 passing tests**. [`integration/`](integration) adds dedicated adversarial tests on top. None

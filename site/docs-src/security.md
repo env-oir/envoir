@@ -76,14 +76,15 @@ machine-readable data (`suite.json`), and byte-exact known-answer vectors
 
 - **157 numbered cases** across the conformance levels (Core, Private, Groups & Files, Legacy,
   Clients, Auth, Public Objects).
-- **117 execute and pass today** — 68 backed by committed byte-exact vectors covering content
+- **148 execute and pass today** — 68 backed by committed byte-exact vectors covering content
   addressing, the 8-word key-name checksum, safety numbers, Ed25519 sign/verify (with two RFC 8032
   cross-checks), canonical CBOR of the four core signed objects, suite fail-closed behavior, and
-  the MOTE content-address + signature validation order — plus the rest exercised directly against
-  the reference crates' public API. Zero failures.
-- **28 are skipped with a documented, per-case reason** (mixnet, MLS, auth, and the new §22/§23
-  public-objects recipes), and **12 §22 `vectored` cases are honest, listed gaps** pending a
-  public-objects implementation — deferred honestly, not silently skipped.
+  the MOTE content-address + signature validation order, plus the full **§22 DMTAP-PUB / §23 CAD**
+  public-objects suite (recomputed from `dmtap_core::pubobj` + `dmtap_core::cad`) — plus the rest
+  exercised directly against the reference crates' public API. Zero failures.
+- **9 are skipped with a documented, per-case reason** (mixnet replay/cover-traffic, the MLS
+  committer-fork detector, MOTE↔JMAP mapping, the deniable session gate, and one §22.7 client-UX
+  attestation). There are **no listed gaps** — the previous 12 §22 `vectored` gaps are closed.
 
 [`crates/conformance-runner`](../crates/conformance-runner) is the reference runner: it drives the
 vector-dispatch loop plus a **drift guard** that fails the build if the committed vectors and what

@@ -46,9 +46,10 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v1 key-transparency hardening** (federated multi-log gossip, quorum-audited bindings,
   equivocation halt) — v0's single-log, TOFU+pinning model is what's implemented; see
   [privacy.md](privacy.md#what-this-project-does-not-claim).
-- **40 of 157 conformance cases** aren't yet executed here (mixnet, MLS handshake bytes, auth,
-  and the spec's new §22/§23 public-objects suite — 12 of those are listed gaps pending a
-  public-objects implementation) — see [security.md](security.md#conformance-suite).
+- **9 of 157 conformance cases** aren't yet executed here (mixnet, MLS committer forks, JMAP
+  mapping, the deniable session gate, and one §22.7 client-UX attestation) — with **no listed
+  gaps**: 148 executed / 157, 0 failures. The spec's §22/§23 public-objects suite is fully wired
+  (`dmtap_core::pubobj` + `dmtap_core::cad`). See [security.md](security.md#conformance-suite).
 - **Real TLS, JMAP push transport, and DEFLATE compression** in the mail-protocol layer —
   explicitly out of scope for the std-only protocol core, deferred to the node binary's transport
   layer.

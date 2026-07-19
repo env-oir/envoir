@@ -25,6 +25,7 @@ on the node.
 | `messaging`| §5 | MLS groups, prekeys/KeyPackages, chat, files (chunked blobs) |
 | `privacy`  | §6 | sealed sender, cover traffic, padding, privacy tiers |
 | `clients`  | §8.1 | JMAP — the node's native, and only, client surface (native-only, §8.5) |
+| `pubserve` | §22 | DMTAP-PUB gateway serving: the five well-known GET endpoints (feed head/range, announce, manifest, chunk) behind the `pub-1` operator opt-in, plus pin storage + author-feed publish/append |
 | `abuse`    | §9 | recipient policy, anonymous tokens, PoW, postage |
 | `store`    | §2,§5 | encrypted-at-rest mailbox + blob store + device-cluster CRDT |
 

@@ -84,11 +84,14 @@ the spec's own roadmap markers, it doesn't belong here.
 - **v1 key-transparency hardening** (federated multi-log gossip, quorum-audited bindings,
   equivocation halt) — v0's single-log, TOFU+pinning model is what's implemented; see
   [privacy.md](privacy.md#what-this-project-does-not-claim).
-- **40 of 157 conformance cases** aren't yet executed: 28 skip with documented per-case reasons
-  (mostly mixnet, MLS/group, and the new §22/§23 public-objects recipes not yet reduced to a
-  fixed-input known-answer test) and 12 §22 `vectored` cases are listed gaps pending a
-  public-objects implementation — the runner reports 0 failures across the 117 cases that do
-  execute. See [security.md](security.md#conformance-suite).
+- **9 of 157 conformance cases** aren't yet executed — all 9 skip with documented per-case reasons
+  (mixnet replay/active-attack, MLS committer forks, JMAP mapping, the deniable session gate, and
+  the one §22.7 client-UX MUST that is verified by implementer attestation rather than a byte-level
+  runner). There are **no listed gaps**: the runner reports 148 executed / 157 with 0 failures.
+  The **§22/§23 public-objects suite is fully wired** — the 12 previously-listed §22 `vectored`
+  gaps now pass (recomputed from the spec's `pub_vectors.json` via `dmtap_core::pubobj`), and the
+  §22 construction-todo and all 11 §23 CAD-profile cases execute against `dmtap_core::cad`. See
+  [security.md](security.md#conformance-suite).
 - **Envoir Send** — a Resend-style programmatic mail-sending API built on the delegated
   capability-token primitive (`crates/dmtap-core/src/capability.rs`, real and tested today) is the
   natural next application, but the dedicated send-service crate is not yet part of this
