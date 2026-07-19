@@ -29,6 +29,9 @@
 //! | `ENVOIR_JMAP_BASE_URL` | `jmap_base_url` | *(derived from `jmap_bind`)* |
 //! | `ENVOIR_PUB_SERVE`     | `pub_serve_enabled` | `false` (opt-in — the operator is choosing to make public objects readable by anyone, §22.6.1) |
 //! | `ENVOIR_PUB_BIND`      | `pub_bind`      | `0.0.0.0:4680` (public surface — unlike JMAP, meant to be reachable off-box) |
+//! | `ENVOIR_SYNC_SERVE`    | `sync_serve_enabled` | `false` (opt-in — the surface discloses and accepts replica ops, `SYNC.md` §5.4) |
+//! | `ENVOIR_SYNC_BIND`     | `sync_bind`     | `127.0.0.1:4690` (loopback — exposing a replica off-box is a deliberate choice) |
+//! | `ENVOIR_SYNC_NAMESPACES` | `sync_namespaces` | empty (the default namespace `""` only, `SYNC.md` §7) |
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,6 +52,9 @@ const DEFAULT_JMAP_BIND: &str = "127.0.0.1:4700";
 /// this surface is **meant** to be reached by other peers off-box (public reads are anonymous —
 /// §22.5.1), so it defaults to all-interfaces like the mesh/Send-API binds, not loopback.
 const DEFAULT_PUB_BIND: &str = "0.0.0.0:4680";
+/// Default bind for the Sync reconciliation surface — loopback, since exposing a replica's op set
+/// off-box is a deliberate operator decision (`substrate/SYNC.md` §5.4).
+const DEFAULT_SYNC_BIND: &str = "127.0.0.1:4690";
 
 /// Fully-resolved daemon configuration.
 #[derive(Debug, Clone)]
@@ -110,6 +116,20 @@ pub struct NodeConfig {
     /// Unlike JMAP this surface is meant to be reachable off-box (reads are anonymous, §22.5.1), so
     /// it defaults to all-interfaces rather than loopback.
     pub pub_bind: String,
+    /// Whether to serve the Sync-substrate reconciliation surface (`substrate/SYNC.md` §5.2/§5.3) —
+    /// version-vector exchange, op pull/push, and range-Merkle fingerprinting. **Off by default**:
+    /// the surface discloses a replica's whole op set and accepts pushes into it, so a node serves
+    /// it only when the operator opts in via `ENVOIR_SYNC_SERVE`. Peers additionally present a
+    /// `sync-1` capability per request (§5.4).
+    pub sync_serve_enabled: bool,
+    /// `host:port` the sync listener binds when [`sync_serve_enabled`](Self::sync_serve_enabled).
+    /// Defaults to loopback: unlike the anonymous public-object surface, reconciliation is a
+    /// peer-to-peer surface an operator should deliberately expose.
+    pub sync_bind: String,
+    /// The namespaces (§7 sparse sync) this node's replica subscribes to, from
+    /// `ENVOIR_SYNC_NAMESPACES` (comma-separated). Empty ⇒ the default namespace `""` only. An op
+    /// pushed into an unsubscribed namespace is refused (`ERR_SYNC_NS_LEAK`, `0x0A0A`).
+    pub sync_namespaces: Vec<String>,
 }
 
 impl Default for NodeConfig {
@@ -133,6 +153,9 @@ impl Default for NodeConfig {
             jmap_base_url: None,
             pub_serve_enabled: false,
             pub_bind: DEFAULT_PUB_BIND.to_string(),
+            sync_serve_enabled: false,
+            sync_bind: DEFAULT_SYNC_BIND.to_string(),
+            sync_namespaces: Vec::new(),
         }
     }
 }
@@ -203,6 +226,18 @@ impl NodeConfig {
             if !v.is_empty() {
                 c.pub_bind = v;
             }
+        }
+        if let Ok(v) = std::env::var("ENVOIR_SYNC_SERVE") {
+            c.sync_serve_enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("ENVOIR_SYNC_BIND") {
+            if !v.is_empty() {
+                c.sync_bind = v;
+            }
+        }
+        if let Ok(v) = std::env::var("ENVOIR_SYNC_NAMESPACES") {
+            c.sync_namespaces =
+                v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect();
         }
         c
     }

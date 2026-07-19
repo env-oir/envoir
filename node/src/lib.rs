@@ -47,6 +47,7 @@ pub mod pubserve;
 pub mod reassembly;
 pub mod seen;
 pub mod send_api;
+pub mod syncserve;
 pub mod transport;
 pub mod usage;
 

@@ -390,6 +390,60 @@ pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
         None
     };
 
+    // The Sync-substrate reconciliation surface (`substrate/SYNC.md` §5.2/§5.3) — opt-in, same
+    // shape as the DMTAP-PUB gateway above. This node self-issues its own `sync-1` capability
+    // (audience = itself) and presents it to `enable_with_capability`, so the fail-closed
+    // verification in `sync1_authorizes` genuinely runs; a *peer* still presents its own `sync-1`
+    // Bearer token per request (§5.4), and every op is COSE-verified on ingest regardless.
+    let sync_gateway = if config.sync_serve_enabled {
+        let owner_ik = {
+            let ks = Keystore::load(&config.keystore_path(), config.passphrase.as_deref())?;
+            ks.identity_key()
+        };
+        let mut gw = crate::syncserve::SyncGateway::new(
+            owner_ik.public(),
+            addr.clone(),
+            config.sync_namespaces.clone(),
+        );
+        let now = now_ms();
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|_| DaemonError::Bind(io::Error::other("rng failure minting the sync-1 capability")))?;
+        let token = dmtap_core::capability::CapabilityToken::issue(
+            &owner_ik,
+            addr.clone(),
+            vec![dmtap_core::capability::Capability {
+                resource: crate::syncserve::SYNC1_RESOURCE.to_string(),
+                ability: crate::syncserve::SYNC1_ABILITY.to_string(),
+                caveats: None,
+            }],
+            now.saturating_sub(1_000),
+            now.saturating_add(365 * 24 * 60 * 60 * 1000),
+            nonce.to_vec(),
+            None,
+        );
+        let enabled = gw.enable_with_capability(&token, now);
+        eprintln!(
+            "envoir-node: Sync substrate gateway {} (namespaces: {:?})",
+            if enabled { "ENABLED" } else { "FAILED TO ENABLE — capability did not verify" },
+            gw.replica.namespaces()
+        );
+        Some(std::sync::Mutex::new(gw))
+    } else {
+        None
+    };
+    let sync_listener = if config.sync_serve_enabled {
+        let l = tokio::net::TcpListener::bind(&config.sync_bind).await.map_err(DaemonError::Bind)?;
+        eprintln!(
+            "envoir-node: Sync listener on {} — {}{{vector,pull,ops,fingerprint}} (sync-1 Bearer required)",
+            config.sync_bind,
+            crate::syncserve::SYNC_BASE
+        );
+        Some(l)
+    } else {
+        None
+    };
+
     let stats = crate::jmap_api::run_loop_with_apis(
         &mut node,
         send_api.as_mut(),
@@ -398,6 +452,8 @@ pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
         jmap_listener,
         pub_gateway.as_ref(),
         pub_listener,
+        sync_gateway.as_ref(),
+        sync_listener,
         config.tick,
         // Supervised mode (ENVOIR_SUPERVISED=1) adds stdin-EOF to the shutdown causes, so a sidecar
         // whose supervising shell died abnormally terminates itself instead of orphaning.

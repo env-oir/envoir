@@ -522,6 +522,8 @@ pub async fn run_loop_with_apis<T: Transport>(
     jmap_listener: Option<TcpListener>,
     pub_gateway: Option<&PubGateway>,
     pub_listener: Option<TcpListener>,
+    sync_gateway: Option<&std::sync::Mutex<crate::syncserve::SyncGateway>>,
+    sync_listener: Option<TcpListener>,
     tick: Duration,
     shutdown: impl Future<Output = ()>,
 ) -> LoopStats {
@@ -547,6 +549,11 @@ pub async fn run_loop_with_apis<T: Transport>(
             accepted = maybe_accept(pub_listener.as_ref()) => {
                 if let (Some(gw), Ok((stream, _peer))) = (pub_gateway, accepted) {
                     let _ = crate::pubserve::handle_connection(gw, stream).await;
+                }
+            }
+            accepted = maybe_accept(sync_listener.as_ref()) => {
+                if let (Some(gw), Ok((stream, _peer))) = (sync_gateway, accepted) {
+                    let _ = crate::syncserve::handle_connection(gw, stream, now_ms()).await;
                 }
             }
             _ = interval.tick() => {

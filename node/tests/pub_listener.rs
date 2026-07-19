@@ -203,6 +203,8 @@ async fn pub_serve_enabled_serves_all_five_endpoints_over_real_http() {
         None,
         Some(&gw),
         Some(listener),
+        None,
+        None,
         Duration::from_millis(5),
         async {
             while !done.load(Ordering::SeqCst) {
@@ -285,6 +287,8 @@ async fn disabled_gateway_serves_nothing_over_real_http() {
         None,
         Some(&gw),
         Some(listener),
+        None,
+        None,
         Duration::from_millis(5),
         async {
             while !done.load(Ordering::SeqCst) {

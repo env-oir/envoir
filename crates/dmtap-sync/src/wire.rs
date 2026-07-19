@@ -68,9 +68,17 @@ impl Hlc {
     /// Decode, denying unknown keys (fail closed).
     pub fn from_sval(cv: SVal) -> Result<Self, DetCborError> {
         let mut f = Fields::new(cv)?;
-        let wall = f.req(1)?.as_int().ok_or(DetCborError::Malformed)? as u64;
-        let counter = u32::try_from(f.req(2)?.as_int().ok_or(DetCborError::Malformed)? as u64)
-            .map_err(|_| DetCborError::Malformed)?;
+        // `wall` and `counter` are unsigned by definition, so they decode from `Uint` directly
+        // rather than through the signed `as_int` (which cannot represent the top half of the u64
+        // range and would reject a legitimate upper-bound HLC, and which would have *accepted* a
+        // negative integer where the schema admits none).
+        let SVal::Uint(wall) = f.req(1)? else {
+            return Err(DetCborError::Malformed);
+        };
+        let SVal::Uint(counter) = f.req(2)? else {
+            return Err(DetCborError::Malformed);
+        };
+        let counter = u32::try_from(counter).map_err(|_| DetCborError::Malformed)?;
         let author = f.req(3)?.as_bytes().ok_or(DetCborError::Malformed)?.to_vec();
         f.deny_unknown()?;
         Ok(Hlc { wall, counter, author })

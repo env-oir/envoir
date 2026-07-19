@@ -988,6 +988,7 @@ dependencies = [
  "dmtap-mls",
  "dmtap-naming",
  "dmtap-send",
+ "dmtap-sync",
  "getrandom 0.2.17",
  "serde",
  "serde_json",

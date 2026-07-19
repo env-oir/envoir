@@ -11,7 +11,7 @@ use crate::crdt::{
     validate_op, DeathClass, DeathReg, DeathState, LwwMap, OrSet, PnCounter,
     RgaSeq, Tree,
 };
-use crate::detcbor::{decode, SVal};
+use crate::detcbor::{decode, DetCborError, SVal};
 use crate::error::SyncError;
 use crate::wire::{
     AddTag, Hlc, SyncOp, DEATH_LIVE, OP_COUNTER, OP_DEATH, OP_LWW_SET, OP_SEQ_INSERT,
@@ -63,6 +63,27 @@ impl VersionVector {
     /// Every `(author, mark)` pair in canonical order.
     pub fn marks(&self) -> impl Iterator<Item = (&Vec<u8>, &Hlc)> {
         self.marks.iter()
+    }
+
+    /// Decode the `{ * ik-pub => Hlc }` wire form (§5.1) — the inverse of
+    /// [`VersionVector::to_sval`], needed by the §5.2 `pull`/`fingerprint` endpoints, which receive
+    /// a caller's vector over the wire. Fails closed on anything that is not a byte-keyed map of
+    /// well-formed HLCs.
+    pub fn from_sval(cv: SVal) -> Result<Self, DetCborError> {
+        let pairs = match cv {
+            SVal::BytesMap(pairs) => pairs,
+            // An **empty** map is key-agnostic on the wire — the decoder cannot tell an empty
+            // bstr-keyed map from an empty int-keyed one, and canonically encodes both as `a0`. A
+            // fresh replica's vector is exactly that, and it is the single most common `pull` body,
+            // so it decodes to the empty vector rather than a parse error.
+            SVal::Map(m) if m.is_empty() => Vec::new(),
+            _ => return Err(DetCborError::Malformed),
+        };
+        let mut marks = BTreeMap::new();
+        for (author, hlc) in pairs {
+            marks.insert(author, Hlc::from_sval(hlc)?);
+        }
+        Ok(VersionVector { marks })
     }
 }
 

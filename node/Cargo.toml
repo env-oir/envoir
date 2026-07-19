@@ -32,6 +32,10 @@ dmtap-send = { path = "../crates/dmtap-send" }
 # used only by the separate gateway) is intentionally NOT enabled here.
 dmtap-mail = { path = "../crates/dmtap-mail" }
 
+# --- The Sync substrate (substrate/SYNC.md): the CRDT algebra, signed-op envelope, snapshots and
+# range-Merkle reconciliation. The node binds its §5.2/§5.3 wire protocol to HTTP (`node::syncserve`).
+dmtap-sync = { path = "../crates/dmtap-sync" }
+
 # --- Durable outbound-queue journal (spec §19.3.3, §0.5, §4.7) ---
 # The sender-side retry queue is the sole durability mechanism and MUST survive restart. The
 # file-backed journal serializes a node snapshot as JSON; the sealed Envelope inside each queued
