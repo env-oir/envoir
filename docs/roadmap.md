@@ -50,6 +50,13 @@ the spec's own roadmap markers, it doesn't belong here.
   dispatch (`self`/`petname`/`dns`/`name-chain`), and the OPTIONAL `name-chain` (ENS/SNS)
   resolver's bidirectional key↔name binding enforcement — all real, tested code behind a network
   I/O seam. See [naming.md](naming.md).
+- **DMTAP-PUB gateway serving** (`node/src/pubserve.rs`, spec §22.5/§22.6) — the five well-known
+  GET endpoints (feed head/range, announce, manifest, chunk) now run over a **real `TcpListener`**
+  in the node daemon, not just the in-process router: config-gated (`ENVOIR_PUB_SERVE`, off by
+  default) and capability-gated (the daemon only enables the listener after a genuine, verified
+  self-issued `pub-1` capability is presented through the same fail-closed path a remote grant
+  would use — never an unconditional bypass). A node that never opts in advertises no `pub-1`
+  grant and serves nothing (§22.6.1). See [`node/README.md`](../node/README.md#dmtap-pub-serving-spec-2225226-opt-in).
 - **The deniable 1:1 mode** (`crates/dmtap-deniable`) and **MLS groups** (`crates/dmtap-mls`) —
   implemented with dedicated crates; see [security.md](security.md#formal-proverif-models) for
   the formal proofs covering the deniable handshake specifically.

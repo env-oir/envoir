@@ -14,6 +14,22 @@ IMAP/POP3/SMTP-submission surfaces live **only on the separate `envoir-gateway`*
 are therefore no `ENVOIR_IMAP_PORT`/`ENVOIR_POP3_PORT`/`ENVOIR_SMTP_PORT`/`ENVOIR_MAIL_HOST` knobs
 on the node.
 
+## DMTAP-PUB serving (spec §22.5/§22.6, opt-in)
+
+The node can optionally serve its own public objects (feed head/range, announce, manifest, chunk)
+over plain HTTP to anyone, at the five well-known paths under `crate::pubserve::WELL_KNOWN_BASE`.
+This is **off by default** — set `ENVOIR_PUB_SERVE=1` to turn it on, and optionally
+`ENVOIR_PUB_BIND` to change its bind address (default `0.0.0.0:4680`, deliberately not loopback:
+unlike JMAP this surface is meant to be reached by other peers off-box).
+
+**Security note:** turning this on is a real disclosure decision, not a no-op. Public reads are
+unauthenticated by design (§22.5.1) — anyone who can reach the port can read anything the gateway
+serves. The daemon only ever enables the listener after presenting itself a genuine, verified
+`pub-1` [`CapabilityToken`] through the same fail-closed `enable_with_capability` path a remote
+grant would use (self-host: operator == node); it never bypasses that check. A node that never
+sets `ENVOIR_PUB_SERVE` advertises no `pub-1` grant and is never expected to serve public objects
+at all (§22.6.1) — that remains the safe default.
+
 ## Modules (planned)
 
 | Module | Spec | Responsibility |
