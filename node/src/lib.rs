@@ -43,6 +43,7 @@ pub mod node;
 pub mod onion;
 pub mod outbound;
 pub mod pow;
+pub mod pubserve;
 pub mod reassembly;
 pub mod seen;
 pub mod send_api;
