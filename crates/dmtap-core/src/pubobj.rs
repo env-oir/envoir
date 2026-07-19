@@ -755,6 +755,140 @@ pub fn check_anti_rollback(
     }
 }
 
+/// Bind a fetched entry range to the **signed** head that authenticates it (§22.4.1): a `FeedHead`
+/// authenticates entries *only* transitively through `tip`, so a consumer that validates a range
+/// with [`verify_feed_chain`] alone has validated internal linkage and nothing else — an
+/// equivocating publisher can serve a signed head at `seq = N` alongside a *different*,
+/// internally-consistent chain also ending at `seq = N`, and the range would pass.
+///
+/// This closes that: the range MUST be non-empty, end exactly at `head.seq`, and its last entry's
+/// [`FeedEntry::entry_id`] MUST equal `head.tip`. Any mismatch is
+/// [`PubError::FeedChainBroken`] (`0x0908`, HALT_ALERT) — never a rollback (`0x0907`), which is
+/// reserved for a *stale but honest* head.
+///
+/// This does not verify `head.sig`; call [`FeedHead::verify`] / [`FeedHead::verify_with_cert`]
+/// first (or use [`FeedFollower`], which sequences both).
+pub fn verify_feed_chain_to_head(entries: &[FeedEntry], head: &FeedHead) -> Result<(), PubError> {
+    verify_feed_chain(entries)?;
+    let last = entries.last().ok_or(PubError::FeedChainBroken)?;
+    if last.seq != head.seq || last.entry_id() != head.tip {
+        return Err(PubError::FeedChainBroken);
+    }
+    Ok(())
+}
+
+/// A stateful consumer of one author feed (§22.4.2) — the piece that makes equivocation detectable
+/// **across separate fetches**.
+///
+/// The per-call primitives ([`check_anti_rollback`], [`verify_feed_chain`],
+/// [`verify_feed_chain_to_head`]) are each individually correct, but a follower that keeps no memory
+/// of what it already accepted cannot see a publisher who serves one history to one fetch and a
+/// forked history to the next. This type retains the accepted `entry_id` at every `seq` it has ever
+/// seen and rejects any later fetch that contradicts it.
+///
+/// Every rejection is fail-closed. Fork/rewrite/mis-binding is
+/// [`PubError::FeedChainBroken`] (`0x0908`, HALT_ALERT); only a strictly-lower `seq` from an
+/// otherwise-consistent publisher is [`PubError::FeedRollback`] (`0x0907`).
+#[derive(Debug, Clone)]
+pub struct FeedFollower {
+    publisher: Vec<u8>,
+    last_seq: Option<u64>,
+    last_tip: Option<ContentId>,
+    /// The `entry_id` this follower has committed to at each `seq` — the equivocation memory.
+    accepted: std::collections::BTreeMap<u64, ContentId>,
+}
+
+impl FeedFollower {
+    /// A follower on first contact with `publisher` (no retained tip).
+    pub fn new(publisher: Vec<u8>) -> Self {
+        FeedFollower { publisher, last_seq: None, last_tip: None, accepted: Default::default() }
+    }
+
+    /// The highest `seq` accepted so far, if any.
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
+    /// The tip retained at [`FeedFollower::last_seq`], if any.
+    pub fn last_tip(&self) -> Option<&ContentId> {
+        self.last_tip.as_ref()
+    }
+
+    /// Ingest one `(head, entries)` fetch (§22.4.4 head + range), fail-closed in this order:
+    ///
+    /// 1. `head.publisher` MUST be this feed's publisher, and `head.sig` MUST verify (`0x0906`).
+    /// 2. §22.4.2 anti-rollback against the retained `(seq, tip)`: lower `seq` ⇒ `0x0907`; equal
+    ///    `seq` with a *different* tip ⇒ `0x0908` (equivocation, never a rollback).
+    /// 3. An advancing head MUST be accompanied by entries; the range MUST chain internally and
+    ///    bind to `head.tip` ([`verify_feed_chain_to_head`], `0x0908`).
+    /// 4. The range MUST join the retained history: no gap, and its first entry's `prev` (or its
+    ///    `entry_id`, when it re-covers an already-accepted position) MUST agree with what was
+    ///    accepted before (`0x0908`).
+    /// 5. No entry may contradict the `entry_id` already accepted at its `seq` (`0x0908`) — this is
+    ///    the cross-fetch check no stateless primitive can make.
+    ///
+    /// State advances only after every check passes, so a rejected fetch can never partially
+    /// corrupt the follower.
+    pub fn accept(
+        &mut self,
+        head: &FeedHead,
+        entries: &[FeedEntry],
+    ) -> Result<RollbackDecision, PubError> {
+        if head.publisher != self.publisher {
+            return Err(PubError::FeedSigInvalid);
+        }
+        head.verify()?;
+
+        let decision = match self.last_seq {
+            Some(last) => check_anti_rollback(last, self.last_tip.as_ref(), head.seq, &head.tip)?,
+            None => RollbackDecision::AcceptNew,
+        };
+
+        // An idempotent re-fetch of the exact retained tip may legitimately carry no entries.
+        if entries.is_empty() {
+            if decision == RollbackDecision::AcceptNew {
+                // A head claiming to advance, with no chain proving it: unprovable, so refuse.
+                return Err(PubError::FeedChainBroken);
+            }
+            return Ok(decision);
+        }
+
+        verify_feed_chain_to_head(entries, head)?;
+
+        let first = &entries[0];
+        // (4) join the retained history — no silent gap, and an honest continuation.
+        if let Some(last) = self.last_seq {
+            if first.seq > last + 1 {
+                return Err(PubError::FeedChainBroken);
+            }
+            if first.seq == last + 1 {
+                match (&first.prev, &self.last_tip) {
+                    (Some(p), Some(t)) if p == t => {}
+                    _ => return Err(PubError::FeedChainBroken),
+                }
+            }
+        }
+
+        // (5) cross-fetch equivocation: nothing may contradict an already-committed position.
+        for e in entries {
+            if let Some(known) = self.accepted.get(&e.seq) {
+                if known != &e.entry_id() {
+                    return Err(PubError::FeedChainBroken);
+                }
+            }
+        }
+
+        for e in entries {
+            self.accepted.insert(e.seq, e.entry_id());
+        }
+        if self.last_seq.is_none_or(|l| head.seq >= l) {
+            self.last_seq = Some(head.seq);
+            self.last_tip = Some(head.tip.clone());
+        }
+        Ok(decision)
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1030,5 +1164,168 @@ mod tests {
         skipped[2].seq = 5;
         assert_eq!(verify_feed_chain(&skipped), Err(PubError::FeedChainBroken));
         let _ = (sk, pk);
+    }
+
+    // ── Adversarial feed-acceptance suite (§22.4.2) ──────────────────────────────────────────
+    //
+    // Cross-implementation motivation: an independent §22 implementation was found to accept a
+    // DIFFERENT TIP at an already-accepted `seq` because its acceptance step compared only `seq`.
+    // These tests pin every member of that bug class in this implementation: same-seq/different-tip,
+    // prev-chain mismatch, tip regression, head-not-bound-to-range, and equivocation split across
+    // two separate fetches (the case no stateless primitive can see).
+
+    /// Build a `[0, n)` feed chain for `sk` plus the signed head committing its tip. `salt`
+    /// distinguishes forked histories (different announce content ⇒ different `entry_id`s).
+    fn feed_of(sk: &IdentityKey, n: u64, salt: &str) -> (Vec<FeedEntry>, FeedHead) {
+        let mut entries: Vec<FeedEntry> = Vec::new();
+        for seq in 0..n {
+            let announce = ContentId::of(format!("{salt}-ann-{seq}").as_bytes());
+            let prev = if seq == 0 { None } else { Some(entries[seq as usize - 1].entry_id()) };
+            entries.push(FeedEntry { seq, announce, prev, ts: 1000 + seq });
+        }
+        let last = entries.last().expect("non-empty");
+        let mut head = FeedHead {
+            v: PUB_V0,
+            suite: Suite::Classical,
+            publisher: sk.public(),
+            seq: last.seq,
+            tip: last.entry_id(),
+            ts: 2000 + last.seq,
+            signer: sk.public(),
+            sig: Vec::new(),
+        };
+        head.sign(sk);
+        (entries, head)
+    }
+
+    #[test]
+    fn adversarial_same_seq_different_tip_is_chain_broken_not_accepted() {
+        let sk = IdentityKey::from_seed(&[0x11u8; 32]);
+        let mut f = FeedFollower::new(sk.public());
+        let (honest, honest_head) = feed_of(&sk, 3, "honest");
+        assert_eq!(f.accept(&honest_head, &honest), Ok(RollbackDecision::AcceptNew));
+
+        // The publisher now presents a FORK: same seq (2), validly signed, but a different tip.
+        let (forked, forked_head) = feed_of(&sk, 3, "forked");
+        assert_ne!(forked_head.tip, honest_head.tip);
+        assert_eq!(forked_head.seq, honest_head.seq);
+        forked_head.verify().expect("the fork is genuinely signed — only the tip betrays it");
+        let err = f.accept(&forked_head, &forked).expect_err("a fork MUST NOT be accepted");
+        assert_eq!(err, PubError::FeedChainBroken);
+        assert_eq!(err.code(), 0x0908, "equivocation is CHAIN_BROKEN, never ROLLBACK 0x0907");
+        // The rejected fetch left the follower on the honest tip.
+        assert_eq!(f.last_tip(), Some(&honest_head.tip));
+    }
+
+    #[test]
+    fn adversarial_equivocation_across_separate_fetches_is_caught() {
+        // THE cross-implementation bug: fetch #1 commits history A; fetch #2 ADVANCES the seq (so
+        // no anti-rollback rule fires) while silently rewriting an already-accepted position.
+        let sk = IdentityKey::from_seed(&[0x22u8; 32]);
+        let mut f = FeedFollower::new(sk.public());
+        let (a, a_head) = feed_of(&sk, 2, "A");
+        assert_eq!(f.accept(&a_head, &a), Ok(RollbackDecision::AcceptNew));
+
+        let (b, b_head) = feed_of(&sk, 4, "B"); // internally perfect, strictly higher seq
+        verify_feed_chain(&b).expect("the rewritten history is internally consistent");
+        verify_feed_chain_to_head(&b, &b_head).expect("and correctly bound to its own head");
+        assert!(b_head.seq > a_head.seq, "an advance, so seq-only logic would accept");
+        assert_ne!(b[1].entry_id(), a[1].entry_id(), "but seq=1 was rewritten");
+        assert_eq!(
+            f.accept(&b_head, &b),
+            Err(PubError::FeedChainBroken),
+            "a rewrite of an accepted position MUST be caught even when the head advances"
+        );
+        assert_eq!(f.last_seq(), Some(1), "state unchanged by the rejected fetch");
+    }
+
+    #[test]
+    fn adversarial_head_not_bound_to_range_is_chain_broken() {
+        // A head signed over history A, served alongside history B's entries. Each object is valid
+        // on its own; only the tip binding exposes the swap.
+        let sk = IdentityKey::from_seed(&[0x33u8; 32]);
+        let (a, a_head) = feed_of(&sk, 3, "A");
+        let (b, _b_head) = feed_of(&sk, 3, "B");
+        verify_feed_chain(&b).expect("B chains internally — verify_feed_chain ALONE is not enough");
+        assert_eq!(verify_feed_chain_to_head(&b, &a_head), Err(PubError::FeedChainBroken));
+        assert_eq!(verify_feed_chain_to_head(&a, &a_head), Ok(()));
+
+        let mut f = FeedFollower::new(sk.public());
+        assert_eq!(f.accept(&a_head, &b), Err(PubError::FeedChainBroken));
+        assert_eq!(f.last_seq(), None, "nothing committed");
+
+        // A range that stops short of the head's seq is equally unbound.
+        assert_eq!(verify_feed_chain_to_head(&a[..2], &a_head), Err(PubError::FeedChainBroken));
+        assert_eq!(verify_feed_chain_to_head(&[], &a_head), Err(PubError::FeedChainBroken));
+    }
+
+    #[test]
+    fn adversarial_prev_chain_mismatch_is_chain_broken() {
+        let sk = IdentityKey::from_seed(&[0x44u8; 32]);
+        let mut f = FeedFollower::new(sk.public());
+
+        // (a) A break INSIDE the presented range.
+        let (mut entries, head) = feed_of(&sk, 4, "P");
+        entries[2].prev = Some(ContentId::of(b"not-the-predecessor"));
+        assert_eq!(f.accept(&head, &entries), Err(PubError::FeedChainBroken));
+
+        // (b) A break at the JOIN with already-accepted history: the continuation's `prev` must
+        // resolve to the retained tip, not to some other entry.
+        let (a, a_head) = feed_of(&sk, 2, "A");
+        assert_eq!(f.accept(&a_head, &a), Ok(RollbackDecision::AcceptNew));
+        let (b, b_head) = feed_of(&sk, 3, "B");
+        assert_eq!(b[2].seq, a_head.seq + 1, "same position, wrong ancestry");
+        assert_eq!(f.accept(&b_head, &b[2..]), Err(PubError::FeedChainBroken));
+
+        // (c) A gap in the history is never silently swallowed.
+        let (c, c_head) = feed_of(&sk, 6, "A");
+        assert_eq!(f.accept(&c_head, &c[4..]), Err(PubError::FeedChainBroken));
+        // …while the honest contiguous continuation of the SAME history is accepted.
+        assert_eq!(f.accept(&c_head, &c[2..]), Ok(RollbackDecision::AcceptNew));
+        assert_eq!(f.last_seq(), Some(5));
+    }
+
+    #[test]
+    fn adversarial_tip_regression_is_rollback_and_idempotent_refetch_is_not() {
+        let sk = IdentityKey::from_seed(&[0x55u8; 32]);
+        let mut f = FeedFollower::new(sk.public());
+        let (full, full_head) = feed_of(&sk, 5, "R");
+        assert_eq!(f.accept(&full_head, &full), Ok(RollbackDecision::AcceptNew));
+
+        // A stale-but-honest head from the SAME history: rollback (0x0907), not a fork.
+        let (short, short_head) = feed_of(&sk, 3, "R");
+        let err = f.accept(&short_head, &short).expect_err("a lower seq MUST NOT be accepted");
+        assert_eq!(err, PubError::FeedRollback);
+        assert_eq!(err.code(), 0x0907);
+        assert_eq!(f.last_seq(), Some(4), "the higher tip is retained");
+
+        // Re-fetching the identical head is a no-op, not an error — with or without entries.
+        assert_eq!(f.accept(&full_head, &full), Ok(RollbackDecision::AcceptIdempotent));
+        assert_eq!(f.accept(&full_head, &[]), Ok(RollbackDecision::AcceptIdempotent));
+    }
+
+    #[test]
+    fn adversarial_unprovable_advance_and_foreign_head_refused() {
+        let sk = IdentityKey::from_seed(&[0x66u8; 32]);
+        let mut f = FeedFollower::new(sk.public());
+        let (e0, h0) = feed_of(&sk, 1, "U");
+
+        // A head with no chain proving it can never move the follower's tip.
+        assert_eq!(f.accept(&h0, &[]), Err(PubError::FeedChainBroken));
+        assert_eq!(f.accept(&h0, &e0), Ok(RollbackDecision::AcceptNew));
+        let (_e3, h3) = feed_of(&sk, 4, "U");
+        assert_eq!(f.accept(&h3, &[]), Err(PubError::FeedChainBroken));
+        assert_eq!(f.last_seq(), Some(0));
+
+        // Another identity's (validly signed) head is not this feed's history.
+        let other = IdentityKey::from_seed(&[0x77u8; 32]);
+        let (oe, oh) = feed_of(&other, 3, "U");
+        oh.verify().expect("valid — for a different publisher");
+        assert_eq!(f.accept(&oh, &oe), Err(PubError::FeedSigInvalid));
+
+        // A forged signature over an otherwise-correct head is 0x0906.
+        let (fe, mut fh) = feed_of(&sk, 3, "U");
+        fh.sig = other.sign_domain(PUB_FEED_DS, &fh.signing_preimage());
+        assert_eq!(f.accept(&fh, &fe), Err(PubError::FeedSigInvalid));
     }
 }
