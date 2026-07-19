@@ -480,9 +480,9 @@ async fn matching_fingerprint_exchanges_nothing_over_http() {
     );
 }
 
-/// §6.2 over the wire: a replica that has truncated its op-log answers a behind-the-cut peer with
-/// the snapshot (key 2) rather than the surviving suffix (key 1), so the peer fast-joins instead of
-/// silently losing the ops that no longer exist.
+/// §5.2.1 over the wire: a replica that has truncated its op-log answers a behind-the-cut peer with
+/// a `FastJoin` (key 2) rather than the surviving suffix (key 1), so the peer fast-joins instead of
+/// silently losing the ops that no longer exist — and the peer can adopt what it is handed.
 #[tokio::test]
 async fn a_truncated_replica_answers_pull_with_a_snapshot_over_http() {
     use dmtap_sync::Snapshot;
@@ -504,8 +504,9 @@ async fn a_truncated_replica_answers_pull_with_a_snapshot_over_http() {
         gw.replica.ingest_cose(&signed_add(&alice, "docs", "list", &format!("e{i}"), i), now()).unwrap();
     }
     let snap = Snapshot::create(&alice, 1, "docs", gw.replica.state(), now());
+    let state_body = dmtap_sync::ObservableState::of(gw.replica.state()).det_cbor();
     let cut = Hlc { wall: now(), counter: 3, author: alice.public() };
-    let dropped = gw.replica.truncate_below(&cut, snap.clone()).unwrap();
+    let dropped = gw.replica.truncate_below(&cut, snap.clone(), state_body.clone()).unwrap();
     assert!(dropped > 0, "the test only means anything if history was actually discarded");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -550,13 +551,99 @@ async fn a_truncated_replica_answers_pull_with_a_snapshot_over_http() {
     let SVal::Map(fields) = decode(&body).expect("CBOR body") else { panic!("map") };
     assert!(
         fields.iter().all(|(k, _)| *k != 1),
-        "a behind-the-cut peer must NOT be handed a partial op list"
+        "a behind-the-cut peer must NOT be handed a partial op list — that answer is well-formed \
+         and would apply without error, which is exactly why §5.2.1 forbids it"
     );
-    let SVal::Bytes(snap_bytes) = fields.iter().find(|(k, _)| *k == 2).expect("key 2 snapshot").1.clone()
-    else {
-        panic!("snapshot is a byte string")
-    };
-    let received = Snapshot::from_det_cbor(&snap_bytes).expect("decodes");
-    received.verify_sig().expect("the peer can verify it independently");
-    assert_eq!(received.root, snap.root, "it is the snapshot that replaced the truncated prefix");
+    let fj_sval = fields.iter().find(|(k, _)| *k == 2).expect("key 2 FastJoin").1.clone();
+    let fj = dmtap_sync::FastJoin::from_det_cbor(&encode(&fj_sval)).expect("FastJoin decodes");
+    fj.snapshot.verify_sig().expect("the peer can verify it independently");
+    assert_eq!(fj.snapshot.root, snap.root, "it is the snapshot that replaced the truncated prefix");
+    assert_eq!(fj.floor, cut, "the responder names its floor — the caller's audit handle");
+
+    // The peer completes §5.2.1 step 3 against what it was given. This body is small, so it rode
+    // inline; the adopt path hashes it to `root` exactly as it would a fetched one.
+    assert!(fj.state.is_some(), "a small state body should ride inline (key 3)");
+    let adopted = fj
+        .adopt(&VersionVector::new(), &["docs".into()], &[], |_| None)
+        .expect("a peer must be able to actually adopt what it was handed");
+    assert_eq!(
+        adopted.det_cbor(),
+        state_body,
+        "the adopted state is byte-identical to the responder's projection"
+    );
+}
+
+/// The by-reference half (§5.2.1): `GET /sync/state/<root>` serves the body a `FastJoin` commits to
+/// by address, and serves it for that address only.
+#[tokio::test]
+async fn the_state_body_is_served_by_content_address() {
+    use dmtap_sync::Snapshot;
+
+    let net = InMemoryNetwork::new();
+    let mut node = make_node(&net);
+
+    let operator = IdentityKey::generate();
+    let operator_pub = operator.public();
+    let mut gw = SyncGateway::new(operator_pub.clone(), operator_pub.clone(), vec!["docs".into()]);
+    assert!(gw.enable_with_capability(
+        &sync1_token(&operator, SYNC1_RESOURCE, operator_pub.clone(), now()),
+        now()
+    ));
+
+    let alice = IdentityKey::generate();
+    for i in 0..3u32 {
+        gw.replica.ingest_cose(&signed_add(&alice, "docs", "list", &format!("e{i}"), i), now()).unwrap();
+    }
+    let snap = Snapshot::create(&alice, 1, "docs", gw.replica.state(), now());
+    let state_body = dmtap_sync::ObservableState::of(gw.replica.state()).det_cbor();
+    let cut = Hlc { wall: now(), counter: 2, author: alice.public() };
+    gw.replica.truncate_below(&cut, snap.clone(), state_body.clone()).unwrap();
+
+    let root_hex: String = snap.root.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = bearer(&sync1_token(&operator, SYNC1_RESOURCE, operator_pub.clone(), now()));
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_client = done.clone();
+    let auth2 = auth.clone();
+    let wrong_hex = "00".repeat(33);
+    let client = tokio::spawn(async move {
+        let hit =
+            roundtrip(addr, "GET", &format!("{SYNC_BASE}state/{root_hex}"), Some(&auth), &[]).await;
+        let miss =
+            roundtrip(addr, "GET", &format!("{SYNC_BASE}state/{wrong_hex}"), Some(&auth2), &[]).await;
+        done_client.store(true, Ordering::SeqCst);
+        (hit, miss)
+    });
+
+    let gw_lock = std::sync::Mutex::new(gw);
+    run_loop_with_apis(
+        &mut node,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&gw_lock),
+        Some(listener),
+        Duration::from_millis(5),
+        async {
+            while !done.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        },
+    )
+    .await;
+
+    let ((hit_status, _, hit_body), (miss_status, _, _)) = client.await.unwrap();
+    assert_eq!(hit_status, 200);
+    assert_eq!(hit_body, state_body, "the address IS the hash of the body served");
+    assert_eq!(
+        dmtap_sync::state_root_of(&hit_body),
+        snap.root,
+        "a caller re-hashes what it received rather than trusting the endpoint"
+    );
+    assert_eq!(miss_status, 404, "an address this replica does not hold is a miss, not a guess");
 }
