@@ -853,6 +853,21 @@ pub fn snapshot_body_encode(members_hex_json: &str) -> Result<Vec<u8>, BErr> {
     Ok(dmtap_sync::SnapshotBody::new(members).det_cbor())
 }
 
+/// **The fold, without the recompute** (§6.1.2): ingest every member through the ordinary §4 op
+/// path and return the resulting `det_cbor(ObservableState)`.
+///
+/// This is what a **responder** uses — it is building the body, so it has no root to check against
+/// yet; the root is *defined* as the hash of what this returns. A **caller** must use
+/// [`snapshot_body_verify_root`] instead: folding without checking the result against
+/// `Snapshot.root` is exactly the unverified adoption §5.2.1 step 3 forbids.
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn snapshot_body_fold(body_bytes: &[u8], ns: &str, receiver_now_ms: f64) -> Result<Vec<u8>, BErr> {
+    let body = dmtap_sync::SnapshotBody::from_det_cbor(body_bytes).js()?;
+    let scope = if ns.is_empty() { None } else { Some(ns) };
+    let state = body.fold(scope, now(receiver_now_ms)?).js()?;
+    Ok(dmtap_sync::ObservableState::of(&state).det_cbor())
+}
+
 /// **Fold-then-recompute** (§6.1.2): ingest every member of `body_bytes` through the ordinary §4 op
 /// path into a **provisional** state, derive `ObservableState` per §6.1.1, and require its hash to
 /// equal `root`. Returns the canonical observable-state bytes on success.

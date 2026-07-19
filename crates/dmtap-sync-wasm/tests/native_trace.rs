@@ -581,9 +581,11 @@ fn sync_ext_value_validate(v: &Value) -> Case {
     for entry in arr(input, "reject") {
         let name = s(entry, "case");
         let bytes = unhex(s(entry, "cbor_hex"));
-        // A reject fails at one of two stages, and WHICH one is the thing worth recording.
+        // A reject fails at one of two stages, and WHICH one is the thing worth recording. The
+        // stage is recorded, not the message: the two surfaces word their decoder errors
+        // differently and that is a binding detail, never a substrate one.
         let verdict = match decode(&bytes) {
-            Err(e) => format!("undecodable: {e}"),
+            Err(_) => "undecodable".to_string(),
             Ok(val) => format!("validates: {}", val.is_ext_value()),
         };
         case.insert(format!("reject_{name}"), verdict);
@@ -595,9 +597,11 @@ fn sync_ext_value_validate(v: &Value) -> Case {
     );
     case.insert("carrier_reencoded".into(), hex(&carrier.det_cbor()));
     case.insert("carrier_op_id".into(), hex(carrier.op_id().as_bytes()));
+    // The value's CANONICAL BYTES, not a debug spelling: the bytes are the semantics (§2.2), and
+    // they are the one projection both surfaces can produce identically.
     case.insert(
-        "carrier_value_json".into(),
-        format!("{:?}", carrier.value.as_ref().expect("carrier has no value")),
+        "carrier_value_cbor".into(),
+        hex(&carrier.value.as_ref().expect("carrier has no value").det_cbor()),
     );
     // §4.1.1: the merge unit is the WHOLE value — nesting is representation, never per-key merge.
     let mut rival = carrier.clone();

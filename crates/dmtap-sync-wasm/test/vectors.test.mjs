@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import * as sync from '../pkg-node/dmtap_sync.js';
-import { runVectors, NOT_COVERED, hex, unhex, refusal } from './trace.mjs';
+import { runVectors, NOT_COVERED, hex, unhex, refusal, RECEIVER_NOW_MS } from './trace.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const VECTORS = join(here, '../../../../dmtap/conformance/vectors/sync_vectors.json');
@@ -69,7 +69,7 @@ test('every vector is either driven or explicitly named as not covered', () => {
   }
   // Guard against silent erosion: if this number drops, coverage was removed.
   assert.equal(skipped.length, 0, 'every vector is driven through the binding');
-  assert.ok(covered.length >= 22, `only ${covered.length} vectors driven through the binding`);
+  assert.ok(covered.length >= 24, `only ${covered.length} vectors driven through the binding`);
 });
 
 // --- 1. the traced values match the frozen vectors -----------------------------------------------
@@ -332,11 +332,27 @@ test('SYNC-FJ-01 — the frozen FastJoin / pull response, snapshot signed outsid
   assert.equal(got.state_address, v.expected.state_fetch_address_hex);
   assert.deepEqual(v.expected.pull_response_keys, [2], 'keys 1 and 2 are mutually exclusive');
   assert.equal(v.expected.ops_key_present, false);
-  // The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body...
+  // The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body.
+  //
+  // Adoption here runs against a CONFORMANT §6.1.2 body (an op set), not this vector's frozen
+  // `observable_state_cbor_hex`, which is a state DOCUMENT and predates C-09 — the vector was not
+  // regenerated when §6.1.2 landed. Every byte-exact ENCODING assertion above is unaffected and
+  // still holds; what moved is what a body IS.
+  assert.ok(got.op_body_cbor.length > 0, 'adoption must be exercised against a real op-set body');
   assert.equal(
+    got.adopted_root,
+    hex(sync.observable_state_root(unhex(got.adopted_state))),
+    'the adopted state must be the one the fetched ops PRODUCE',
+  );
+  assert.notEqual(
     got.adopted_state,
     v.input.observable_state_cbor_hex,
-    'a corrupted inline hint must be discarded, not adopted',
+    'this vector predates C-09; its state document must not be adoptable as a body',
+  );
+  assert.equal(
+    got.adopted_state,
+    hex(sync.snapshot_body_fold(unhex(got.op_body_cbor), '', RECEIVER_NOW_MS)),
+    'a corrupted inline hint must be discarded in favour of the fetched body, not adopted',
   );
   assert.equal(v.expected.inline_state_is_cache_hint_verified_against_root, true);
   // ...and with nothing fetchable it fails CLOSED rather than trusting what it could not verify.
@@ -415,6 +431,73 @@ test('SYNC-FJ-02 — the MUST in both directions, and no fallback to the suffix'
   assert.equal(v.expected.suffix_fallback_after_failed_fastjoin_forbidden, true);
   // And the other direction is refused from the caller's side too.
   assert.match(got.caught_up_refuses_fastjoin, /0x0A09/);
+});
+
+
+test('SYNC-VAL-01 — the whole recursive ext-value, accepted and refused from both sides', () => {
+  const v = byName.sync_ext_value_boundary;
+  const got = t('sync_ext_value_boundary');
+  // Every accept case must DECODE and VALIDATE. Both stages matter: C-08 is the conflation of an
+  // encoder-side refusal (a text-keyed map could not be built at all) with a validator-side one.
+  for (const c of v.input.accept) {
+    assert.equal(got[`accept_${c.case}`], 'true', `accept case \`${c.case}\` validated to false`);
+    assert.equal(
+      got[`accept_${c.case}_reencoded`],
+      c.cbor_hex,
+      `accept case \`${c.case}\` does not re-encode canonically`,
+    );
+  }
+  assert.equal(v.expected.accept_all, true);
+  // Every reject case is refused — at whichever stage. What is forbidden is accepting it.
+  for (const c of v.input.reject) {
+    assert.notEqual(
+      got[`reject_${c.case}`],
+      'validates: true',
+      `reject case \`${c.case}\` was ACCEPTED as an ext-value`,
+    );
+  }
+  assert.equal(v.expected.reject_all, true);
+  assert.equal(v.expected.reject_error_code, '0x0A03');
+  // The recursion is the point: an integer-keyed map nested at depth 2 is caught, not waved
+  // through by a shallow check.
+  assert.equal(got.reject_nested_int_keyed_map, 'validates: false');
+  assert.equal(v.expected.validation_is_recursive, true);
+  // The carrier op — the intended end-to-end shape — is accepted and round-trips byte-exactly.
+  assert.equal(got.carrier_valid, 'true', 'the carrier op was refused; that is the whole of C-08');
+  assert.equal(got.carrier_reencoded, v.input.carrier_op_cbor_hex);
+  assert.equal(v.expected.carrier_op_accepted, true);
+  // §4.1.1: nesting is REPRESENTATION. The merge unit is the whole value, so a concurrent write of
+  // a different nested map replaces it entire — there is no per-key merge at this boundary.
+  assert.equal(got.whole_value_wins, hex(sync.encode_value(JSON.stringify({ tmap: [['x', { int: 99 }]] }))));
+});
+
+test('SYNC-SNAP-03 — the body is an op set, and a projection-adopter diverges', () => {
+  const v = byName.sync_snapshot_body_is_op_set;
+  const got = t('sync_snapshot_body_is_op_set');
+  // Fold-then-recompute: the ops PRODUCE the committed state, which is strictly stronger than
+  // hashing the transfer bytes.
+  assert.equal(got.body_roundtrip, v.input.snapshot_body_cbor_hex);
+  assert.equal(got.folded_state, v.expected.folded_state_cbor_hex);
+  assert.equal(got.folded_root, v.expected.folded_root_hex);
+  assert.equal(got.folded_root, v.input.snapshot_root_hex, 'the body must fold to Snapshot.root');
+  assert.equal(v.expected.body_folds_to_root, true);
+  // A body offered against a root it does not produce is 0x0A09 and discarded whole.
+  assert.match(got.wrong_root_refusal, /0x0A09/);
+  assert.equal(v.expected.body_mismatch_error_code, '0x0A09');
+  // The ordering premise the vector exists for: after `covers`, yet BELOW the incumbent. `covers`
+  // bounds each author's own stream; the §3 HLC orders across authors.
+  assert.equal(got.post_op_is_after_covers, 'true', 'vector premise broken');
+  assert.equal(got.post_op_is_below_incumbent, 'true', 'vector premise broken');
+  // A conformant replica folded the body, so it HAS the incumbent's HLC — and keeps it.
+  assert.equal(got.winning_value_after_post_op, v.expected.winning_value_after_post_op);
+  assert.equal(got.state_after_post_op, v.expected.state_after_post_op_cbor_hex);
+  assert.equal(got.root_after_post_op, v.expected.root_after_post_op_hex);
+  // A projection-adopter has the value but not its HLC, applies the write, and lands elsewhere.
+  assert.equal(got.projection_adopt_state, v.expected.projection_adopt_state_cbor_hex);
+  assert.equal(got.projection_adopt_root, v.expected.projection_adopt_root_hex);
+  assert.equal(v.expected.projection_adopt_is_nonconformant, true);
+  assert.equal(got.roots_differ, 'true', 'the divergence was not reproduced');
+  assert.equal(v.expected.roots_differ, true);
 });
 
 // --- 2. THE cross-surface assertion --------------------------------------------------------------

@@ -28,7 +28,8 @@ export const RECEIVER_NOW_MS = 1_700_000_900_000;
  * Currently empty: the §5.2.1 fast-join objects looked like pure transport at first, but the
  * FastJoin encoding, the below-floor predicate and the caller-side verification sequence are all
  * algebra — only the fetch is transport, and the binding leaves that to the host. So a browser
- * replica can participate in fast-join, and both surfaces drive all 22 vectors.
+ * replica can participate in fast-join, and both surfaces drive all 24 vectors — the C-08
+ * `ext-value` boundary and the C-09 op-set snapshot body included.
  */
 export const NOT_COVERED = {};
 
@@ -538,12 +539,32 @@ const executors = {
     const byRef = mk(null);
     const inline = mk(i.observable_state_cbor_hex);
 
+    // Adoption runs against a CONFORMANT §6.1.2 body — an op set — because this vector's frozen
+    // `observable_state_cbor_hex` is a state DOCUMENT and predates C-09. The response ENCODING
+    // above is unchanged by C-09 and still reproduces the frozen bytes; only adoption moved.
+    const opBody = conformantBody(sign, i.snapshot_signer_seed_hex, i.snapshot_signer_pubkey_hex);
+    const opRoot = sync.observable_state_root(sync.snapshot_body_fold(opBody, '', RECEIVER_NOW_MS));
+    const opUnsigned = { ...unsigned, root: hex(opRoot) };
+    const opPre = JSON.parse(sync.snapshot_signing_input(JSON.stringify(opUnsigned))).preimage;
+    const opSnapshot = sync.snapshot_assemble(
+      JSON.stringify(opUnsigned),
+      sign(i.snapshot_signer_seed_hex, unhex(opPre)),
+    );
+    const mkOp = (state) =>
+      sync.fastjoin_encode(
+        JSON.stringify({
+          snapshot: JSON.parse(sync.snapshot_decode(opSnapshot)),
+          floor: floorHlc,
+          state,
+        }),
+      );
+
     // A corrupted inline hint must be DISCARDED in favour of the fetched body, not adopted...
-    const corrupt = Array.from(unhex(i.observable_state_cbor_hex));
-    corrupt[3] ^= 0xff;
-    const hinted = mk(hex(new Uint8Array(corrupt)));
+    const corrupt = Array.from(opBody);
+    corrupt[corrupt.length - 1] ^= 0xff;
+    const hinted = mkOp(hex(new Uint8Array(corrupt)));
     const body = unhex(i.observable_state_cbor_hex);
-    const adopted = sync.fastjoin_adopt(hinted, '[]', '[]', '[]', body);
+    const adopted = sync.fastjoin_adopt(hinted, '[]', '[]', '[]', RECEIVER_NOW_MS, opBody);
 
     return {
       snapshot_preimage: preimage,
@@ -556,14 +577,134 @@ const executors = {
       fastjoin_roundtrip: hex(sync.fastjoin_encode(sync.fastjoin_decode(byRef))),
       state_address: hex(sync.fastjoin_state_address(byRef)),
       adopted_state: hex(adopted),
+      adopted_root: hex(sync.observable_state_root(adopted)),
+      op_body_cbor: hex(opBody),
       // ...and with nothing fetchable, the same unverifiable hint fails CLOSED.
       corrupt_hint_unfetchable: refusal(() =>
-        sync.fastjoin_adopt(hinted, '[]', '[]', '[]', undefined),
+        sync.fastjoin_adopt(hinted, '[]', '[]', '[]', RECEIVER_NOW_MS, undefined),
       ),
       caller_at_covers_below_floor: String(
         sync.caller_is_below_floor(snapshot, JSON.stringify(coversMarks(i.snapshot_covers_cbor_hex))),
       ),
     };
+  },
+
+  // SYNC-VAL-01 — the `ext-value` boundary from both sides (§4.1/§4.1.1, C-08).
+  //
+  // Both stages are recorded per case, because C-08 is precisely the conflation of the two: a
+  // text-keyed map used to have no ENCODER path (it could not be built at all), while an
+  // integer-keyed map is encodable and correctly VALIDATES to false.
+  sync_ext_value_validate(v) {
+    const out = {};
+    for (const c of v.input.accept) {
+      const json = sync.decode_value(unhex(c.cbor_hex)); // throws if it cannot even be represented
+      out[`accept_${c.case}`] = String(sync.is_ext_value(json));
+      out[`accept_${c.case}_reencoded`] = hex(sync.encode_value(json));
+    }
+    for (const c of v.input.reject) {
+      // A reject fails at one of two stages, and WHICH one is the thing worth recording.
+      // The STAGE is recorded, not the message: the two surfaces word their decoder errors
+      // differently and that is a binding detail, never a substrate one.
+      let verdict;
+      try {
+        verdict = `validates: ${sync.is_ext_value(sync.decode_value(unhex(c.cbor_hex)))}`;
+      } catch (e) {
+        JSON.parse(e.message); // a non-structured throw is a harness bug, so let it surface
+        verdict = 'undecodable';
+      }
+      out[`reject_${c.case}`] = verdict;
+    }
+    const carrier = unhex(v.input.carrier_op_cbor_hex);
+    out.carrier_valid = String(ok(() => sync.validate_op(carrier, RECEIVER_NOW_MS)));
+    out.carrier_reencoded = hex(sync.encode_op(sync.decode_op(carrier)));
+    out.carrier_op_id = hex(sync.op_id(carrier));
+    // The value's CANONICAL BYTES, not a JSON spelling: the bytes are the semantics (§2.2).
+    out.carrier_value_cbor = hex(
+      sync.encode_value(JSON.stringify(JSON.parse(sync.decode_op(carrier)).value)),
+    );
+    // §4.1.1: the merge unit is the WHOLE value — nesting is representation, never per-key merge.
+    const decoded = JSON.parse(sync.decode_op(carrier));
+    const rival = {
+      ...decoded,
+      hlc: { ...decoded.hlc, author: decoded.hlc.author ?? decoded.hlc.author_hex },
+      value: { tmap: [['x', { int: 99 }]] },
+    };
+    rival.hlc = { ...rival.hlc, counter: rival.hlc.counter + 1 };
+    const engine = ingest([hex(carrier), hex(sync.encode_op(JSON.stringify(rival)))]);
+    out.whole_value_wins = hex(
+      sync.encode_value(
+        JSON.stringify(JSON.parse(engine.lww_cell(decoded.target, decoded.field)).value),
+      ),
+    );
+    out.refusal_code = '0x0A03 ERR_SYNC_OP_INVALID FAIL_CLOSED_BLOCK';
+    return out;
+  },
+
+  // SYNC-SNAP-03 — the body is an op set, verified by fold-then-recompute (§6.1.2, C-09).
+  sync_snapshot_body_fold(v) {
+    const i = v.input;
+    const bodyBytes = unhex(i.snapshot_body_cbor_hex);
+    const members = JSON.parse(sync.snapshot_body_decode(bodyBytes));
+    const root = unhex(i.snapshot_root_hex);
+    const folded = sync.snapshot_body_verify_root(bodyBytes, root, '', RECEIVER_NOW_MS);
+
+    const out = {
+      body_roundtrip: hex(sync.snapshot_body_encode(JSON.stringify(members))),
+      member_count: String(members.length),
+      member_op_ids: members
+        .map((m) => hex(sync.op_id(sync.verify_signed_op(unhex(m)))))
+        .join(','),
+      folded_state: hex(folded),
+      folded_root: hex(sync.observable_state_root(folded)),
+    };
+
+    // A body that does not PRODUCE the root it is offered against is 0x0A09, discarded whole.
+    const tampered = JSON.parse(sync.decode_observable_state(folded));
+    tampered.lww[0][2] = { tstr: 'TAMPERED' };
+    const wrongRoot = sync.observable_state_root(
+      sync.encode_observable_state(JSON.stringify(tampered)),
+    );
+    out.wrong_root_refusal = refusal(() =>
+      sync.snapshot_body_verify_root(bodyBytes, wrongRoot, '', RECEIVER_NOW_MS),
+    );
+
+    // The ordering demo: (W,3,B) is genuinely after `covers` and still BELOW the incumbent (W,4,A).
+    const post = sync.verify_signed_op(unhex(i.post_covers_op_cbor_hex));
+    const postHlc = JSON.parse(sync.decode_op(post)).hlc;
+    const incumbent = sync.verify_signed_op(unhex(members[0]));
+    const incumbentOp = JSON.parse(sync.decode_op(incumbent));
+    const covers = coversMarks(i.snapshot_covers_cbor_hex);
+    const mark = covers.find((m) => m.author === postHlc.author);
+    out.post_op_is_after_covers = String(
+      mark === undefined ||
+        sync.compare_hlc(JSON.stringify(postHlc), JSON.stringify(mark.hlc)) > 0,
+    );
+    out.post_op_is_below_incumbent = String(
+      sync.compare_hlc(JSON.stringify(postHlc), JSON.stringify(incumbentOp.hlc)) < 0,
+    );
+
+    // The conformant replica FOLDED the body, so it holds the incumbent's HLC and keeps it.
+    const conformant = ingest([]);
+    for (const m of members) conformant.ingest_signed(unhex(m), RECEIVER_NOW_MS);
+    conformant.ingest_signed(unhex(i.post_covers_op_cbor_hex), RECEIVER_NOW_MS);
+    const after = conformant.observable_state();
+    out.state_after_post_op = hex(after);
+    out.root_after_post_op = hex(sync.observable_state_root(after));
+    out.winning_value_after_post_op = JSON.parse(
+      conformant.lww_cell(incumbentOp.target, incumbentOp.field),
+    ).value.tstr;
+
+    // The projection-adopter has the VALUE but not its HLC, so the same op wins — a different
+    // root, permanently, with no error raised on either side.
+    const projection = ingest([]);
+    projection.ingest_signed(unhex(i.post_covers_op_cbor_hex), RECEIVER_NOW_MS);
+    const projected = projection.observable_state();
+    out.projection_adopt_state = hex(projected);
+    out.projection_adopt_root = hex(sync.observable_state_root(projected));
+    out.roots_differ = String(
+      hex(sync.observable_state_root(projected)) !== hex(sync.observable_state_root(after)),
+    );
+    return out;
   },
 
   // SYNC-FJ-02 — the MUST in both directions, and the caller-side fail-closed paths.
@@ -616,10 +757,10 @@ const executors = {
         sync.fastjoin_check_progress(fj, prevRoot, prevCovers),
       ),
       // A body no holder can serve: 0x0A0C, fail-closed, never a fallback to the suffix.
-      state_unavailable: refusal(() => sync.fastjoin_adopt(fj, behind, '[]', '[]', undefined)),
+      state_unavailable: refusal(() => sync.fastjoin_adopt(fj, behind, '[]', '[]', RECEIVER_NOW_MS, undefined)),
       // And a caught-up caller must not be fast-joined at all.
       caught_up_refuses_fastjoin: refusal(() =>
-        sync.fastjoin_adopt(fj, caughtUp, '[]', '[]', undefined),
+        sync.fastjoin_adopt(fj, caughtUp, '[]', '[]', RECEIVER_NOW_MS, undefined),
       ),
     };
   },
@@ -661,6 +802,29 @@ const executors = {
     };
   },
 };
+
+/**
+ * A minimal but genuine §6.1.2 `SnapshotBody`: one signed LWW op, the same shape `SYNC-SNAP-03`
+ * freezes. Used where a vector freezes a response ENCODING but predates C-09's body type.
+ *
+ * The op is signed through the DETACHED path, like everything else here — the seed never enters
+ * the module (`substrate/BINDINGS.md` §3, the no-raw-key rule).
+ */
+function conformantBody(sign, seedHex, authorHex) {
+  const op = sync.encode_op(
+    JSON.stringify({
+      kind: 3,
+      ns: '',
+      target: 'doc1',
+      field: 'title',
+      value: { tstr: 'n' },
+      hlc: { wall: 1700000100000, counter: 4, author: authorHex },
+    }),
+  );
+  const si = JSON.parse(sync.op_signing_input(op));
+  const cose = sync.op_attach_signature(op, sign(seedHex, unhex(si.sig_structure)));
+  return sync.snapshot_body_encode(JSON.stringify([hex(cose)]));
+}
 
 /** `{2: FastJoin}` — the §5.2.1 pull envelope, built with the generic CBOR helpers. */
 const pullEnvelope = (fastjoinBytes) =>

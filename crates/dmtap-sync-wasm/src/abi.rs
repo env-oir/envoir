@@ -417,6 +417,9 @@ fn dispatch(name: &str, a: &[Value]) -> Result<Value, BErr> {
         // --- the §6.1.2 snapshot body (an op set, not a state document) ---
         "snapshot_body_decode" => stringed(crate::snapshot_body_decode(&b_arg(a, 0)?)?),
         "snapshot_body_encode" => hexed(crate::snapshot_body_encode(&s_arg(a, 0)?)?),
+        "snapshot_body_fold" => {
+            hexed(crate::snapshot_body_fold(&b_arg(a, 0)?, &s_arg(a, 1)?, f_arg(a, 2)?)?)
+        }
         "snapshot_body_verify_root" => hexed(crate::snapshot_body_verify_root(
             &b_arg(a, 0)?,
             &b_arg(a, 1)?,
@@ -559,6 +562,7 @@ pub const ENTRY_POINTS: &[&str] = &[
     "snapshot_assemble",
     "snapshot_body_decode",
     "snapshot_body_encode",
+    "snapshot_body_fold",
     "snapshot_body_verify_root",
     "fastjoin_decode",
     "fastjoin_encode",
