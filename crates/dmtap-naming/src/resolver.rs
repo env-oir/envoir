@@ -17,40 +17,57 @@
 //! layer that swaps the in-memory DNS/mesh/KT for network fetches and implements the same trait —
 //! the verification core (`kt`, `merkle`) is identical.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{Identity, KeyPackageBundleRef};
 use dmtap_core::TimestampMs;
 
+use crate::canonical;
 use crate::dns::DmtapTxtRecord;
 use crate::error::ResolveError;
 use crate::keypackage::{InMemoryKeyPackages, KeyPackageSource};
 use crate::kt::{self, KtLog, KtProof};
 
-/// A parsed DMTAP `name@domain` address (§3.9.1), with the `_dmtap` DNS query names it derives and
-/// subaddressing (`you+tag@domain`, §3.9.4) canonicalization.
+/// A parsed DMTAP `name@domain` address (§3.9.1), held in **canonical form** ([`crate::canonical`]:
+/// local = NFC + lowercase, domain = UTS-46 **A-labels**, every label single-script), with the
+/// `_dmtap` DNS query names it derives and subaddressing (`you+tag@domain`, §3.9.4)
+/// canonicalization. Parsing IS the canonicalization chokepoint: no un-normalized spelling ever
+/// reaches an identity comparison, KT leaf, qname, or pin key through this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmtapName {
-    /// The full local part as typed (MAY include a `+tag`).
+    /// The canonical local part (MAY include a `+tag`): NFC + lowercased.
     pub local: String,
-    /// The domain part.
+    /// The canonical domain part: UTS-46 A-label (ASCII/punycode) form.
     pub domain: String,
 }
 
 impl DmtapName {
-    /// Parse `local@domain`, failing closed on a missing/empty part or a domain without a dot.
+    /// Parse `local@domain` into the **canonical** form, failing closed on a missing/empty part, a
+    /// domain that is not a real FQDN under UTS-46/IDNA, or a mixed-script label (`0x0121`). Case,
+    /// NFC/NFD spelling, and U-label/A-label spelling all collapse here, so `ALICE@Example.COM`,
+    /// `alice@example.com`, `alice@bücher.example` and `alice@xn--bcher-kva.example` can never be
+    /// distinct identities downstream.
     pub fn parse(s: &str) -> Result<Self, ResolveError> {
         let (local, domain) = s
+            .trim()
             .split_once('@')
             .ok_or(ResolveError::MalformedName("no '@' in name"))?;
         if local.is_empty() || domain.is_empty() {
             return Err(ResolveError::MalformedName("empty local or domain part"));
         }
-        if domain.contains('@') || !domain.contains('.') {
+        if domain.contains('@') {
+            return Err(ResolveError::MalformedName("more than one '@' in name"));
+        }
+        let local = canonical::canonical_local(local)?;
+        let domain = canonical::canonical_domain(domain)?;
+        // FQDN check AFTER canonicalization: UTS-46 maps e.g. the ideographic full stop U+3002 to
+        // `.`, so the raw string is not the form the dot rule is meaningful on.
+        if !domain.contains('.') {
             return Err(ResolveError::MalformedName("domain is not a FQDN"));
         }
-        Ok(DmtapName { local: local.to_owned(), domain: domain.to_owned() })
+        Ok(DmtapName { local, domain })
     }
 
     /// The base local part with any `+tag` subaddress stripped (§3.9.4): `you+tag` → `you`.
@@ -64,9 +81,16 @@ impl DmtapName {
         format!("{}@{}", self.base_local(), self.domain)
     }
 
-    /// The `_dmtap` TXT query name: `<base_local>._dmtap.<domain>` (§3.2).
+    /// The `_dmtap` TXT query name: `<base_local>._dmtap.<domain>` (§3.2). **Qnames are always
+    /// built from A-labels**: `self.domain` is already the A-label form, and a non-ASCII local
+    /// label is punycoded here too, so no raw Unicode label ever goes on the DNS wire. A local part
+    /// that cannot be expressed as a hostname label (spaces, `_`, …) is kept verbatim — such a
+    /// qname simply never resolves, which is the fail-closed outcome, and inventing a lossy
+    /// encoding would risk *colliding* two locals onto one qname.
     pub fn txt_qname(&self) -> String {
-        format!("{}._dmtap.{}", self.base_local(), self.domain)
+        let local = idna::domain_to_ascii(self.base_local())
+            .unwrap_or_else(|_| self.base_local().to_owned());
+        format!("{}._dmtap.{}", local, self.domain)
     }
 
     /// The `_dmtap` SVCB query name: `_dmtap.<domain>` (§3.2).
@@ -126,6 +150,11 @@ pub struct InMemoryResolver {
     now: TimestampMs,
     freshness_window: Option<TimestampMs>,
     keypkgs: InMemoryKeyPackages,
+    /// The name-keyed pin store (§3.4), keyed by UTS-39 **skeleton** → canonical pinned name, so a
+    /// new resolution that is *confusable* with (but not equal to) an already-pinned name is
+    /// rejected (`0x0122`) instead of silently pinned beside it. `RefCell`: pinning is a resolve
+    /// side effect and [`Resolver::resolve`] takes `&self` (the harness is single-threaded).
+    pins: RefCell<HashMap<String, String>>,
 }
 
 impl InMemoryResolver {
@@ -140,6 +169,7 @@ impl InMemoryResolver {
             now,
             freshness_window: None,
             keypkgs: InMemoryKeyPackages::new(),
+            pins: RefCell::new(HashMap::new()),
         }
     }
 
@@ -217,8 +247,13 @@ impl Resolver for InMemoryResolver {
         // (`0x0109`) already caught above: it is either a *revoked* alias (once listed, since
         // dropped — `0x011D`) or a *never-verified* self-asserted alias (`0x011C`). Fail closed on
         // either; the two codes only differ in the mandated response (REJECT_NOTIFY vs BLOCK).
+        // `Identity.names` entries are owner-typed strings: compare them in CANONICAL form against
+        // the (already canonical) resolved address, so `ALICE@Example.COM` in a published identity
+        // still claims `alice@example.com`. An entry that cannot canonicalize (bad UTS-46 domain,
+        // mixed-script label) simply never matches — fail-closed, never a guess.
         let addr = dmtap_name.base_address();
-        if !identity.names.iter().any(|n| n == &addr) {
+        let claims = |n: &String| canonical::canonical_name(n).is_ok_and(|c| c == addr);
+        if !identity.names.iter().any(claims) {
             if self.alias_was_revoked(&addr, identity) {
                 return Err(ResolveError::AliasRevoked(
                     "alias retired in a newer Identity version",
@@ -261,7 +296,26 @@ impl Resolver for InMemoryResolver {
             }
         };
 
-        // 5. PIN (name → ik, id) as a TOFU pin (§3.4).
+        // 5. PIN (name → ik, id) as a TOFU pin (§3.4) — gated by the UTS-39 confusables check:
+        // a verified-but-confusable name (all-Cyrillic `аррӏе.com` beside a pinned `apple.com`)
+        // is REJECTED (`0x0122`), never silently pinned as a second, visually identical identity.
+        // The per-label mixed-script gate already ran at parse; this catches whole-label
+        // substitutions it structurally cannot. Keyed by skeleton so lookup is O(1); an exact
+        // re-resolution of the same canonical name is never a collision.
+        {
+            let mut pins = self.pins.borrow_mut();
+            let skel = canonical::skeleton(&addr);
+            match pins.get(&skel) {
+                Some(existing) if existing != &addr => {
+                    return Err(ResolveError::ConfusableName(
+                        "resolved name skeleton-collides with a different already-pinned name",
+                    ));
+                }
+                _ => {
+                    pins.insert(skel, addr.clone());
+                }
+            }
+        }
         let ik = txt.ik.clone();
         Ok(PinnedResolution {
             name: addr,
@@ -314,7 +368,13 @@ impl InMemoryResolver {
             {
                 return false;
             }
-            if older.names.iter().any(|n| n == addr) {
+            // Same canonical comparison as the live-names check: a prior version's spelling of the
+            // alias counts however it was cased/encoded, and an uncanonicalizable entry never does.
+            if older
+                .names
+                .iter()
+                .any(|n| canonical::canonical_name(n).is_ok_and(|c| c == addr))
+            {
                 return true;
             }
             successor_version = older.version;
@@ -679,5 +739,132 @@ mod tests {
         assert_eq!(n.base_address(), "alice@example.com");
         assert_eq!(n.txt_qname(), "alice._dmtap.example.com");
         assert_eq!(n.svcb_qname(), "_dmtap.example.com");
+    }
+
+    // ── canonical-form + confusables hardening (i18n; 0x0121 / 0x0122) ──────────────────────────
+
+    #[test]
+    fn ascii_case_variants_resolve_to_one_identity() {
+        // Pre-canonicalization this was a live bug: `ALICE@Example.COM` found the TXT record (DNS
+        // is case-insensitive) but hard-failed the exact-equality `Identity.names` check. Now every
+        // spelling folds to one canonical address end-to-end.
+        let name = "alice@example.com";
+        let (id, txt) = make_identity(name, 1, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+        log.append_identity(name, &id).unwrap();
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("alice._dmtap.example.com", &txt);
+        r.publish_identity(id.clone());
+        r.pin_log(log);
+
+        let res = r.resolve("ALICE@Example.COM").unwrap();
+        assert_eq!(res.name, "alice@example.com");
+        assert_eq!(res.identity_id, id.content_id());
+        // Parse-level equality too: the canonical struct is spelling-independent.
+        assert_eq!(
+            DmtapName::parse("ALICE@Example.COM").unwrap(),
+            DmtapName::parse("alice@example.com").unwrap()
+        );
+    }
+
+    #[test]
+    fn u_label_a_label_and_nfd_spellings_are_one_identity() {
+        // The identity claims the U-label spelling; the TXT record sits at the A-label qname (the
+        // only qname real DNS serves); the resolver is asked with NFC-U-label, NFD-U-label, and
+        // A-label spellings — all one identity, one KT leaf, one pin.
+        let claimed = "alice@bücher.example";
+        let (id, txt) = make_identity(claimed, 1, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+        // The log ingests the U-label spelling; leaf_for canonicalizes, so verification of the
+        // A-label spelling finds the same leaf.
+        log.append_identity(claimed, &id).unwrap();
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("alice._dmtap.xn--bcher-kva.example", &txt);
+        r.publish_identity(id.clone());
+        r.pin_log(log);
+
+        for spelling in [
+            "alice@bücher.example",             // NFC U-label
+            "alice@bu\u{0308}cher.example",     // NFD U-label
+            "alice@xn--bcher-kva.example",      // A-label
+            "ALICE@BÜCHER.example",             // shouty U-label
+        ] {
+            let res = r.resolve(spelling).unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert_eq!(res.name, "alice@xn--bcher-kva.example", "canonical pin name for {spelling}");
+            assert_eq!(res.identity_id, id.content_id());
+        }
+        // Qnames are always built from A-labels — never a raw Unicode label on the wire.
+        assert_eq!(
+            DmtapName::parse("alice@bücher.example").unwrap().txt_qname(),
+            "alice._dmtap.xn--bcher-kva.example"
+        );
+    }
+
+    #[test]
+    fn mixed_script_name_is_rejected_before_resolution_0x0121() {
+        // `pаypal` (Latin + Cyrillic а) never reaches DNS: the parse/canonicalization chokepoint
+        // rejects it, so there is nothing a spoofed zone could even serve.
+        let r = InMemoryResolver::new(NOW);
+        let err = r.resolve("alice@p\u{0430}ypal.com").unwrap_err();
+        assert!(matches!(err, ResolveError::MixedScriptLabel(_)));
+        assert_eq!(err.code(), 0x0121);
+    }
+
+    #[test]
+    fn cyrillic_whole_label_spoof_rejected_as_confusable_at_pin_time_0x0122() {
+        // `аррӏе` is ALL-Cyrillic (а-р-р-ӏ-е) — single-script, so the 0x0121 label gate passes it,
+        // and DNS/KT can legitimately verify it (the attacker really owns the spoof domain). The
+        // pin store is the last line: its UTS-39 skeleton collides with the already-pinned
+        // `apple.com`, so it must be REJECTED, not silently pinned beside it.
+        let honest = "alice@apple.com";
+        let spoof = "alice@аррӏе.com"; // U+0430 U+0440 U+0440 U+04CF U+0435
+        let (hid, htxt) = make_identity(honest, 1, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+        // The spoof identity claims the canonical (A-label) spelling its DNS actually serves.
+        let spoof_canonical = crate::canonical::canonical_name(spoof).unwrap();
+        let (sid, stxt) =
+            make_identity(&spoof_canonical, 2, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+        log.append_identity(honest, &hid).unwrap();
+        log.append_identity(&spoof_canonical, &sid).unwrap();
+
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt("alice._dmtap.apple.com", &htxt);
+        r.set_txt(
+            DmtapName::parse(spoof).unwrap().txt_qname(), // alice._dmtap.xn--…
+            &stxt,
+        );
+        r.publish_identity(hid);
+        r.publish_identity(sid);
+        r.pin_log(log);
+
+        // Honest name pins fine, and re-resolving the SAME name is never a collision.
+        assert!(r.resolve(honest).is_ok());
+        assert!(r.resolve(honest).is_ok());
+
+        // The confusable spoof is verified by DNS+KT — and still refused at pin time.
+        let err = r.resolve(spoof).unwrap_err();
+        assert!(matches!(err, ResolveError::ConfusableName(_)));
+        assert_eq!(err.code(), 0x0122);
+    }
+
+    #[test]
+    fn single_script_cyrillic_domain_resolves_and_pins() {
+        // An honest all-Cyrillic name is not collateral damage: single-script per label passes the
+        // 0x0121 gate, and with no confusable pin beside it, it resolves and pins normally.
+        let name = "иван@почта.рф";
+        let canonical = crate::canonical::canonical_name(name).unwrap();
+        let (id, txt) = make_identity(name, 3, KeyPackageBundleRef::new("/kp", ContentId::of(b"k")));
+        let mut log = InMemoryKtLog::new(IdentityKey::from_seed(&[9; 32]));
+        log.append_identity(name, &id).unwrap();
+        let mut r = InMemoryResolver::new(NOW);
+        r.set_txt(DmtapName::parse(name).unwrap().txt_qname(), &txt);
+        r.publish_identity(id.clone());
+        r.pin_log(log);
+
+        let res = r.resolve(name).unwrap();
+        assert_eq!(res.name, canonical, "pinned under the canonical (A-label) form");
+        assert!(res.name.contains("xn--"));
+        assert_eq!(res.identity_id, id.content_id());
     }
 }

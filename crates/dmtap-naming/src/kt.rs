@@ -148,9 +148,17 @@ impl KtLog for UnreachableLog {
 /// Recompute the §18.4.9 KT leaf for `name`'s current `Identity`: the leaf hash over
 /// `[name, ik, version, identity_id]`, where `ik` is the identity's classical key and
 /// `identity_id` is its content address. `None` if the identity has no classical suite key.
+///
+/// The name is put through the [`crate::canonical`] chokepoint first, so the **append** side
+/// ([`InMemoryKtLog::append_identity`], a real log's ingestion) and the **verify** side
+/// ([`verify_attestation`]) always hash the same canonical string — `ALICE@Example.COM`,
+/// `alice@example.com` and the U-label/A-label spellings are ONE leaf, never two aliasable ones.
+/// A name that cannot canonicalize (mixed-script label, bad UTS-46 domain) has **no** leaf —
+/// fail-closed: it can be neither logged nor proven.
 pub fn leaf_for(name: &str, identity: &Identity) -> Option<ContentId> {
+    let name = crate::canonical::canonical_name(name).ok()?;
     let ik = identity.iks.get(&Suite::Classical.as_u8())?;
-    Some(identity_leaf_hash(name, ik, identity.version, &identity.content_id()))
+    Some(identity_leaf_hash(&name, ik, identity.version, &identity.content_id()))
 }
 
 /// Cross-check the DNS pointer against the fetched `Identity` (§3.3 step 3–4): the DNS `id` MUST be

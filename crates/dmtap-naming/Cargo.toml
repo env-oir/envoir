@@ -17,4 +17,22 @@ blake3 = "1"
 # Ergonomic fail-closed error enums, matching dmtap-core's style.
 thiserror = "1"
 
+# --- Unicode canonicalization + UTS-39 confusables defense (spec §3.9.1, i18n hardening) ---
+# `idna` is the url/servo-stack UTS-46/IDNA processor — small, pure Rust, the ecosystem standard,
+# and ALREADY pinned in this workspace's Cargo.lock (it rides in under `url`). Every domain a name
+# carries is canonicalized through it to the A-label (punycode) form, so `bücher.example`,
+# `BÜCHER.example`, an NFD spelling, and `xn--bcher-kva.example` are ONE identity and every DNS
+# qname is built from A-labels only (never a raw Unicode label on the wire).
+idna = "1"
+# NFC for the LOCAL part (UTS-46 governs only the domain side of the `@`): `unicode-normalization`
+# is the unicode-rs standard — pure Rust, table-embedding (no build-time fetch, no runtime data
+# file), snapshot pinned in Cargo.lock. Also supplies the NFD pass under the UTS-39 skeleton.
+unicode-normalization = "0.1"
+# The Unicode `Script` property for the UTS-39 single-script-per-label rejection. `icu_properties`
+# is ICU4X's property crate and is ALREADY in the build graph (idna 1.x does its UTS-46 mapping
+# through ICU4X via `idna_adapter`), so taking it directly adds zero new transitive code; its
+# default `compiled_data` feature embeds the property tables the same way gateway's `psl` embeds
+# the Public Suffix List — no fetch, no data file, snapshot pinned in Cargo.lock.
+icu_properties = "2"
+
 [dev-dependencies]

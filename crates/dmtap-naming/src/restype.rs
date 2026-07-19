@@ -28,6 +28,7 @@ use std::collections::HashSet;
 
 use dmtap_core::keyname;
 
+use crate::canonical;
 use crate::error::ResolveError;
 
 /// A crypto **name-chain** admitted as a `name-chain` resolver (§3.12.5). DMTAP hard-wires none — a
@@ -116,7 +117,19 @@ pub enum ResolverKind {
 /// - bare `local.eth` / `local.sol` (no `@`) → `name-chain` (the mission's bare chain form).
 /// - a bare word-list that checksum-verifies as a key-name → `self` (§3.9.6).
 /// - any other bare label → `petname` (a local name, §3.9.3).
+///
+/// Classification also runs the name through the [`crate::canonical`] chokepoint: a name whose
+/// form is recognized but that cannot **canonicalize** — a domain UTS-46/IDNA rejects, or any
+/// mixed-script label (`0x0121`) — is rejected here, before any resolver is consulted, so an
+/// unnormalizable/homograph name is unresolvable under every resolver type at once.
 pub fn classify(name: &str) -> Result<ResolverType, ResolveError> {
+    let ty = classify_form(name)?;
+    canonical::canonical_name(name)?;
+    Ok(ty)
+}
+
+/// The pure §3.12.4 form dispatch (see [`classify`], which adds the canonicalization gate).
+fn classify_form(name: &str) -> Result<ResolverType, ResolveError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(ResolveError::ResolverTypeUnsupported("empty name"));
@@ -312,15 +325,36 @@ impl PetnameBook {
     }
 
     /// Assign `petname` to an **already-pinned** key `ik` (the local labeling step, §3.9.3).
-    pub fn assign(&mut self, petname: impl Into<String>, ik: impl Into<Vec<u8>>) {
-        self.map.insert(petname.into(), ik.into());
+    ///
+    /// The petname is stored in **canonical form** ([`crate::canonical`]: NFC + lowercase,
+    /// single-script labels, `0x0121` on a homograph mix) and gated by the UTS-39 **skeleton**
+    /// check: a new petname confusable with a *different* existing one (`mum` beside Cyrillic
+    /// `мum` — or, since that mix is already `0x0121`, an all-confusable-script look-alike) is
+    /// rejected (`0x0122`) rather than silently shadowing the label the user already trusts.
+    /// Re-assigning the exact same canonical petname (rebinding it to a new key) stays allowed —
+    /// that is the user's own explicit relabeling, not a spoof.
+    pub fn assign(
+        &mut self,
+        petname: impl Into<String>,
+        ik: impl Into<Vec<u8>>,
+    ) -> Result<(), ResolveError> {
+        let pet = canonical::canonical_name(&petname.into())?;
+        if canonical::find_confusable(&pet, self.map.keys().map(String::as_str)).is_some() {
+            return Err(ResolveError::ConfusableName(
+                "petname skeleton-collides with a different existing petname",
+            ));
+        }
+        self.map.insert(pet, ik.into());
+        Ok(())
     }
 
     /// Resolve a local `petname` to its pinned key, or a `NameResolution` miss if unassigned.
+    /// Lookup is by canonical form, so `Mum` finds the book's `mum` — one label, one identity.
     pub fn resolve(&self, petname: &str) -> Result<ResolvedBinding, ResolveError> {
-        match self.map.get(petname) {
+        let pet = canonical::canonical_name(petname)?;
+        match self.map.get(&pet) {
             Some(ik) => Ok(ResolvedBinding {
-                name: petname.to_owned(),
+                name: pet,
                 ik: ik.clone(),
                 resolver_type: ResolverType::Petname,
                 verification: Verification::LocalPetname,
@@ -425,10 +459,41 @@ mod tests {
     }
 
     #[test]
+    fn classify_rejects_mixed_script_and_folds_case_insensitively() {
+        // Form is recognized (dns), but the label mixes Latin + Cyrillic — rejected at the same
+        // chokepoint (0x0121), before any resolver is consulted.
+        let err = classify("alice@p\u{0430}ypal.com").unwrap_err();
+        assert!(matches!(err, ResolveError::MixedScriptLabel(_)));
+        assert_eq!(err.code(), 0x0121);
+        // The CJK exemptions pass classification.
+        assert_eq!(classify("alice@東京テスト.example").unwrap(), ResolverType::Dns);
+        // A single-script Cyrillic domain classifies fine.
+        assert_eq!(classify("иван@почта.рф").unwrap(), ResolverType::Dns);
+    }
+
+    #[test]
+    fn petname_book_folds_case_and_rejects_confusables_0x0122() {
+        let ik = IdentityKey::from_seed(&[7; 32]).public();
+        let mut book = PetnameBook::new();
+        book.assign("Cop", ik.clone()).unwrap();
+        // Canonical fold: `Cop` and `cop` are one label.
+        assert_eq!(book.resolve("cop").unwrap().ik, ik);
+        // Re-assigning the SAME canonical petname (user relabeling) stays allowed…
+        let ik2 = IdentityKey::from_seed(&[8; 32]).public();
+        book.assign("cop", ik2.clone()).unwrap();
+        assert_eq!(book.resolve("COP").unwrap().ik, ik2);
+        // …but a *different* petname whose skeleton collides is refused: Cyrillic `сор`
+        // (с-о-р, U+0441 U+043E U+0440) is single-script, so only the skeleton gate can catch it.
+        let err = book.assign("сор", ik).unwrap_err();
+        assert!(matches!(err, ResolveError::ConfusableName(_)));
+        assert_eq!(err.code(), 0x0122);
+    }
+
+    #[test]
     fn petname_book_resolves_pinned_and_misses_unknown() {
         let ik = IdentityKey::from_seed(&[7; 32]).public();
         let mut book = PetnameBook::new();
-        book.assign("mum", ik.clone());
+        book.assign("mum", ik.clone()).unwrap();
         let b = book.resolve("mum").unwrap();
         assert_eq!(b.ik, ik);
         assert_eq!(b.verification, Verification::LocalPetname);

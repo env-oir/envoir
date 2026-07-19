@@ -122,6 +122,44 @@ fourth naming system a deployment could add. This reference build does not imple
 guessing at a directory that doesn't exist here. This is the honest, disclosed edge of "the
 resolver set is open" — registered in the framework, absent from this codebase.
 
+## Canonical name form & confusables defense (i18n)
+
+Names are identity-bearing strings — they key KT leaves, the `Identity.names` forward-check, and
+the pin store — so **one identity must have exactly one spelling**. Every entry point (parse,
+form classification, KT leaf computation, `Identity.names` comparison, pin and petname keys)
+funnels through one chokepoint,
+[`canonical::canonical_name`](../crates/dmtap-naming/src/canonical.rs). The canonical form,
+precisely:
+
+- **Local part** — Unicode **NFC**, then lowercased (simple case fold), then NFC again (casing
+  can denormalize). `ALICE@…`, `alice@…`, and an NFD spelling are one identity — previously the
+  ASCII case difference alone hard-failed the identity check after DNS happily resolved it.
+- **Domain part** — full **UTS-46/IDNA** processing (the `idna` crate from the url/servo stack);
+  the canonical stored/compared form is the **A-label (ASCII/punycode)** form, and DNS qnames are
+  always built from A-labels. `bücher.example`, `BÜCHER.example`, an NFD spelling, and
+  `xn--bcher-kva.example` are one identity.
+- **Chain and bare forms** (`.eth`/`.sol`, key-names, petnames) — NFC + lowercase (their
+  namespaces are not DNS, so no punycoding), same script rules.
+- **Single script per label** (UTS-39): characters with script `Common`/`Inherited` are exempt,
+  and the conventional **Han+Hiragana+Katakana**, **Han+Hangul**, and **Han+Bopomofo**
+  combinations are admitted; any other multi-script label — the classic `pаypal.com` homograph
+  (Latin + Cyrillic `а`) — **fails closed** with `ERR_NAME_LABEL_MIXED_SCRIPT` (`0x0121`,
+  pending §21.3 spec registration) *before any resolver runs*.
+
+The mixed-script rule cannot catch a **whole-label** substitution — all-Cyrillic `аррӏе.com` is
+internally single-script and its DNS/KT chain can verify honestly (the attacker really owns the
+spoof domain). That is caught at **pin time**: the resolver keeps its name-keyed pin store keyed
+by a UTS-39-informed **skeleton** ([`canonical::skeleton`](../crates/dmtap-naming/src/canonical.rs)
+— lowercase + NFD, then a confusables fold), and a new name whose skeleton collides with a
+*different* already-pinned name (or petname, in the petname book) is rejected with
+`ERR_NAME_CONFUSABLE_WITH_PIN` (`0x0122`, pending registration) instead of being silently pinned
+as a second, visually identical identity. **Honesty:** the fold is a documented *subset* of
+UTS-39's `confusables.txt` (the high-value Cyrillic/Greek/Latin look-alike sets plus `0`/`O`,
+`1`/`l`), not the full ~6k-entry table — sufficient in v0 precisely because the mixed-script rule
+already forbids mixing scripts *inside* a label, forcing an attacker all-in on one script, which
+is what the folded sets cover. Honest single-script non-Latin names (`иван@почта.рф`) resolve and
+pin normally.
+
 ## The pluggable resolver-type framework
 
 Naming resolution is always the same two steps, whichever rung produced the pointer (spec

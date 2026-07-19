@@ -7,6 +7,14 @@
 //! normative (the spec governs, §10.4).
 //!
 //! ## What it does
+//! - [`canonical`] — the **canonical name form** every entry point funnels through (i18n
+//!   hardening): local part = Unicode **NFC + lowercase**; domain = **UTS-46/IDNA** with the
+//!   canonical stored/compared form being the **A-label** (punycode) form and DNS qnames always
+//!   built from A-labels; every label **single-script** (UTS-39, with the Common/Inherited and
+//!   Han+kana/Hangul/Bopomofo exemptions — `ERR_NAME_LABEL_MIXED_SCRIPT`, `0x0121`); plus the
+//!   pin-time UTS-39 **skeleton** confusables gate (`ERR_NAME_CONFUSABLE_WITH_PIN`, `0x0122`).
+//!   Parse, classify, `Identity.names` comparison, KT leaf computation, and pin/petname keys all
+//!   route through it — one spelling, one identity, everywhere.
 //! - [`dns`] — parse the §3.2 `_dmtap` **TXT** and **SVCB** records into fail-closed structs.
 //! - [`merkle`] — RFC 6962 inclusion-proof verification + a tree builder (§18.4.10, §18.9.5); the
 //!   arithmetic `dmtap-core`'s unsigned [`InclusionProof`](dmtap_core::kt::InclusionProof) needs.
@@ -45,6 +53,7 @@
 #![forbid(unsafe_code)]
 
 pub mod base64url;
+pub mod canonical;
 pub mod dns;
 pub mod error;
 pub mod keypackage;
@@ -55,6 +64,7 @@ pub mod reconcile;
 pub mod resolver;
 pub mod restype;
 
+pub use canonical::{canonical_domain, canonical_local, canonical_name, find_confusable, skeleton};
 pub use dns::{DmtapSvcbRecord, DmtapTxtRecord};
 pub use error::ResolveError;
 pub use keypackage::{InMemoryKeyPackages, KeyPackageSource};

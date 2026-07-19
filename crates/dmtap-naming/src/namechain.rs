@@ -119,17 +119,29 @@ impl<C: NameChainClient> NameChainResolver<C> {
         name: &str,
         claimed: &Identity,
     ) -> Result<ResolvedBinding, ResolveError> {
+        // 0. Canonicalize at the chokepoint ([`crate::canonical`]): chain names fold to NFC +
+        // lowercase with single-script labels (`0x0121` on a homograph mix), exactly as a real
+        // ENS/SNS client normalizes before its own lookup — so `Vitalik.ETH` and `vitalik.eth`
+        // are ONE on-chain identity, and a mixed-script chain label never even reaches the RPC.
+        let name = crate::canonical::canonical_name(name)?;
+
         // 1. Discover the on-chain pointer (read-only, §3.12.5(c)). Discovery is never proof (§3.1).
         let chain_ik = self
             .client
-            .resolve(name)
+            .resolve(&name)
             .ok_or(ResolveError::NameResolution("no on-chain name→ik record"))?;
 
         // 2. The claimed identity must stand on its own signed chain before we trust any field of it.
         claimed.verify(None)?;
 
-        // 3. Bidirectional direction A — the key claims the name (§3.9.4 forward check).
-        if !claimed.names.iter().any(|n| n == name) {
+        // 3. Bidirectional direction A — the key claims the name (§3.9.4 forward check), compared
+        // in canonical form on both sides (an uncanonicalizable `Identity.names` entry never
+        // matches — fail-closed).
+        if !claimed
+            .names
+            .iter()
+            .any(|n| crate::canonical::canonical_name(n).is_ok_and(|c| c == name))
+        {
             return Err(ResolveError::NameChainBindingUnverified(
                 "chain names a key that does not claim the name in Identity.names",
             ));
@@ -148,7 +160,7 @@ impl<C: NameChainClient> NameChainResolver<C> {
         }
 
         Ok(ResolvedBinding {
-            name: name.to_owned(),
+            name,
             ik: classical.clone(),
             resolver_type: ResolverType::NameChain(self.client.chain()),
             verification: Verification::ChainBound,
