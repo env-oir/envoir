@@ -186,7 +186,7 @@ unit of work.
 All of this is tested, under `-race`: `concurrency_test.go` covers concurrent instantiation from one
 runtime, 12 goroutines × 40 iterations hammering a single shared `Instance`, instance isolation,
 pooled parallelism converging on one state root, use-after-close, and — the one with teeth — the
-**full 22-vector conformance run executed concurrently on four pooled instances**, each asserted
+**full 24-vector conformance run executed concurrently on four pooled instances**, each asserted
 byte-identical to the native Rust trace.
 
 ---
@@ -246,14 +246,25 @@ the algebra for it to disagree with, so a divergence is a bug in the binding.
 The suite refuses to skip itself when the sibling spec repo is not checked out — a proof that
 quietly does not run is worse than no proof, because it reports success.
 
-**Currently 22 of 24 vectors.** `SYNC-SNAP-03` and `SYNC-VAL-01` (corrections C-08/C-09) landed in
-the spec repo on 2026-07-19 and are driven by **no surface yet**: C-09 redefines a `SnapshotBody` as
-the minimal set of individually-signed ops whose fold equals the observable state, rather than
-`det_cbor(ObservableState)`, and `dmtap-sync` has no such type and no fold. That is core substrate
-work in Rust, not binding work. Both are listed in this harness's `notCovered` — guarded so an entry
-is permitted **only while the native trace does not drive it either**, which means the moment the
-native runner grows an executor, this binding goes red until it grows one too. Go cannot quietly
-fall behind the other surfaces.
+**All 24 vectors, on all three surfaces.** `SYNC-SNAP-03` and `SYNC-VAL-01` (corrections C-08/C-09)
+landed in the spec repo on 2026-07-19 and were briefly listed in this harness's `notCovered`, because
+they needed core work in Rust rather than binding work: C-09 redefines a `SnapshotBody` as the
+minimal set of individually-signed ops whose fold equals the observable state, rather than
+`det_cbor(ObservableState)`, and `dmtap-sync` had no such type and no fold. That work landed, and
+`notCovered` is now empty.
+
+The guard that made this ordering safe is worth keeping in mind if you ever reach for that map: an
+entry is permitted **only while the native trace does not drive it either**. So the moment the
+native runner grows an executor, this binding goes red until it grows one too — Go cannot quietly
+fall behind the other surfaces, and `notCovered` can only ever hold vectors *no* surface implements.
+
+`SnapshotBody` is exposed here as `SnapshotBodyDecode`/`Encode`/`Fold`/`VerifyRoot`. Note which one
+you want: `Fold` is for a **responder** building a body (it has no root to check against yet — the
+root is *defined* as the hash of what `Fold` returns), while a **caller** must use `VerifyRoot`,
+because folding without checking the result against `Snapshot.root` is exactly the unverified
+adoption §5.2.1 step 3 forbids. Adoption itself stays on the ordinary op path via
+`Engine.IngestSigned`; there is deliberately no state-import entry point, and §6.1.2 is explicit
+that an implementation exposing none is not thereby incomplete.
 
 ---
 

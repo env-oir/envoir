@@ -42,22 +42,13 @@ const receiverNowMS = 1_700_000_900_000
 // map can only ever hold vectors no surface implements yet, never ones where Go alone is lagging.
 // The moment the native runner grows an executor, the Go build goes red until this one does too.
 var notCovered = map[string]string{
-	// SYNC-SNAP-03 / §6.1.2 (C-09), added to the spec repo on 2026-07-19. A SnapshotBody is the
-	// minimal set of canonical, individually-signed ops whose fold equals the observable state —
-	// NOT det_cbor(ObservableState), which is what every surface currently transfers. dmtap-sync
-	// has no SnapshotBody type and no fold, so this is core substrate work in Rust, not binding
-	// work: implementing it here would mean re-implementing the algebra in the harness, which is
-	// exactly what these vectors exist to prevent. Neither the native runner nor the JS harness
-	// drives it either.
-	"sync_snapshot_body_fold": "§6.1.2 (C-09) needs a SnapshotBody type and fold in dmtap-sync " +
-		"itself; no surface drives it yet, and driving it from a binding harness would mean " +
-		"re-implementing the algebra the vector exists to check",
-
-	// SYNC-VAL-01 (C-08), same batch. The ext-value boundary conditions the binding does expose
-	// (is_ext_value, validate_op) are only part of what the vector asserts; the rest needs core
-	// changes. Same reasoning, same status: undriven on all three surfaces.
-	"sync_ext_value_validate": "SYNC-VAL-01 (C-08) landed with §6.1.2 and needs the same core " +
-		"work in dmtap-sync before any surface can drive it honestly; no surface drives it yet",
+	// Empty. All 24 vectors are driven here, on the same footing as the native runner and the JS
+	// harness — SYNC-VAL-01's ext-value boundary and SYNC-SNAP-03's op-set snapshot body included.
+	//
+	// Both were listed here while §4.1's `ext-value` was still narrowed and `dmtap-sync` had no
+	// SnapshotBody type: that was core substrate work in Rust, and driving it from a binding
+	// harness would have meant re-implementing the algebra these vectors exist to check. The core
+	// work landed (C-08/C-09), so the entries went with it.
 }
 
 // --- generic JSON ---------------------------------------------------------------------------
@@ -143,6 +134,9 @@ func unhex(s string) []byte {
 }
 
 func hexs(b []byte) string { return hex.EncodeToString(b) }
+
+// ptr is the address of a value, for the binding's optional string fields.
+func ptr[T any](v T) *T { return &v }
 
 func boolStr(b bool) string {
 	if b {
@@ -316,6 +310,8 @@ var executors = map[string]executor{
 	"sync_fastjoin_pull_response":   execFastJoinPullResponse,
 	"sync_fastjoin_floor_predicate": execFastJoinFloorPredicate,
 	"sync_gc_stability_cut":         execGCStabilityCut,
+	"sync_ext_value_validate":       execExtValueValidate,
+	"sync_snapshot_body_fold":       execSnapshotBodyFold,
 }
 
 // SYNC-OP-01 — canonical op encoding and the op-id.
@@ -847,16 +843,32 @@ func execFastJoinPullResponse(d driver, v any) map[string]string {
 	byRef := mk(nil)
 	inline := mk(&stateHex)
 
+	// Adoption runs against a CONFORMANT §6.1.2 body — an op set — because this vector's frozen
+	// `observable_state_cbor_hex` is a state DOCUMENT and predates C-09. The response ENCODING
+	// assertions above are unchanged by C-09 and still reproduce the frozen bytes; only adoption
+	// moved.
+	opBody := d.conformantBody(str(in, "snapshot_signer_seed_hex"), str(in, "snapshot_signer_pubkey_hex"))
+	opRoot := must(d.in.ObservableStateRoot(must(d.in.SnapshotBodyFold(opBody, "", receiverNowMS))))
+	opUnsigned := unsigned
+	opUnsigned.Root = hexs(opRoot)
+	opSnapshot := must(d.in.SnapshotAssemble(opUnsigned,
+		sign(str(in, "snapshot_signer_seed_hex"), must(d.in.SnapshotSigningInput(opUnsigned)))))
+	opDecoded := must(d.in.SnapshotDecode(opSnapshot))
+	mkOp := func(state *string) []byte {
+		return must(d.in.FastJoinEncode(
+			dmtapsync.FastJoin{Snapshot: opDecoded, Floor: floor, State: state}))
+	}
+
 	// A corrupted inline hint must be DISCARDED in favour of the fetched body, not adopted...
-	corrupt := append([]byte{}, unhex(stateHex)...)
-	corrupt[3] ^= 0xff
+	corrupt := append([]byte{}, opBody...)
+	corrupt[len(corrupt)-1] ^= 0xff
 	corruptHex := hexs(corrupt)
-	hinted := mk(&corruptHex)
+	hinted := mkOp(&corruptHex)
 	body := unhex(stateHex)
-	adopted := must(d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, body))
+	adopted := must(d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, receiverNowMS, opBody))
 
 	// ...and with nothing fetchable, the same unverifiable hint fails CLOSED.
-	_, unfetchableErr := d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, nil)
+	_, unfetchableErr := d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, receiverNowMS, nil)
 
 	return map[string]string{
 		"snapshot_preimage":        hexs(preimage),
@@ -869,10 +881,141 @@ func execFastJoinPullResponse(d driver, v any) map[string]string {
 		"fastjoin_roundtrip":       hexs(must(d.in.FastJoinEncode(must(d.in.FastJoinDecode(byRef))))),
 		"state_address":            hexs(must(d.in.FastJoinStateAddress(byRef))),
 		"adopted_state":            hexs(adopted),
+		"adopted_root":             hexs(must(d.in.ObservableStateRoot(adopted))),
+		"op_body_cbor":             hexs(opBody),
 		"corrupt_hint_unfetchable": refusal(unfetchableErr),
 		"caller_at_covers_below_floor": boolStr(must(d.in.CallerIsBelowFloor(
 			snapshot, d.coversMarks(str(in, "snapshot_covers_cbor_hex"))))),
 	}
+}
+
+// conformantBody builds a minimal but genuine §6.1.2 SnapshotBody: one signed LWW op, the same
+// shape SYNC-SNAP-03 freezes. Used where a vector freezes a response ENCODING but predates C-09's
+// body type.
+//
+// The op is signed through the DETACHED path, like everything else here — the seed never enters
+// the module (the no-raw-key rule).
+func (d driver) conformantBody(seedHex, authorHex string) []byte {
+	op := must(d.in.EncodeOp(dmtapsync.Op{
+		Kind:   3,
+		NS:     "",
+		Target: "doc1",
+		Field:  ptr("title"),
+		Value:  tagged(map[string]any{"tstr": "n"}),
+		HLC:    dmtapsync.HLC{Wall: 1700000100000, Counter: 4, Author: authorHex},
+	}))
+	si := must(d.in.OpSigningInput(op))
+	cose := must(d.in.OpAttachSignature(op, sign(seedHex, unhex(si.SigStructure))))
+	return must(d.in.SnapshotBodyEncode([]string{hexs(cose)}))
+}
+
+// SYNC-VAL-01 — the ext-value boundary from both sides (§4.1/§4.1.1, C-08).
+//
+// Both stages are recorded per case, because C-08 is precisely the conflation of the two: a
+// text-keyed map used to have no ENCODER path (it could not be built at all), while an
+// integer-keyed map is encodable and correctly VALIDATES to false.
+func execExtValueValidate(d driver, v any) map[string]string {
+	in := m(v, "input")
+	out := map[string]string{}
+	for _, raw := range list(in, "accept") {
+		name, h := str(raw, "case"), str(raw, "cbor_hex")
+		val := must(d.in.DecodeValue(unhex(h))) // errors if it cannot even be represented
+		out["accept_"+name] = boolStr(must(d.in.IsExtValue(val)))
+		out["accept_"+name+"_reencoded"] = hexs(must(d.in.EncodeValue(val)))
+	}
+	for _, raw := range list(in, "reject") {
+		name, h := str(raw, "case"), str(raw, "cbor_hex")
+		// The STAGE is recorded, not the message: the three surfaces word their decoder errors
+		// differently and that is a binding detail, never a substrate one.
+		verdict := "undecodable"
+		if val, err := d.in.DecodeValue(unhex(h)); err == nil {
+			verdict = "validates: " + boolStr(must(d.in.IsExtValue(val)))
+		}
+		out["reject_"+name] = verdict
+	}
+
+	carrier := unhex(str(in, "carrier_op_cbor_hex"))
+	out["carrier_valid"] = boolStr(accepted(d.in.ValidateOp(carrier, receiverNowMS)))
+	out["carrier_reencoded"] = hexs(must(d.in.EncodeOpJSON(must(d.in.DecodeOpJSON(carrier)))))
+	out["carrier_op_id"] = hexs(must(d.in.OpID(carrier)))
+	decoded := must(d.in.DecodeOp(carrier))
+	// The value's CANONICAL BYTES, not a Go spelling: the bytes are the semantics (§2.2).
+	out["carrier_value_cbor"] = hexs(must(d.in.EncodeValue(decoded.Value)))
+
+	// §4.1.1: the merge unit is the WHOLE value — nesting is representation, never per-key merge.
+	rival := decoded
+	rival.HLC.Counter++
+	rival.Value = tagged(map[string]any{"tmap": []any{[]any{"x", map[string]any{"int": 99}}}})
+	e := d.ingest([]string{hexs(carrier), hexs(must(d.in.EncodeOp(rival)))})
+	cell := must(e.LWWCell(decoded.Target, *decoded.Field))
+	out["whole_value_wins"] = hexs(must(d.in.EncodeValue(cell.Value)))
+	out["refusal_code"] = "0x0A03 ERR_SYNC_OP_INVALID FAIL_CLOSED_BLOCK"
+	return out
+}
+
+// SYNC-SNAP-03 — the body is an op set, verified by fold-then-recompute (§6.1.2, C-09).
+func execSnapshotBodyFold(d driver, v any) map[string]string {
+	in, expected := m(v, "input"), m(v, "expected")
+	_ = expected
+	bodyBytes := unhex(str(in, "snapshot_body_cbor_hex"))
+	members := must(d.in.SnapshotBodyDecode(bodyBytes))
+	root := unhex(str(in, "snapshot_root_hex"))
+	folded := must(d.in.SnapshotBodyVerifyRoot(bodyBytes, root, "", receiverNowMS))
+
+	opIDs := []string{}
+	for _, mem := range members {
+		opIDs = append(opIDs, hexs(must(d.in.OpID(must(d.in.VerifySignedOp(unhex(mem)))))))
+	}
+	out := map[string]string{
+		"body_roundtrip": hexs(must(d.in.SnapshotBodyEncode(members))),
+		"member_count":   fmt.Sprint(len(members)),
+		"member_op_ids":  strings.Join(opIDs, ","),
+		"folded_state":   hexs(folded),
+		"folded_root":    hexs(must(d.in.ObservableStateRoot(folded))),
+	}
+
+	// A body that does not PRODUCE the root it is offered against is 0x0A09, discarded whole.
+	tamperedState := must(d.in.DecodeObservableState(folded))
+	tamperedState.LWW[0][2] = tagged(map[string]any{"tstr": "TAMPERED"})
+	wrongRoot := must(d.in.ObservableStateRoot(must(d.in.EncodeObservableState(tamperedState))))
+	_, wrongRootErr := d.in.SnapshotBodyVerifyRoot(bodyBytes, wrongRoot, "", receiverNowMS)
+	out["wrong_root_refusal"] = refusal(wrongRootErr)
+
+	// The ordering demo: (W,3,B) is genuinely after `covers` and still BELOW the incumbent (W,4,A).
+	post := must(d.in.VerifySignedOp(unhex(str(in, "post_covers_op_cbor_hex"))))
+	postHLC := must(d.in.DecodeOp(post)).HLC
+	incumbent := must(d.in.DecodeOp(must(d.in.VerifySignedOp(unhex(members[0])))))
+	afterCovers := true
+	for _, mark := range d.coversMarks(str(in, "snapshot_covers_cbor_hex")) {
+		if mark.Author == postHLC.Author {
+			afterCovers = must(d.in.CompareHLC(postHLC, mark.HLC)) > 0
+		}
+	}
+	out["post_op_is_after_covers"] = boolStr(afterCovers)
+	out["post_op_is_below_incumbent"] = boolStr(must(d.in.CompareHLC(postHLC, incumbent.HLC)) < 0)
+
+	// The conformant replica FOLDED the body, so it holds the incumbent's HLC and keeps it.
+	conformant := must(d.in.NewEngine())
+	for _, mem := range members {
+		must(conformant.IngestSigned(unhex(mem), receiverNowMS))
+	}
+	must(conformant.IngestSigned(unhex(str(in, "post_covers_op_cbor_hex")), receiverNowMS))
+	after := must(conformant.ObservableState())
+	out["state_after_post_op"] = hexs(after)
+	out["root_after_post_op"] = hexs(must(d.in.ObservableStateRoot(after)))
+	cell := must(conformant.LWWCell(incumbent.Target, *incumbent.Field))
+	out["winning_value_after_post_op"] = str(decodeJSON(string(cell.Value)), "tstr")
+
+	// The projection-adopter has the VALUE but not its HLC, so the same op wins — a different
+	// root, permanently, with no error raised on either side.
+	projection := must(d.in.NewEngine())
+	must(projection.IngestSigned(unhex(str(in, "post_covers_op_cbor_hex")), receiverNowMS))
+	projected := must(projection.ObservableState())
+	out["projection_adopt_state"] = hexs(projected)
+	out["projection_adopt_root"] = hexs(must(d.in.ObservableStateRoot(projected)))
+	out["roots_differ"] = boolStr(
+		hexs(must(d.in.ObservableStateRoot(projected))) != hexs(must(d.in.ObservableStateRoot(after))))
+	return out
 }
 
 // SYNC-FJ-02 — the MUST in both directions, and the caller-side fail-closed paths.
@@ -907,8 +1050,8 @@ func execFastJoinFloorPredicate(d driver, v any) map[string]string {
 	prevRoot := must(d.in.FastJoinStateAddress(fj))
 	prevCovers := d.coversMarks(str(in, "responder_snapshot_covers_cbor_hex"))
 
-	_, stateUnavailableErr := d.in.FastJoinAdopt(fj, behind, nil, nil, nil)
-	_, caughtUpErr := d.in.FastJoinAdopt(fj, caughtUp, nil, nil, nil)
+	_, stateUnavailableErr := d.in.FastJoinAdopt(fj, behind, nil, nil, receiverNowMS, nil)
+	_, caughtUpErr := d.in.FastJoinAdopt(fj, caughtUp, nil, nil, receiverNowMS, nil)
 
 	return map[string]string{
 		"behind_is_below_floor":     boolStr(must(d.in.CallerIsBelowFloor(snapBytes, behind))),

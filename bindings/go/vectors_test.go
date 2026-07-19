@@ -179,7 +179,7 @@ func TestEveryVectorIsDrivenOrExplicitlyNotCovered(t *testing.T) {
 		}
 	}
 	// Guard against silent erosion: if this drops, coverage was removed.
-	if len(f.result.covered) < 22 {
+	if len(f.result.covered) < 24 {
 		t.Errorf("only %d vectors driven through the binding", len(f.result.covered))
 	}
 	t.Logf("%d vectors driven, %d awaiting core substrate support on every surface",
@@ -507,9 +507,24 @@ func TestSyncFJ01FrozenFastJoinAndPullResponse(t *testing.T) {
 	eq(t, got["fastjoin_roundtrip"], got["fastjoin_cbor"], "decode/encode changed the FastJoin")
 	eq(t, got["state_address"], str(exp, "state_fetch_address_hex"), "state fetch address")
 
-	// The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body...
-	eq(t, got["adopted_state"], str(in, "observable_state_cbor_hex"),
-		"a corrupted inline hint must be discarded, not adopted")
+	// The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body.
+	//
+	// Adoption here runs against a CONFORMANT §6.1.2 body (an op set), not this vector's frozen
+	// `observable_state_cbor_hex`, which is a state DOCUMENT and predates C-09 — the vector was not
+	// regenerated when §6.1.2 landed. Every byte-exact ENCODING assertion above is unaffected and
+	// still holds; what moved is what a body IS.
+	if got["op_body_cbor"] == "" {
+		t.Error("adoption must be exercised against a real op-set body")
+	}
+	if got["adopted_state"] == str(in, "observable_state_cbor_hex") {
+		t.Error("this vector predates C-09; its state document must not be adoptable as a body")
+	}
+	eq(t, got["adopted_root"],
+		hexs(must(f.in.ObservableStateRoot(unhex(got["adopted_state"])))),
+		"the adopted state must be the one the fetched ops PRODUCE")
+	eq(t, got["adopted_state"],
+		hexs(must(f.in.SnapshotBodyFold(unhex(got["op_body_cbor"]), "", receiverNowMS))),
+		"a corrupted inline hint must be discarded in favour of the fetched body, not adopted")
 	if m(exp, "inline_state_is_cache_hint_verified_against_root") != true {
 		t.Error("the vector's own premise does not hold")
 	}
@@ -517,6 +532,87 @@ func TestSyncFJ01FrozenFastJoinAndPullResponse(t *testing.T) {
 	matches(t, got["corrupt_hint_unfetchable"], `0x0A0C`, "unverifiable hint, nothing fetchable")
 	eq(t, got["caller_at_covers_below_floor"], "false",
 		"a caller already at `covers` is not below the floor")
+}
+
+func TestSyncVAL01TheWholeRecursiveExtValue(t *testing.T) {
+	f := load(t)
+	v, got := f.v("sync_ext_value_boundary"), f.got("sync_ext_value_boundary")
+	in, exp := m(v, "input"), m(v, "expected")
+
+	// Every accept case must DECODE and VALIDATE. Both stages matter: C-08 is the conflation of an
+	// encoder-side refusal (a text-keyed map could not be built at all) with a validator-side one.
+	for _, raw := range list(in, "accept") {
+		name, h := str(raw, "case"), str(raw, "cbor_hex")
+		eq(t, got["accept_"+name], "true", "accept case `"+name+"` validated to false")
+		eq(t, got["accept_"+name+"_reencoded"], h, "accept case `"+name+"` re-encoding")
+	}
+	if m(exp, "accept_all") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	// Every reject case is refused — at whichever stage. What is forbidden is accepting it.
+	for _, raw := range list(in, "reject") {
+		name := str(raw, "case")
+		if got["reject_"+name] == "validates: true" {
+			t.Errorf("reject case `%s` was ACCEPTED as an ext-value", name)
+		}
+	}
+	if m(exp, "reject_all") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	eq(t, str(exp, "reject_error_code"), "0x0A03", "reject error code")
+	// The recursion is the point: an integer-keyed map nested at depth 2 is caught, not waved
+	// through by a shallow check.
+	eq(t, got["reject_nested_int_keyed_map"], "validates: false", "validation is not recursive")
+	if m(exp, "validation_is_recursive") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	// The carrier op — the intended end-to-end shape — is accepted and round-trips byte-exactly.
+	eq(t, got["carrier_valid"], "true", "the carrier op was refused; that is the whole of C-08")
+	eq(t, got["carrier_reencoded"], str(in, "carrier_op_cbor_hex"), "carrier op re-encoding")
+	if m(exp, "carrier_op_accepted") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	// §4.1.1: nesting is REPRESENTATION. The merge unit is the whole value, so a concurrent write
+	// of a different nested map replaces it entire — there is no per-key merge at this boundary.
+	rival := must(f.in.EncodeValue(json.RawMessage(`{"tmap":[["x",{"int":99}]]}`)))
+	eq(t, got["whole_value_wins"], hexs(rival), "the whole value must win, never a per-key merge")
+}
+
+func TestSyncSNAP03TheBodyIsAnOpSet(t *testing.T) {
+	f := load(t)
+	v, got := f.v("sync_snapshot_body_is_op_set"), f.got("sync_snapshot_body_is_op_set")
+	in, exp := m(v, "input"), m(v, "expected")
+
+	// Fold-then-recompute: the ops PRODUCE the committed state, which is strictly stronger than
+	// hashing the transfer bytes.
+	eq(t, got["body_roundtrip"], str(in, "snapshot_body_cbor_hex"), "body round-trip")
+	eq(t, got["folded_state"], str(exp, "folded_state_cbor_hex"), "folded state")
+	eq(t, got["folded_root"], str(exp, "folded_root_hex"), "folded root")
+	eq(t, got["folded_root"], str(in, "snapshot_root_hex"), "the body must fold to Snapshot.root")
+	if m(exp, "body_folds_to_root") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	// A body offered against a root it does not produce is 0x0A09 and discarded whole.
+	matches(t, got["wrong_root_refusal"], `0x0A09`, "a body verified against a root it cannot produce")
+	eq(t, str(exp, "body_mismatch_error_code"), "0x0A09", "body mismatch code")
+
+	// The ordering premise the vector exists for: after `covers`, yet BELOW the incumbent.
+	// `covers` bounds each author's own stream; the §3 HLC orders across authors.
+	eq(t, got["post_op_is_after_covers"], "true", "vector premise broken")
+	eq(t, got["post_op_is_below_incumbent"], "true", "vector premise broken")
+
+	// A conformant replica folded the body, so it HAS the incumbent's HLC — and keeps it.
+	eq(t, got["winning_value_after_post_op"], str(exp, "winning_value_after_post_op"), "winner")
+	eq(t, got["state_after_post_op"], str(exp, "state_after_post_op_cbor_hex"), "state after")
+	eq(t, got["root_after_post_op"], str(exp, "root_after_post_op_hex"), "root after")
+
+	// A projection-adopter has the value but not its HLC, applies the write, and lands elsewhere.
+	eq(t, got["projection_adopt_state"], str(exp, "projection_adopt_state_cbor_hex"), "projection")
+	eq(t, got["projection_adopt_root"], str(exp, "projection_adopt_root_hex"), "projection root")
+	if m(exp, "projection_adopt_is_nonconformant") != true || m(exp, "roots_differ") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	eq(t, got["roots_differ"], "true", "the divergence was not reproduced")
 }
 
 func TestSyncFJ02TheMUSTInBothDirectionsAndNoSuffixFallback(t *testing.T) {
@@ -596,7 +692,7 @@ func TestSyncFJ02TheMUSTInBothDirectionsAndNoSuffixFallback(t *testing.T) {
 //
 // The native trace is recorded by tests/native_trace.rs calling dmtap-sync directly — no wasm, no
 // marshalling. The JS surface is held to the same file by test/vectors.test.mjs. So a pass here
-// means all three surfaces produced identical bytes for all 22 vectors, and any divergence is a
+// means all three surfaces produced identical bytes for all 24 vectors, and any divergence is a
 // CRITICAL finding about the binding, never a test to adjust.
 func TestGoAndNativeRustAreByteIdentical(t *testing.T) {
 	f := load(t)

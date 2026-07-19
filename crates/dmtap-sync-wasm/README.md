@@ -18,8 +18,8 @@ The reason to believe any of this is one command:
 
 ```sh
 ./build.sh                                            # compile the binding
-cargo test -p dmtap-sync-wasm --test native_trace     # 22 vectors through NATIVE Rust
-node --test 'crates/dmtap-sync-wasm/test/*.test.mjs'  # the same 22 through WASM, from JS
+cargo test -p dmtap-sync-wasm --test native_trace     # 24 vectors through NATIVE Rust
+node --test 'crates/dmtap-sync-wasm/test/*.test.mjs'  # the same 24 through WASM, from JS
 ```
 
 The JS suite drives the frozen conformance vectors
@@ -28,11 +28,18 @@ vector, that every recomputed byte matches **both** the vector's frozen expectat
 recorded from the native Rust engine. That second assertion is the one `BINDINGS.md` §4 calls
 non-negotiable: without it, "the browser computes what the server computes" is a claim.
 
-Current status: **22/22 vectors driven through both surfaces, byte-identical; 29 JS assertions,
+Current status: **24/24 vectors driven through both surfaces, byte-identical; 31 JS assertions,
 7 native.** `NOT_COVERED` is empty — nothing is skipped. The §5.2.1 fast-join vectors looked like
 pure transport at first, but the `FastJoin` encoding, the below-floor predicate and the caller-side
 verification sequence are all algebra; only the fetch is transport, and the binding leaves that to
-the host. So a browser replica can fast-join too.
+the host. So a browser replica can fast-join too — and, since correction C-09, fold and verify a
+`SnapshotBody` while it is there.
+
+Two trace fields are deliberately recorded as the *substrate* sees them rather than as either
+surface words them: a `SYNC-VAL-01` reject case records the **stage** it failed at (`undecodable`
+vs `validates: false`), not the decoder's message, and a carrier value is recorded as canonical
+CBOR rather than a debug or JSON spelling. Both surfaces word those differently, and letting a
+binding detail into the trace would make the parity assertion fail on prose instead of on bytes.
 
 Nothing here is a mock. The vectors' `signature_hex` is reproduced by `node:crypto` signing a
 preimage the WASM module hands out — which simultaneously proves the detached signing protocol
