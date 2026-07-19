@@ -166,11 +166,13 @@ fn handle_connection(
     let mut in_data = false;
     let mut secured = false;
 
-    // `read_line` yields `None` on peer disconnect, which ends the session.
+    // `read_line` yields raw line bytes (`None` on peer disconnect, which ends the session).
     while let Some(line) = read_line(&mut conn)? {
         if in_data {
-            // Everything is message content until the terminating '.'; feed straight through.
-            let reply = session.feed_line(&line);
+            // Everything is message content until the terminating '.'; feed the RAW bytes straight
+            // through — a DATA line is arbitrary 8-bit content (ISO-8859-x, GB18030, …) and must
+            // reach DKIM verification / the sealed MOTE byte-exact, never through a UTF-8 decode.
+            let reply = session.feed_line_bytes(&line);
             if reply.code != 0 {
                 write_all(&mut conn, &reply.wire())?;
                 in_data = false;
@@ -178,6 +180,9 @@ fn handle_connection(
             continue;
         }
 
+        // Command phase: RFC 5321 commands are ASCII, so this decode is lossless for any
+        // conforming client (a broken peer at worst garbles its own 502).
+        let line = String::from_utf8_lossy(&line);
         let verb = line.split(' ').next().unwrap_or("").to_ascii_uppercase();
         match verb.as_str() {
             "EHLO" | "HELO" => {

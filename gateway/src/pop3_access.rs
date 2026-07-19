@@ -150,8 +150,10 @@ impl<S: MailStore, A: Authenticator> LineProtocol for Pop3Line<S, A> {
     fn greeting(&mut self) -> String {
         self.session.greeting()
     }
-    fn feed_line(&mut self, line: &str) -> String {
-        self.session.feed_line(line)
+    // POP3 is command-only on the client→server leg (RFC 1939 commands are ASCII; there is no
+    // client DATA phase), so decoding here is lossless for any conforming client.
+    fn feed_line_bytes(&mut self, line: &[u8]) -> String {
+        self.session.feed_line(&String::from_utf8_lossy(line))
     }
     fn is_starttls(&self, line: &str) -> bool {
         verb_of(line) == "STLS"

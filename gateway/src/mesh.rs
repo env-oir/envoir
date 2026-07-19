@@ -37,7 +37,7 @@ use dmtap_core::mote::Envelope;
 use crate::attestation::Attestation;
 use crate::b64;
 use crate::inbound::{DeliveryOutcome, MeshDelivery};
-use crate::net::{read_line, write_all};
+use crate::net::{read_line_str, write_all};
 
 /// The honest **unconfigured** mesh seam: acks nothing, so inbound mail is deferred `451` and the
 /// legacy sender retries (§7.4). A gateway wired with this is safe — it never silently accepts and
@@ -160,7 +160,7 @@ impl HttpMeshDelivery {
         tcp.flush()?;
 
         // Only the status line matters for the ack decision.
-        let status = read_line(&mut tcp)?.ok_or_else(|| {
+        let status = read_line_str(&mut tcp)?.ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "no HTTP status line")
         })?;
         let code_ok = status.split_whitespace().nth(1).map(|c| c.starts_with('2')).unwrap_or(false);

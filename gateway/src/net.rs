@@ -16,11 +16,17 @@ pub(crate) fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Read one CRLF-terminated line from `r`, returning it **without** the trailing CR/LF. `Ok(None)`
-/// signals a clean EOF at a line boundary (peer hung up). Reads a byte at a time so we never buffer
-/// past the line — critical for STARTTLS, where the very next byte after our `220` is TLS
-/// ClientHello and must not be swallowed by a read-ahead buffer.
-pub(crate) fn read_line(r: &mut dyn Read) -> io::Result<Option<String>> {
+/// Read one CRLF-terminated line from `r` as **raw bytes**, returned **without** the trailing
+/// CR/LF. `Ok(None)` signals a clean EOF at a line boundary (peer hung up). Reads a byte at a time
+/// so we never buffer past the line — critical for STARTTLS, where the very next byte after our
+/// `220` is TLS ClientHello and must not be swallowed by a read-ahead buffer.
+///
+/// Bytes, not `String`, on purpose (the audit's item 1): an SMTP `DATA` line is arbitrary 8-bit
+/// content (ISO-8859-x, GB18030, Shift_JIS, …), and a lossy UTF-8 decode here turned every such
+/// byte into U+FFFD **before DKIM verification** — corrupting stored mail and breaking body hashes.
+/// The inbound MX feeds these bytes straight through; reply/command contexts that genuinely want
+/// text use [`read_line_str`].
+pub(crate) fn read_line(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let mut buf: Vec<u8> = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
     loop {
@@ -37,7 +43,7 @@ pub(crate) fn read_line(r: &mut dyn Read) -> io::Result<Option<String>> {
                     if buf.last() == Some(&b'\r') {
                         buf.pop();
                     }
-                    return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+                    return Ok(Some(buf));
                 }
                 buf.push(byte[0]);
                 // A defensive cap so a hostile peer can't force unbounded growth on one line.
@@ -51,12 +57,19 @@ pub(crate) fn read_line(r: &mut dyn Read) -> io::Result<Option<String>> {
     }
 }
 
+/// [`read_line`] decoded to text for contexts that are servers' own replies / status lines (SMTP
+/// reply parsing, the mesh ingest status) — ASCII per RFC 5321 §4.2, so the lossy fallback can only
+/// mis-render a broken peer's reply text, never message content. DATA paths MUST use [`read_line`].
+pub(crate) fn read_line_str(r: &mut dyn Read) -> io::Result<Option<String>> {
+    Ok(read_line(r)?.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
 /// Read a (possibly multi-line) SMTP reply and return `(code, joined_text)`. Continuation lines use
 /// `NNN-text`; the final line uses `NNN text` (RFC 5321 §4.2.1).
 pub(crate) fn read_reply(r: &mut dyn Read) -> io::Result<(u16, String)> {
     let mut text = String::new();
     loop {
-        let line = read_line(r)?
+        let line = read_line_str(r)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no SMTP reply"))?;
         if line.len() < 3 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "short SMTP reply line"));

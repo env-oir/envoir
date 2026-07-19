@@ -88,8 +88,16 @@ impl DnsMxResolver {
 
 impl MxResolver for DnsMxResolver {
     fn resolve_mx(&self, domain: &str) -> Vec<MxHost> {
+        // A-label the domain up front (idempotent for ASCII): the MX query itself is converted
+        // again inside `query_raw`, but the RFC 5321 §5.1 A/AAAA **fallback host** below must also
+        // be the punycoded form — returning the bare Unicode domain would hand the transport a name
+        // it can neither dial nor put in SNI. An unconvertible domain keeps its original spelling
+        // here (the doomed query then fails and the fallback is returned verbatim): this trait has
+        // no error channel, and [`crate::outbound`] already refuses such destinations with the
+        // specific [`crate::outbound::OutboundError::IdnNotConvertible`] before resolving.
+        let domain = crate::idn::domain_to_ascii(domain).unwrap_or_else(|_| domain.to_string());
         let fallback = || vec![MxHost { host: domain.to_string(), preference: 0 }];
-        let (packet, msg) = match self.client.query_raw(domain, TYPE_MX) {
+        let (packet, msg) = match self.client.query_raw(&domain, TYPE_MX) {
             Ok(r) => r,
             Err(_) => return fallback(),
         };

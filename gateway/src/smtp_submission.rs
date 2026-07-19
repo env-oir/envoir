@@ -255,8 +255,10 @@ impl<A: Authenticator, K: SubmissionSink> LineProtocol for SmtpLine<A, K> {
     fn greeting(&mut self) -> String {
         self.session.greeting()
     }
-    fn feed_line(&mut self, line: &str) -> String {
-        let reply = self.session.feed_line(line);
+    // Raw bytes through to `dmtap-mail`'s lossless entry point: a submission DATA line under an
+    // 8-bit CTE must be buffered byte-exact (the session's own docs on `feed_line_bytes`).
+    fn feed_line_bytes(&mut self, line: &[u8]) -> String {
+        let reply = self.session.feed_line_bytes(line);
         // Drain and route any submission the session accepted on this line (a completed `DATA`).
         self.route_pending();
         reply

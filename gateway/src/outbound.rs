@@ -11,10 +11,11 @@
 
 use dmtap_core::mote::Payload;
 use dmtap_core::TimestampMs;
-use dmtap_mail::mime::format_rfc5322_date;
+use dmtap_mail::mime::{encode_display_name, encode_header_value, format_rfc5322_date};
 
 use crate::b64;
 use crate::dkim::{self, DkimKey};
+use crate::idn;
 use crate::mta_sts::any_pattern_matches;
 use crate::mx::{InMemoryMxResolver, MxHost, MxResolver};
 use crate::outbound_guard::{OutboundSenderGuard, SenderVerdict};
@@ -139,6 +140,14 @@ pub enum OutboundError {
     NoMxHost(String),
     #[error("header field {0} contains a CR, LF, or NUL — refused to avoid header injection")]
     HeaderInjection(&'static str),
+    /// The address domain has no valid DNS A-label (punycode) spelling — it can never be resolved,
+    /// dialed, or named in TLS SNI. Diagnosed here, at the translate/send boundary, instead of
+    /// surfacing later as an opaque `TlsUnavailable` from the transport (the audit's item 2).
+    #[error(
+        "domain {0} is not IDNA-convertible to a DNS A-label form ({1}); it cannot be resolved, \
+         dialed, or named in TLS — permanent failure, not retried"
+    )]
+    IdnNotConvertible(String, String),
 }
 
 impl OutboundGateway {
@@ -192,8 +201,12 @@ impl OutboundGateway {
         to_addr: &str,
         now: TimestampMs,
     ) -> Result<Vec<u8>, OutboundError> {
+        // Wire-normalize the From first (display-name split + domain → A-labels) so the DKIM
+        // delegation lookup and the signed `d=` compare against the same ASCII domain spelling the
+        // rendered header will carry (DKIM `d=` must be ASCII on the wire anyway).
+        let (_, from_spec) = wire_address(from_addr)?;
         let from_domain =
-            domain_of(from_addr).ok_or_else(|| OutboundError::BadFromAddress(from_addr.into()))?;
+            domain_of(&from_spec).ok_or_else(|| OutboundError::BadFromAddress(from_addr.into()))?;
         let key = self
             .dkim_key_for(from_domain)
             .ok_or_else(|| OutboundError::NotDelegated(from_domain.into()))?;
@@ -223,6 +236,21 @@ impl OutboundGateway {
         let dest_domain = match domain_of(to_addr) {
             Some(d) => d.to_string(),
             None => return OutboundReport::Failed(OutboundError::BadDestAddress(to_addr.into())),
+        };
+        // A-label the destination at the one place all downstream consumers branch from: the
+        // MTA-STS policy lookup (`_mta-sts.<domain>` TXT + `mta-sts.<domain>` HTTPS SNI), the MX
+        // resolution qname, and — via the resolver's A/AAAA fallback — the host the transport dials
+        // and names in SNI. An unspellable domain is the specific permanent error above (in
+        // practice `translate_and_sign` already refused it while rendering `To:`; this covers the
+        // send path independently, fail-closed).
+        let dest_domain = match idn::domain_to_ascii(&dest_domain) {
+            Ok(d) => d,
+            Err(e) => {
+                return OutboundReport::Failed(OutboundError::IdnNotConvertible(
+                    dest_domain,
+                    e.to_string(),
+                ))
+            }
         };
 
         // Enforce TLS via the MTA-STS/DANE policy hook (§7.3 step 4).
@@ -321,6 +349,15 @@ impl OutboundGateway {
 /// Render an outbound `mail` MOTE payload to RFC 5322 with the sender's real domain address in
 /// `From:` (the delegated-DKIM domain), CRLF line endings. A deterministic `Message-ID` from the
 /// body keeps re-renders stable.
+///
+/// i18n toward the legacy wire (audit items 2–3): the `Subject:` and any From/To display-names are
+/// RFC 2047-encoded (via `dmtap-mail`'s shared encoder) so strict MTAs see printable-ASCII header
+/// values instead of raw 8-bit UTF-8 they may mangle or reject; address **domains** are converted
+/// to A-labels (so a message to an IDN domain with an ASCII local part needs no SMTPUTF8 at all —
+/// the lossless negotiate-down). Non-ASCII **local parts** have no down-conversion and are kept
+/// verbatim — that message genuinely requires SMTPUTF8, which the transport gates explicitly. DKIM
+/// then signs the final encoded bytes ([`OutboundGateway::translate_and_sign`] renders first,
+/// signs second), so what the destination verifies is exactly what was emitted.
 pub fn render_rfc5322(
     payload: &Payload,
     from_addr: &str,
@@ -328,7 +365,8 @@ pub fn render_rfc5322(
     ts: TimestampMs,
 ) -> Result<Vec<u8>, OutboundError> {
     // A CR/LF/NUL in any interpolated header field would inject extra headers or a premature body
-    // separator into the message the gateway then DKIM-signs. Refuse fail-closed before rendering.
+    // separator into the message the gateway then DKIM-signs. Refuse fail-closed before rendering
+    // (checked on the RAW inputs, before any encoding could mask a smuggled CRLF).
     let no_inject = |field: &str, name: &'static str| -> Result<(), OutboundError> {
         if field.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
             return Err(OutboundError::HeaderInjection(name));
@@ -341,13 +379,19 @@ pub fn render_rfc5322(
     no_inject(&subject, "Subject")?;
     let mime = payload.headers.mime.clone().unwrap_or_else(|| "text/plain; charset=utf-8".into());
     no_inject(&mime, "Content-Type")?;
+    let from_field = wire_address_field(from_addr)?;
+    let to_field = wire_address_field(to_addr)?;
+    // Encoded AFTER the injection check: the encoder's own output only folds with CRLF+SP
+    // (a legal continuation), never a bare header break.
+    let subject = encode_header_value(&subject);
     let date = format_rfc5322_date(ts);
+    let (_, from_spec) = wire_address(from_addr)?;
     let mid =
-        format!("<{}@{}>", b64_id(&payload.body), domain_of(from_addr).unwrap_or("dmtap.local"));
+        format!("<{}@{}>", b64_id(&payload.body), domain_of(&from_spec).unwrap_or("dmtap.local"));
 
     let mut msg = String::new();
-    msg.push_str(&format!("From: {from_addr}\r\n"));
-    msg.push_str(&format!("To: {to_addr}\r\n"));
+    msg.push_str(&format!("From: {from_field}\r\n"));
+    msg.push_str(&format!("To: {to_field}\r\n"));
     msg.push_str(&format!("Date: {date}\r\n"));
     msg.push_str(&format!("Subject: {subject}\r\n"));
     msg.push_str(&format!("Message-ID: {mid}\r\n"));
@@ -361,6 +405,41 @@ pub fn render_rfc5322(
         bytes.extend_from_slice(b"\r\n");
     }
     Ok(bytes)
+}
+
+/// Split an outbound address parameter (`addr-spec` or `Display Name <addr-spec>`) into its
+/// optional display name and the addr-spec, with the addr-spec's **domain converted to A-labels**
+/// (the wire boundary of [`crate::idn`]). The local part is untouched — a non-ASCII local part has
+/// no legacy spelling and is the transport's SMTPUTF8 gate to judge, not silently mangled here.
+fn wire_address(addr: &str) -> Result<(Option<String>, String), OutboundError> {
+    let raw = addr.trim();
+    let (name, spec) = match (raw.find('<'), raw.rfind('>')) {
+        (Some(l), Some(r)) if l < r => {
+            let name = raw[..l].trim().trim_matches('"').trim();
+            (if name.is_empty() { None } else { Some(name.to_string()) }, raw[l + 1..r].trim())
+        }
+        _ => (None, raw),
+    };
+    let spec = match spec.rsplit_once('@') {
+        Some((local, domain)) if !domain.is_empty() => {
+            let ascii = idn::domain_to_ascii(domain)
+                .map_err(|e| OutboundError::IdnNotConvertible(domain.to_string(), e.to_string()))?;
+            format!("{local}@{ascii}")
+        }
+        _ => spec.to_string(),
+    };
+    Ok((name, spec))
+}
+
+/// The full header-field spelling of an outbound address: RFC 2047/quoted display name (via
+/// `dmtap-mail`'s `encode_display_name`) + angle-addr with an A-label domain. A bare addr-spec
+/// stays bare.
+fn wire_address_field(addr: &str) -> Result<String, OutboundError> {
+    let (name, spec) = wire_address(addr)?;
+    Ok(match name {
+        Some(n) => format!("{} <{spec}>", encode_display_name(&n)),
+        None => spec,
+    })
 }
 
 /// A short, URL-safe-ish stable token from the body's content address, for Message-ID.

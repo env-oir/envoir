@@ -65,9 +65,13 @@ impl LegacyTls {
 pub trait LineProtocol {
     /// The session's opening greeting (sent once, before the first client line).
     fn greeting(&mut self) -> String;
-    /// Feed one client line (CRLF already stripped); return the reply to write back (empty ⇒ nothing
-    /// is written, e.g. a submission `DATA` content line).
-    fn feed_line(&mut self, line: &str) -> String;
+    /// Feed one **raw** client line (CRLF already stripped); return the reply to write back (empty
+    /// ⇒ nothing is written, e.g. a submission `DATA` content line). Bytes, not `&str`: a
+    /// submission `DATA` line under an 8-bit CTE is arbitrary ISO-8859-x/GB18030/Shift_JIS content
+    /// that must reach the session byte-exact — a lossy UTF-8 decode at the transport corrupts it
+    /// to U+FFFD before any protocol code runs (the impls that are genuinely ASCII-only, like
+    /// POP3, decode internally).
+    fn feed_line_bytes(&mut self, line: &[u8]) -> String;
     /// Whether `line` is the in-band TLS-upgrade command (`STLS` / `STARTTLS`).
     fn is_starttls(&self, line: &str) -> bool;
     /// Whether a reply to the upgrade command indicates the server accepted it (POP3 `+OK`, SMTP `2xx`).
@@ -107,17 +111,27 @@ pub fn serve_line_session<P: LineProtocol>(
     writer.write_all(proto.greeting().as_bytes())?;
     writer.flush()?;
 
-    let mut line = String::new();
+    let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
         if read_line_capped(&mut reader, &mut line)? == 0 {
             break; // clean EOF
         }
-        let cmd = line.trim_end_matches(['\r', '\n']);
-        let wants_upgrade = !secured && proto.is_starttls(cmd);
-        let quit = proto.is_quit(cmd);
+        let mut cmd: &[u8] = &line;
+        while let Some((&last, rest)) = cmd.split_last() {
+            if last == b'\r' || last == b'\n' {
+                cmd = rest;
+            } else {
+                break;
+            }
+        }
+        // Verb classification (STARTTLS/STLS/QUIT) is ASCII; the lossy view is for that only — the
+        // protocol itself is fed the raw bytes.
+        let cmd_text = String::from_utf8_lossy(cmd);
+        let wants_upgrade = !secured && proto.is_starttls(&cmd_text);
+        let quit = proto.is_quit(&cmd_text);
 
-        let reply = proto.feed_line(cmd);
+        let reply = proto.feed_line_bytes(cmd);
         if !reply.is_empty() {
             writer.write_all(reply.as_bytes())?;
             writer.flush()?;
@@ -144,10 +158,12 @@ pub fn serve_line_session<P: LineProtocol>(
     Ok(())
 }
 
-/// Read up to (and including) the next `\n` into `out`, but refuse a line longer than [`MAX_LINE`]
-/// (fail-closed, bounded memory). Returns bytes read (`0` at clean EOF).
-fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut String) -> io::Result<usize> {
-    let mut buf = Vec::new();
+/// Read up to (and including) the next `\n` into `out` as **raw bytes**, but refuse a line longer
+/// than [`MAX_LINE`] (fail-closed, bounded memory). Returns bytes read (`0` at clean EOF). Raw
+/// bytes on purpose: this loop also carries submission `DATA` content lines, and the previous
+/// lossy-`String` accumulation turned every 8-bit legacy body byte into U+FFFD before the protocol
+/// session ever saw it.
+fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut Vec<u8>) -> io::Result<usize> {
     let mut total = 0;
     loop {
         let available = match reader.fill_buf() {
@@ -159,20 +175,19 @@ fn read_line_capped<R: BufRead>(reader: &mut R, out: &mut String) -> io::Result<
             break; // EOF
         }
         if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&available[..=pos]);
+            out.extend_from_slice(&available[..=pos]);
             reader.consume(pos + 1);
             total += pos + 1;
             break;
         }
         let n = available.len();
-        buf.extend_from_slice(available);
+        out.extend_from_slice(available);
         reader.consume(n);
         total += n;
-        if buf.len() > MAX_LINE {
+        if out.len() > MAX_LINE {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "protocol line too long"));
         }
     }
-    out.push_str(&String::from_utf8_lossy(&buf));
     Ok(total)
 }
 

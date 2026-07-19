@@ -94,11 +94,10 @@ pub fn sign(key: &DkimKey, message: &[u8], t: u64) -> String {
     // 4. Assemble the signing input: each signed header (relaxed, bottom-up per-name), then the
     //    DKIM-Signature header itself (relaxed, empty b=) with NO trailing CRLF (RFC 6376 §3.7).
     let mut signing_input = assemble_signed_headers(&headers, &h_names);
-    signing_input.extend_from_slice(
-        canonicalize_header("DKIM-Signature", &dkim_header_base)
-            .trim_end_matches("\r\n")
-            .as_bytes(),
-    );
+    signing_input.extend_from_slice(strip_final_crlf(&canonicalize_header(
+        "DKIM-Signature",
+        dkim_header_base.as_bytes(),
+    )));
 
     // 5. Sign SHA-256(signing_input) with Ed25519 (RFC 8463 §3).
     let digest = Sha256::digest(&signing_input);
@@ -115,7 +114,10 @@ pub fn verify(message: &[u8], public_key: &[u8]) -> Result<(), DkimError> {
     let (headers, body) = split_headers_body(message);
     let (_dkim_name, dkim_value) =
         find_header(&headers, "dkim-signature").ok_or(DkimError::NoSignature)?;
-    let tags = parse_tags(dkim_value);
+    // The DKIM-Signature tag list is ASCII by construction (base64/tokens), so this decode is
+    // lossless for any signature that could verify; the signing-input reconstruction below still
+    // uses the raw value bytes (`empty_b_value`), never this text view.
+    let tags = parse_tags(&String::from_utf8_lossy(dkim_value));
 
     let get = |k: &str| tags.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     if get("a").as_deref() != Some("ed25519-sha256") {
@@ -150,9 +152,8 @@ pub fn verify(message: &[u8], public_key: &[u8]) -> Result<(), DkimError> {
     // header with b= emptied.
     let mut signing_input = assemble_signed_headers(&headers, &h_names);
     let dkim_emptied = empty_b_value(dkim_value);
-    signing_input.extend_from_slice(
-        canonicalize_header("DKIM-Signature", &dkim_emptied).trim_end_matches("\r\n").as_bytes(),
-    );
+    signing_input
+        .extend_from_slice(strip_final_crlf(&canonicalize_header("DKIM-Signature", &dkim_emptied)));
 
     // Verify Ed25519 over SHA-256(signing_input).
     let vk_bytes: [u8; 32] = public_key.try_into().map_err(|_| DkimError::BadPublicKey)?;
@@ -262,7 +263,7 @@ pub enum DkimVerdict {
 pub fn signing_domain_selector(message: &[u8]) -> Option<(String, String)> {
     let (headers, _body) = split_headers_body(message);
     let (_name, value) = find_header(&headers, "dkim-signature")?;
-    let tags = parse_tags(value);
+    let tags = parse_tags(&String::from_utf8_lossy(value));
     let get = |k: &str| tags.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     Some((get("d")?, get("s")?))
 }
@@ -325,10 +326,20 @@ pub enum DkimError {
 }
 
 // --- RFC 6376 canonicalization + header helpers --------------------------------------------
+//
+// Everything below is **byte-based** on purpose (the protocol-i18n audit's item 1): RFC 6376
+// canonicalization is defined over octets, and legacy mail legitimately carries raw 8-bit bytes
+// (ISO-8859-x subjects, GB18030 bodies) in both headers and body. The previous `from_utf8_lossy`
+// round-trips replaced those bytes with U+FFFD (or re-encoded Latin-1 as two-byte UTF-8) before
+// hashing, so a perfectly valid external signature over an 8-bit message could never verify —
+// which under `DkimPolicy::Reject` bounced legitimate international mail. Only the ASCII-by-spec
+// DKIM tag list gets a text view.
 
-/// Split a message into (header lines, body). Headers are returned as `(name, value)` pairs with
-/// folding preserved in `value` (canonicalization handles unfolding).
-fn split_headers_body(message: &[u8]) -> (Vec<(String, String)>, &[u8]) {
+/// Split a message into (header lines, body). Headers are returned as `(name, value-bytes)` pairs
+/// with folding preserved in `value` (canonicalization handles unfolding). Names are decoded as
+/// text (header field names are ASCII per RFC 5322 §2.2; a non-ASCII name can never match a signed
+/// name and so only ever describes an unsigned header).
+fn split_headers_body(message: &[u8]) -> (Vec<(String, Vec<u8>)>, &[u8]) {
     let (head, body) = match find_blank_line(message) {
         Some(idx) => (&message[..idx], &message[idx + 4..]),
         None => (message, &b""[..]),
@@ -341,24 +352,49 @@ fn find_blank_line(message: &[u8]) -> Option<usize> {
     message.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// Parse header lines into `(name, value)`, joining continuation (folded) lines into the value.
-fn parse_headers(head: &[u8]) -> Vec<(String, String)> {
-    let text = String::from_utf8_lossy(head);
-    let mut out: Vec<(String, String)> = Vec::new();
-    for raw in text.split("\r\n") {
+/// Split on CRLF pairs (never lone CR or LF — RFC 5322 line breaks are CRLF on the SMTP wire).
+fn split_crlf(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'\r' && bytes[i + 1] == b'\n' {
+            out.push(&bytes[start..i]);
+            start = i + 2;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out.push(&bytes[start..]);
+    out
+}
+
+/// `bytes` with one trailing CRLF removed (RFC 6376 §3.7: the final DKIM-Signature line in the
+/// signing input carries no terminator).
+fn strip_final_crlf(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r\n").unwrap_or(bytes)
+}
+
+/// Parse header lines into `(name, value-bytes)`, joining continuation (folded) lines into the
+/// value verbatim (fold CRLF+WSP included — unfolding is canonicalization's job).
+fn parse_headers(head: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    for raw in split_crlf(head) {
         if raw.is_empty() {
             continue;
         }
-        if raw.starts_with(' ') || raw.starts_with('\t') {
+        if raw[0] == b' ' || raw[0] == b'\t' {
             // Continuation of the previous header value (folded line).
             if let Some(last) = out.last_mut() {
-                last.1.push_str("\r\n");
-                last.1.push_str(raw);
+                last.1.extend_from_slice(b"\r\n");
+                last.1.extend_from_slice(raw);
             }
             continue;
         }
-        if let Some((name, value)) = raw.split_once(':') {
-            out.push((name.to_string(), value.to_string()));
+        if let Some(colon) = raw.iter().position(|&b| b == b':') {
+            let name = String::from_utf8_lossy(&raw[..colon]).into_owned();
+            out.push((name, raw[colon + 1..].to_vec()));
         }
     }
     out
@@ -366,12 +402,12 @@ fn parse_headers(head: &[u8]) -> Vec<(String, String)> {
 
 /// Find a header by case-insensitive name; returns the ORIGINAL `(name, value)` (last occurrence,
 /// matching how a single-instance signed header is treated). Used for both signing and verifying.
-fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<(&'a str, &'a str)> {
+fn find_header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<(&'a str, &'a [u8])> {
     headers
         .iter()
         .rev()
         .find(|(n, _)| n.trim().eq_ignore_ascii_case(name))
-        .map(|(n, v)| (n.as_str(), v.as_str()))
+        .map(|(n, v)| (n.as_str(), v.as_slice()))
 }
 
 /// Assemble the canonicalized signing bytes for an ordered `h=` name list, honoring RFC 6376
@@ -383,7 +419,7 @@ fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<(&'a s
 /// the signature fails. This replaces the previous `find_header`-per-entry loop, which always
 /// resolved every repeat of a name to the single bottom-most instance (so a repeated `from` bound
 /// nothing new and oversigning was inert).
-fn assemble_signed_headers(headers: &[(String, String)], h_names: &[&str]) -> Vec<u8> {
+fn assemble_signed_headers(headers: &[(String, Vec<u8>)], h_names: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
     for (k, name) in h_names.iter().enumerate() {
         let key = name.trim();
@@ -397,7 +433,7 @@ fn assemble_signed_headers(headers: &[(String, String)], h_names: &[&str]) -> Ve
             .filter(|(n, _)| n.trim().eq_ignore_ascii_case(key))
             .nth(occurrence);
         if let Some((n, v)) = instance {
-            out.extend_from_slice(canonicalize_header(n, v).as_bytes());
+            out.extend_from_slice(&canonicalize_header(n, v));
         }
     }
     out
@@ -405,48 +441,60 @@ fn assemble_signed_headers(headers: &[(String, String)], h_names: &[&str]) -> Ve
 
 /// Relaxed header canonicalization (RFC 6376 §3.4.2): lowercase name, unfold, compress internal
 /// WSP runs to a single SP in the value, strip leading/trailing value WSP, single CRLF terminator.
-fn canonicalize_header(name: &str, value: &str) -> String {
-    let name = name.trim().to_ascii_lowercase();
-    // Unfold: remove CRLF, then collapse runs of WSP to one space.
-    let unfolded = value.replace("\r\n", "");
-    let mut collapsed = String::with_capacity(unfolded.len());
+/// Operates on octets: WSP/CRLF are ASCII, so 8-bit value bytes pass through untouched — exactly
+/// what an octet-faithful verifier on the other side hashes.
+fn canonicalize_header(name: &str, value: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(name.len() + value.len() + 3);
+    out.extend(name.trim().bytes().map(|b| b.to_ascii_lowercase()));
+    out.push(b':');
+    // Unfold (drop CRLF pairs), then collapse WSP runs to one SP, suppressing leading WSP.
+    let mut val: Vec<u8> = Vec::with_capacity(value.len());
     let mut in_wsp = false;
-    for ch in unfolded.chars() {
-        if ch == ' ' || ch == '\t' {
+    let mut i = 0;
+    while i < value.len() {
+        let b = value[i];
+        if b == b'\r' && value.get(i + 1) == Some(&b'\n') {
+            i += 2;
+            continue;
+        }
+        if b == b' ' || b == b'\t' {
             in_wsp = true;
         } else {
-            if in_wsp && !collapsed.is_empty() {
-                collapsed.push(' ');
+            if in_wsp && !val.is_empty() {
+                val.push(b' ');
             }
             in_wsp = false;
-            collapsed.push(ch);
+            val.push(b);
         }
+        i += 1;
     }
-    let value = collapsed.trim_end();
-    format!("{name}:{value}\r\n")
+    // Trailing WSP is dropped because a space is only emitted before the next non-WSP byte.
+    out.extend_from_slice(&val);
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// Relaxed body canonicalization (RFC 6376 §3.4.4): strip trailing WSP per line, collapse internal
 /// WSP runs to one SP, remove trailing empty lines, terminate with a single CRLF (empty body → "").
+/// Octet-based: an ISO-8859-x / GB18030 body hashes over its original bytes (see module note).
 fn canonicalize_body(body: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(body);
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.split("\r\n") {
-        // Collapse internal WSP runs, strip trailing WSP.
-        let mut collapsed = String::with_capacity(line.len());
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for line in split_crlf(body) {
+        // Collapse internal WSP runs, strip trailing WSP (§3.4.4 keeps a leading run as one SP).
+        let mut collapsed: Vec<u8> = Vec::with_capacity(line.len());
         let mut in_wsp = false;
-        for ch in line.chars() {
-            if ch == ' ' || ch == '\t' {
+        for &b in line {
+            if b == b' ' || b == b'\t' {
                 in_wsp = true;
             } else {
                 if in_wsp {
-                    collapsed.push(' ');
+                    collapsed.push(b' ');
                 }
                 in_wsp = false;
-                collapsed.push(ch);
+                collapsed.push(b);
             }
         }
-        // Trailing WSP is dropped because we only emit a space before the next non-WSP char.
+        // Trailing WSP is dropped because we only emit a space before the next non-WSP byte.
         lines.push(collapsed);
     }
     // Remove trailing empty lines.
@@ -456,7 +504,13 @@ fn canonicalize_body(body: &[u8]) -> Vec<u8> {
     if lines.is_empty() {
         return Vec::new();
     }
-    let mut out = lines.join("\r\n").into_bytes();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(l);
+    }
     out.extend_from_slice(b"\r\n");
     out
 }
@@ -480,11 +534,13 @@ fn parse_tags(value: &str) -> Vec<(String, String)> {
 }
 
 /// Return the DKIM-Signature value with the `b=` tag's content removed (kept as `b=`), preserving
-/// everything else verbatim (RFC 6376 §3.7: the b= value is emptied but the tag stays).
-fn empty_b_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
+/// everything else **byte**-verbatim (RFC 6376 §3.7: the b= value is emptied but the tag stays —
+/// and any non-ASCII byte a sloppy signer put elsewhere in the value must survive untouched, since
+/// this reconstruction feeds the signing input).
+fn empty_b_value(value: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(value.len());
     let mut i = 0;
-    let bytes = value.as_bytes();
+    let bytes = value;
     while i < bytes.len() {
         // Match a `b` tag at a token boundary: start-of-string or right after ';' (+ optional WSP).
         let at_boundary = i == 0 || {
@@ -501,7 +557,7 @@ fn empty_b_value(value: &str) -> String {
                 k += 1;
             }
             if k < bytes.len() && bytes[k] == b'=' {
-                out.push_str("b=");
+                out.extend_from_slice(b"b=");
                 // Skip the old value up to the next ';' or end.
                 let mut m = k + 1;
                 while m < bytes.len() && bytes[m] != b';' {
@@ -511,7 +567,7 @@ fn empty_b_value(value: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     out
@@ -602,6 +658,32 @@ mod tests {
             Err(DkimError::SignatureInvalid),
             "an appended From is caught by oversigning"
         );
+    }
+
+    #[test]
+    fn eight_bit_bodies_and_headers_hash_over_their_original_bytes() {
+        // Raw ISO-8859-1 bytes (invalid UTF-8) in BOTH a signed header and the body. The previous
+        // lossy-String canonicalization replaced each with U+FFFD before hashing, so a genuine
+        // external signature over such a message could never verify (BodyHashMismatch) — this test
+        // FAILS against that behavior.
+        let msg: Vec<u8> = [
+            &b"From: alice@sender.example\r\nSubject: caf"[..],
+            &[0xE9],
+            &b"\r\n\r\nl'"[..],
+            &[0xFC],
+            &b"ber-body\r\n"[..],
+        ]
+        .concat();
+        let key = DkimKey::from_seed("sender.example", "s1", &[11u8; 32]);
+        let header = sign(&key, &msg, 1_752_600_000);
+        let mut signed = header.into_bytes();
+        signed.extend_from_slice(&msg);
+        assert_eq!(verify(&signed, &key.public_bytes()), Ok(()), "octet-faithful round trip");
+
+        // And the lossy-mangled copy (what a UTF-8-decoding pipeline would have carried) does NOT
+        // verify: the replacement characters are simply not the signed bytes.
+        let mangled = String::from_utf8_lossy(&signed).into_owned().into_bytes();
+        assert!(verify(&mangled, &key.public_bytes()).is_err());
     }
 
     #[test]

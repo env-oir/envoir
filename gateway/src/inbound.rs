@@ -831,11 +831,26 @@ impl<'g> MxSession<'g> {
         self.spf_outcome = None;
     }
 
-    /// Feed one command line (no CRLF), or — during `DATA` — one data line. A lone `.` ends DATA.
+    /// Feed one command line (no CRLF), or — during `DATA` — one data line.
+    ///
+    /// Compatibility wrapper over [`Self::feed_line_bytes`] — a socket driver must prefer that: a
+    /// `&str` can only exist post-UTF-8-validation, so an 8-bit `DATA` line (ISO-8859-x, GB18030,
+    /// Shift_JIS…) has already been rejected or lossy-mangled by the time it is a `&str`.
     pub fn feed_line(&mut self, line: &str) -> SmtpReply {
+        self.feed_line_bytes(line.as_bytes())
+    }
+
+    /// Feed one **raw** line (without CRLF). The lossless entry point ([`crate::inbound_tcp`] feeds
+    /// it directly): `DATA` lines are accumulated byte-exact — DKIM body hashes are computed over
+    /// the original bytes, and the sealed MOTE carries the sender's actual message, not U+FFFD
+    /// soup. Command lines are ASCII per RFC 5321, so the lossy decode below is lossless for any
+    /// conforming client; genuinely undecodable command bytes can only come from a broken peer and
+    /// at worst mis-spell its own error reply. A lone `.` ends DATA.
+    pub fn feed_line_bytes(&mut self, line: &[u8]) -> SmtpReply {
         if self.phase == Phase::Data {
             return self.feed_data(line);
         }
+        let line: &str = &String::from_utf8_lossy(line);
         let (verb, rest) = match line.split_once(' ') {
             Some((v, r)) => (v.to_ascii_uppercase(), r.trim()),
             None => (line.trim().to_ascii_uppercase(), ""),
@@ -906,8 +921,8 @@ impl<'g> MxSession<'g> {
         SmtpReply::new(354, "start mail input; end with <CRLF>.<CRLF>")
     }
 
-    fn feed_data(&mut self, line: &str) -> SmtpReply {
-        if line == "." {
+    fn feed_data(&mut self, line: &[u8]) -> SmtpReply {
+        if line == b"." {
             self.phase = Phase::Command;
             let mail_from = self.mail_from.clone().unwrap_or_default();
             let rcpt_to = self.rcpt_to.clone().unwrap_or_default();
@@ -924,9 +939,11 @@ impl<'g> MxSession<'g> {
                 spf_outcome.as_ref(),
             );
         }
-        // Undo SMTP dot-stuffing (RFC 5321 §4.5.2), then append the line with CRLF.
-        let unstuffed = line.strip_prefix('.').unwrap_or(line);
-        self.data.extend_from_slice(unstuffed.as_bytes());
+        // Undo SMTP dot-stuffing (RFC 5321 §4.5.2) on the raw bytes, then append the line with
+        // CRLF. Byte-exact end-to-end: this buffer is what DKIM verification hashes and what the
+        // MOTE seals — no UTF-8 decode may ever touch it.
+        let unstuffed = line.strip_prefix(b".").unwrap_or(line);
+        self.data.extend_from_slice(unstuffed);
         self.data.extend_from_slice(b"\r\n");
         // No reply mid-DATA.
         SmtpReply::new(0, "")

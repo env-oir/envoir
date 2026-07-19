@@ -16,7 +16,8 @@ use std::time::Duration;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-use crate::net::{crypto_provider, read_line, read_reply, write_all};
+use crate::idn;
+use crate::net::{crypto_provider, read_line_str, read_reply, write_all};
 use crate::outbound::{OutboundTransport, TransportResult};
 
 /// A concrete SMTP-client transport to a destination MX. Stateless per send (§7.4): one TCP
@@ -139,6 +140,14 @@ impl SmtpTcpTransport {
         message: &[u8],
         require_tls: bool,
     ) -> Result<TransportResult, TransportAbort> {
+        // A-label (punycode) the destination before it touches the ASCII worlds below: the OS
+        // resolver in `dial_addr` and the rustls SNI `ServerName` in `upgrade` (which flatly
+        // rejects non-ASCII — previously surfacing as an opaque `TlsUnavailable`). A domain with
+        // no DNS spelling is a specific, diagnosable PERMANENT failure: retrying cannot ever make
+        // `bücher.<invalid>` spellable (RFC 3463 5.1.2, bad destination system address).
+        let dest_domain = idn::domain_to_ascii(dest_domain)
+            .map_err(|e| TransportAbort::Permanent { code: 553, text: format!("5.1.2 {e}") })?;
+        let dest_domain = dest_domain.as_str();
         let addr = self.dial_addr(dest_domain)?;
         let tcp = TcpStream::connect_timeout(&addr, self.connect_timeout)?;
         tcp.set_read_timeout(Some(self.io_timeout))?;
@@ -149,7 +158,7 @@ impl SmtpTcpTransport {
         expect_2xx(read_reply(&mut stream)?)?;
 
         // EHLO → capability list.
-        let caps = self.ehlo(&mut stream)?;
+        let mut caps = self.ehlo(&mut stream)?;
         let starttls_offered = caps.iter().any(|c| c.eq_ignore_ascii_case("STARTTLS"));
 
         if require_tls && !starttls_offered {
@@ -168,8 +177,9 @@ impl SmtpTcpTransport {
             stream = stream
                 .upgrade(&self.client_config, dest_domain)
                 .map_err(|_| TransportAbort::Tls)?;
-            // Re-EHLO over the encrypted channel (RFC 3207 §4.2).
-            self.ehlo(&mut stream)?;
+            // Re-EHLO over the encrypted channel (RFC 3207 §4.2) — and the capability list MUST be
+            // re-read from it: pre-TLS capabilities are unauthenticated and void after the upgrade.
+            caps = self.ehlo(&mut stream)?;
         }
 
         // Envelope is derived from the rendered message headers (the trait carries only the bytes).
@@ -178,7 +188,48 @@ impl SmtpTcpTransport {
             TransportAbort::Io(io::Error::new(io::ErrorKind::InvalidInput, "no To: header"))
         })?;
 
-        write_all(&mut stream, &format!("MAIL FROM:<{mail_from}>\r\n"))?;
+        // Honest EAI posture (RFC 6531/6152): check what THIS message actually needs against what
+        // the peer actually advertised, instead of shipping raw UTF-8 and hoping.
+        //
+        // - A non-ASCII ENVELOPE address (in practice a non-ASCII local part — the renderer already
+        //   A-labels domains, which is the lossless negotiate-down for IDN-domain recipients)
+        //   requires SMTPUTF8. RFC 6531 §3.1: a client MUST NOT use it against a peer that did not
+        //   advertise it, so a missing capability is a specific PERMANENT failure (5.6.7, address
+        //   requires internationalization) — the peer will not grow the extension on retry.
+        // - An 8-bit message body requires 8BITMIME. There is no lossless downgrade for a body we
+        //   have already DKIM-signed (re-encoding to QP would break the signed bytes), so a peer
+        //   without it is the specific PERMANENT 5.6.3 (conversion required but not supported); a
+        //   pure-ASCII body simply never asks for the extension.
+        let has_cap = |cap: &str| caps.iter().any(|c| c.eq_ignore_ascii_case(cap));
+        let needs_smtputf8 = !mail_from.is_ascii() || !rcpt_to.is_ascii();
+        let needs_8bitmime = message.iter().any(|&b| b >= 0x80);
+        if needs_smtputf8 && !has_cap("SMTPUTF8") {
+            return Err(TransportAbort::Permanent {
+                code: 553,
+                text: format!(
+                    "5.6.7 envelope address requires SMTPUTF8 (RFC 6531) but {dest_domain} does \
+                     not advertise it; cannot deliver without corrupting the address"
+                ),
+            });
+        }
+        if needs_8bitmime && !has_cap("8BITMIME") {
+            return Err(TransportAbort::Permanent {
+                code: 554,
+                text: format!(
+                    "5.6.3 message body is 8-bit but {dest_domain} does not advertise 8BITMIME \
+                     (RFC 6152); refusing to send bytes the peer has not agreed to carry"
+                ),
+            });
+        }
+        let mut mail_params = String::new();
+        if needs_8bitmime {
+            mail_params.push_str(" BODY=8BITMIME");
+        }
+        if needs_smtputf8 {
+            mail_params.push_str(" SMTPUTF8");
+        }
+
+        write_all(&mut stream, &format!("MAIL FROM:<{mail_from}>{mail_params}\r\n"))?;
         expect_2xx(read_reply(&mut stream)?)?;
         write_all(&mut stream, &format!("RCPT TO:<{rcpt_to}>\r\n"))?;
         expect_2xx(read_reply(&mut stream)?)?;
@@ -207,7 +258,7 @@ impl SmtpTcpTransport {
         write_all(stream, &format!("EHLO {}\r\n", self.ehlo_name))?;
         let mut caps = Vec::new();
         loop {
-            let line = read_line(stream)?
+            let line = read_line_str(stream)?
                 .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no EHLO reply"))?;
             if line.len() < 3 {
                 return Err(TransportAbort::Io(io::Error::new(

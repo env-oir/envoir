@@ -90,6 +90,19 @@ selector label.
   node-driven outbound signing leg is a documented roadmap item, not auto-wired by the daemon.
 - **Attestation key.** The reference daemon generates its gateway attestation key per boot; a
   persistent, DNS-published attestation selector is a production follow-up.
+- **EAI / SMTPUTF8 posture (RFC 6531) — deliberately asymmetric.** The inbound MX does **not**
+  advertise `SMTPUTF8`: this v0 gateway cannot resolve a non-ASCII local part to a DMTAP recipient,
+  and per RFC 6531 §3.1 a conforming EAI sender therefore bounces cleanly at its *own* MTA — an
+  honest refusal, never a mangled address or a silent drop. (Everything else about inbound i18n is
+  real: 8-bit `DATA` is carried byte-exact end-to-end, so ISO-8859-x/GB18030 bodies survive and
+  DKIM verifies over the original bytes.) Outbound, the transport checks what each message actually
+  needs against the destination's EHLO capabilities: an IDN recipient *domain* is converted to its
+  A-label (punycode) form at the DNS/dial/SNI boundary and needs no extension at all, while a
+  non-ASCII *local part* requires the peer to advertise `SMTPUTF8` (and an 8-bit body `8BITMIME`) —
+  when the peer doesn't, the send fails with a specific permanent error naming the missing
+  extension (`5.6.7` / `5.6.3`), because there is no lossless downgrade for an address, and
+  re-encoding an already-DKIM-signed body would break the signature. What is **not** implemented:
+  serving mailboxes under non-ASCII local parts, and generating internationalized DSNs (RFC 6533).
 
 ## What it does
 

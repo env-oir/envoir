@@ -51,6 +51,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 
+# --- UTS-46/IDNA A-label (punycode) conversion for outbound IDN destinations ---
+# `idna` is the url/servo-stack UTS-46 processor — small, pure Rust, the ecosystem standard, and
+# ALREADY pinned in this workspace's Cargo.lock (dmtap-naming uses it for canonical name identity).
+# The gateway takes it directly rather than through dmtap-naming: it needs only the one boundary
+# conversion (Unicode domain → A-labels at DNS-qname/dial/SNI time, see `idn`), and depending on the
+# whole naming resolver for that would invert the intended layering (naming sits beside, not under,
+# the gateway). Without this, an IDN recipient domain leaks raw UTF-8 label bytes into DNS queries
+# and is rejected by rustls `ServerName` as an opaque TLS abort.
+idna = "1"
+
 # --- Public Suffix List for RFC 7489 §3.2 DMARC organizational-domain determination ---
 # `psl` is a self-contained, `#![no_std]`, forbid(unsafe) crate that EMBEDS a compiled snapshot of
 # Mozilla's Public Suffix List (no build-time fetch, no runtime data file); the exact snapshot is

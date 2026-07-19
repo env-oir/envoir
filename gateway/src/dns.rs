@@ -80,8 +80,12 @@ fn encode_name(buf: &mut Vec<u8>, name: &str) {
         if label.is_empty() {
             continue;
         }
-        // A hostile/misconfigured label longer than 63 bytes is simply truncated to fit the DNS
-        // label-length octet; the resulting query will just not resolve, which is a safe failure.
+        // Labels reaching this encoder are ASCII A-labels: every real query flows through
+        // [`UdpDnsClient::query_raw`], which converts the qname via [`crate::idn::domain_to_ascii`]
+        // (punycode + RFC 1035 length validation) and REFUSES oversized/unspellable names with a
+        // specific error before any packet is built. The clamp below is therefore a defensive
+        // last resort for direct `encode_query` callers only — and, being post-IDNA ASCII, it can
+        // no longer split a multi-byte codepoint; the truncated query simply fails to resolve.
         let len = label.len().min(63);
         buf.push(len as u8);
         buf.extend_from_slice(&label.as_bytes()[..len]);
@@ -256,6 +260,14 @@ impl UdpDnsClient {
     /// decoding) that must re-decode a compression pointer inside an answer's rdata against the
     /// original buffer.
     pub fn query_raw(&self, qname: &str, qtype: u16) -> io::Result<(Vec<u8>, DnsMessage)> {
+        // The one wire boundary every gateway DNS query crosses: convert the qname to its A-label
+        // (punycode) form so an IDN destination (`bücher.example` → `xn--bcher-kva.example`) builds
+        // a valid query instead of leaking raw UTF-8 label bytes that no resolver will ever match.
+        // Service-prefixed owner names (`_mta-sts.…`, `<sel>._domainkey.…`) survive — see
+        // [`crate::idn`] on the deny-list choice. A genuinely unspellable name is a specific
+        // `InvalidInput` error, never a truncated or garbage packet.
+        let qname = crate::idn::domain_to_ascii(qname)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         // The 16-bit query id is drawn from the OS CSPRNG, not a clock reading. Without DNSSEC
         // validation the only defenses against an OFF-PATH forged answer are the unpredictability
         // of the query id and the ephemeral source port; a predictable id (e.g. derived from
@@ -263,7 +275,7 @@ impl UdpDnsClient {
         // actually raises the bar (RFC 5452). It is not a substitute for DNSSEC — an on-path
         // attacker still wins — but it removes the cheap off-path spoof.
         let id = random_txn_id()?;
-        let query = encode_query(id, qname, qtype);
+        let query = encode_query(id, &qname, qtype);
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(self.timeout))?;
         socket.set_write_timeout(Some(self.timeout))?;
