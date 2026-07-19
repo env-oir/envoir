@@ -18,8 +18,8 @@ The reason to believe any of this is one command:
 
 ```sh
 ./build.sh                                            # compile the binding
-cargo test -p dmtap-sync-wasm --test native_trace     # 20 vectors through NATIVE Rust
-node --test 'crates/dmtap-sync-wasm/test/*.test.mjs'  # the same 20 through WASM, from JS
+cargo test -p dmtap-sync-wasm --test native_trace     # 22 vectors through NATIVE Rust
+node --test 'crates/dmtap-sync-wasm/test/*.test.mjs'  # the same 22 through WASM, from JS
 ```
 
 The JS suite drives the frozen conformance vectors
@@ -28,10 +28,11 @@ vector, that every recomputed byte matches **both** the vector's frozen expectat
 recorded from the native Rust engine. That second assertion is the one `BINDINGS.md` §4 calls
 non-negotiable: without it, "the browser computes what the server computes" is a claim.
 
-Current status: **20/20 vectors driven through both surfaces, byte-identical; 27 JS assertions,
-7 native.** The two remaining vectors in the file (`SYNC-FJ-01`, `SYNC-FJ-02`) are §5.2.1
-*transport* objects, not algebra, and are named in `NOT_COVERED` with that reason rather than
-quietly dropped.
+Current status: **22/22 vectors driven through both surfaces, byte-identical; 29 JS assertions,
+7 native.** `NOT_COVERED` is empty — nothing is skipped. The §5.2.1 fast-join vectors looked like
+pure transport at first, but the `FastJoin` encoding, the below-floor predicate and the caller-side
+verification sequence are all algebra; only the fetch is transport, and the binding leaves that to
+the host. So a browser replica can fast-join too.
 
 Nothing here is a mock. The vectors' `signature_hex` is reproduced by `node:crypto` signing a
 preimage the WASM module hands out — which simultaneously proves the detached signing protocol
@@ -96,6 +97,7 @@ bytes *are* the semantics. Everything byte-shaped crosses as `Uint8Array`.
 | **Signing** | `op_signing_input` · `op_attach_signature` · `verify_signed_op` · `decode_signed_op` |
 | **Engine** | `SyncEngine`: `ingest_signed` · `ingest_ambient_authenticated` · `has_op` · `merge` · `observable_state` · `observable_state_json` · `state_root` · `verify_root` · `version_vector` · `version_vector_cbor` · `lww_cell` · `set_contains` · `set_members` · `set_surviving_tags` · `counter_total` · `counter_entries` · `death_state` · `sequence` · `tree` · `prune_below` |
 | **Snapshots** | `observable_state_root` · `encode_observable_state` · `decode_observable_state` · `snapshot_decode` · `snapshot_verify` · `snapshot_signing_input` · `snapshot_assemble` |
+| **Fast-join (§5.2.1)** | `fastjoin_decode` · `fastjoin_encode` · `caller_is_below_floor` · `fastjoin_state_address` · `fastjoin_adopt` |
 | **Reconciliation** | `fingerprint` · `summarize` · `reconcile` |
 | **Policy / GC** | `check_admitted` · `check_counter_entry` · `check_ns_ref` · `scope_to_subscription` · `stability_cut` |
 | **Meta** | `version` · `error_registry` |
@@ -130,8 +132,10 @@ malformed. Different bugs, different fixes — and a caller that has to regex-ma
 ## What this does NOT cover
 
 * **Transport.** No sockets, no HTTP, no discovery. §5.2's pull/push protocol is the host's job;
-  this is the algebra and the envelope. (That is exactly why the two `SYNC-FJ-*` vectors are out of
-  scope here.)
+  this is the algebra and the envelope. Fast-join follows the same line: `fastjoin_adopt` verifies
+  everything and tells you (via `fastjoin_state_address`) what to fetch, but **you** perform the
+  `GET /sync/state/<root>` and hand the bytes back. Keeping the network out is also what keeps
+  every call synchronous.
 * **Persistence.** `SyncEngine` is in-memory. Bring your own store; replay or fast-join on load.
 * **Identity and admission policy.** `check_admitted` tests membership in a list *you* supply. It
   does not resolve `DeviceCert` chains, namespace policy objects, or revocation — that is
@@ -191,8 +195,10 @@ introduced, that is the job.
 2. Keep your storage and your transport. Persist the canonical op bytes (`encode_op`) — they are
    the durable artifact; the engine is a fold over them.
 3. Replace your signing with the detached protocol above, keeping keys in WebCrypto.
-4. On join, either replay your ops through `ingest_signed`, or adopt a snapshot: verify its
-   signature, fetch the state body, hash it with `observable_state_root`, compare to
-   `Snapshot.root`, and only then trust it.
+4. On join, either replay your ops through `ingest_signed`, or fast-join: pass the responder's
+   `FastJoin` to `fastjoin_adopt` with whatever `GET /sync/state/<root>` returned. It verifies the
+   signature, checks the snapshot actually closes your gap, and hashes the body against
+   `Snapshot.root` before returning any state. **If it throws, keep your old vector and do not fall
+   back to the responder's op suffix** — that fallback is a silent lost write.
 5. Wire `sync_vectors.json` into your own test suite. Every implementation reproduces the same
    frozen bytes; that is what makes two independently built products interoperate.

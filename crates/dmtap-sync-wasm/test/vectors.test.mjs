@@ -68,7 +68,8 @@ test('every vector is either driven or explicitly named as not covered', () => {
     assert.ok(reason && reason.length > 40, `vector ${name} is skipped without a real reason`);
   }
   // Guard against silent erosion: if this number drops, coverage was removed.
-  assert.ok(covered.length >= 20, `only ${covered.length} vectors driven through the binding`);
+  assert.equal(skipped.length, 0, 'every vector is driven through the binding');
+  assert.ok(covered.length >= 22, `only ${covered.length} vectors driven through the binding`);
 });
 
 // --- 1. the traced values match the frozen vectors -----------------------------------------------
@@ -311,6 +312,65 @@ test('SYNC-GC-01 — the stability cut excludes stale replicas and fails closed 
   assert.equal(got.unknown_watermark_cut, 'null', 'a cut was computed with an unknown watermark');
   assert.equal(got.pruned_something, 'true', 'a collapsed pair below the cut was not reclaimed');
   assert.equal(got.state_before_gc, got.state_after_gc, 'GC below the cut changed observable state');
+});
+
+test('SYNC-FJ-01 — the frozen FastJoin / pull response, snapshot signed outside the module', () => {
+  const v = byName.sync_fastjoin_response;
+  const got = t('sync_fastjoin_response');
+  assert.equal(got.snapshot_preimage, v.expected.snapshot_sig_preimage_hex);
+  assert.equal(
+    got.snapshot_sig,
+    v.expected.snapshot_sig_hex,
+    'a detached snapshot signature must reproduce the frozen one',
+  );
+  assert.equal(got.snapshot_cbor, v.expected.snapshot_cbor_hex);
+  assert.equal(got.state_root, v.input.snapshot_root_hex, 'the root IS the address of the body');
+  assert.equal(got.fastjoin_cbor, v.expected.fastjoin_cbor_hex);
+  assert.equal(got.pull_cbor, v.expected.pull_response_cbor_hex);
+  assert.equal(got.pull_inline_cbor, v.expected.pull_response_with_inline_state_cbor_hex);
+  assert.equal(got.fastjoin_roundtrip, got.fastjoin_cbor, 'decode/encode changed the FastJoin');
+  assert.equal(got.state_address, v.expected.state_fetch_address_hex);
+  assert.deepEqual(v.expected.pull_response_keys, [2], 'keys 1 and 2 are mutually exclusive');
+  assert.equal(v.expected.ops_key_present, false);
+  // The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body...
+  assert.equal(
+    got.adopted_state,
+    v.input.observable_state_cbor_hex,
+    'a corrupted inline hint must be discarded, not adopted',
+  );
+  assert.equal(v.expected.inline_state_is_cache_hint_verified_against_root, true);
+  // ...and with nothing fetchable it fails CLOSED rather than trusting what it could not verify.
+  assert.match(got.corrupt_hint_unfetchable, /0x0A0C/);
+  assert.equal(
+    got.caller_at_covers_below_floor,
+    'false',
+    'a caller already at `covers` is not below the floor',
+  );
+});
+
+test('SYNC-FJ-02 — the MUST in both directions, and no fallback to the suffix', () => {
+  const v = byName.sync_fastjoin_below_floor_suffix_forbidden;
+  const got = t('sync_fastjoin_below_floor_suffix_forbidden');
+  assert.equal(got.behind_is_below_floor, String(v.expected.caller_behind_is_below_floor));
+  assert.equal(got.caught_up_is_below_floor, String(v.expected.caller_caught_up_is_below_floor));
+  // The forbidden answer is well-formed — that is exactly why the MUST is needed.
+  assert.equal(got.ops_response_would_be, v.expected.caller_behind_ops_response_would_be_cbor_hex);
+  assert.equal(
+    got.ops_response_would_be,
+    v.expected.caller_caught_up_response_cbor_hex,
+    'the same bytes are the CORRECT answer for a caught-up caller',
+  );
+  assert.equal(v.expected.caller_behind_ops_response_forbidden, true);
+  assert.equal(v.expected.caller_caught_up_fastjoin_forbidden, true);
+  // Caller-side fail-closed, both paths.
+  assert.match(got.gap_not_closed, new RegExp(v.expected.snapshot_not_covering_gap_error_code));
+  assert.ok(got.gap_not_closed.includes(v.expected.snapshot_not_covering_gap_error_name));
+  assert.match(got.state_unavailable, new RegExp(v.expected.state_body_unfetchable_error_code));
+  assert.ok(got.state_unavailable.includes(v.expected.state_body_unfetchable_error_name));
+  assert.ok(got.state_unavailable.includes(v.expected.state_body_unfetchable_action));
+  assert.equal(v.expected.suffix_fallback_after_failed_fastjoin_forbidden, true);
+  // And the other direction is refused from the caller's side too.
+  assert.match(got.caught_up_refuses_fastjoin, /0x0A09/);
 });
 
 // --- 2. THE cross-surface assertion --------------------------------------------------------------

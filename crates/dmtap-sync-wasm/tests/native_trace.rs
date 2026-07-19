@@ -26,7 +26,8 @@ use dmtap_sync::detcbor::{decode, encode, SVal};
 use dmtap_sync::snapshot::ObservableState;
 use dmtap_sync::state::SyncState;
 use dmtap_sync::wire::{AddTag, Hlc, SyncOp};
-use dmtap_sync::{cose, OpEntry, SyncError};
+use dmtap_sync::state::VersionVector;
+use dmtap_sync::{cose, FastJoin, OpEntry, SyncError};
 use serde_json::{json, Value};
 
 /// Same receiver clock as the native conformance runner and the JS harness (§3).
@@ -697,8 +698,151 @@ fn sync_gc_stability_cut(v: &Value) -> Case {
     ])
 }
 
-/// Operations deliberately not traced. MUST match `NOT_COVERED` in `test/trace.mjs`.
-const NOT_COVERED: [&str; 2] = ["sync_fastjoin_pull_response", "sync_fastjoin_floor_predicate"];
+// --- §5.2.1 fast-join ---------------------------------------------------------------------------
+
+fn vector_of(h: &str) -> VersionVector {
+    VersionVector::from_sval(decode(&unhex(h)).expect("vector CBOR")).expect("VersionVector")
+}
+
+fn hlc_of_hex(h: &str) -> Hlc {
+    Hlc::from_sval(decode(&unhex(h)).expect("hlc CBOR")).expect("Hlc")
+}
+
+/// `{2: FastJoin}` — the §5.2.1 pull envelope.
+fn pull_envelope(fj: &FastJoin) -> Vec<u8> {
+    encode(&SVal::Map(vec![(2, decode(&fj.det_cbor()).expect("own FastJoin encoding"))]))
+}
+
+fn sync_fastjoin_pull_response(v: &Value) -> Case {
+    let i = &v["input"];
+    let seed: [u8; 32] = unhex(s(i, "snapshot_signer_seed_hex")).try_into().unwrap();
+    let sk = IdentityKey::from_seed(&seed);
+    let body = unhex(s(i, "observable_state_cbor_hex"));
+
+    let mut snapshot = dmtap_sync::Snapshot {
+        v: 0,
+        suite: 1,
+        ns: s(i, "snapshot_ns").to_owned(),
+        covers: vector_of(s(i, "snapshot_covers_cbor_hex")),
+        root: dmtap_core::id::ContentId(unhex(s(i, "snapshot_root_hex"))),
+        ts: i["snapshot_ts"].as_u64().expect("snapshot_ts"),
+        signer: sk.public(),
+        sig: Vec::new(),
+    };
+    let preimage = snapshot.signing_preimage();
+    snapshot.sig = sk.sign_domain(&[], &preimage);
+    let floor = hlc_of_hex(s(i, "floor_hlc_cbor_hex"));
+
+    let by_ref = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: None };
+    let inline =
+        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(body.clone()) };
+
+    // The corrupted inline hint: discarded in favour of a fetch, never adopted.
+    let mut corrupt = body.clone();
+    corrupt[3] ^= 0xff;
+    let hinted = FastJoin { snapshot: snapshot.clone(), floor, state: Some(corrupt) };
+    let empty = VersionVector::new();
+    let adopted = hinted
+        .adopt(&empty, &[], &[], |_| Some(body.clone()))
+        .expect("a corrupted inline hint must fall back to the fetched body");
+
+    Case::from([
+        ("snapshot_preimage".into(), hex(&preimage)),
+        ("snapshot_sig".into(), hex(&snapshot.sig)),
+        ("snapshot_cbor".into(), hex(&snapshot.det_cbor())),
+        ("state_root".into(), hex(dmtap_sync::state_root_of(&body).as_bytes())),
+        ("fastjoin_cbor".into(), hex(&by_ref.det_cbor())),
+        ("pull_cbor".into(), hex(&pull_envelope(&by_ref))),
+        ("pull_inline_cbor".into(), hex(&pull_envelope(&inline))),
+        (
+            "fastjoin_roundtrip".into(),
+            hex(&FastJoin::from_det_cbor(&by_ref.det_cbor()).expect("round-trip").det_cbor()),
+        ),
+        ("state_address".into(), hex(snapshot.root.as_bytes())),
+        ("adopted_state".into(), hex(&adopted.det_cbor())),
+        (
+            "corrupt_hint_unfetchable".into(),
+            refusal(hinted.adopt(&empty, &[], &[], |_| None).expect_err("adopted unverified bytes")),
+        ),
+        (
+            "caller_at_covers_below_floor".into(),
+            dmtap_sync::caller_is_below_floor(
+                &snapshot,
+                &vector_of(s(i, "snapshot_covers_cbor_hex")),
+            )
+            .to_string(),
+        ),
+    ])
+}
+
+fn sync_fastjoin_floor_predicate(v: &Value) -> Case {
+    let i = &v["input"];
+    // The responder's FastJoin, taken from the frozen pull response.
+    let pull = decode(&unhex(s(&v["expected"], "caller_behind_response_cbor_hex"))).expect("pull");
+    let SVal::Map(fields) = pull else { panic!("pull response is not a map") };
+    let (_, fj_sval) = fields.into_iter().find(|(k, _)| *k == 2).expect("key 2");
+    let fj = FastJoin::from_det_cbor(&encode(&fj_sval)).expect("FastJoin decodes");
+
+    let behind = vector_of(s(i, "caller_behind_vector_cbor_hex"));
+    let caught_up = vector_of(s(i, "caller_caught_up_vector_cbor_hex"));
+    let floor = hlc_of_hex(s(i, "responder_floor_hlc_cbor_hex"));
+
+    // The forbidden answer, recomputed — well-formed, which is exactly why the MUST exists. Each op
+    // is embedded as a CBOR ITEM, as the vector freezes it.
+    let items: Vec<SVal> =
+        strs(i, "surviving_suffix_ops_cbor_hex").iter().map(|h| decode(&unhex(h)).unwrap()).collect();
+    let would_be = encode(&SVal::Map(vec![(1, SVal::Array(items))]));
+
+    let gap_fj = FastJoin {
+        snapshot: dmtap_sync::Snapshot::from_det_cbor(&unhex(s(i, "snapshot_not_covering_gap_cbor_hex")))
+            .expect("snapshot decodes"),
+        floor,
+        state: None,
+    };
+
+    Case::from([
+        (
+            "behind_is_below_floor".into(),
+            dmtap_sync::caller_is_below_floor(&fj.snapshot, &behind).to_string(),
+        ),
+        (
+            "caught_up_is_below_floor".into(),
+            dmtap_sync::caller_is_below_floor(&fj.snapshot, &caught_up).to_string(),
+        ),
+        ("ops_response_would_be".into(), hex(&would_be)),
+        (
+            "fastjoin_roundtrip".into(),
+            hex(&FastJoin { snapshot: fj.snapshot.clone(), floor: fj.floor.clone(), state: None }
+                .det_cbor()),
+        ),
+        (
+            "gap_not_closed".into(),
+            refusal(
+                gap_fj
+                    .adopt(&behind, &[], &[], |_| Some(Vec::new()))
+                    .expect_err("a snapshot that does not close the gap was adopted"),
+            ),
+        ),
+        (
+            "state_unavailable".into(),
+            refusal(
+                fj.adopt(&behind, &[], &[], |_| None)
+                    .expect_err("a fast-join with no obtainable body was adopted"),
+            ),
+        ),
+        (
+            "caught_up_refuses_fastjoin".into(),
+            refusal(
+                fj.adopt(&caught_up, &[], &[], |_| None)
+                    .expect_err("a caught-up caller was fast-joined"),
+            ),
+        ),
+    ])
+}
+
+/// Operations deliberately not traced. MUST match `NOT_COVERED` in `test/trace.mjs`. Empty: both
+/// surfaces drive all 22 vectors, including the §5.2.1 fast-join path.
+const NOT_COVERED: [&str; 0] = [];
 
 fn execute(operation: &str, v: &Value) -> Option<Case> {
     Some(match operation {
@@ -721,6 +865,8 @@ fn execute(operation: &str, v: &Value) -> Option<Case> {
         "sync_ns_sparse_filter" => sync_ns_sparse_filter(v),
         "sync_ns_leak_check" => sync_ns_leak_check(v),
         "sync_gc_stability_cut" => sync_gc_stability_cut(v),
+        "sync_fastjoin_pull_response" => sync_fastjoin_pull_response(v),
+        "sync_fastjoin_floor_predicate" => sync_fastjoin_floor_predicate(v),
         other if NOT_COVERED.contains(&other) => return None,
         other => panic!(
             "no native executor for sync operation `{other}` — a new vector must be driven \
@@ -747,7 +893,7 @@ fn native_trace_matches_the_committed_artifact() {
             trace.insert(name, json!(case));
         }
     }
-    assert!(trace.len() >= 20, "only {} vectors driven natively", trace.len());
+    assert!(trace.len() >= 22, "only {} vectors driven natively", trace.len());
 
     let document = json!({
         "note": "Recorded by `cargo test -p dmtap-sync-wasm --test native_trace` from dmtap-sync \

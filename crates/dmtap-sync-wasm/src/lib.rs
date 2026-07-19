@@ -42,7 +42,7 @@ use dmtap_sync::detcbor::SVal;
 use dmtap_sync::snapshot::{ObservableState, Snapshot};
 use dmtap_sync::state::{SyncState, VersionVector};
 use dmtap_sync::wire::{Hlc, SyncOp};
-use dmtap_sync::{cose, OpEntry, ReconConfig, SyncError};
+use dmtap_sync::{cose, FastJoin, OpEntry, ReconConfig, SyncError};
 use serde_json::{json, Value};
 use wasm_bindgen::prelude::*;
 
@@ -760,6 +760,108 @@ pub fn snapshot_assemble(
     s.sig = signature.to_vec();
     s.verify_sig().js()?;
     Ok(s.det_cbor())
+}
+
+// -------------------------------------------------------------------------------------------
+// fast-join (§5.2.1)
+// -------------------------------------------------------------------------------------------
+
+/// Decode a `FastJoin` — the answer a `pull` returns to a caller below the responder's §6.2
+/// truncation floor — **without** trusting it: `{snapshot, floor, state}`.
+#[wasm_bindgen]
+pub fn fastjoin_decode(bytes: &[u8]) -> Result<String, JsError> {
+    let fj = FastJoin::from_det_cbor(bytes).js()?;
+    Ok(out(json!({
+        "snapshot": snapshot_json(&fj.snapshot),
+        "floor": hlc_to_json(&fj.floor),
+        "state": fj.state.as_deref().map(hex),
+    })))
+}
+
+/// Encode a `FastJoin` from `{snapshot, floor, state?}` (the shape [`fastjoin_decode`] emits).
+#[wasm_bindgen]
+pub fn fastjoin_encode(fastjoin_json: &str) -> Result<Vec<u8>, JsError> {
+    let v = parse(fastjoin_json)?;
+    let state = match v.get("state").filter(|s| !s.is_null()) {
+        Some(s) => Some(unhex(s.as_str().ok_or_else(|| binding_err("`state` is not hex"))?).js()?),
+        None => None,
+    };
+    let fj = FastJoin {
+        snapshot: snapshot_from_json(v.get("snapshot").ok_or_else(|| binding_err("missing `snapshot`"))?)
+            .js()?,
+        floor: hlc_from_json(v.get("floor").ok_or_else(|| binding_err("missing `floor`"))?).js()?,
+        state,
+    };
+    Ok(fj.det_cbor())
+}
+
+/// **The §5.2.1 responder predicate**: is a caller holding `vector` below the floor this snapshot
+/// stands in for — i.e. would the surviving suffix be an incomplete answer for it?
+///
+/// The test is domination of `covers`, not a comparison against the floor alone. A responder for
+/// which this is true MUST answer fast-join; one for which it is false MUST answer with ops.
+#[wasm_bindgen]
+pub fn caller_is_below_floor(snapshot_bytes: &[u8], vector_json: &str) -> Result<bool, JsError> {
+    let snapshot = Snapshot::from_det_cbor(snapshot_bytes).js()?;
+    Ok(dmtap_sync::caller_is_below_floor(&snapshot, &version_vector_from_json(&parse(vector_json)?).js()?))
+}
+
+/// The content address a fast-join's state body must be fetched from
+/// (`GET /sync/state/<root>`) — what the host needs before it can call [`fastjoin_adopt`].
+#[wasm_bindgen]
+pub fn fastjoin_state_address(fastjoin_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+    Ok(FastJoin::from_det_cbor(fastjoin_bytes).js()?.snapshot.root.as_bytes().to_vec())
+}
+
+/// The §5.2.1 caller-side sequence, steps 1–3: verify the snapshot, check it closes the gap, and
+/// obtain and hash-verify the state body. Returns the **verified** observable-state bytes.
+///
+/// `fetched_body` is what the host retrieved from `GET /sync/state/<root>`, or `undefined` if it
+/// could not retrieve anything. **The fetch itself is the host's job** — this binding does no I/O
+/// (see the crate docs), and keeping the network out of it is also what keeps this call
+/// synchronous. An inline `state` in the FastJoin is tried first and held to exactly the same hash
+/// check, then discarded on mismatch: it is a cache hint, never a second source of truth.
+///
+/// Throws `0x0A02`/`0x0A01`/`0x0A0A` for an unverifiable or out-of-scope snapshot, `0x0A09` if it
+/// does not close the caller's gap or the body does not hash to `root`, and `0x0A0C` if no body
+/// could be obtained at all.
+///
+/// **On any failure the caller MUST keep its old vector and MUST NOT fall back to the responder's
+/// surviving suffix.** That fallback is the silent lost-write this whole path exists to prevent,
+/// which is why this function returns state rather than mutating an engine: adoption is a separate,
+/// deliberate step the host takes only on success.
+#[wasm_bindgen]
+pub fn fastjoin_adopt(
+    fastjoin_bytes: &[u8],
+    caller_vector_json: &str,
+    subscribed_json: &str,
+    admitted_hex_json: &str,
+    fetched_body: Option<Vec<u8>>,
+) -> Result<Vec<u8>, JsError> {
+    let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
+    let caller = version_vector_from_json(&parse(caller_vector_json)?).js()?;
+    let subscribed: Vec<String> = parse(subscribed_json)?
+        .as_array()
+        .ok_or_else(|| binding_err("expected a JSON array of namespaces"))?
+        .iter()
+        .map(|e| e.as_str().unwrap_or_default().to_owned())
+        .collect();
+    let admitted: Vec<Vec<u8>> = parse(admitted_hex_json)?
+        .as_array()
+        .ok_or_else(|| binding_err("expected a JSON array of hex signer keys"))?
+        .iter()
+        .map(|e| unhex(e.as_str().unwrap_or_default()).map_err(binding_err))
+        .collect::<Result<_, _>>()?;
+    let adopted = fj.adopt(&caller, &subscribed, &admitted, |_| fetched_body).js()?;
+    Ok(adopted.det_cbor())
+}
+
+fn version_vector_from_json(v: &Value) -> Result<VersionVector, String> {
+    let mut vv = VersionVector::new();
+    for e in v.as_array().ok_or("expected a JSON array of {author, hlc} marks")? {
+        vv.observe(&hlc_from_json(e.get("hlc").ok_or("mark without `hlc`")?)?);
+    }
+    Ok(vv)
 }
 
 // -------------------------------------------------------------------------------------------

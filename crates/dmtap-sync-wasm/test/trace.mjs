@@ -22,15 +22,15 @@ import * as sync from '../pkg-node/dmtap_sync.js';
 // native runner.
 export const RECEIVER_NOW_MS = 1_700_000_900_000;
 
-/** Operations this harness deliberately does not drive, and why. Asserted to be exhaustive. */
-export const NOT_COVERED = {
-  sync_fastjoin_pull_response:
-    'the §5.2.1 pull/FastJoin response is a TRANSPORT object; this binding exposes the algebra ' +
-    'and the envelope, not the wire protocol (see the crate docs, "What this binding does NOT cover")',
-  sync_fastjoin_floor_predicate:
-    'same: the below-floor responder predicate is a transport-layer decision made by the node, ' +
-    'not by the CRDT engine this binding wraps',
-};
+/**
+ * Operations this harness deliberately does not drive, and why. Asserted to be exhaustive.
+ *
+ * Currently empty: the §5.2.1 fast-join objects looked like pure transport at first, but the
+ * FastJoin encoding, the below-floor predicate and the caller-side verification sequence are all
+ * algebra — only the fetch is transport, and the binding leaves that to the host. So a browser
+ * replica can participate in fast-join, and both surfaces drive all 22 vectors.
+ */
+export const NOT_COVERED = {};
 
 const enc = new TextEncoder();
 
@@ -488,6 +488,103 @@ const executors = {
     };
   },
 
+  // SYNC-FJ-01 — the frozen FastJoin / pull response encoding.
+  sync_fastjoin_pull_response(v, { sign }) {
+    const i = v.input;
+    // The snapshot is re-signed here through the DETACHED path — the seed never enters the module.
+    const unsigned = {
+      v: 0,
+      suite: 1,
+      ns: i.snapshot_ns,
+      covers: coversFromCbor(i.snapshot_covers_cbor_hex),
+      root: i.snapshot_root_hex,
+      ts: i.snapshot_ts,
+      signer: i.snapshot_signer_pubkey_hex,
+    };
+    const { preimage } = JSON.parse(sync.snapshot_signing_input(JSON.stringify(unsigned)));
+    const sig = sign(i.snapshot_signer_seed_hex, unhex(preimage));
+    const snapshot = sync.snapshot_assemble(JSON.stringify(unsigned), sig);
+
+    const floor = JSON.parse(sync.decode_value(unhex(i.floor_hlc_cbor_hex)));
+    const floorHlc = svalToHlc(floor);
+    const mk = (state) =>
+      sync.fastjoin_encode(
+        JSON.stringify({ snapshot: JSON.parse(sync.snapshot_decode(snapshot)), floor: floorHlc, state }),
+      );
+    const byRef = mk(null);
+    const inline = mk(i.observable_state_cbor_hex);
+
+    // A corrupted inline hint must be DISCARDED in favour of the fetched body, not adopted...
+    const corrupt = Array.from(unhex(i.observable_state_cbor_hex));
+    corrupt[3] ^= 0xff;
+    const hinted = mk(hex(new Uint8Array(corrupt)));
+    const body = unhex(i.observable_state_cbor_hex);
+    const adopted = sync.fastjoin_adopt(hinted, '[]', '[]', '[]', body);
+
+    return {
+      snapshot_preimage: preimage,
+      snapshot_sig: hex(sig),
+      snapshot_cbor: hex(snapshot),
+      state_root: hex(sync.observable_state_root(body)),
+      fastjoin_cbor: hex(byRef),
+      pull_cbor: hex(pullEnvelope(byRef)),
+      pull_inline_cbor: hex(pullEnvelope(inline)),
+      fastjoin_roundtrip: hex(sync.fastjoin_encode(sync.fastjoin_decode(byRef))),
+      state_address: hex(sync.fastjoin_state_address(byRef)),
+      adopted_state: hex(adopted),
+      // ...and with nothing fetchable, the same unverifiable hint fails CLOSED.
+      corrupt_hint_unfetchable: refusal(() =>
+        sync.fastjoin_adopt(hinted, '[]', '[]', '[]', undefined),
+      ),
+      caller_at_covers_below_floor: String(
+        sync.caller_is_below_floor(snapshot, JSON.stringify(coversMarks(i.snapshot_covers_cbor_hex))),
+      ),
+    };
+  },
+
+  // SYNC-FJ-02 — the MUST in both directions, and the caller-side fail-closed paths.
+  sync_fastjoin_floor_predicate(v) {
+    const i = v.input;
+    const fj = fastjoinFromPull(v.expected.caller_behind_response_cbor_hex);
+    const snap = sync.fastjoin_encode(
+      JSON.stringify({ ...JSON.parse(sync.fastjoin_decode(fj)), state: null }),
+    );
+    const snapBytes = snapshotOf(fj);
+    const behind = JSON.stringify(coversMarks(i.caller_behind_vector_cbor_hex));
+    const caughtUp = JSON.stringify(coversMarks(i.caller_caught_up_vector_cbor_hex));
+
+    // The forbidden answer is WELL-FORMED — recomputed here, which is why the MUST is needed.
+    const wouldBe = sync.encode_value(
+      JSON.stringify({
+        map: [[1, { arr: i.surviving_suffix_ops_cbor_hex.map((h) => JSON.parse(sync.decode_value(unhex(h)))) }]],
+      }),
+    );
+
+    const floor = svalToHlc(JSON.parse(sync.decode_value(unhex(i.responder_floor_hlc_cbor_hex))));
+    const gapFj = sync.fastjoin_encode(
+      JSON.stringify({
+        snapshot: JSON.parse(sync.snapshot_decode(unhex(i.snapshot_not_covering_gap_cbor_hex))),
+        floor,
+        state: null,
+      }),
+    );
+
+    return {
+      behind_is_below_floor: String(sync.caller_is_below_floor(snapBytes, behind)),
+      caught_up_is_below_floor: String(sync.caller_is_below_floor(snapBytes, caughtUp)),
+      ops_response_would_be: hex(wouldBe),
+      fastjoin_roundtrip: hex(snap),
+      // A snapshot that does not close the gap it was sent to close.
+      gap_not_closed: refusal(() => sync.fastjoin_adopt(gapFj, behind, '[]', '[]', new Uint8Array(0))),
+      // A body no holder can serve: 0x0A0C, fail-closed, never a fallback to the suffix.
+      state_unavailable: refusal(() => sync.fastjoin_adopt(fj, behind, '[]', '[]', undefined)),
+      // And a caught-up caller must not be fast-joined at all.
+      caught_up_refuses_fastjoin: refusal(() =>
+        sync.fastjoin_adopt(fj, caughtUp, '[]', '[]', undefined),
+      ),
+    };
+  },
+
   // SYNC-GC-01 — the stability cut, and that GC below it is observably a no-op.
   sync_gc_stability_cut(v) {
     const live = v.input.live_replica_watermarks.map((w) => JSON.parse(hlcJson(w.max_applied_hlc)));
@@ -525,6 +622,41 @@ const executors = {
     };
   },
 };
+
+/** `{2: FastJoin}` — the §5.2.1 pull envelope, built with the generic CBOR helpers. */
+const pullEnvelope = (fastjoinBytes) =>
+  sync.encode_value(
+    JSON.stringify({ map: [[2, JSON.parse(sync.decode_value(fastjoinBytes))]] }),
+  );
+
+/** Pull the FastJoin bytes back out of a `{2: FastJoin}` response. */
+function fastjoinFromPull(pullHex) {
+  const outer = JSON.parse(sync.decode_value(unhex(pullHex)));
+  const entry = outer.map.find(([k]) => k === 2);
+  return sync.encode_value(JSON.stringify(entry[1]));
+}
+
+/** The snapshot bytes inside a FastJoin. */
+const snapshotOf = (fastjoinBytes) => {
+  const inner = JSON.parse(sync.decode_value(fastjoinBytes));
+  return sync.encode_value(JSON.stringify(inner.map.find(([k]) => k === 1)[1]));
+};
+
+/** An HLC decoded as a generic CBOR map, turned back into the binding's HLC spelling. */
+const svalToHlc = (sval) => {
+  const f = Object.fromEntries(sval.map);
+  return { wall: f[1].int, counter: f[2].int, author: f[3].bstr };
+};
+
+/** A VersionVector's CBOR turned into the `[{author, hlc}]` marks the binding takes. */
+const coversMarks = (vectorHex) =>
+  JSON.parse(sync.decode_value(unhex(vectorHex))).bmap.map(([author, hlc]) => ({
+    author,
+    hlc: svalToHlc(hlc),
+  }));
+
+/** The same, in the shape `snapshot_signing_input`/`snapshot_assemble` expect. */
+const coversFromCbor = (vectorHex) => coversMarks(vectorHex);
 
 /** The vectors spell observable state as bare strings; the binding wants tagged values. */
 function observableToBindingJson(o) {
