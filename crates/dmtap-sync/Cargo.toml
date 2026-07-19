@@ -1,0 +1,22 @@
+[package]
+name = "dmtap-sync"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "DMTAP substrate capability ③ — Sync (substrate/SYNC.md): the signed, deterministic, MULTI-AUTHOR CRDT operation algebra (OR-Set, HLC-LWW register, remove-wins death certificate, PN-counter, RGA sequence, cycle-safe movable tree), per-op RFC 9052 COSE_Sign1 authenticity, canonical observable-state snapshot roots, and range-Merkle reconciliation fingerprints"
+repository = "https://example.invalid/envoir"
+
+[dependencies]
+# Ed25519 (COSE_Sign1 signing/verification) and the §18.1.5 v0 content address (0x1e ‖ BLAKE3-256)
+# come from core; this crate adds NO new third-party dependency.
+dmtap-core = { path = "../dmtap-core" }
+
+[dev-dependencies]
+# The §5.6 single-owner device-cluster reference. Used ONLY by the parity tests
+# (`tests/clustersync_parity.rs`), which prove that this crate's generalized OR-Set / LWW /
+# death-certificate merges agree op-for-op with the §5.6 normative profile on the subset both
+# cover — the "reuse" obligation discharged as an executable cross-check rather than as a type
+# dependency (§5.6's `Hlc`/value type is the `device`-flavoured, unsigned-integer-only one; the
+# substrate value type must additionally carry negative integers, §4.1 `ext-value`).
+dmtap-clustersync = { path = "../dmtap-clustersync" }

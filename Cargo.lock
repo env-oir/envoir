@@ -857,6 +857,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dmtap-sync"
+version = "0.0.1"
+dependencies = [
+ "dmtap-clustersync",
+ "dmtap-core",
+]
+
+[[package]]
 name = "downgrade-tests"
 version = "0.0.1"
 dependencies = [
