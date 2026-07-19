@@ -8,7 +8,7 @@ the spec's own roadmap markers, it doesn't belong here.
 
 - **The MOTE delivery engine** (`dmtap::node` in `node/`) — real identity keys, real MLS/HPKE
   sealing, the full recipient-validation pipeline, and the sender-retry state machine,
-  demonstrated end-to-end by `cargo run -p envoir-node -- run` over an in-process transport. The
+  demonstrated end-to-end by `cargo run -p envoir-node -- demo` over an in-process transport. The
   delivery + anti-rollback/anti-abuse state (per-contact suite high-water-marks, journaled retry
   entries) is **restart-safe**: a `FileJournal` persists the whole snapshot and a node reopened
   from the same path resumes with rollback protection intact, not reset to a weaker
@@ -21,11 +21,15 @@ the spec's own roadmap markers, it doesn't belong here.
   large-message round-tripping included). DCUtR is wired and empirically attempts a hole-punch, but
   a real NAT-traversed upgrade needs two distinct NATs and isn't reproducible on loopback, so that
   one case stays an honest `#[ignore]`. This crate is not yet the transport `envoir-node`'s `run`/
-  `serve-mail` commands use by default — see [architecture.md](architecture.md#the-mesh-and-mixnet).
+  `serve` daemon command uses by default (it uses a real TCP transport, not this libp2p mesh) —
+  see [architecture.md](architecture.md#the-mesh-and-mixnet).
 - **The client-protocol layer** (`crates/dmtap-mail`) — real IMAP (RFC 9051/3501, including
   CONDSTORE/QRESYNC, SEARCHRES, SORT/THREAD, BINARY), POP3, SMTP-submission, and JMAP Core/Mail
-  servers, plus autodiscovery (Thunderbird, Apple, Microsoft), all runnable via
-  `cargo run -p envoir-node -- serve-mail`. See the crate's own capability matrix in
+  servers, plus autodiscovery (Thunderbird, Apple, Microsoft), all runnable via the
+  `envoir-gateway` binary's `GATEWAY_IMAP_ENABLE`/`GATEWAY_POP3_ENABLE`/
+  `GATEWAY_SUBMISSION_ENABLE` toggles (`gateway/src/personal.rs`) — the node binary itself only
+  enables this crate's native, JMAP-only surface (`ENVOIR_JMAP`, no legacy protocols). See the
+  crate's own capability matrix in
   [`crates/dmtap-mail/README.md`](../crates/dmtap-mail/README.md) for exactly what's done vs.
   explicitly deferred (real TLS, DEFLATE compression, cross-server CATENATE URLFETCH, JMAP push
   transport).
@@ -80,9 +84,9 @@ the spec's own roadmap markers, it doesn't belong here.
 
 - **The libp2p mesh transport isn't the node binary's default yet, and the mixnet isn't wired in at
   all.** `crates/dmtap-p2p` proves the libp2p transport works (see above), but `envoir-node`'s
-  `run`/`serve-mail` commands still drive the delivery engine over an in-process transport today —
-  flagged directly in `node/src/main.rs`'s own doc comments as "a separate frontier task," not
-  hidden. The mixnet (Sphinx onion format, entry/mix/exit routing, cover traffic) exists as
+  `run`/`serve` daemon drives the delivery engine over a plain `TcpTransport` (`node/src/transport.rs`)
+  today, not the libp2p mesh — flagged directly in `node/src/main.rs`'s own doc comments as "a
+  separate frontier task," not hidden. The mixnet (Sphinx onion format, entry/mix/exit routing, cover traffic) exists as
   wire-format types and a mechanism simulator (`crates/netsim`), not as a running transport a node
   can send traffic over yet.
 - **Post-quantum suite `0x02`** (ML-DSA-65 / X-Wing hybrid) is reserved in the spec and correctly

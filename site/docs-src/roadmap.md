@@ -8,11 +8,14 @@ the spec's own roadmap markers, it doesn't belong here.
 
 - **The MOTE delivery engine** (`dmtap::node` in `node/`) — real identity keys, real MLS/HPKE
   sealing, the full recipient-validation pipeline, and the sender-retry state machine,
-  demonstrated end-to-end by `cargo run -p envoir-node -- run` over an in-process transport.
+  demonstrated end-to-end by `cargo run -p envoir-node -- demo` over an in-process transport (the
+  node's `run`/`serve` daemon command runs the same engine long-lived, over a real TCP transport).
 - **The client-protocol layer** (`crates/dmtap-mail`) — real IMAP (RFC 9051/3501, including
   CONDSTORE/QRESYNC, SEARCHRES, SORT/THREAD, BINARY), POP3, SMTP-submission, and JMAP Core/Mail
-  servers, plus autodiscovery (Thunderbird, Apple, Microsoft), all runnable via
-  `cargo run -p envoir-node -- serve-mail`. See the crate's own capability matrix in
+  servers, plus autodiscovery (Thunderbird, Apple, Microsoft), all runnable via the
+  `envoir-gateway` binary (`GATEWAY_IMAP_ENABLE`/`GATEWAY_POP3_ENABLE`/`GATEWAY_SUBMISSION_ENABLE`)
+  — the node binary itself only enables this crate's native JMAP surface (`ENVOIR_JMAP`), no
+  legacy protocols. See the crate's own capability matrix in
   [`crates/dmtap-mail/README.md`](../crates/dmtap-mail/README.md) for exactly what's done vs.
   explicitly deferred (real TLS, DEFLATE compression, cross-server CATENATE URLFETCH, JMAP push
   transport).
@@ -37,8 +40,9 @@ the spec's own roadmap markers, it doesn't belong here.
 
 ## What's stubbed or deferred, and why
 
-- **The libp2p mesh and mixnet transports** are not yet wired into the node binary — the delivery
-  engine above runs over an in-process transport today. This is flagged directly in
+- **The libp2p mesh and mixnet transports** are not yet wired into the node binary — the `run`/
+  `serve` daemon drives delivery over a plain TCP transport today, not the libp2p mesh
+  (`crates/dmtap-p2p`, proven separately at the crate level). This is flagged directly in
   `node/src/main.rs`'s own doc comments as "a separate frontier task," not hidden.
 - **Post-quantum suite `0x02`** (ML-DSA-65 / X-Wing hybrid) is reserved in the spec and correctly
   **fails closed** as an unknown/unimplemented suite — it is not yet implemented, and no code

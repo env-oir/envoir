@@ -96,8 +96,9 @@ key, not its address. [`crates/dmtap-p2p`](../crates/dmtap-p2p) implements this 
 real — two live libp2p swarms exchanging a sealed MOTE and an ack over the wire, a working
 Kademlia PUT/GET, and a Circuit-Relay-v2 reservation that delivers a frame to a peer with no
 direct address at all, all proven on loopback by dedicated tests. It is not yet the transport
-`envoir-node`'s `run`/`serve-mail` commands use by default — see [roadmap.md](roadmap.md) for
-exactly what's wired into the binary today versus proven at the crate level.
+`envoir-node`'s `run`/`serve` daemon command uses by default (that uses a plain TCP transport) —
+see [roadmap.md](roadmap.md) for exactly what's wired into the binary today versus proven at the
+crate level.
 
 The privacy layer on top is a **mixnet** profiled from Sphinx (packet format) and Loopix/Nym
 (operational design): messages travel as fixed-length, onion-wrapped packets through a 3-hop

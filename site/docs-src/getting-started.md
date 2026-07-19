@@ -1,8 +1,8 @@
 # Getting Started
 
 This walks through building the workspace and running the real, working pieces: the reference
-node's delivery engine, its demo mail servers, the legacy gateway, and the web client. Every
-command below is copied from the actual CLI entry points (`node/src/main.rs`,
+node's delivery engine and daemon, the legacy gateway (including its demo mail servers), and the
+web client. Every command below is copied from the actual CLI entry points (`node/src/main.rs`,
 `gateway/src/main.rs`) — nothing aspirational.
 
 ## Prerequisites
@@ -33,16 +33,17 @@ cargo run -p envoir-node -- <command>
 | Command | What it does |
 |---|---|
 | `version` | Print the version and default crypto suite |
-| `run` | Run the delivery engine: two in-process nodes exchange a real, end-to-end-encrypted MOTE over an in-memory transport (seal → validate → decrypt → ack) |
-| `serve-mail` | Run the client-protocol servers — **real** IMAP (`:1143`), POP3 (`:1110`), and SMTP-submission (`:1587`) listeners against an in-memory mailbox, with a fixed demo app-password (`owner@dmtap.local` / `app-password`) |
-| `init` | Not yet implemented — will generate a root identity key + recovery policy |
+| `init` | Generate a root Ed25519 identity + X25519 sealing keypair, persist them to a keystore, and print the `_dmtap` DNS record to publish |
+| `run` (alias `serve`) | Run the real long-running node daemon — loads the keystore + durable outbound journal, binds the mesh transport, and serves until SIGINT/SIGTERM |
+| `demo` | Run the delivery engine as a one-shot demo: two in-process nodes exchange a real, end-to-end-encrypted MOTE over an in-memory transport (seal → validate → decrypt → ack), then exit |
+| `record` | Reload the keystore and print just its `_dmtap` DNS record |
 | `gateway` | Points you at the dedicated `envoir-gateway` binary below |
 | `help` | Usage |
 
 Try the delivery demo first — it's the clearest illustration of what's real today:
 
 ```sh
-cargo run -p envoir-node -- run
+cargo run -p envoir-node -- demo
 ```
 
 You'll see Alice seal a MOTE to Bob, Bob validate/decrypt/store/ack it, and Alice's outbound queue
@@ -50,11 +51,17 @@ reach `ACKED` — the actual recipient-validation pipeline and sender-retry stat
 just over an in-process transport rather than the libp2p mesh (see [Roadmap](roadmap.md) for
 what's stubbed).
 
-To point a real mail client (or `curl` / `openssl s_client`) at the demo mail servers:
+To run the real daemon (persists identity + outbound queue, serves until stopped):
 
 ```sh
-cargo run -p envoir-node -- serve-mail
+cargo run -p envoir-node -- init   # once, to create a keystore
+cargo run -p envoir-node -- run    # the daemon; Ctrl-C to stop
 ```
+
+Legacy IMAP/POP3/SMTP-submission clients aren't served by the node — only the separate
+`envoir-gateway` binary speaks those protocols (see below). The node's own client-sync surface is
+JMAP, opt-in via `ENVOIR_JMAP=1` (see [`node/src/config.rs`](../node/src/config.rs) for the full
+`ENVOIR_*` environment reference).
 
 ## Run the gateway (optional)
 

@@ -250,12 +250,14 @@ workspace, and it never gates a protocol, client, or privacy feature.
 cargo build --workspace
 
 # Two in-process nodes exchange a real, end-to-end-encrypted MOTE
+cargo run -p envoir-node -- demo
+
+# The real node daemon (persists identity + outbound queue, serves until stopped)
+cargo run -p envoir-node -- init   # once, to create a keystore
 cargo run -p envoir-node -- run
 
-# Demo IMAP (1143) / POP3 (1110) / SMTP-submission (1587) servers against an in-memory mailbox
-cargo run -p envoir-node -- serve-mail
-
-# The optional legacy-email bridge (see gateway/README.md for the 2-command personal quickstart)
+# The optional legacy-email bridge — real IMAP/POP3/SMTP-submission live here, not on the node
+# (see gateway/README.md for the 2-command personal quickstart)
 cargo run -p envoir-gateway -- run
 ```
 

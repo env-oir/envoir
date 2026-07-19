@@ -16,7 +16,10 @@ and speaks the legacy protocol; the mesh/relay never decrypts; there is no centr
   projection) is **synchronous and std-only**, so it always builds offline and is fully unit +
   integration tested.
 - Real **TCP listeners** (thread-per-connection, std only — *no async runtime*) live behind the
-  optional `net` feature. `cargo run -p envoir-node -- serve-mail` runs them on localhost.
+  optional `net` feature. `envoir-gateway` is the binary that enables it and runs them
+  (`GATEWAY_IMAP_ENABLE`/`GATEWAY_POP3_ENABLE`/`GATEWAY_SUBMISSION_ENABLE`, see
+  `gateway/src/personal.rs`) — `envoir-node` intentionally does NOT enable `net` (its native
+  client-sync surface is JMAP only, see `node/Cargo.toml`).
 - Auth is **app-passwords bound to the DMTAP identity** (spec §8.2), verified via the
   `Authenticator` trait; SASL PLAIN/LOGIN carry the credential. A DMTAP peer's identity key is
   projected to an address via the 8-word **key-name** (`<keyname>@dmtap.local`, spec §3.9.1).
@@ -185,5 +188,8 @@ The IMAP FETCH/SEARCH/STORE paths are built to stay proportional to the *answer*
 ```sh
 cargo test -p dmtap-mail                 # synchronous core: unit + integration tests
 cargo test -p dmtap-mail --features net  # + the TCP literal-reader tests
-cargo run  -p envoir-node -- serve-mail  # demo IMAP:1143 / POP3:1110 / Submission:1587
+
+# Real IMAP:1143 / POP3:1110 / Submission:1587 listeners (gateway/src/personal.rs defaults):
+GATEWAY_IMAP_ENABLE=1 GATEWAY_POP3_ENABLE=1 GATEWAY_SUBMISSION_ENABLE=1 \
+  cargo run -p envoir-gateway -- run
 ```
