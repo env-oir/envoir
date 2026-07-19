@@ -29,6 +29,11 @@ pub enum SyncError {
     NsLeak,
     /// `0x0A0B` — an open-namespace admission limit (rate/quota) exceeded (§9).
     AdmissionQuota,
+    /// `0x0A0C` — a fast-join's observable-state body could not be obtained from any holder
+    /// (§5.2.1 step 3). The round fails **closed**: the caller keeps its old vector rather than
+    /// half-adopting, and MUST NOT fall back to the truncated suffix — that fallback is exactly the
+    /// silent lost-write §5.2.1 exists to prevent.
+    SnapshotStateUnavailable,
 }
 
 /// The §10.7-class action a receiver takes for a given failure.
@@ -59,6 +64,7 @@ impl SyncError {
             SyncError::SnapshotRootMismatch => 0x0A09,
             SyncError::NsLeak => 0x0A0A,
             SyncError::AdmissionQuota => 0x0A0B,
+            SyncError::SnapshotStateUnavailable => 0x0A0C,
         }
     }
 
@@ -81,6 +87,7 @@ impl SyncError {
             SyncError::SnapshotRootMismatch => "ERR_SYNC_SNAPSHOT_ROOT_MISMATCH",
             SyncError::NsLeak => "ERR_SYNC_NS_LEAK",
             SyncError::AdmissionQuota => "ERR_SYNC_ADMISSION_QUOTA",
+            SyncError::SnapshotStateUnavailable => "ERR_SYNC_SNAPSHOT_STATE_UNAVAILABLE",
         }
     }
 
@@ -125,5 +132,12 @@ mod tests {
         assert_eq!(SyncError::AdmissionQuota.action(), Action::DenyPolicy);
         assert_eq!(SyncError::SeqOriginMissing.action(), Action::DeferRequests);
         assert_eq!(SyncError::CounterForeign.action(), Action::FailClosedBlock);
+        // §5.2.1's addition: unfetchable state body is a BLOCK, never a downgrade to the suffix.
+        assert_eq!(SyncError::SnapshotStateUnavailable.code_hex(), "0x0A0C");
+        assert_eq!(
+            SyncError::SnapshotStateUnavailable.name(),
+            "ERR_SYNC_SNAPSHOT_STATE_UNAVAILABLE"
+        );
+        assert_eq!(SyncError::SnapshotStateUnavailable.action(), Action::FailClosedBlock);
     }
 }

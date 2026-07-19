@@ -15,9 +15,9 @@ use serde_json::Value;
 use dmtap_core::identity::IdentityKey;
 use dmtap_sync::detcbor::{decode, encode, SVal};
 use dmtap_sync::{
-    check_admitted, check_counter_entry, check_ns_ref, cose, snapshot::ObservableState,
-    stability_cut, state::SyncState, validate_op, DeathClass, DeathState, Hlc, OpEntry, SyncError,
-    SyncOp,
+    caller_is_below_floor, check_admitted, check_counter_entry, check_ns_ref, cose,
+    snapshot::ObservableState, stability_cut, state::SyncState, state::VersionVector, validate_op,
+    DeathClass, DeathState, FastJoin, Hlc, OpEntry, Snapshot, SyncError, SyncOp,
 };
 
 use crate::{hex, unhex, Vector, Verdict};
@@ -54,6 +54,8 @@ pub fn check(v: &Vector) -> Result<Verdict, String> {
         "sync_ns_sparse_filter" => ns_sparse_filter(v),
         "sync_ns_leak_check" => ns_leak_check(v),
         "sync_gc_stability_cut" => gc_stability_cut(v),
+        "sync_fastjoin_pull_response" => fastjoin_pull_response(v),
+        "sync_fastjoin_floor_predicate" => fastjoin_floor_predicate(v),
         other => Err(format!("no executor registered for sync operation `{other}`")),
     }
 }
@@ -983,4 +985,252 @@ fn gc_stability_cut(v: &Vector) -> Result<Verdict, String> {
     }
     eq("observable state after GC", hex(&ObservableState::of(&st).det_cbor()).as_str(), hex(&before).as_str())?;
     Ok(Verdict::Pass)
+}
+
+// --- SYNC-FJ-01 / SYNC-FJ-02 (§5.2.1 fast-join) ------------------------------------------------
+
+/// Decode a `VersionVector` from its canonical CBOR.
+fn vector_from_hex(h: &str) -> Result<VersionVector, String> {
+    let cv = decode(&unhex(h)?).map_err(|e| format!("vector decode: {e}"))?;
+    VersionVector::from_sval(cv).map_err(|e| format!("VersionVector::from_sval: {e}"))
+}
+
+fn hlc_from_hex(h: &str) -> Result<Hlc, String> {
+    let cv = decode(&unhex(h)?).map_err(|e| format!("hlc decode: {e}"))?;
+    Hlc::from_sval(cv).map_err(|e| format!("Hlc::from_sval: {e}"))
+}
+
+/// `SYNC-FJ-01` — the frozen `FastJoin` / `pull` response encoding.
+///
+/// Every byte here is **recomputed**: the snapshot is re-signed from the vector's seed, the
+/// `FastJoin` and the `pull` envelope are re-encoded from the reference types, and the results are
+/// compared to the frozen hex. Nothing is restated.
+fn fastjoin_pull_response(v: &Vector) -> Result<Verdict, String> {
+    let seed: [u8; 32] = unhex(s(&v.input, "snapshot_signer_seed_hex")?)?
+        .try_into()
+        .map_err(|_| "snapshot_signer_seed_hex is not 32 bytes".to_string())?;
+    let sk = IdentityKey::from_seed(&seed);
+    eq("snapshot signer", hex(&sk.public()).as_str(), s(&v.input, "snapshot_signer_pubkey_hex")?)?;
+
+    let covers = vector_from_hex(s(&v.input, "snapshot_covers_cbor_hex")?)?;
+    let root = unhex(s(&v.input, "snapshot_root_hex")?)?;
+    let state_body = unhex(s(&v.input, "observable_state_cbor_hex")?)?;
+    // The root is the content address of the state body — recomputed, not taken on trust.
+    eq(
+        "snapshot root == H(state body)",
+        hex(dmtap_sync::state_root_of(&state_body).as_bytes()).as_str(),
+        s(&v.input, "snapshot_root_hex")?,
+    )?;
+
+    let mut snapshot = dmtap_sync::Snapshot {
+        v: 0,
+        suite: 1,
+        ns: s(&v.input, "snapshot_ns")?.to_string(),
+        covers,
+        root: dmtap_core::id::ContentId(root),
+        ts: v.input.get("snapshot_ts").and_then(Value::as_u64).ok_or("missing snapshot_ts")?,
+        signer: sk.public(),
+        sig: Vec::new(),
+    };
+    // The §18.1.6 preimage: DS-tag ‖ 0x00 ‖ det_cbor(Snapshot ∖ {8}).
+    eq(
+        "snapshot signing preimage",
+        hex(&snapshot.signing_preimage()).as_str(),
+        s(&v.expected, "snapshot_sig_preimage_hex")?,
+    )?;
+    snapshot.sig = sk.sign_domain(&[], &snapshot.signing_preimage());
+    eq("snapshot signature", hex(&snapshot.sig).as_str(), s(&v.expected, "snapshot_sig_hex")?)?;
+    eq("snapshot", hex(&snapshot.det_cbor()).as_str(), s(&v.expected, "snapshot_cbor_hex")?)?;
+    snapshot.verify_sig().map_err(|e| format!("the re-signed snapshot does not verify: {e}"))?;
+
+    let floor = hlc_from_hex(s(&v.input, "floor_hlc_cbor_hex")?)?;
+
+    // By-reference: the bounded signed descriptor plus the floor, no state body.
+    let by_ref = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: None };
+    eq("FastJoin", hex(&by_ref.det_cbor()).as_str(), s(&v.expected, "fastjoin_cbor_hex")?)?;
+    eq(
+        "pull response",
+        hex(&pull_envelope(&by_ref)).as_str(),
+        s(&v.expected, "pull_response_cbor_hex")?,
+    )?;
+
+    // Inline (key 3): the bounded optimization, same descriptor, state carried alongside.
+    let inline =
+        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(state_body.clone()) };
+    eq(
+        "pull response with inline state",
+        hex(&pull_envelope(&inline)).as_str(),
+        s(&v.expected, "pull_response_with_inline_state_cbor_hex")?,
+    )?;
+
+    // Both round-trip through the decoder byte-for-byte.
+    for (label, fj) in [("by-reference", &by_ref), ("inline", &inline)] {
+        let back = FastJoin::from_det_cbor(&fj.det_cbor())
+            .map_err(|e| format!("{label} FastJoin does not round-trip: {e}"))?;
+        eq(&format!("{label} round-trip"), &back, fj)?;
+    }
+
+    // The response carries key 2 and NOT key 1 — the two are mutually exclusive (§5.2.1).
+    eq(
+        "pull_response_keys",
+        arr(&v.expected, "pull_response_keys")?.iter().filter_map(Value::as_u64).collect::<Vec<_>>(),
+        vec![2u64],
+    )?;
+    eq("ops_key_present", v.expected.get("ops_key_present").and_then(Value::as_bool), Some(false))?;
+
+    // The by-reference fetch address IS the snapshot root.
+    eq("state fetch address", s(&v.expected, "state_fetch_address_hex")?, s(&v.input, "snapshot_root_hex")?)?;
+    eq("state fetch endpoint", s(&v.expected, "state_fetch_endpoint")?, "GET /sync/state/<root>")?;
+
+    // The inline copy is a CACHE HINT: it is hashed to `root` exactly like a fetched body, and a
+    // corrupted inline copy must be discarded (and the body fetched by reference) rather than
+    // adopted. Proven by adopting with a corrupted key 3 and a working fetcher.
+    let caller = vector_from_hex(s(&v.input, "snapshot_covers_cbor_hex")?)?;
+    // A caller that lacks everything: an empty vector is below any non-empty `covers`.
+    let behind = VersionVector::new();
+    let mut corrupted = state_body.clone();
+    corrupted[3] ^= 0xff;
+    let hinted = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(corrupted) };
+    let adopted = hinted
+        .adopt(&behind, &[], &[], |addr| {
+            (addr.as_bytes() == snapshot.root.as_bytes()).then(|| state_body.clone())
+        })
+        .map_err(|e| format!("a corrupted inline hint was not discarded in favour of a fetch: {e}"))?;
+    eq(
+        "adopted state",
+        hex(&adopted.det_cbor()).as_str(),
+        s(&v.input, "observable_state_cbor_hex")?,
+    )?;
+    eq(
+        "inline_state_is_cache_hint_verified_against_root",
+        v.expected.get("inline_state_is_cache_hint_verified_against_root").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    // ...and with no fetcher available, the SAME corrupted hint fails CLOSED (0x0A0C), never
+    // adopting the bytes it could not verify.
+    match hinted.adopt(&behind, &[], &[], |_| None) {
+        Err(SyncError::SnapshotStateUnavailable) => {}
+        Err(e) => return Err(format!("unfetchable body gave {e}, want 0x0A0C")),
+        Ok(_) => return Err("an unverifiable inline state body was adopted".into()),
+    }
+    // A caller already at `covers` is NOT below the floor and must not be fast-joined at all.
+    if caller_is_below_floor(&snapshot, &caller) {
+        return Err("a caller at `covers` was judged below the floor".into());
+    }
+    Ok(Verdict::Pass)
+}
+
+/// The §5.2.1 `pull` envelope for a fast-join answer: `{2: FastJoin}`.
+fn pull_envelope(fj: &FastJoin) -> Vec<u8> {
+    encode(&SVal::Map(vec![(2, decode(&fj.det_cbor()).expect("own FastJoin encoding"))]))
+}
+
+/// `SYNC-FJ-02` — the MUST, in both directions, and the caller-side fail-closed paths.
+fn fastjoin_floor_predicate(v: &Vector) -> Result<Verdict, String> {
+    let covers = vector_from_hex(s(&v.input, "responder_snapshot_covers_cbor_hex")?)?;
+    let floor = hlc_from_hex(s(&v.input, "responder_floor_hlc_cbor_hex")?)?;
+    let behind = vector_from_hex(s(&v.input, "caller_behind_vector_cbor_hex")?)?;
+    let caught_up = vector_from_hex(s(&v.input, "caller_caught_up_vector_cbor_hex")?)?;
+
+    // The predicate itself, both directions (§5.2.1's two MUSTs).
+    let responder_snapshot = decode_fastjoin_from_pull(s(&v.expected, "caller_behind_response_cbor_hex")?)?;
+    eq("responder covers", &responder_snapshot.snapshot.covers, &covers)?;
+    eq("responder floor", &responder_snapshot.floor, &floor)?;
+
+    eq(
+        "caller_behind_is_below_floor",
+        caller_is_below_floor(&responder_snapshot.snapshot, &behind),
+        v.expected.get("caller_behind_is_below_floor").and_then(Value::as_bool).ok_or("missing")?,
+    )?;
+    eq(
+        "caller_caught_up_is_below_floor",
+        caller_is_below_floor(&responder_snapshot.snapshot, &caught_up),
+        v.expected.get("caller_caught_up_is_below_floor").and_then(Value::as_bool).ok_or("missing")?,
+    )?;
+    eq(
+        "caller_behind_ops_response_forbidden",
+        v.expected.get("caller_behind_ops_response_forbidden").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    eq(
+        "caller_caught_up_fastjoin_forbidden",
+        v.expected.get("caller_caught_up_fastjoin_forbidden").and_then(Value::as_bool),
+        Some(true),
+    )?;
+
+    // The forbidden answer is WELL-FORMED — that is exactly why the MUST is needed. Recompute it
+    // from the surviving suffix and confirm it matches what the vector says the responder would
+    // wrongly have sent.
+    // NOTE the encoding: the vector embeds each op as a CBOR ITEM inside key 1's array, not as a
+    // bstr wrapping it — which is what §5.2's `{1 => [COSE_Sign1(SyncOp) | SyncFrame]}` reads as,
+    // since a `COSE_Sign1` is itself a 4-element array. Reproduced as frozen. (`node`'s existing
+    // `POST /sync/pull` bstr-wraps its ops; see SYNC_KNOWN_DISCREPANCIES.)
+    let suffix = hex_list(&v.input, "surviving_suffix_ops_cbor_hex")?;
+    let items: Vec<SVal> = suffix
+        .iter()
+        .map(|b| decode(b).map_err(|e| format!("suffix op does not decode: {e}")))
+        .collect::<Result<_, String>>()?;
+    let would_be = encode(&SVal::Map(vec![(1, SVal::Array(items))]));
+    eq(
+        "the forbidden ops response",
+        hex(&would_be).as_str(),
+        s(&v.expected, "caller_behind_ops_response_would_be_cbor_hex")?,
+    )?;
+    // ...and it is the CORRECT answer for the caught-up caller.
+    eq(
+        "the caught-up caller's ops response",
+        hex(&would_be).as_str(),
+        s(&v.expected, "caller_caught_up_response_cbor_hex")?,
+    )?;
+
+    // Caller-side fail-closed #1: a snapshot whose `covers` does not close the gap is 0x0A09.
+    let not_covering = Snapshot::from_det_cbor(&unhex(s(&v.input, "snapshot_not_covering_gap_cbor_hex")?)?)
+        .map_err(|e| format!("snapshot_not_covering_gap does not decode: {e}"))?;
+    let gap_fj = FastJoin { snapshot: not_covering, floor: floor.clone(), state: None };
+    match gap_fj.adopt(&behind, &[], &[], |_| Some(Vec::new())) {
+        Err(e) => {
+            eq("snapshot_not_covering_gap error", e.code_hex().as_str(), s(&v.expected, "snapshot_not_covering_gap_error_code")?)?;
+            eq("snapshot_not_covering_gap name", e.name(), s(&v.expected, "snapshot_not_covering_gap_error_name")?)?;
+        }
+        Ok(_) => return Err("a snapshot that does not close the gap was adopted".into()),
+    }
+
+    // Caller-side fail-closed #2: an unfetchable state body is 0x0A0C, with the caller's vector
+    // UNCHANGED — and never a fallback to the suffix.
+    let before = behind.clone();
+    let unfetchable = responder_snapshot.clone();
+    match unfetchable.adopt(&behind, &[], &[], |_| None) {
+        Err(e) => {
+            eq("state_body_unfetchable code", e.code_hex().as_str(), s(&v.expected, "state_body_unfetchable_error_code")?)?;
+            eq("state_body_unfetchable name", e.name(), s(&v.expected, "state_body_unfetchable_error_name")?)?;
+            eq("state_body_unfetchable action", e.action_str(), s(&v.expected, "state_body_unfetchable_action")?)?;
+        }
+        Ok(_) => return Err("a fast-join with no obtainable state body was adopted".into()),
+    }
+    eq("caller vector unchanged", &before, &behind)?;
+    eq(
+        "state_body_unfetchable_caller_vector_unchanged",
+        v.expected.get("state_body_unfetchable_caller_vector_unchanged").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    eq(
+        "suffix_fallback_after_failed_fastjoin_forbidden",
+        v.expected.get("suffix_fallback_after_failed_fastjoin_forbidden").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    // The predicate is stated in the vector as domination of `covers`, not a floor comparison.
+    eq(
+        "predicate",
+        s(&v.expected, "predicate")?,
+        "behind_floor := exists (author, hlc) in Snapshot.covers such that caller_vector.lacks(hlc)",
+    )?;
+    Ok(Verdict::Pass)
+}
+
+/// Pull the `FastJoin` out of a `{2: FastJoin}` pull response.
+fn decode_fastjoin_from_pull(pull_hex: &str) -> Result<FastJoin, String> {
+    let cv = decode(&unhex(pull_hex)?).map_err(|e| format!("pull response decode: {e}"))?;
+    let SVal::Map(fields) = cv else { return Err("pull response is not a map".into()) };
+    let (_, fj) = fields.into_iter().find(|(k, _)| *k == 2).ok_or("pull response has no key 2")?;
+    FastJoin::from_det_cbor(&encode(&fj)).map_err(|e| format!("FastJoin decode: {e}"))
 }

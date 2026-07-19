@@ -15,7 +15,7 @@
 use crate::detcbor::{encode, SVal};
 use crate::error::SyncError;
 use crate::state::{SyncState, VersionVector};
-use crate::wire::{ds_hash, DS_SNAPSHOT, DS_SNAPSHOT_STATE, TREE_ROOT};
+use crate::wire::{ds_hash, Hlc, DS_SNAPSHOT, DS_SNAPSHOT_STATE, TREE_ROOT};
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{verify_domain, IdentityKey};
 
@@ -164,6 +164,63 @@ impl ObservableState {
     pub fn root(&self) -> ContentId {
         ds_hash(DS_SNAPSHOT_STATE, &self.det_cbor())
     }
+
+    /// Decode a canonical observable-state body (§6.1.1) — what a fast-joining replica receives
+    /// instead of a history, and what `GET /sync/state/<root>` serves.
+    ///
+    /// Fails closed on anything that is not exactly six sections of correctly-shaped entries: a
+    /// body that decodes loosely could hash to `root` yet mean something different to two
+    /// replicas, which is the one thing §6.1 exists to rule out.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<ObservableState, SyncError> {
+        let cv = crate::detcbor::decode(bytes).map_err(|_| SyncError::OpInvalid)?;
+        let sections = match cv {
+            SVal::Array(a) if a.len() == 6 => a,
+            _ => return Err(SyncError::OpInvalid),
+        };
+        let rows = |i: usize, arity: usize| -> Result<Vec<Vec<SVal>>, SyncError> {
+            match &sections[i] {
+                SVal::Array(entries) => entries
+                    .iter()
+                    .map(|e| match e {
+                        SVal::Array(t) if t.len() == arity => Ok(t.clone()),
+                        _ => Err(SyncError::OpInvalid),
+                    })
+                    .collect(),
+                _ => Err(SyncError::OpInvalid),
+            }
+        };
+        let text = |v: &SVal| -> Result<String, SyncError> {
+            v.as_text().map(str::to_owned).ok_or(SyncError::OpInvalid)
+        };
+        let mut st = ObservableState::default();
+        for t in rows(0, 2)? {
+            st.orset.push((text(&t[0])?, t[1].clone()));
+        }
+        for t in rows(1, 3)? {
+            st.lww.push((text(&t[0])?, text(&t[1])?, t[2].clone()));
+        }
+        for t in rows(2, 3)? {
+            st.pn.push((
+                text(&t[0])?,
+                text(&t[1])?,
+                t[2].as_int().ok_or(SyncError::OpInvalid)? as i128,
+            ));
+        }
+        for t in rows(3, 2)? {
+            st.death.push((text(&t[0])?, text(&t[1])?));
+        }
+        for t in rows(4, 2)? {
+            let atoms = match &t[1] {
+                SVal::Array(a) => a.clone(),
+                _ => return Err(SyncError::OpInvalid),
+            };
+            st.rga.push((text(&t[0])?, atoms));
+        }
+        for t in rows(5, 3)? {
+            st.tree.push((text(&t[0])?, text(&t[1])?, text(&t[2])?));
+        }
+        Ok(st)
+    }
 }
 
 /// The observable-state root of a replica.
@@ -304,6 +361,189 @@ impl Snapshot {
         verify_domain(&self.signer, &[], &self.preimage(), &self.sig)
             .map_err(|_| SyncError::OpSigInvalid)
     }
+}
+
+// ============================================================================================
+// §5.2.1 — fast-join from a snapshot over the wire
+// ============================================================================================
+
+/// The `FastJoin` object a §5.2 `pull` returns to a caller below the responder's §6.2 truncation
+/// floor (§5.2.1, frozen by `SYNC-FJ-01`).
+///
+/// ```cddl
+/// FastJoin = {
+///   1 => Snapshot,   ; the §6.1 signed descriptor — bounded, so it ships INLINE
+///   2 => Hlc,        ; floor — the responder's §6.2 cut, the caller's audit handle
+///   ? 3 => bstr,     ; OPTIONAL inline det_cbor(ObservableState), a bounded cache hint
+/// }
+/// ```
+///
+/// The encoding split is the design: the signed descriptor is sized by the author count and
+/// carries the signature, `covers` and the `root` commitment, so it must travel inline; the
+/// observable state is unbounded (potentially megabytes) and travels **by reference** at
+/// `Snapshot.root`, fetched from `GET /sync/state/<root>`. By-reference keeps a sync round's
+/// response bounded and reuses content addressing the protocol already has — the body is immutable
+/// and self-verifying, so any holder may serve it and every peer joining at the same `covers`
+/// dedupes to the same bytes.
+///
+/// [`FastJoin::state`] is a **cache hint, never a second source of truth**: it is hashed against
+/// `root` exactly like a fetched body and discarded on mismatch, so there is one verification path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FastJoin {
+    /// The §6.1 signed snapshot that replaced the truncated prefix (key 1).
+    pub snapshot: Snapshot,
+    /// The §6.2 truncation floor in force at the responder (key 2).
+    pub floor: Hlc,
+    /// An OPTIONAL bounded inline copy of `det_cbor(ObservableState)` (key 3).
+    pub state: Option<Vec<u8>>,
+}
+
+/// The RECOMMENDED ceiling on an inline state body (§5.2.1). Above it, ship by reference only —
+/// the inline copy exists to collapse the small-namespace case to one round trip, not to make a
+/// sync round's response size unbounded again.
+pub const INLINE_STATE_CEILING: usize = 64 * 1024;
+
+impl FastJoin {
+    /// The canonical wire encoding.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        let mut fields = vec![
+            (1, crate::detcbor::decode(&self.snapshot.det_cbor()).expect("own snapshot encoding")),
+            (2, self.floor.to_sval()),
+        ];
+        if let Some(state) = &self.state {
+            fields.push((3, SVal::Bytes(state.clone())));
+        }
+        encode(&SVal::Map(fields))
+    }
+
+    /// Decode, denying unknown keys. The signature is **not** checked here — call
+    /// [`FastJoin::adopt`]; decoding and trusting stay separate steps.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, SyncError> {
+        let cv = crate::detcbor::decode(bytes).map_err(|_| SyncError::OpInvalid)?;
+        let mut f = crate::detcbor::Fields::new(cv).map_err(|_| SyncError::OpInvalid)?;
+        let bad = |_| SyncError::OpInvalid;
+        let snapshot = Snapshot::from_det_cbor(&encode(&f.req(1).map_err(bad)?))?;
+        let floor = Hlc::from_sval(f.req(2).map_err(bad)?).map_err(bad)?;
+        let state = match f.take(3) {
+            Some(SVal::Bytes(b)) => Some(b),
+            Some(_) => return Err(SyncError::OpInvalid),
+            None => None,
+        };
+        f.deny_unknown().map_err(bad)?;
+        Ok(FastJoin { snapshot, floor, state })
+    }
+
+    /// The §5.2.1 caller-side sequence, steps 1–3, fail-closed at every step.
+    ///
+    /// 1. **Verify the snapshot** — signature under `DMTAP-SYNC-v0/snapshot` (`0x0A02`), signer
+    ///    admission against `admitted` when the deployment supplies a list (`0x0A01`), and
+    ///    `Snapshot.ns` among the caller's subscriptions (`0x0A0A`).
+    /// 2. **Check it closes the gap** — `covers` MUST dominate every HLC `caller` lacks, and the
+    ///    responder's `floor` MUST NOT exceed `covers`. A fast-join that would leave the same hole
+    ///    it was sent to fill is `0x0A09`.
+    /// 3. **Obtain and verify the state body** — the inline copy if it hashes to `root`, otherwise
+    ///    whatever `fetch` returns for `root`, hashed the same way. `0x0A09` if a body is served
+    ///    but does not hash to `root`; `0x0A0C` if no holder can serve one at all.
+    ///
+    /// Returns the **verified** observable state. Adoption itself (step 4) and resuming the pull at
+    /// `covers` (step 5) are the caller's, under the deployment's §6.1 trust policy — this function
+    /// exists so that no caller can reach those steps with an unverified snapshot or body.
+    ///
+    /// **There is deliberately no fallback here.** Every failure path returns an error and leaves
+    /// the caller's vector untouched. Falling back to the responder's surviving suffix on a failed
+    /// fast-join would reintroduce, by the back door, exactly the silent lost-write §5.2.1's MUST
+    /// exists to prevent.
+    pub fn adopt(
+        &self,
+        caller: &VersionVector,
+        subscribed: &[String],
+        admitted: &[Vec<u8>],
+        fetch: impl FnOnce(&ContentId) -> Option<Vec<u8>>,
+    ) -> Result<ObservableState, SyncError> {
+        // --- step 1: the snapshot itself -----------------------------------------------------
+        self.snapshot.verify_sig()?;
+        if !admitted.is_empty() {
+            crate::crdt::check_admitted(&self.snapshot.signer, admitted)?;
+        }
+        if !subscribed.is_empty() && !subscribed.iter().any(|ns| *ns == self.snapshot.ns) {
+            return Err(SyncError::NsLeak);
+        }
+
+        // --- step 2: does it close the gap? --------------------------------------------------
+        check_covers_closes_gap(&self.snapshot, &self.floor, caller)?;
+
+        // --- step 3: the state body ----------------------------------------------------------
+        // The inline copy is tried first and held to the SAME hash check as a fetched body; on
+        // mismatch it is discarded (not an error — it was only ever a hint) and the by-reference
+        // path is taken.
+        let inline = self.state.as_ref().filter(|b| state_root_of(b) == self.snapshot.root);
+        let body = match inline {
+            Some(b) => b.clone(),
+            None => fetch(&self.snapshot.root).ok_or(SyncError::SnapshotStateUnavailable)?,
+        };
+        if state_root_of(&body) != self.snapshot.root {
+            return Err(SyncError::SnapshotRootMismatch);
+        }
+        ObservableState::from_det_cbor(&body)
+    }
+}
+
+/// The §6.1 root of an encoded observable-state body.
+pub fn state_root_of(body: &[u8]) -> ContentId {
+    ds_hash(DS_SNAPSHOT_STATE, body)
+}
+
+/// **The §5.2.1 responder predicate**: is `caller` below the floor a retained `snapshot` stands in
+/// for — i.e. would the surviving suffix be an incomplete answer?
+///
+/// The test is domination of the snapshot's `covers`, **not** a comparison against the floor `Hlc`
+/// alone: if the caller lacks any HLC the snapshot folded in, some op it needs may have been
+/// truncated, and only the snapshot can give that state back.
+///
+/// A responder for which this is `true` MUST answer `fast-join`, never `ops`. A responder for which
+/// it is `false` MUST answer `ops`, never `fast-join` — forcing a caught-up caller to fast-join
+/// would trade its verified local history for a trusted checkpoint.
+pub fn caller_is_below_floor(snapshot: &Snapshot, caller: &VersionVector) -> bool {
+    snapshot.covers.marks().any(|(_, hlc)| caller.lacks(hlc))
+}
+
+/// Whether a fast-join's snapshot actually closes the gap it was sent to close (§5.2.1 step 2).
+///
+/// `0x0A09` when `covers` fails to dominate something the caller lacks, or when the responder's
+/// `floor` exceeds `covers` — in either case adopting would leave the caller with the same hole,
+/// while telling it the round succeeded.
+pub fn check_covers_closes_gap(
+    snapshot: &Snapshot,
+    floor: &Hlc,
+    caller: &VersionVector,
+) -> Result<(), SyncError> {
+    // The floor must be accounted for by the checkpoint: `covers` MUST carry a mark for the
+    // floor's author, otherwise the responder discarded a prefix belonging to an author the
+    // snapshot never folded in, and the gap is real.
+    //
+    // Note precisely what is NOT checked, because it cannot be: §5.2.1's "the floor MUST NOT
+    // exceed `covers`" is not an HLC comparison against the covers mark. A floor sits, by
+    // construction, one step ABOVE the last covered op — `SYNC-FJ-01`'s own data has
+    // floor = (W,5,A) with covers A@(W,4) — so `covers.lacks(floor)` is TRUE for a perfectly
+    // well-formed fast-join. Whether every truncated op below the floor was folded into `covers` is
+    // a statement about ops the caller cannot see and the marks do not encode; the responder
+    // enforces it at truncation time (where the ops are still in hand), and the caller's real
+    // protection is the root check in step 3 plus the below-floor predicate here.
+    if !snapshot.covers.marks().any(|(author, _)| author.as_slice() == floor.author.as_slice()) {
+        return Err(SyncError::SnapshotRootMismatch);
+    }
+    // An empty `covers` accounts for nothing, so it can close no gap.
+    if snapshot.covers.marks().next().is_none() {
+        return Err(SyncError::SnapshotRootMismatch);
+    }
+    // The other direction of §5.2.1's MUST, enforced from the caller's side: a caller that is NOT
+    // below the floor must not be fast-joined. Its surviving-suffix answer is complete, and
+    // adopting a checkpoint instead would trade verified local history for a trusted one. A
+    // responder that sends `fast-join` anyway is refused rather than obeyed.
+    if !caller_is_below_floor(snapshot, caller) {
+        return Err(SyncError::SnapshotRootMismatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

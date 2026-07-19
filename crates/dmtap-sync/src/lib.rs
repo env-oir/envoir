@@ -31,6 +31,11 @@
 //!   the signed [`Snapshot`](snapshot::Snapshot) (§6.1/§6.1.1).
 //! * [`recon`] — the range-Merkle fingerprint fold and the recursive diff (§5.3).
 //!
+//! [`snapshot`] also carries the §5.2.1 fast-join path: [`FastJoin`] (the `pull` answer to a caller
+//! below a §6.2 truncation floor), the responder predicate [`caller_is_below_floor`], and
+//! [`FastJoin::adopt`], the fail-closed caller-side sequence. There is no fallback to the surviving
+//! suffix on any failure there — that fallback is the silent lost-write §5.2.1 exists to prevent.
+//!
 //! ## Fail-closed posture
 //!
 //! Every ingest path verifies the op signature (`0x0A02`), checks author admission (`0x0A01`), and
@@ -67,7 +72,8 @@ pub use detcbor::{DetCborError, SVal};
 pub use error::{Action, SyncError};
 pub use recon::{fingerprint, reconcile, summarize, OpEntry, RangeFingerprint, ReconConfig,
     ReconOutcome};
-pub use snapshot::{state_root, verify_root, ObservableState, Snapshot};
+pub use snapshot::{caller_is_below_floor, check_covers_closes_gap, state_root, state_root_of,
+    verify_root, FastJoin, ObservableState, Snapshot, INLINE_STATE_CEILING};
 pub use state::{scope_to_subscription, stability_cut, SyncState, VersionVector};
 pub use wire::{
     ds_hash, op_id_of, AddTag, Hlc, OpRef, SyncOp, DEATH_LIVE, DS_OP, DS_OP_ID, DS_RECON_FP,
