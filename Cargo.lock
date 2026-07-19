@@ -416,6 +416,7 @@ dependencies = [
  "dmtap-deniable",
  "dmtap-mls",
  "dmtap-naming",
+ "dmtap-sync",
  "envoir-gateway",
  "serde",
  "serde_json",

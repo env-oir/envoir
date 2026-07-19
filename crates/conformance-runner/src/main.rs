@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use conformance_runner::{
     check_all_vectors, load_suite, load_vectors, run_all_suite_cases, CaseOutcome, Verdict,
+    SYNC_KNOWN_DISCREPANCIES,
 };
 
 fn vectors_path() -> PathBuf {
@@ -26,6 +27,12 @@ fn vectors_path() -> PathBuf {
 /// §22/§23 suite cases resolve their `pub_*` vectors.
 fn pub_vectors_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/pub_vectors.json")
+}
+
+/// The sibling spec repo's **Sync substrate** (`substrate/SYNC.md` §10) known-answer vectors —
+/// again a SEPARATE file, recomputed here via the `dmtap-sync` reference crate.
+fn sync_vectors_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/sync_vectors.json")
 }
 
 /// The sibling spec repo's conformance-suite catalog. Optional: this harness's mandatory proof
@@ -59,10 +66,30 @@ fn main() {
         }
     }
 
+    // The Sync-substrate vectors are kept in their OWN report section rather than merged, because
+    // one of them carries an expectation that contradicts SYNC.md's own text (see
+    // SYNC_KNOWN_DISCREPANCIES): it is reported as a named discrepancy, not silently failed and not
+    // silently passed. Every OTHER sync vector gates the exit code exactly like a core vector.
+    let svp = sync_vectors_path();
+    let sync_vf = if svp.exists() {
+        match load_vectors(&svp) {
+            Ok(svf) => Some(svf),
+            Err(e) => {
+                eprintln!("WARN: could not load {}: {e}", svp.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!("=== DMTAP conformance-runner ===");
     println!("vectors file : {}", vectors_path.display());
     if pub_count > 0 {
         println!("pub vectors  : {} (from {})", pub_count, pvp.display());
+    }
+    if let Some(svf) = &sync_vf {
+        println!("sync vectors : {} (from {})", svf.vectors.len(), svp.display());
     }
     println!("format       : {}", vf.format);
     println!("suite        : {}", vf.suite);
@@ -96,6 +123,50 @@ fn main() {
         "--- vectors.json summary: {pass} pass, {pass_generic} pass (generic), {fail} FAIL, {} total ---",
         results.len()
     );
+
+    // --- Sync substrate (substrate/SYNC.md §10) ------------------------------------------------
+    let mut sync_fail = 0usize;
+    if let Some(svf) = &sync_vf {
+        println!();
+        println!("=== Sync substrate vectors: {} ===", svp.display());
+        let mut sync_pass = 0usize;
+        let mut discrepancies: Vec<(String, String)> = Vec::new();
+        for (name, verdict) in check_all_vectors(svf) {
+            let known = SYNC_KNOWN_DISCREPANCIES.iter().find(|(n, _)| *n == name);
+            match (&verdict, known) {
+                (Verdict::Pass | Verdict::PassGeneric, None) => {
+                    sync_pass += 1;
+                    println!("PASS   {name}");
+                }
+                (Verdict::Pass | Verdict::PassGeneric, Some(_)) => {
+                    // The spec repo fixed the vector: say so loudly, and drop the allowlist entry.
+                    sync_fail += 1;
+                    println!(
+                        "FAIL   {name}: listed in SYNC_KNOWN_DISCREPANCIES but now PASSES — the \
+                         vector was fixed upstream; remove the allowlist entry"
+                    );
+                }
+                (Verdict::Fail(e), Some((_, why))) => {
+                    println!("DISCREPANCY  {name}: {e}");
+                    discrepancies.push((name.clone(), (*why).to_string()));
+                }
+                (Verdict::Fail(e), None) => {
+                    sync_fail += 1;
+                    println!("FAIL   {name}: {e}");
+                }
+            }
+        }
+        println!(
+            "--- sync summary: {sync_pass} pass, {} known spec/vector discrepancy, {sync_fail} FAIL, {} total ---",
+            discrepancies.len(),
+            svf.vectors.len()
+        );
+        for (name, why) in &discrepancies {
+            println!();
+            println!("KNOWN DISCREPANCY — {name}");
+            println!("  {why}");
+        }
+    }
 
     // suite.json cross-reference (optional; report only, does not affect exit code — see docs).
     let suite_path = suite_path();
@@ -227,8 +298,11 @@ fn main() {
         println!("(sibling spec repo's suite.json not found at {} — skipping cross-reference; vectors.json-only run)", suite_path.display());
     }
 
-    if fail > 0 {
-        eprintln!("\nconformance-runner: {fail} vector(s) FAILED — this is the mandatory gate, exiting non-zero.");
+    if fail > 0 || sync_fail > 0 {
+        eprintln!(
+            "\nconformance-runner: {fail} vectors.json + {sync_fail} sync vector(s) FAILED — this is \
+             the mandatory gate, exiting non-zero."
+        );
         std::process::exit(1);
     }
     println!("\nconformance-runner: all {} vectors.json checks PASS.", pass + pass_generic);

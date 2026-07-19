@@ -36,6 +36,31 @@ use serde_json::Value;
 mod construction;
 pub use construction::recognized_ids as construction_recognized_ids;
 
+/// Executor for the Sync-substrate vectors (`sync_vectors.json`, `substrate/SYNC.md` §10).
+pub mod sync;
+
+/// Sync-substrate vectors whose committed `expected` value **contradicts the specification text**
+/// they claim to mechanize. These are reported as a named, explained discrepancy instead of being
+/// silently allowed to fail (or, worse, "fixed" by bending the implementation to the vector): this
+/// repo is not the writer of the `dmtap` spec repo, and `SYNC.md` §13 is explicit that where the
+/// document and an implementation disagree, **the document governs**.
+///
+/// Each entry is `(vector name, why it cannot pass as written)`.
+pub const SYNC_KNOWN_DISCREPANCIES: &[(&str, &str)] = &[(
+    "sync_pn_counter_convergence",
+    "SYNC-PN-01 expects P[A]=5 / total=3 after three ops, calling the third a \"replay of author \
+     A's own contribution\" — but that third op carries hlc.counter=1 where the first carries 0, \
+     so its det_cbor (and therefore its op-id, SYNC.md §4.1) DIFFERS: it is a distinct op, not a \
+     replay. §4.6 says a `counter` op's value is a signed delta and \"a positive delta d sets \
+     P[author] += d\", so two distinct +5 ops from A give P[A]=10 and total=8. The expectation \
+     holds only under a reading in which an op's value is the author's cumulative running total \
+     folded by max, which §4.2/§4.6 explicitly reject (\"value = signed delta\"). MINIMAL FIX in \
+     the dmtap repo: give the replayed op the SAME hlc as the first (counter 0) so it is genuinely \
+     the same op; the reference then reproduces P[A]=5, N[B]=2, total=3 exactly, because ingest \
+     dedups by op-id and a true replay is a no-op. The runner proves this: it applies the \
+     true-replay variant and asserts the vector's own expected P/N/total.",
+)];
+
 use dmtap_core::capability::{CapabilityRevocation, CapabilityToken};
 use dmtap_core::cbor::{self, Cv};
 use dmtap_core::deniable::{DeniableFrame, DeniablePayload, DeniablePrekeyBundle};
@@ -196,6 +221,12 @@ pub fn check_vector(v: &Vector) -> Verdict {
 }
 
 fn check_vector_inner(v: &Vector) -> Result<Verdict, String> {
+    // The Sync substrate (`substrate/SYNC.md`) has its own vector file and its own reference
+    // crate (`dmtap-sync`); dispatch there first so every `sync_*` operation EXECUTES rather than
+    // falling through to the generic canonical round-trip.
+    if sync::handles(&v.operation) {
+        return sync::check(v);
+    }
     match v.operation.as_str() {
         "content_address" => {
             let bytes = unhex(as_hex_str(&v.input, "bytes_hex")?)?;

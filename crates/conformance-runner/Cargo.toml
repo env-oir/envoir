@@ -22,6 +22,10 @@ dmtap-mls = { path = "../dmtap-mls" }
 # CRDT merge) — drives the DMTAP-SYNC-01..05 construction-todo cases. A regular (not dev-only)
 # dependency because `construction.rs` is a module of this crate's LIBRARY, not a test file.
 dmtap-clustersync = { path = "../dmtap-clustersync" }
+# The substrate Sync capability reference (substrate/SYNC.md) — drives every `sync_*` vector in the
+# sibling spec repo's `sync_vectors.json` through real code (see `src/sync.rs`), exactly as
+# `dmtap-core::pubobj` drives `pub_vectors.json`.
+dmtap-sync = { path = "../dmtap-sync" }
 envoir-gateway = { path = "../../gateway" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
