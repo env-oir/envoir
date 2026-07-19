@@ -44,17 +44,25 @@ use dmtap_sync::state::{SyncState, VersionVector};
 use dmtap_sync::wire::{Hlc, SyncOp};
 use dmtap_sync::{cose, FastJoin, OpEntry, ReconConfig, SyncError};
 use serde_json::{json, Value};
+#[cfg(feature = "js")]
 use wasm_bindgen::prelude::*;
 
-mod err;
+// The raw-ABI surface is mutually exclusive with the wasm-bindgen one: it unwraps the error
+// carrier as a plain message, which only holds when `js` is off. Build it with
+// `--no-default-features --features abi`.
+#[cfg(all(feature = "abi", not(feature = "js")))]
+mod abi;
+#[cfg(all(target_arch = "wasm32", feature = "abi"))]
+mod entropy;
+pub mod err;
 mod jsonval;
 
-use err::{binding_err, IntoJs};
+use err::{binding_err, BErr, IntoJs};
 use jsonval::{addtag_to_json, hex, hlc_from_json, hlc_to_json, op_from_json, op_to_json,
     sval_from_json, sval_to_json, unhex};
 
 /// The substrate version this binding speaks, and the crate it wraps.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn version() -> String {
     json!({
         "binding": env!("CARGO_PKG_VERSION"),
@@ -70,11 +78,11 @@ pub fn version() -> String {
 // helpers
 // -------------------------------------------------------------------------------------------
 
-fn parse(s: &str) -> Result<Value, JsError> {
+fn parse(s: &str) -> Result<Value, BErr> {
     serde_json::from_str(s).map_err(|e| binding_err(format!("argument is not valid JSON: {e}")))
 }
 
-fn ops_from_json(v: &Value) -> Result<Vec<SyncOp>, JsError> {
+fn ops_from_json(v: &Value) -> Result<Vec<SyncOp>, BErr> {
     v.as_array()
         .ok_or_else(|| binding_err("expected a JSON array of ops"))?
         .iter()
@@ -82,7 +90,7 @@ fn ops_from_json(v: &Value) -> Result<Vec<SyncOp>, JsError> {
         .collect()
 }
 
-fn now(ms: f64) -> Result<u64, JsError> {
+fn now(ms: f64) -> Result<u64, BErr> {
     if !ms.is_finite() || ms < 0.0 {
         return Err(binding_err("receiver_now_ms must be a non-negative finite number"));
     }
@@ -98,14 +106,14 @@ fn out(v: Value) -> String {
 // -------------------------------------------------------------------------------------------
 
 /// Encode a tagged JSON value (see the `jsonval` module docs) to deterministic CBOR (§18.1.1).
-#[wasm_bindgen]
-pub fn encode_value(value_json: &str) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn encode_value(value_json: &str) -> Result<Vec<u8>, BErr> {
     Ok(sval_from_json(&parse(value_json)?).js()?.det_cbor())
 }
 
 /// Decode deterministic CBOR back to a tagged JSON value.
-#[wasm_bindgen]
-pub fn decode_value(bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn decode_value(bytes: &[u8]) -> Result<String, BErr> {
     let v = dmtap_sync::detcbor::decode(bytes)
         .map_err(|e| binding_err(format!("not canonical CBOR: {e}")))?;
     Ok(out(sval_to_json(&v).js()?))
@@ -113,35 +121,35 @@ pub fn decode_value(bytes: &[u8]) -> Result<String, JsError> {
 
 /// Whether a value is a legal §4.1 `cv` (the `ext-value` subset). A `SyncOp` carrying anything
 /// else is refused at validation, so a product can check before it mints.
-#[wasm_bindgen]
-pub fn is_ext_value(value_json: &str) -> Result<bool, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn is_ext_value(value_json: &str) -> Result<bool, BErr> {
     Ok(sval_from_json(&parse(value_json)?).js()?.is_ext_value())
 }
 
 /// Encode a `SyncOp` (JSON) to its canonical §4.1 deterministic-CBOR bytes.
-#[wasm_bindgen]
-pub fn encode_op(op_json: &str) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn encode_op(op_json: &str) -> Result<Vec<u8>, BErr> {
     Ok(op_from_json(&parse(op_json)?).js()?.det_cbor())
 }
 
 /// Decode canonical `SyncOp` bytes to JSON. Non-canonical encodings are **refused**, never
 /// silently re-canonicalized (§2.2).
-#[wasm_bindgen]
-pub fn decode_op(bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn decode_op(bytes: &[u8]) -> Result<String, BErr> {
     let op = SyncOp::from_det_cbor(bytes).js()?;
     Ok(out(op_to_json(&op).js()?))
 }
 
 /// The §4.1 `op-id` content address of an encoded op (`0x1e ‖ BLAKE3-256(DS-tag ‖ 0x00 ‖ body)`).
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn op_id(op_bytes: &[u8]) -> Vec<u8> {
     dmtap_sync::op_id_of(op_bytes).as_bytes().to_vec()
 }
 
 /// Run the state-free structural/causality/skew validators (§4) against an encoded op. Throws the
 /// structured refusal on failure; this is the same check [`SyncEngine::ingest_signed`] performs.
-#[wasm_bindgen]
-pub fn validate_op(op_bytes: &[u8], receiver_now_ms: f64) -> Result<(), JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn validate_op(op_bytes: &[u8], receiver_now_ms: f64) -> Result<(), BErr> {
     let op = SyncOp::from_det_cbor(op_bytes).js()?;
     dmtap_sync::validate_op(&op, now(receiver_now_ms)?).js()
 }
@@ -155,46 +163,46 @@ pub fn validate_op(op_bytes: &[u8], receiver_now_ms: f64) -> Result<(), JsError>
 ///
 /// The order is lexicographic by `(wall, counter, author)`, and because `author` is a public key
 /// two distinct authors never tie, so the order is total across every replica.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub struct HlcClock {
     inner: Hlc,
 }
 
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 impl HlcClock {
     /// A clock for `author` (a 32-byte Ed25519 public key), starting at zero.
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "js", wasm_bindgen(constructor))]
     pub fn new(author: &[u8]) -> HlcClock {
         HlcClock { inner: Hlc { wall: 0, counter: 0, author: author.to_vec() } }
     }
 
     /// Advance and return the next timestamp for a locally-minted op.
-    pub fn tick(&mut self, now_ms: f64) -> Result<String, JsError> {
+    pub fn tick(&mut self, now_ms: f64) -> Result<String, BErr> {
         Ok(out(hlc_to_json(&self.inner.tick(now(now_ms)?))))
     }
 
     /// Fold a remote timestamp in, so this clock never lags behind causality it has seen.
-    pub fn observe(&mut self, hlc_json: &str) -> Result<(), JsError> {
+    pub fn observe(&mut self, hlc_json: &str) -> Result<(), BErr> {
         self.inner.observe(&hlc_from_json(&parse(hlc_json)?).js()?);
         Ok(())
     }
 
     /// The current timestamp without advancing.
-    #[wasm_bindgen(getter)]
+    #[cfg_attr(feature = "js", wasm_bindgen(getter))]
     pub fn current(&self) -> String {
         out(hlc_to_json(&self.inner))
     }
 }
 
 /// The canonical CBOR encoding of an HLC — the bytes §2.2 tiebreaks and §6.1.1 sorts compare.
-#[wasm_bindgen]
-pub fn encode_hlc(hlc_json: &str) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn encode_hlc(hlc_json: &str) -> Result<Vec<u8>, BErr> {
     Ok(hlc_from_json(&parse(hlc_json)?).js()?.det_cbor())
 }
 
 /// Compare two HLCs in the normative total order: `-1`, `0` or `1`.
-#[wasm_bindgen]
-pub fn compare_hlc(a_json: &str, b_json: &str) -> Result<i32, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn compare_hlc(a_json: &str, b_json: &str) -> Result<i32, BErr> {
     let a = hlc_from_json(&parse(a_json)?).js()?;
     let b = hlc_from_json(&parse(b_json)?).js()?;
     Ok(match a.cmp(&b) {
@@ -234,8 +242,8 @@ pub fn compare_hlc(a_json: &str, b_json: &str) -> Result<i32, JsError> {
 /// The insecure path is not "discouraged" here — it is **absent**, because a documented-but-present
 /// footgun is still a footgun. `dmtap_sync::cose::sign_op` remains available to native Rust
 /// callers, who have a memory model in which holding a secret key is a defensible thing to do.
-#[wasm_bindgen]
-pub fn op_signing_input(op_bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn op_signing_input(op_bytes: &[u8]) -> Result<String, BErr> {
     let op = SyncOp::from_det_cbor(op_bytes).js()?;
     let protected = cose::protected_header(&op.hlc.author);
     let aad = cose::op_external_aad();
@@ -255,8 +263,8 @@ pub fn op_signing_input(op_bytes: &[u8]) -> Result<String, JsError> {
 /// wrong key, over the wrong preimage, or by a custodian that silently failed cannot leave this
 /// function as a well-formed op. A binding that emitted unverifiable envelopes would just push the
 /// failure onto some other replica's ingest path, hours later and with no context.
-#[wasm_bindgen]
-pub fn op_attach_signature(op_bytes: &[u8], signature: &[u8]) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn op_attach_signature(op_bytes: &[u8], signature: &[u8]) -> Result<Vec<u8>, BErr> {
     let op = SyncOp::from_det_cbor(op_bytes).js()?;
     let envelope = cose::CoseSign1 {
         protected: cose::protected_header(&op.hlc.author),
@@ -271,16 +279,16 @@ pub fn op_attach_signature(op_bytes: &[u8], signature: &[u8]) -> Result<Vec<u8>,
 ///
 /// Fails closed (`0x0A02`) on a tampered payload, a substituted `kid`, a non-empty unprotected
 /// header, a detached payload, or a signature minted under any other DS-tag.
-#[wasm_bindgen]
-pub fn verify_signed_op(cose_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn verify_signed_op(cose_bytes: &[u8]) -> Result<Vec<u8>, BErr> {
     Ok(cose::verify_op_bytes(cose_bytes).js()?.det_cbor())
 }
 
 /// The four wire parts of a `COSE_Sign1`, for inspection without trusting it:
 /// `{protected, unprotected, payload, signature, alg, kid}`. Decoding and trusting are
 /// deliberately separate steps — this does **not** verify.
-#[wasm_bindgen]
-pub fn decode_signed_op(cose_bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn decode_signed_op(cose_bytes: &[u8]) -> Result<String, BErr> {
     let c = cose::CoseSign1::from_bytes(cose_bytes).js()?;
     let (alg, kid) = c.header().js()?;
     Ok(out(json!({
@@ -303,7 +311,7 @@ pub fn decode_signed_op(cose_bytes: &[u8]) -> Result<String, JsError> {
 /// In-memory only. Ops are deduplicated by `op-id`, so re-delivering one is a no-op, and every
 /// merge is commutative/associative/idempotent — the arrival order of concurrent ops never changes
 /// the outcome.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub struct SyncEngine {
     state: SyncState,
 }
@@ -314,10 +322,24 @@ impl Default for SyncEngine {
     }
 }
 
-#[wasm_bindgen]
+impl SyncEngine {
+    /// A detached copy of this replica's state.
+    ///
+    /// Not exported to either surface — it exists because [`SyncEngine::merge`] takes two engines,
+    /// and the raw-ABI surface reaches them through one handle slab it cannot borrow from twice at
+    /// once — so it is `abi`-only, and gated rather than left to warn under the `js` build. Merging
+    /// a copy is identical to merging the original by construction: the merge is state-based, so it
+    /// reads the operand and never mutates it.
+    #[cfg(feature = "abi")]
+    pub(crate) fn snapshot_clone(&self) -> SyncEngine {
+        SyncEngine { state: self.state.clone() }
+    }
+}
+
+#[cfg_attr(feature = "js", wasm_bindgen)]
 impl SyncEngine {
     /// An empty replica.
-    #[wasm_bindgen(constructor)]
+    #[cfg_attr(feature = "js", wasm_bindgen(constructor))]
     pub fn new() -> SyncEngine {
         SyncEngine { state: SyncState::new() }
     }
@@ -331,7 +353,7 @@ impl SyncEngine {
         &mut self,
         cose_bytes: &[u8],
         receiver_now_ms: f64,
-    ) -> Result<bool, JsError> {
+    ) -> Result<bool, BErr> {
         let op = cose::verify_op_bytes(cose_bytes).js()?;
         self.state.ingest(&op, now(receiver_now_ms)?).js()
     }
@@ -347,7 +369,7 @@ impl SyncEngine {
         &mut self,
         op_bytes: &[u8],
         receiver_now_ms: f64,
-    ) -> Result<bool, JsError> {
+    ) -> Result<bool, BErr> {
         let op = SyncOp::from_det_cbor(op_bytes).js()?;
         self.state.ingest(&op, now(receiver_now_ms)?).js()
     }
@@ -371,7 +393,7 @@ impl SyncEngine {
     }
 
     /// The same projection as JSON, for a product that wants to render it rather than hash it.
-    pub fn observable_state_json(&self) -> Result<String, JsError> {
+    pub fn observable_state_json(&self) -> Result<String, BErr> {
         let o = ObservableState::of(&self.state);
         let orset = o
             .orset
@@ -411,7 +433,7 @@ impl SyncEngine {
 
     /// Recompute the root and compare it to a claimed one. A mismatch is `0x0A09` — evidence of
     /// divergence, whose §12 action is `HALT_ALERT`, not a retry.
-    pub fn verify_root(&self, claimed: &[u8]) -> Result<(), JsError> {
+    pub fn verify_root(&self, claimed: &[u8]) -> Result<(), BErr> {
         dmtap_sync::verify_root(&self.state, &ContentId(claimed.to_vec())).js()
     }
 
@@ -433,7 +455,7 @@ impl SyncEngine {
     // --- per-kind reads ---
 
     /// The winning LWW cell for `target`/`field`: `{hlc, value}`, or `null`.
-    pub fn lww_cell(&self, target: &str, field: &str) -> Result<String, JsError> {
+    pub fn lww_cell(&self, target: &str, field: &str) -> Result<String, BErr> {
         Ok(match self.state.lww.cell(target, field) {
             Some((h, v)) => out(json!({ "hlc": hlc_to_json(h), "value": sval_to_json(v).js()? })),
             None => "null".into(),
@@ -441,13 +463,13 @@ impl SyncEngine {
     }
 
     /// Whether an OR-Set element is present (add-wins, unless a death certificate dominates).
-    pub fn set_contains(&self, target: &str, value_json: &str) -> Result<bool, JsError> {
+    pub fn set_contains(&self, target: &str, value_json: &str) -> Result<bool, BErr> {
         let v = sval_from_json(&parse(value_json)?).js()?;
         Ok(self.state.is_present(target, &v))
     }
 
     /// Every present `(target, element)` pair.
-    pub fn set_members(&self) -> Result<String, JsError> {
+    pub fn set_members(&self) -> Result<String, BErr> {
         let members = self
             .state
             .present_members()
@@ -460,7 +482,7 @@ impl SyncEngine {
 
     /// The add-tags of an element that no observed-remove has tombstoned — the causal evidence
     /// behind "present".
-    pub fn set_surviving_tags(&self, target: &str, value_json: &str) -> Result<String, JsError> {
+    pub fn set_surviving_tags(&self, target: &str, value_json: &str) -> Result<String, BErr> {
         let v = sval_from_json(&parse(value_json)?).js()?;
         Ok(out(json!(self
             .state
@@ -498,7 +520,7 @@ impl SyncEngine {
     /// An RGA sequence: `{values, atoms}`, where `atoms` carries every element id including
     /// tombstones (§4.7 keeps them until the §6.2 stability cut) and `values` is the visible
     /// sequence.
-    pub fn sequence(&self, target: &str) -> Result<String, JsError> {
+    pub fn sequence(&self, target: &str) -> Result<String, BErr> {
         let Some(seq) = self.state.sequences.get(target) else { return Ok("null".into()) };
         let atoms = seq
             .order()
@@ -537,7 +559,7 @@ impl SyncEngine {
     /// Reclaim collapsed add/tombstone pairs strictly below a §6.2 stability cut. Returns the
     /// number of entries dropped; **observable state is unchanged by construction** — GC below the
     /// cut can only remove causal evidence no replica can still cite.
-    pub fn prune_below(&mut self, cut_hlc_json: &str) -> Result<usize, JsError> {
+    pub fn prune_below(&mut self, cut_hlc_json: &str) -> Result<usize, BErr> {
         let cut = hlc_from_json(&parse(cut_hlc_json)?).js()?;
         Ok(self.state.orset.prune_stable(&cut))
     }
@@ -549,7 +571,7 @@ impl SyncEngine {
 
 /// The §6.1 root of an already-encoded observable state — for verifying a state body fetched by
 /// address against a `Snapshot.root` before adopting it.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn observable_state_root(state_cbor: &[u8]) -> Vec<u8> {
     dmtap_sync::ds_hash(dmtap_sync::DS_SNAPSHOT_STATE, state_cbor).as_bytes().to_vec()
 }
@@ -562,21 +584,21 @@ pub fn observable_state_root(state_cbor: &[u8]) -> Vec<u8> {
 /// re-encode it, hash it, and compare against `Snapshot.root` before trusting a byte of it.
 /// Section entries are re-sorted canonically on the way out, so a body that arrives in any other
 /// order still hashes to the same root — or, if it was tampered with, visibly does not.
-#[wasm_bindgen]
-pub fn encode_observable_state(state_json: &str) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn encode_observable_state(state_json: &str) -> Result<Vec<u8>, BErr> {
     Ok(observable_from_json(&parse(state_json)?).js()?.det_cbor())
 }
 
 /// Decode a canonical observable-state body to its JSON projection.
-#[wasm_bindgen]
-pub fn decode_observable_state(bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn decode_observable_state(bytes: &[u8]) -> Result<String, BErr> {
     let v = dmtap_sync::detcbor::decode(bytes)
         .map_err(|e| binding_err(format!("not canonical CBOR: {e}")))?;
     let sections = v.as_array().filter(|s| s.len() == 6).ok_or_else(|| {
         binding_err("an observable state is exactly six sections (§6.1.1) — never abbreviated")
     })?;
     let sec = |i: usize| sections[i].as_array().unwrap_or(&[]).to_vec();
-    let tuples = |i: usize, arity: usize| -> Result<Vec<Vec<SVal>>, JsError> {
+    let tuples = |i: usize, arity: usize| -> Result<Vec<Vec<SVal>>, BErr> {
         sec(i)
             .iter()
             .map(|e| {
@@ -682,8 +704,8 @@ fn observable_from_json(v: &Value) -> Result<ObservableState, String> {
 }
 
 /// Decode a signed snapshot to JSON **without** trusting it. Call [`snapshot_verify`] before use.
-#[wasm_bindgen]
-pub fn snapshot_decode(bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn snapshot_decode(bytes: &[u8]) -> Result<String, BErr> {
     let s = Snapshot::from_det_cbor(bytes).js()?;
     Ok(out(snapshot_json(&s)))
 }
@@ -734,8 +756,8 @@ fn snapshot_from_json(v: &Value) -> Result<Snapshot, String> {
 /// fast-joining replica additionally hash-verifies the state body against `root` and decides
 /// whether it trusts `signer` at all; §6.1's trust policy is the deployment's call, not this
 /// crate's.
-#[wasm_bindgen]
-pub fn snapshot_verify(bytes: &[u8]) -> Result<(), JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn snapshot_verify(bytes: &[u8]) -> Result<(), BErr> {
     Snapshot::from_det_cbor(bytes).js()?.verify_sig().js()
 }
 
@@ -743,19 +765,19 @@ pub fn snapshot_verify(bytes: &[u8]) -> Result<(), JsError> {
 /// `DMTAP-SYNC-v0/snapshot`. Same rule as ops — sign it externally, then [`snapshot_assemble`].
 ///
 /// Takes the snapshot as JSON without `sig` (see [`snapshot_decode`] for the shape).
-#[wasm_bindgen]
-pub fn snapshot_signing_input(snapshot_json_no_sig: &str) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn snapshot_signing_input(snapshot_json_no_sig: &str) -> Result<String, BErr> {
     let s = snapshot_from_json(&parse(snapshot_json_no_sig)?).js()?;
     Ok(out(json!({ "preimage": hex(&s.signing_preimage()) })))
 }
 
 /// Assemble the signed snapshot wire bytes from its JSON and a detached signature. As with ops,
 /// the signature is **verified before the bytes are returned**.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn snapshot_assemble(
     snapshot_json_no_sig: &str,
     signature: &[u8],
-) -> Result<Vec<u8>, JsError> {
+) -> Result<Vec<u8>, BErr> {
     let mut s = snapshot_from_json(&parse(snapshot_json_no_sig)?).js()?;
     s.sig = signature.to_vec();
     s.verify_sig().js()?;
@@ -768,8 +790,8 @@ pub fn snapshot_assemble(
 
 /// Decode a `FastJoin` — the answer a `pull` returns to a caller below the responder's §6.2
 /// truncation floor — **without** trusting it: `{snapshot, floor, state}`.
-#[wasm_bindgen]
-pub fn fastjoin_decode(bytes: &[u8]) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fastjoin_decode(bytes: &[u8]) -> Result<String, BErr> {
     let fj = FastJoin::from_det_cbor(bytes).js()?;
     Ok(out(json!({
         "snapshot": snapshot_json(&fj.snapshot),
@@ -779,8 +801,8 @@ pub fn fastjoin_decode(bytes: &[u8]) -> Result<String, JsError> {
 }
 
 /// Encode a `FastJoin` from `{snapshot, floor, state?}` (the shape [`fastjoin_decode`] emits).
-#[wasm_bindgen]
-pub fn fastjoin_encode(fastjoin_json: &str) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fastjoin_encode(fastjoin_json: &str) -> Result<Vec<u8>, BErr> {
     let v = parse(fastjoin_json)?;
     let state = match v.get("state").filter(|s| !s.is_null()) {
         Some(s) => Some(unhex(s.as_str().ok_or_else(|| binding_err("`state` is not hex"))?).js()?),
@@ -800,16 +822,16 @@ pub fn fastjoin_encode(fastjoin_json: &str) -> Result<Vec<u8>, JsError> {
 ///
 /// The test is domination of `covers`, not a comparison against the floor alone. A responder for
 /// which this is true MUST answer fast-join; one for which it is false MUST answer with ops.
-#[wasm_bindgen]
-pub fn caller_is_below_floor(snapshot_bytes: &[u8], vector_json: &str) -> Result<bool, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn caller_is_below_floor(snapshot_bytes: &[u8], vector_json: &str) -> Result<bool, BErr> {
     let snapshot = Snapshot::from_det_cbor(snapshot_bytes).js()?;
     Ok(dmtap_sync::caller_is_below_floor(&snapshot, &version_vector_from_json(&parse(vector_json)?).js()?))
 }
 
 /// The content address a fast-join's state body must be fetched from
 /// (`GET /sync/state/<root>`) — what the host needs before it can call [`fastjoin_adopt`].
-#[wasm_bindgen]
-pub fn fastjoin_state_address(fastjoin_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fastjoin_state_address(fastjoin_bytes: &[u8]) -> Result<Vec<u8>, BErr> {
     Ok(FastJoin::from_det_cbor(fastjoin_bytes).js()?.snapshot.root.as_bytes().to_vec())
 }
 
@@ -830,14 +852,14 @@ pub fn fastjoin_state_address(fastjoin_bytes: &[u8]) -> Result<Vec<u8>, JsError>
 /// surviving suffix.** That fallback is the silent lost-write this whole path exists to prevent,
 /// which is why this function returns state rather than mutating an engine: adoption is a separate,
 /// deliberate step the host takes only on success.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn fastjoin_adopt(
     fastjoin_bytes: &[u8],
     caller_vector_json: &str,
     subscribed_json: &str,
     admitted_hex_json: &str,
     fetched_body: Option<Vec<u8>>,
-) -> Result<Vec<u8>, JsError> {
+) -> Result<Vec<u8>, BErr> {
     let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
     let caller = version_vector_from_json(&parse(caller_vector_json)?).js()?;
     let subscribed: Vec<String> = parse(subscribed_json)?
@@ -864,12 +886,12 @@ pub fn fastjoin_adopt(
 /// the same join, or `undefined` on the first round. A host driving a pull loop MUST call this (or
 /// [`fastjoin_adopt_after`]) rather than [`fastjoin_adopt`] alone: the loop it prevents is
 /// unbounded, and nothing else in the protocol terminates it.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn fastjoin_check_progress(
     fastjoin_bytes: &[u8],
     previous_root: Option<Vec<u8>>,
     previous_covers_json: Option<String>,
-) -> Result<(), JsError> {
+) -> Result<(), BErr> {
     let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
     let prev = match (previous_root, previous_covers_json) {
         (Some(r), Some(c)) => {
@@ -882,7 +904,7 @@ pub fn fastjoin_check_progress(
 
 /// [`fastjoin_adopt`] preceded by the [progress MUST](fastjoin_check_progress) — the call a real
 /// pull loop should use.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn fastjoin_adopt_after(
     fastjoin_bytes: &[u8],
     previous_root: Option<Vec<u8>>,
@@ -891,7 +913,7 @@ pub fn fastjoin_adopt_after(
     subscribed_json: &str,
     admitted_hex_json: &str,
     fetched_body: Option<Vec<u8>>,
-) -> Result<Vec<u8>, JsError> {
+) -> Result<Vec<u8>, BErr> {
     fastjoin_check_progress(fastjoin_bytes, previous_root, previous_covers_json)?;
     fastjoin_adopt(
         fastjoin_bytes,
@@ -908,11 +930,11 @@ pub fn fastjoin_adopt_after(
 ///
 /// There is deliberately **no** floor-vs-`covers` comparison in here — see
 /// [`fastjoin_naive_covers_lacks_floor_rejected`] for the predicate that was removed and why.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn fastjoin_check_covers(
     fastjoin_bytes: &[u8],
     caller_vector_json: &str,
-) -> Result<(), JsError> {
+) -> Result<(), BErr> {
     let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
     let caller = version_vector_from_json(&parse(caller_vector_json)?).js()?;
     dmtap_sync::check_covers_closes_gap(&fj.snapshot, &fj.floor, &caller).js()
@@ -924,8 +946,8 @@ pub fn fastjoin_check_covers(
 /// verdict. It is **not** a conformance test: an author whose only op sits *at* the floor is
 /// retained rather than truncated, so `covers` need never name it. Treating `false` as a failure
 /// rejects conformant peers — the defect §14 C-07 removed.
-#[wasm_bindgen]
-pub fn fastjoin_covers_carries_floor_author_mark(fastjoin_bytes: &[u8]) -> Result<bool, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fastjoin_covers_carries_floor_author_mark(fastjoin_bytes: &[u8]) -> Result<bool, BErr> {
     let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
     Ok(dmtap_sync::covers_carries_mark_for_floor_author(&fj.snapshot, &fj.floor))
 }
@@ -937,8 +959,8 @@ pub fn fastjoin_covers_carries_floor_author_mark(fastjoin_bytes: &[u8]) -> Resul
 /// **Never gate adoption on this.** `floor` is a single `Hlc` and `covers` is a per-author
 /// `VersionVector`; there is no ordering between them (§5.2.2). This is a counterexample witness,
 /// not an API for deciding anything.
-#[wasm_bindgen]
-pub fn fastjoin_naive_covers_lacks_floor_rejected(fastjoin_bytes: &[u8]) -> Result<bool, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fastjoin_naive_covers_lacks_floor_rejected(fastjoin_bytes: &[u8]) -> Result<bool, BErr> {
     let fj = FastJoin::from_det_cbor(fastjoin_bytes).js()?;
     Ok(fj.snapshot.covers.lacks(&fj.floor))
 }
@@ -955,7 +977,7 @@ fn version_vector_from_json(v: &Value) -> Result<VersionVector, String> {
 // reconciliation (§5.3)
 // -------------------------------------------------------------------------------------------
 
-fn entries_from_json(v: &Value) -> Result<Vec<OpEntry>, JsError> {
+fn entries_from_json(v: &Value) -> Result<Vec<OpEntry>, BErr> {
     v.as_array()
         .ok_or_else(|| binding_err("expected a JSON array of {hlc, id} entries"))?
         .iter()
@@ -975,15 +997,15 @@ fn entries_from_json(v: &Value) -> Result<Vec<OpEntry>, JsError> {
 ///
 /// `count` is carried alongside the hash on purpose — without it an empty range and a range whose
 /// ops happen to fold to the same value would be indistinguishable (§5.3).
-#[wasm_bindgen]
-pub fn fingerprint(entries_json: &str) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn fingerprint(entries_json: &str) -> Result<String, BErr> {
     let (fp, count) = dmtap_sync::fingerprint(&entries_from_json(&parse(entries_json)?)?);
     Ok(out(json!({ "fp": hex(fp.as_bytes()), "count": count })))
 }
 
 /// Fingerprint only the entries within `[lo, hi)`: `{lo, hi, fp, count}`.
-#[wasm_bindgen]
-pub fn summarize(entries_json: &str, lo_json: &str, hi_json: &str) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn summarize(entries_json: &str, lo_json: &str, hi_json: &str) -> Result<String, BErr> {
     let entries = entries_from_json(&parse(entries_json)?)?;
     let lo = hlc_from_json(&parse(lo_json)?).js()?;
     let hi = hlc_from_json(&parse(hi_json)?).js()?;
@@ -1001,13 +1023,13 @@ pub fn summarize(entries_json: &str, lo_json: &str, hi_json: &str) -> Result<Str
 ///
 /// Matching `(fp, count)` prunes a whole range with **nothing exchanged**, which is the entire
 /// point: reconciliation cost tracks the size of the difference, not the size of the history.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn reconcile(
     here_json: &str,
     there_json: &str,
     lo_json: &str,
     hi_json: &str,
-) -> Result<String, JsError> {
+) -> Result<String, BErr> {
     let here = entries_from_json(&parse(here_json)?)?;
     let there = entries_from_json(&parse(there_json)?)?;
     let lo = hlc_from_json(&parse(lo_json)?).js()?;
@@ -1028,8 +1050,8 @@ pub fn reconcile(
 ///
 /// This is a **list membership check**, not a policy engine: resolving `DeviceCert` chains,
 /// namespace policy objects and revocation is capability ① and lives outside this binding.
-#[wasm_bindgen]
-pub fn check_admitted(author: &[u8], admitted_hex_json: &str) -> Result<(), JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn check_admitted(author: &[u8], admitted_hex_json: &str) -> Result<(), BErr> {
     let list: Vec<Vec<u8>> = parse(admitted_hex_json)?
         .as_array()
         .ok_or_else(|| binding_err("expected a JSON array of hex author keys"))?
@@ -1041,22 +1063,22 @@ pub fn check_admitted(author: &[u8], admitted_hex_json: &str) -> Result<(), JsEr
 
 /// Whether a PN-counter op may touch an entry: an author may only mutate its **own** `P`/`N`
 /// (§4.6). Throws `0x0A06` otherwise.
-#[wasm_bindgen]
-pub fn check_counter_entry(op_author: &[u8], entry_author: &[u8]) -> Result<(), JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn check_counter_entry(op_author: &[u8], entry_author: &[u8]) -> Result<(), BErr> {
     dmtap_sync::check_counter_entry(op_author, entry_author).js()
 }
 
 /// Whether an op may reference a target: cross-namespace references are `0x0A0A` (§7).
-#[wasm_bindgen]
-pub fn check_ns_ref(op_ns: &str, referenced_target_ns: &str) -> Result<(), JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn check_ns_ref(op_ns: &str, referenced_target_ns: &str) -> Result<(), BErr> {
     dmtap_sync::check_ns_ref(op_ns, referenced_target_ns).js()
 }
 
 /// Filter ops down to a caller's subscribed namespaces (§7) — the responder-side sparse-sync
 /// scope. Takes ops as JSON and returns their canonical bytes as hex, so nothing is re-encoded on
 /// the way out.
-#[wasm_bindgen]
-pub fn scope_to_subscription(ops_json: &str, subscribed_json: &str) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn scope_to_subscription(ops_json: &str, subscribed_json: &str) -> Result<String, BErr> {
     let ops = ops_from_json(&parse(ops_json)?)?;
     let subs: Vec<String> = parse(subscribed_json)?
         .as_array()
@@ -1076,8 +1098,8 @@ pub fn scope_to_subscription(ops_json: &str, subscribed_json: &str) -> Result<St
 ///
 /// Each element is either an HLC object or `null` for "watermark unknown". Excluding a stale
 /// replica is the **caller's** liveness decision; including one drags the cut down forever.
-#[wasm_bindgen]
-pub fn stability_cut(watermarks_json: &str) -> Result<String, JsError> {
+#[cfg_attr(feature = "js", wasm_bindgen)]
+pub fn stability_cut(watermarks_json: &str) -> Result<String, BErr> {
     let marks: Vec<Option<Hlc>> = parse(watermarks_json)?
         .as_array()
         .ok_or_else(|| binding_err("expected a JSON array of HLCs or nulls"))?
@@ -1098,7 +1120,7 @@ pub fn stability_cut(watermarks_json: &str) -> Result<String, JsError> {
 
 /// The `0x0A` error registry, for a product mapping refusals to its own UI:
 /// `[{code, name, action}, …]`.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn error_registry() -> String {
     let all = [
         SyncError::AuthorUnauthorized,
@@ -1120,7 +1142,7 @@ pub fn error_registry() -> String {
 }
 
 /// The eight §4.2 op kinds by name, so a JS caller never hard-codes a magic number.
-#[wasm_bindgen]
+#[cfg_attr(feature = "js", wasm_bindgen)]
 pub fn op_kinds() -> String {
     out(json!({
         "set_add": dmtap_sync::OP_SET_ADD,
@@ -1174,7 +1196,7 @@ mod tests {
     #[test]
     fn attach_signature_refuses_an_envelope_that_does_not_verify() {
         // Asserted at the `dmtap-sync` layer this function delegates to, because building a
-        // `JsError` requires a JS host and cannot run on a native target. The wasm-side assertion
+        // `BErr` requires a JS host and cannot run on a native target. The wasm-side assertion
         // that `op_attach_signature` itself throws lives in `test/vectors.test.mjs`.
         let op = SyncOp::from_det_cbor(&encode_op(OP_JSON).unwrap()).unwrap();
         let envelope = cose::CoseSign1 {
@@ -1193,10 +1215,15 @@ mod tests {
         // A guard against a future "convenience" regression: no EXPORTED signature may take a seed
         // or a secret key. If this fires, re-read `op_signing_input`'s rationale before deleting
         // it. Only exported signatures are scanned, so prose and test code do not trip it.
+        //
+        // Both surfaces are covered: an entry point is exported to JS by the `cfg_attr(…,
+        // wasm_bindgen…)` marker, and to the Go binding by being dispatchable in `abi.rs` — which
+        // can only reach functions declared here, so scanning this file covers that surface too.
+        // `abi.rs` has its own, stricter guard over the dispatch table itself.
         let mut exported = false;
         for line in include_str!("lib.rs").lines() {
             let t = line.trim();
-            if t == "#[wasm_bindgen]" || t.starts_with("#[wasm_bindgen(") {
+            if t.starts_with("#[cfg_attr(feature = \"js\", wasm_bindgen") {
                 exported = true;
                 continue;
             }

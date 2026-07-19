@@ -5,3 +5,12 @@
 node_modules/
 dist/
 .env
+
+# Compiled WebAssembly artifacts. These are BUILD OUTPUT, not source: `crates/dmtap-sync-wasm/
+# build.sh` produces the browser ones and `build-abi.sh` the raw-ABI module the Go binding embeds.
+# Committing them once already cost a real bug — a stale checked-in module kept aborting on free
+# long after the source it was built from had been fixed, because nothing ties a binary blob in git
+# to the code that produced it. Generating them at build time makes that class of drift impossible.
+crates/dmtap-sync-wasm/pkg/
+crates/dmtap-sync-wasm/pkg-node/
+bindings/go/dmtap_sync_abi.wasm

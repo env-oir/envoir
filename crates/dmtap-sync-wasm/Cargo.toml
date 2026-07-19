@@ -11,6 +11,25 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Two artifacts, one source. The entry points in `lib.rs` are written once, against the `err::BErr`
+# carrier, and each feature only decides how they reach a host:
+#
+#   js   (default)  wasm-bindgen — the browser/JS binding. `wasm-pack build`, see build.sh.
+#   abi             a raw pointer/length ABI with ZERO imports — the module the Go binding
+#                   (`bindings/go`) embeds and runs under wazero. wasm-bindgen's glue needs a JS
+#                   host for `externref` and thrown Errors, which a pure-Go runtime cannot supply,
+#                   so the Go surface gets its own boundary over the SAME function bodies rather
+#                   than a second implementation of them. See `src/abi.rs`.
+#
+# They are mutually exclusive in practice (build one or the other), not by construction: `abi` alone
+# is what the Go artifact is built with, via `--no-default-features --features abi`.
+[features]
+default = ["js"]
+js = ["dep:wasm-bindgen", "getrandom_02/js", "getrandom_03/wasm_js", "getrandom_04/wasm_js"]
+# The Go artifact's entropy story is the `custom` backend in `src/entropy.rs`, not the browser's
+# `crypto.getRandomValues` — see the RNG block below.
+abi = ["getrandom_02/custom"]
+
 [dependencies]
 # The algebra. Everything this crate returns is produced by these two crates; the binding marshals
 # arguments and never re-implements a merge, a hash or an encoding (BINDINGS.md §4).
@@ -19,14 +38,26 @@ dmtap-sync = { path = "../dmtap-sync" }
 # The JS boundary + the structured argument/result encoding. `serde_json` is already a workspace
 # dependency (conformance-runner), so this adds no new third-party crate to the tree.
 serde_json = "1"
-wasm-bindgen = "0.2"
+wasm-bindgen = { version = "0.2", optional = true }
 
 # --- wasm32 RNG plumbing ------------------------------------------------------------------------
 # `dmtap-core` pulls three `getrandom` majors transitively (ed25519-dalek / x-wing / ml-dsa). None
 # of them compiles for `wasm32-unknown-unknown` without being told where entropy comes from, so the
-# binding crate names them explicitly and points them at the host's `crypto.getRandomValues`. This
-# crate never generates a key itself — signing is detached — but those paths must still link.
+# binding crate names them explicitly. WHERE it points them at depends on the surface, and the two
+# answers are genuinely different:
+#
+#   js   the host's `crypto.getRandomValues`, via wasm-bindgen. A browser has a real CSPRNG.
+#   abi  a `custom` backend that FAILS (`src/entropy.rs`). A wazero module is given no host
+#        functions at all — deliberately, so it has no clock, no filesystem and no network — which
+#        means there is no honest source of entropy inside it. Returning zeros or a counter to make
+#        the link succeed would be the dangerous option: it links just as well and silently produces
+#        predictable "random" bytes if anything ever reaches for them. Failing means an unreachable
+#        path stays unreachable, and a future change that starts needing entropy fails loudly at the
+#        call rather than quietly generating a guessable key.
+#
+# This crate never generates a key itself — signing is detached on both surfaces — but these paths
+# must still LINK, which is the whole reason this block exists.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
-getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2" }
+getrandom_03 = { package = "getrandom", version = "0.3" }
+getrandom_04 = { package = "getrandom", version = "0.4" }
