@@ -97,7 +97,7 @@ bytes *are* the semantics. Everything byte-shaped crosses as `Uint8Array`.
 | **Signing** | `op_signing_input` · `op_attach_signature` · `verify_signed_op` · `decode_signed_op` |
 | **Engine** | `SyncEngine`: `ingest_signed` · `ingest_ambient_authenticated` · `has_op` · `merge` · `observable_state` · `observable_state_json` · `state_root` · `verify_root` · `version_vector` · `version_vector_cbor` · `lww_cell` · `set_contains` · `set_members` · `set_surviving_tags` · `counter_total` · `counter_entries` · `death_state` · `sequence` · `tree` · `prune_below` |
 | **Snapshots** | `observable_state_root` · `encode_observable_state` · `decode_observable_state` · `snapshot_decode` · `snapshot_verify` · `snapshot_signing_input` · `snapshot_assemble` |
-| **Fast-join (§5.2.1)** | `fastjoin_decode` · `fastjoin_encode` · `caller_is_below_floor` · `fastjoin_state_address` · `fastjoin_adopt` |
+| **Fast-join (§5.2.1)** | `fastjoin_decode` · `fastjoin_encode` · `caller_is_below_floor` · `fastjoin_state_address` · `fastjoin_adopt` · `fastjoin_adopt_after` · `fastjoin_check_progress` · `fastjoin_check_covers` · `fastjoin_covers_carries_floor_author_mark` |
 | **Reconciliation** | `fingerprint` · `summarize` · `reconcile` |
 | **Policy / GC** | `check_admitted` · `check_counter_entry` · `check_ns_ref` · `scope_to_subscription` · `stability_cut` |
 | **Meta** | `version` · `error_registry` |
@@ -149,15 +149,56 @@ malformed. Different bugs, different fixes — and a caller that has to regex-ma
 
 | Artifact | Raw | Gzipped |
 |---|---|---|
-| `pkg-node/dmtap_sync_bg.wasm` (`--target nodejs`) | 577 KB | 223 KB |
-| `pkg/dmtap_sync_bg.wasm` (`--target bundler`) | 601 KB | 232 KB |
+| `pkg-node/dmtap_sync_bg.wasm` (`--target nodejs`) | 395,912 B (387 KiB) | 154,657 B (151 KiB) |
+| `pkg/dmtap_sync_bg.wasm` (`--target bundler`) | 395,912 B (387 KiB) | 154,657 B (151 KiB) |
 
-Reported honestly rather than rounded down: **this is bigger than it needs to be.** The Sync algebra
-itself is small; the bulk is `dmtap-core`'s suite-`0x02` post-quantum stack (`ml-dsa`, `x-wing`,
-`hpke`) linked in because `dmtap-sync` depends on `dmtap-core` as a whole and those modules are not
-feature-gated. Sync uses Ed25519 and BLAKE3 and nothing else. Feature-gating `dmtap-core`'s PQ
-suite is the obvious lever and would cut this substantially; it is a change to the core crate's
-public surface, so it is left as a deliberate follow-up rather than done in passing here.
+Both targets emit the same `.wasm`; only the JS glue differs.
+
+### A correction, and what actually costs the bytes
+
+An earlier revision of this file blamed the size on `dmtap-core`'s suite-`0x02` post-quantum stack
+(`ml-dsa`, `x-wing`, `hpke`) being linked in for want of feature gates, and proposed feature-gating
+the core as the fix. **That was measured and found to be wrong**, and the claim is corrected here
+rather than quietly dropped.
+
+Two independent checks say so. Building the binding against a `dmtap-core` stripped of `mote`, `pq`,
+`deniable`, `mixnet`, `sphinx` and their dependencies changed the artifact by **+256 bytes** — it
+did not shrink. And attributing every function in the pre-`wasm-opt` module by symbol gives:
+
+| Origin | Share of code |
+|---|---|
+| `alloc` (dominated by `BTreeMap` monomorphization) | 20.6% |
+| `core` | 17.1% |
+| `dmtap-sync-wasm` (this crate's JSON marshalling) | 16.7% |
+| `dmtap-sync` (the algebra itself) | 13.0% |
+| `curve25519` (Ed25519 verification — genuinely used) | 4.7% |
+| `serde_json` | 4.3% |
+| **`dmtap-core`** | **0.2%** (1,466 bytes) |
+| `ml-dsa`, `x-wing`, `hpke`, `chacha20poly1305` | **0 bytes** |
+
+Link-time dead-code elimination already removes the entire PQ/HPKE surface, because nothing
+reachable from a `#[wasm_bindgen]` export touches it. `dmtap-core` contributes 0.2% of the module,
+so feature-gating it could not have paid for the `cfg` complexity it would have added to a crate the
+node, gateway, mail, clustersync, deniable, MLS, naming, p2p and conformance crates all depend on.
+**No feature gates were added, and none should be added for this reason.**
+
+The lever that did work is the build profile, applied in `build.sh` to the WASM build **only** so
+that native binaries are compiled exactly as before:
+
+| Setting | Raw | Gzipped |
+|---|---|---|
+| baseline (`release`, `opt-level=3`) | 600,776 | 231,552 |
+| `lto=fat` + `codegen-units=1` alone | 600,005 | 231,989 |
+| **`opt-level=z`** alone | 399,763 | 156,215 |
+| `opt-level=z` + `lto=fat` + `codegen-units=1` | 391,657 | 153,092 |
+
+`opt-level=z` is essentially the whole win: `release` inlines and unrolls the `BTreeMap`/CRDT
+generics that dominate this module, and trading that speed for ~34% less download is the right call
+for code that ships to a browser on every page load. (`panic=abort` was measured and deliberately
+not set — `wasm32-unknown-unknown` already aborts on panic, so it changes nothing.)
+
+The remaining bulk is the algebra and its marshalling, which is the code you are actually here for.
+Shrinking it further means a leaner JSON boundary in *this* crate, not surgery on `dmtap-core`.
 
 ---
 
@@ -197,9 +238,20 @@ introduced, that is the job.
    the durable artifact; the engine is a fold over them.
 3. Replace your signing with the detached protocol above, keeping keys in WebCrypto.
 4. On join, either replay your ops through `ingest_signed`, or fast-join: pass the responder's
-   `FastJoin` to `fastjoin_adopt` with whatever `GET /sync/state/<root>` returned. It verifies the
-   signature, checks the snapshot actually closes your gap, and hashes the body against
-   `Snapshot.root` before returning any state. **If it throws, keep your old vector and do not fall
-   back to the responder's op suffix** — that fallback is a silent lost write.
+   `FastJoin` to `fastjoin_adopt_after` with whatever `GET /sync/state/<root>` returned. It verifies
+   the signature, checks what §5.2.2 says is checkable about `covers`, enforces the step-5 progress
+   MUST, and hashes the body against `Snapshot.root` before returning any state. **If it throws,
+   keep your old vector and do not fall back to the responder's op suffix** — that fallback is a
+   silent lost write. Two things to know, both of which look like bugs and are not:
+   * Adopting `covers` **may move your vector backwards** for some author. That is intended and is
+     not an error — step 5's re-pull re-ships every retained op above `covers`.
+   * **Do not compare `floor` to `covers`.** `floor` is a single HLC, `covers` is a per-author
+     vector; there is no ordering between them, and the natural-looking `covers.lacks(floor)`
+     returns `true` for perfectly conformant responders (§5.2.2, correction C-07). The binding
+     exposes that predicate only as `fastjoin_naive_covers_lacks_floor_rejected`, named so it cannot
+     be mistaken for a verdict.
+   Use `fastjoin_adopt_after` rather than `fastjoin_adopt` in a real pull loop: only the former
+   enforces the progress MUST, and the loop it prevents (a responder re-offering the same
+   `root`/`covers` forever) is otherwise unbounded.
 5. Wire `sync_vectors.json` into your own test suite. Every implementation reproduces the same
    frozen bytes; that is what makes two independently built products interoperate.

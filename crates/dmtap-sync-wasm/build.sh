@@ -15,6 +15,25 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# --- Size profile (WASM-ONLY) -------------------------------------------------------------------
+# Exported here rather than written into the workspace `[profile.release]` on purpose: these settings
+# must shape the browser artifact WITHOUT touching how the node/gateway binaries are compiled.
+#
+#   opt-level=z     the whole win. `release` defaults to opt-level=3, which inlines and unrolls the
+#                   BTreeMap/CRDT generics that dominate this module; `z` gives up that speed for a
+#                   ~34% smaller download. Measured 600_776 -> 399_763 raw on its own.
+#   lto=fat + cu=1  cross-crate dead-code elimination and no per-CGU duplication. Worth ~8 KB HERE
+#                   (399_763 -> 391_657); on its own, without opt-level=z, worth ~nothing (600_005) —
+#                   the reachable set is already minimal, so there is little left to strip.
+#
+# NOT set: panic=abort. wasm32-unknown-unknown already aborts on panic, so it changes no bytes
+# (measured 391_899 WITH it vs 391_657 without) and would only add a divergence from native builds.
+#
+# Override any of these from the environment if you are bisecting a size or codegen question.
+export CARGO_PROFILE_RELEASE_OPT_LEVEL="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-z}"
+export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-fat}"
+export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
+
 targets=("${@:-nodejs bundler}")
 # shellcheck disable=SC2206
 targets=(${targets[*]})
