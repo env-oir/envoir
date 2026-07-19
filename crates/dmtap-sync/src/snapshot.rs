@@ -244,6 +244,49 @@ impl Snapshot {
         s
     }
 
+    /// The complete signed wire bytes: the signing body plus `sig` at key 8 (§6.1). A snapshot has
+    /// to travel — it is what a truncated replica hands a peer that is behind the cut (§6.2) — so
+    /// it needs a canonical encoding, not just a signing preimage.
+    pub fn det_cbor(&self) -> Vec<u8> {
+        encode(&SVal::Map(vec![
+            (1, SVal::Uint(self.v as u64)),
+            (2, SVal::Uint(self.suite as u64)),
+            (3, SVal::Text(self.ns.clone())),
+            (4, self.covers.to_sval()),
+            (5, SVal::Bytes(self.root.as_bytes().to_vec())),
+            (6, SVal::Uint(self.ts)),
+            (7, SVal::Bytes(self.signer.clone())),
+            (8, SVal::Bytes(self.sig.clone())),
+        ]))
+    }
+
+    /// Decode a snapshot from wire bytes, denying unknown keys. The signature is **not** checked
+    /// here — call [`Snapshot::verify_sig`]; decoding and trusting are deliberately separate steps.
+    pub fn from_det_cbor(bytes: &[u8]) -> Result<Self, SyncError> {
+        let cv = crate::detcbor::decode(bytes).map_err(|_| SyncError::OpInvalid)?;
+        let mut f = crate::detcbor::Fields::new(cv).map_err(|_| SyncError::OpInvalid)?;
+        let bad = |_| SyncError::OpInvalid;
+        let SVal::Uint(v) = f.req(1).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let SVal::Uint(suite) = f.req(2).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let SVal::Text(ns) = f.req(3).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let covers = VersionVector::from_sval(f.req(4).map_err(bad)?).map_err(bad)?;
+        let SVal::Bytes(root) = f.req(5).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let SVal::Uint(ts) = f.req(6).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let SVal::Bytes(signer) = f.req(7).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        let SVal::Bytes(sig) = f.req(8).map_err(bad)? else { return Err(SyncError::OpInvalid) };
+        f.deny_unknown().map_err(bad)?;
+        Ok(Snapshot {
+            v: u8::try_from(v).map_err(|_| SyncError::UnsupportedVersion)?,
+            suite: u8::try_from(suite).map_err(|_| SyncError::UnsupportedVersion)?,
+            ns,
+            covers,
+            root: ContentId(root),
+            ts,
+            signer,
+            sig,
+        })
+    }
+
     /// Verify the snapshot's own signature under `signer` (fails closed, `0x0A02`).
     pub fn verify_sig(&self) -> Result<(), SyncError> {
         if self.v != 0 {

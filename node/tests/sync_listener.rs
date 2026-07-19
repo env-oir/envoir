@@ -479,3 +479,84 @@ async fn matching_fingerprint_exchanges_nothing_over_http() {
         "equal (fp, count) ⇒ the range short-circuits and nothing is exchanged (§5.3)"
     );
 }
+
+/// §6.2 over the wire: a replica that has truncated its op-log answers a behind-the-cut peer with
+/// the snapshot (key 2) rather than the surviving suffix (key 1), so the peer fast-joins instead of
+/// silently losing the ops that no longer exist.
+#[tokio::test]
+async fn a_truncated_replica_answers_pull_with_a_snapshot_over_http() {
+    use dmtap_sync::Snapshot;
+
+    let net = InMemoryNetwork::new();
+    let mut node = make_node(&net);
+
+    let operator = IdentityKey::generate();
+    let operator_pub = operator.public();
+    let mut gw = SyncGateway::new(operator_pub.clone(), operator_pub.clone(), vec!["docs".into()]);
+    assert!(gw.enable_with_capability(
+        &sync1_token(&operator, SYNC1_RESOURCE, operator_pub.clone(), now()),
+        now()
+    ));
+
+    // Five ops, a snapshot over all of them, then truncate everything below the last two.
+    let alice = IdentityKey::generate();
+    for i in 0..5u32 {
+        gw.replica.ingest_cose(&signed_add(&alice, "docs", "list", &format!("e{i}"), i), now()).unwrap();
+    }
+    let snap = Snapshot::create(&alice, 1, "docs", gw.replica.state(), now());
+    let cut = Hlc { wall: now(), counter: 3, author: alice.public() };
+    let dropped = gw.replica.truncate_below(&cut, snap.clone()).unwrap();
+    assert!(dropped > 0, "the test only means anything if history was actually discarded");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = bearer(&sync1_token(&operator, SYNC1_RESOURCE, operator_pub.clone(), now()));
+    // A brand-new peer: empty vector, therefore behind the cut.
+    let body = encode(&SVal::Map(vec![
+        (1, VersionVector::new().to_sval()),
+        (2, SVal::Array(vec![SVal::Text("docs".into())])),
+    ]));
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_client = done.clone();
+    let client = tokio::spawn(async move {
+        let r = roundtrip(addr, "POST", &format!("{SYNC_BASE}pull"), Some(&auth), &body).await;
+        done_client.store(true, Ordering::SeqCst);
+        r
+    });
+
+    let gw_lock = std::sync::Mutex::new(gw);
+    run_loop_with_apis(
+        &mut node,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&gw_lock),
+        Some(listener),
+        Duration::from_millis(5),
+        async {
+            while !done.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        },
+    )
+    .await;
+
+    let (status, _, body) = client.await.unwrap();
+    assert_eq!(status, 200);
+    let SVal::Map(fields) = decode(&body).expect("CBOR body") else { panic!("map") };
+    assert!(
+        fields.iter().all(|(k, _)| *k != 1),
+        "a behind-the-cut peer must NOT be handed a partial op list"
+    );
+    let SVal::Bytes(snap_bytes) = fields.iter().find(|(k, _)| *k == 2).expect("key 2 snapshot").1.clone()
+    else {
+        panic!("snapshot is a byte string")
+    };
+    let received = Snapshot::from_det_cbor(&snap_bytes).expect("decodes");
+    received.verify_sig().expect("the peer can verify it independently");
+    assert_eq!(received.root, snap.root, "it is the snapshot that replaced the truncated prefix");
+}

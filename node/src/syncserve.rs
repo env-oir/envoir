@@ -29,7 +29,9 @@ use dmtap_core::id::ContentId;
 use dmtap_core::TimestampMs;
 use dmtap_sync::detcbor::{decode, encode};
 use dmtap_sync::recon::{summarize, OpEntry, RangeFingerprint};
-use dmtap_sync::{verify_op_bytes, Hlc, SVal, SyncError, SyncOp, SyncState, VersionVector};
+use dmtap_sync::{
+    verify_op_bytes, Hlc, SVal, Snapshot, SyncError, SyncOp, SyncState, VersionVector,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -95,6 +97,26 @@ pub struct SyncReplica {
     /// The namespaces this replica subscribes to (§7 sparse sync). Empty = the default namespace
     /// `""` only.
     ns: BTreeSet<String>,
+    /// The §6.2 truncation floor: the HLC below which the op-log prefix has been discarded. `None`
+    /// means the journal is complete back to genesis.
+    truncated_below: Option<Hlc>,
+    /// The snapshot that **replaces** the truncated prefix. Truncation without one is refused, so
+    /// this is `Some` whenever `truncated_below` is.
+    snapshot: Option<Snapshot>,
+}
+
+/// What a §5.2 `pull` can answer once §6.2 truncation is in play.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullOutcome {
+    /// The ops the caller lacks, oldest HLC first — the ordinary §5.2 answer.
+    Ops(Vec<Vec<u8>>),
+    /// The caller is behind the truncation floor: some of the ops it lacks no longer exist here, so
+    /// shipping the surviving suffix would **silently lose** the rest. It is handed the snapshot
+    /// instead, adopts that state, sets its vector to `covers`, and pulls only what follows.
+    ///
+    /// This is the case §6.2 requires to be safe and §5.2's response shape has no room for — see
+    /// the note on [`SyncReplica::truncate_below`].
+    FastJoin(Box<Snapshot>),
 }
 
 impl SyncReplica {
@@ -102,7 +124,95 @@ impl SyncReplica {
     pub fn new(ns: Vec<String>) -> Self {
         let ns: BTreeSet<String> =
             if ns.is_empty() { [String::new()].into_iter().collect() } else { ns.into_iter().collect() };
-        SyncReplica { state: SyncState::new(), journal: BTreeMap::new(), ns }
+        SyncReplica {
+            state: SyncState::new(),
+            journal: BTreeMap::new(),
+            ns,
+            truncated_below: None,
+            snapshot: None,
+        }
+    }
+
+    /// The §6.2 truncation floor, if the op-log prefix has been discarded.
+    pub fn truncated_below(&self) -> Option<&Hlc> {
+        self.truncated_below.as_ref()
+    }
+
+    /// The snapshot standing in for the truncated prefix, if any.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// **Op-log truncation** (§6.2): discard the journal prefix below `cut`, with `snapshot` — a
+    /// checkpoint at vector `V` — retained as the replacement for the discarded history.
+    ///
+    /// §6.2 permits this only "once a snapshot at vector `V` exists and every live replica has
+    /// advanced past `V`". Computing that liveness condition is the caller's job (it needs the
+    /// `StabilityMark` set, which lives above this type); what is enforced *here* is the part that
+    /// makes it safe, fail-closed:
+    ///
+    /// - the snapshot MUST verify under its own signature, and be for a namespace this replica
+    ///   subscribes to;
+    /// - the snapshot MUST actually cover everything being dropped — every journalled op below
+    ///   `cut` must be dominated by `snapshot.covers`. An op below the cut that the snapshot does
+    ///   not account for would be erased with nothing standing in for it, so the whole truncation
+    ///   is refused rather than performed partially;
+    /// - the floor only ever advances (`max` of the old and new cut), so a later call with a lower
+    ///   cut cannot reopen a window that was already closed.
+    ///
+    /// Returns how many ops were dropped.
+    ///
+    /// **Spec gap (reported, not worked around).** §6.2 mandates that a peer behind the cut be able
+    /// to recover, and §6.1 gives it the mechanism (adopt the snapshot, set the vector to `covers`,
+    /// pull the rest) — but §5.2's `pull` response is `{ ops: [...] }` with no way to *say* "you
+    /// are behind my floor, fast-join from this snapshot instead". Answering with the surviving
+    /// suffix would silently lose ops, which §6.2 exists to prevent, and answering with an error
+    /// would strand the peer. This implementation therefore extends the `pull` response with an
+    /// optional key 2 carrying the snapshot ([`PullOutcome::FastJoin`]); key 1 is unchanged, so a
+    /// peer that never truncates never sees it. That extension is **not** in §5.2 and the wire
+    /// shape is not frozen by any vector.
+    pub fn truncate_below(&mut self, cut: &Hlc, snapshot: Snapshot) -> Result<usize, SyncError> {
+        snapshot.verify_sig()?;
+        if !self.ns.contains(&snapshot.ns) {
+            return Err(SyncError::NsLeak);
+        }
+        // Every op about to be dropped must be accounted for by the snapshot.
+        let doomed: Vec<Vec<u8>> = self
+            .journal
+            .iter()
+            .filter(|(_, j)| j.op.hlc < *cut)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &doomed {
+            let hlc = &self.journal[id].op.hlc;
+            if snapshot.covers.lacks(hlc) {
+                // The snapshot does not fold this op in: truncating would destroy it outright.
+                return Err(SyncError::SnapshotRootMismatch);
+            }
+        }
+        for id in &doomed {
+            self.journal.remove(id);
+        }
+        let floor = match self.truncated_below.take() {
+            Some(prev) if prev > *cut => prev,
+            _ => cut.clone(),
+        };
+        self.truncated_below = Some(floor);
+        self.snapshot = Some(snapshot);
+        Ok(doomed.len())
+    }
+
+    /// Whether `vector` is at or past this replica's truncation floor — i.e. whether the surviving
+    /// journal suffix is a *complete* answer for that caller.
+    ///
+    /// The test is domination of the snapshot's `covers`: if the caller lacks any HLC the snapshot
+    /// folded in, then some op it needs may have been truncated, and only the snapshot can give it
+    /// that state back.
+    fn caller_is_behind_cut(&self, vector: &VersionVector) -> bool {
+        let Some(snapshot) = &self.snapshot else {
+            return false; // nothing truncated: the journal is complete
+        };
+        snapshot.covers.marks().any(|(_, hlc)| vector.lacks(hlc))
     }
 
     /// The namespaces this replica subscribes to, canonically ordered.
@@ -150,7 +260,32 @@ impl SyncReplica {
     ///
     /// Oldest-first matters: a truncated batch is then a prefix of the difference, so the caller's
     /// vector advances monotonically and the next round resumes exactly where this one stopped.
-    pub fn ops_after(&self, vector: &VersionVector, ns: &[String], limit: usize) -> Vec<Vec<u8>> {
+    ///
+    /// If the op-log has been truncated (§6.2) and the caller is behind the floor, this answers
+    /// [`PullOutcome::FastJoin`] instead: the ops it needs are gone, so it is handed the snapshot
+    /// that replaced them rather than a suffix that would silently lose the rest.
+    pub fn ops_after(
+        &self,
+        vector: &VersionVector,
+        ns: &[String],
+        limit: usize,
+    ) -> PullOutcome {
+        if self.caller_is_behind_cut(vector) {
+            let snapshot = self.snapshot.clone().expect("checked by caller_is_behind_cut");
+            return PullOutcome::FastJoin(Box::new(snapshot));
+        }
+        PullOutcome::Ops(self.ops_after_unchecked(vector, ns, limit))
+    }
+
+    /// The raw difference computation, with no §6.2 floor check — the body of
+    /// [`SyncReplica::ops_after`], split out so the floor check cannot be accidentally skipped by a
+    /// future caller of the difference itself.
+    fn ops_after_unchecked(
+        &self,
+        vector: &VersionVector,
+        ns: &[String],
+        limit: usize,
+    ) -> Vec<Vec<u8>> {
         let mut wanted: Vec<&Journalled> = self
             .journal
             .values()
@@ -330,17 +465,26 @@ fn vector_response(gw: &SyncGateway) -> SyncResponse {
     ])))
 }
 
-/// `POST /sync/pull {1: vector, 2: [ns]}` → `{1: [COSE_Sign1(SyncOp)]}` (§5.2).
+/// `POST /sync/pull {1: vector, 2: [ns]}` → `{1: [COSE_Sign1(SyncOp)]}` (§5.2), **or**
+/// `{2: Snapshot}` when the caller is behind this replica's §6.2 truncation floor.
+///
+/// Key 2 is an extension beyond §5.2's frozen shape; see the note on
+/// [`SyncReplica::truncate_below`] for why §6.2 cannot be implemented safely without it. A replica
+/// that never truncates never emits it.
 fn pull_response(gw: &SyncGateway, body: &[u8]) -> SyncResponse {
     let (vector, ns) = match parse_vector_request(body) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let ops = gw.replica.ops_after(&vector, &ns, PULL_BATCH_LIMIT);
-    SyncResponse::cbor(encode(&SVal::Map(vec![(
-        1,
-        SVal::Array(ops.into_iter().map(SVal::Bytes).collect()),
-    )])))
+    match gw.replica.ops_after(&vector, &ns, PULL_BATCH_LIMIT) {
+        PullOutcome::Ops(ops) => SyncResponse::cbor(encode(&SVal::Map(vec![(
+            1,
+            SVal::Array(ops.into_iter().map(SVal::Bytes).collect()),
+        )]))),
+        PullOutcome::FastJoin(snapshot) => {
+            SyncResponse::cbor(encode(&SVal::Map(vec![(2, SVal::Bytes(snapshot.det_cbor()))])))
+        }
+    }
 }
 
 /// `POST /sync/ops {1: [COSE_Sign1(SyncOp)]}` → `{1: applied}` (§5.2).
@@ -594,5 +738,200 @@ fn reason_phrase(status: u16) -> &'static str {
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
         _ => "",
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dmtap_core::identity::IdentityKey;
+    use dmtap_sync::sign_op;
+
+    const T: u64 = 1_752_000_000_000;
+
+    fn hlc(sk: &IdentityKey, counter: u32) -> Hlc {
+        Hlc { wall: T, counter, author: sk.public() }
+    }
+
+    /// A signed `set-add` op into `ns` at `counter`.
+    fn op(sk: &IdentityKey, ns: &str, element: &str, counter: u32) -> Vec<u8> {
+        let o = SyncOp {
+            kind: dmtap_sync::wire::OP_SET_ADD,
+            ns: ns.to_string(),
+            target: "list".to_string(),
+            field: None,
+            value: Some(SVal::Text(element.to_string())),
+            hlc: hlc(sk, counter),
+            observed: None,
+            reference: None,
+        };
+        sign_op(sk, &o).unwrap().to_bytes()
+    }
+
+    /// A replica holding `n` ops from one author at counters `0..n`.
+    fn replica_with(sk: &IdentityKey, n: u32) -> SyncReplica {
+        let mut r = SyncReplica::new(vec!["docs".into()]);
+        for i in 0..n {
+            r.ingest_cose(&op(sk, "docs", &format!("e{i}"), i), T).unwrap();
+        }
+        r
+    }
+
+    fn snapshot_of(r: &SyncReplica, sk: &IdentityKey) -> Snapshot {
+        Snapshot::create(sk, 1, "docs", r.state(), T)
+    }
+
+    /// §6.2: the prefix below the cut is dropped and the snapshot stands in for it.
+    #[test]
+    fn truncation_drops_the_prefix_and_keeps_the_suffix() {
+        let sk = IdentityKey::generate();
+        let mut r = replica_with(&sk, 5);
+        let snap = snapshot_of(&r, &sk);
+        assert_eq!(r.len(), 5);
+
+        let dropped = r.truncate_below(&hlc(&sk, 3), snap).unwrap();
+        assert_eq!(dropped, 3, "counters 0,1,2 are below the cut");
+        assert_eq!(r.len(), 2, "the suffix at 3,4 survives");
+        assert_eq!(r.truncated_below(), Some(&hlc(&sk, 3)));
+        assert!(r.snapshot().is_some(), "a truncated log always has its replacement");
+    }
+
+    /// The safety property the whole feature turns on: a peer behind the cut is told to fast-join
+    /// from the snapshot, never handed the surviving suffix (which would silently lose the ops that
+    /// no longer exist here).
+    #[test]
+    fn a_peer_behind_the_cut_is_told_to_fast_join_not_silently_shortchanged() {
+        let sk = IdentityKey::generate();
+        let mut r = replica_with(&sk, 5);
+        let snap = snapshot_of(&r, &sk);
+        r.truncate_below(&hlc(&sk, 3), snap.clone()).unwrap();
+
+        // A brand-new peer (empty vector) is behind everything.
+        let outcome = r.ops_after(&VersionVector::new(), &[], PULL_BATCH_LIMIT);
+        match outcome {
+            PullOutcome::FastJoin(s) => {
+                assert_eq!(s.covers, snap.covers, "handed the snapshot that replaced the prefix");
+                assert_eq!(s.root, snap.root);
+            }
+            PullOutcome::Ops(ops) => panic!(
+                "a peer behind the cut was handed {} ops — the truncated ones are gone and it \
+                 would never learn they existed",
+                ops.len()
+            ),
+        }
+
+        // A peer that is only PARTIALLY behind — it has counters 0..2 but not the snapshot's full
+        // covers — is still behind: it cannot be served a complete difference either.
+        let mut partial = VersionVector::new();
+        partial.observe(&hlc(&sk, 2));
+        assert!(
+            matches!(r.ops_after(&partial, &[], PULL_BATCH_LIMIT), PullOutcome::FastJoin(_)),
+            "any caller not dominating `covers` must fast-join"
+        );
+    }
+
+    /// A peer that is already past the cut gets the ordinary §5.2 answer — truncation must not
+    /// degrade the common case into a snapshot download.
+    #[test]
+    fn a_peer_past_the_cut_still_gets_ordinary_ops() {
+        let sk = IdentityKey::generate();
+        let mut r = replica_with(&sk, 5);
+        let snap = snapshot_of(&r, &sk);
+        let covers = snap.covers.clone();
+        r.truncate_below(&hlc(&sk, 3), snap).unwrap();
+
+        // A caller whose vector dominates `covers` (it has everything the snapshot folded in).
+        let mut caught_up = VersionVector::new();
+        for (_, h) in covers.marks() {
+            caught_up.observe(h);
+        }
+        match r.ops_after(&caught_up, &[], PULL_BATCH_LIMIT) {
+            PullOutcome::Ops(ops) => assert!(ops.is_empty(), "it already has everything"),
+            PullOutcome::FastJoin(_) => panic!("a caught-up peer must not be forced to fast-join"),
+        }
+
+        // An untruncated replica never fast-joins anybody, however far behind they are.
+        let fresh = replica_with(&sk, 3);
+        assert!(matches!(
+            fresh.ops_after(&VersionVector::new(), &[], PULL_BATCH_LIMIT),
+            PullOutcome::Ops(_)
+        ));
+    }
+
+    /// Truncation is refused when the snapshot does not account for everything being dropped —
+    /// otherwise an op would be erased with nothing standing in for it.
+    #[test]
+    fn truncation_is_refused_when_the_snapshot_does_not_cover_the_prefix() {
+        let sk = IdentityKey::generate();
+        let other = IdentityKey::generate();
+
+        // Snapshot taken at 3 ops, THEN a fourth op from a second author arrives below the cut.
+        let mut r = replica_with(&sk, 3);
+        let stale = snapshot_of(&r, &sk);
+        r.ingest_cose(&op(&other, "docs", "late", 0), T).unwrap();
+        assert_eq!(r.len(), 4);
+
+        // The cut would drop the late op, which the stale snapshot never folded in.
+        let cut = Hlc { wall: T + 1, counter: 0, author: sk.public() };
+        assert_eq!(
+            r.truncate_below(&cut, stale),
+            Err(SyncError::SnapshotRootMismatch),
+            "an uncovered op below the cut must abort the whole truncation"
+        );
+        assert_eq!(r.len(), 4, "nothing was dropped");
+        assert!(r.truncated_below().is_none(), "and no floor was set");
+    }
+
+    /// The floor only advances, and a forged or foreign-namespace snapshot is refused.
+    #[test]
+    fn truncation_is_fail_closed_on_signature_namespace_and_regression() {
+        let sk = IdentityKey::generate();
+        let mut r = replica_with(&sk, 5);
+
+        // A snapshot with a broken signature never becomes the replacement for real history.
+        let mut forged = snapshot_of(&r, &sk);
+        forged.sig[0] ^= 0xFF;
+        assert_eq!(r.truncate_below(&hlc(&sk, 3), forged), Err(SyncError::OpSigInvalid));
+        assert!(r.snapshot().is_none());
+
+        // Nor does one for a namespace this replica does not subscribe to.
+        let mut foreign = snapshot_of(&r, &sk);
+        foreign.ns = "secrets".into();
+        foreign.sig = Vec::new();
+        let resigned = {
+            let mut s = foreign.clone();
+            // Re-sign so the namespace check, not the signature check, is what rejects it.
+            s.sig = Snapshot::create(&sk, 1, "secrets", r.state(), T).sig;
+            s
+        };
+        assert!(matches!(
+            r.truncate_below(&hlc(&sk, 3), resigned),
+            Err(SyncError::NsLeak | SyncError::OpSigInvalid)
+        ));
+
+        // A real truncation, then a LOWER cut: the floor must not regress.
+        let snap = snapshot_of(&r, &sk);
+        r.truncate_below(&hlc(&sk, 4), snap.clone()).unwrap();
+        assert_eq!(r.truncated_below(), Some(&hlc(&sk, 4)));
+        r.truncate_below(&hlc(&sk, 1), snap).unwrap();
+        assert_eq!(
+            r.truncated_below(),
+            Some(&hlc(&sk, 4)),
+            "the floor only ever advances — a lower cut cannot reopen a closed window"
+        );
+    }
+
+    /// A snapshot round-trips through its wire encoding, so the fast-join answer a peer receives is
+    /// the snapshot the responder holds.
+    #[test]
+    fn snapshot_wire_bytes_round_trip() {
+        let sk = IdentityKey::generate();
+        let r = replica_with(&sk, 3);
+        let snap = snapshot_of(&r, &sk);
+        let decoded = Snapshot::from_det_cbor(&snap.det_cbor()).expect("round trip");
+        assert_eq!(decoded, snap);
+        decoded.verify_sig().expect("signature survives the round trip");
     }
 }
