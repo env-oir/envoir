@@ -339,12 +339,65 @@ pub async fn serve(config: NodeConfig) -> Result<LoopStats, DaemonError> {
         None
     };
 
+    // The DMTAP-PUB gateway (spec §22.5/§22.6) — the node's optional public-object HTTP surface,
+    // opt-in. Reads are anonymous (§22.5.1); the capability gate governs whether the operator serves
+    // *at all* (§22.6.1). This node self-issues its own `pub-1` capability (audience = itself) and
+    // presents it to `enable_with_capability` rather than bypassing the gate with an unconditional
+    // `enable()` — the fail-closed verification in `pub1_authorizes` genuinely runs, it is simply
+    // this node that both issues and holds the grant (the self-host case: operator == node).
+    let pub_gateway = if config.pub_serve_enabled {
+        let mut gw = crate::pubserve::PubGateway::new(dmtap_core::pubobj::ServePolicy::default());
+        let now = now_ms();
+        let owner_ik = {
+            let ks = Keystore::load(&config.keystore_path(), config.passphrase.as_deref())?;
+            ks.identity_key()
+        };
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce)
+            .map_err(|_| DaemonError::Bind(io::Error::other("rng failure minting the pub-1 capability")))?;
+        let token = dmtap_core::capability::CapabilityToken::issue(
+            &owner_ik,
+            addr.clone(),
+            vec![dmtap_core::capability::Capability {
+                resource: crate::pubserve::PUB1_RESOURCE.to_string(),
+                ability: crate::pubserve::PUB1_ABILITY.to_string(),
+                caveats: None,
+            }],
+            now.saturating_sub(1_000),
+            now.saturating_add(365 * 24 * 60 * 60 * 1000),
+            nonce.to_vec(),
+            None,
+        );
+        let enabled = gw.enable_with_capability(&token, &addr, now);
+        eprintln!(
+            "envoir-node: DMTAP-PUB gateway {} (self-issued pub-1 capability; operator == this node)",
+            if enabled { "ENABLED" } else { "FAILED TO ENABLE — capability did not verify" }
+        );
+        Some(gw)
+    } else {
+        None
+    };
+    let pub_listener = if config.pub_serve_enabled {
+        let l = tokio::net::TcpListener::bind(&config.pub_bind).await.map_err(DaemonError::Bind)?;
+        eprintln!(
+            "envoir-node: DMTAP-PUB listener on {} — anonymous reads under {} (feed head/range, \
+             announce, manifest, chunk)",
+            config.pub_bind,
+            crate::pubserve::WELL_KNOWN_BASE
+        );
+        Some(l)
+    } else {
+        None
+    };
+
     let stats = crate::jmap_api::run_loop_with_apis(
         &mut node,
         send_api.as_mut(),
         send_listener,
         jmap_api.as_ref(),
         jmap_listener,
+        pub_gateway.as_ref(),
+        pub_listener,
         config.tick,
         // Supervised mode (ENVOIR_SUPERVISED=1) adds stdin-EOF to the shutdown causes, so a sidecar
         // whose supervising shell died abnormally terminates itself instead of orphaning.

@@ -77,6 +77,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::daemon::{now_ms, LoopStats};
 use crate::node::Node;
+use crate::pubserve::PubGateway;
 use crate::send_api::{read_request, SendApi};
 use crate::transport::Transport;
 
@@ -497,12 +498,17 @@ impl JmapResponse {
 
 /// The daemon's steady-state loop serving the node's client/programmatic surfaces alongside the
 /// delivery tick, all **inline on this one task** (a [`Node`] is `!Send`): the delivery/retry/
-/// deadline tick, plus — behind their config flags — the Envoir Send API and the native JMAP
-/// listener. Either listener may be absent (`None`); with both absent it is exactly
-/// [`crate::daemon::run_loop`]. When both APIs are enabled, the JMAP listener additionally serves
-/// the `/v1/*` Send routes (one client-facing base URL — see [`JmapApi::handle`]) while the
-/// standalone Send listener keeps working unchanged. Runs until `shutdown`, then flushes a final
-/// durable checkpoint.
+/// deadline tick, plus — behind their config flags — the Envoir Send API, the native JMAP
+/// listener, and the DMTAP-PUB gateway (§22.5/§22.6). Any listener may be absent (`None`); with all
+/// absent it is exactly [`crate::daemon::run_loop`]. When both the Send and JMAP APIs are enabled,
+/// the JMAP listener additionally serves the `/v1/*` Send routes (one client-facing base URL — see
+/// [`JmapApi::handle`]) while the standalone Send listener keeps working unchanged. Runs until
+/// `shutdown`, then flushes a final durable checkpoint.
+///
+/// The PUB gateway is `Send + Sync` (it holds no reference to the `!Send` `Node`) — it does not
+/// *need* to run inline here the way the Send/JMAP surfaces do, but it is interleaved into this
+/// same `select!` anyway so the one `shutdown` future and the one final flush cover every listener
+/// the daemon serves, rather than needing a second supervised task.
 ///
 /// The `select!` is **not** `biased`: ranking `accept` above the delivery `tick` would starve the
 /// tick under a stream of connections (each is handled inline). Fair polling keeps delivery/retry
@@ -514,6 +520,8 @@ pub async fn run_loop_with_apis<T: Transport>(
     send_listener: Option<TcpListener>,
     jmap_api: Option<&JmapApi>,
     jmap_listener: Option<TcpListener>,
+    pub_gateway: Option<&PubGateway>,
+    pub_listener: Option<TcpListener>,
     tick: Duration,
     shutdown: impl Future<Output = ()>,
 ) -> LoopStats {
@@ -534,6 +542,11 @@ pub async fn run_loop_with_apis<T: Transport>(
                     // The Send API is threaded into the JMAP handler so `/v1/*` on THIS listener
                     // reaches the real capability-gated send path (see `JmapApi::handle`).
                     let _ = api.handle_connection(node, send_api.as_deref_mut(), stream).await;
+                }
+            }
+            accepted = maybe_accept(pub_listener.as_ref()) => {
+                if let (Some(gw), Ok((stream, _peer))) = (pub_gateway, accepted) {
+                    let _ = crate::pubserve::handle_connection(gw, stream).await;
                 }
             }
             _ = interval.tick() => {

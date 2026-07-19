@@ -20,6 +20,8 @@
 //! root — it re-verifies on store so it can never serve wrong-but-accepted bytes.
 
 use std::collections::BTreeMap;
+use std::io;
+use std::time::Duration;
 
 use dmtap_core::capability::CapabilityToken;
 use dmtap_core::id::ContentId;
@@ -30,6 +32,8 @@ use dmtap_core::pubobj::{
 };
 use dmtap_core::suite::Suite;
 use dmtap_core::TimestampMs;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 /// The §22.6.1 / §10.2 capability resource string a `pub-1`-granting [`CapabilityToken`] carries.
 pub const PUB1_RESOURCE: &str = "pub-1";
@@ -436,6 +440,82 @@ pub fn handle(gw: &PubGateway, method: &str, raw_path: &str) -> PubResponse {
             }
         }
         _ => PubResponse::not_found(),
+    }
+}
+
+// ── Live HTTP serving (the daemon's real TcpListener, spec §22.5.1) ─────────────────────────────
+
+/// How long a single connection may take to deliver its request before it is dropped. Mirrors the
+/// JMAP/Send-API listeners' bound (§22.5.1 reads are anonymous and unauthenticated, so this is the
+/// only defense against a client that opens a socket and never sends).
+const PUB_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound the write too: a slow-reading client must not pin the connection open indefinitely.
+const PUB_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Serve one accepted connection against `gw`: read the request (bounded), route it through the
+/// pure [`handle`] router, and write the response with its cache directives. Framing errors and
+/// slow clients degrade to `400`/`408` rather than propagating — one bad client never takes down
+/// the caller. `gw` is `Send + Sync` (unlike [`crate::jmap_api::JmapApi`]/[`crate::send_api::SendApi`],
+/// it holds no reference to the `!Send` [`crate::node::Node`]), so — unlike those two — this
+/// function does not need to run inline with the node's own task; the daemon still interleaves it
+/// into the same steady-state `select!` so one shutdown future stops every listener together.
+pub async fn handle_connection(gw: &PubGateway, mut stream: TcpStream) -> io::Result<()> {
+    let resp = match tokio::time::timeout(PUB_READ_TIMEOUT, crate::send_api::read_request(&mut stream)).await
+    {
+        Ok(Ok(Some(req))) => handle(gw, &req.method, &req.path),
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => PubResponse {
+            status: 400,
+            content_type: "text/plain",
+            cache_control: None,
+            etag: None,
+            body: format!("bad request: {e}").into_bytes(),
+        },
+        Err(_) => PubResponse {
+            status: 408,
+            content_type: "text/plain",
+            cache_control: None,
+            etag: None,
+            body: b"request timeout".to_vec(),
+        },
+    };
+    match tokio::time::timeout(PUB_WRITE_TIMEOUT, write_response(&resp, &mut stream)).await {
+        Ok(r) => r,
+        Err(_) => Ok(()),
+    }
+}
+
+/// Write one [`PubResponse`] as an HTTP/1.1 `Connection: close` reply, including `Cache-Control` /
+/// `ETag` when the response carries them (§22.5.1's caching directives).
+async fn write_response(resp: &PubResponse, stream: &mut TcpStream) -> io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        resp.status,
+        pub_reason_phrase(resp.status),
+        resp.content_type,
+        resp.body.len(),
+    );
+    if let Some(cc) = &resp.cache_control {
+        head.push_str(&format!("Cache-Control: {cc}\r\n"));
+    }
+    if let Some(etag) = &resp.etag {
+        head.push_str(&format!("ETag: \"{etag}\"\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&resp.body).await?;
+    stream.flush().await
+}
+
+/// A conventional reason phrase for the status codes this surface emits (cosmetic).
+fn pub_reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        _ => "",
     }
 }
 

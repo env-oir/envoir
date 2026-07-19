@@ -172,6 +172,8 @@ async fn client_authenticates_and_reads_genuinely_delivered_mail_over_tcp() {
         None,
         Some(&jmap),
         Some(listener),
+        None,
+        None,
         Duration::from_millis(5),
         async {
             while !done.load(Ordering::SeqCst) {
@@ -299,6 +301,8 @@ async fn browser_client_sends_through_the_jmap_listener_with_a_bearer_token() {
         None, // the standalone :4610 listener is not needed for the one-base-URL path
         Some(&jmap),
         Some(listener),
+        None,
+        None,
         Duration::from_millis(5),
         async {
             while !done.load(Ordering::SeqCst) {

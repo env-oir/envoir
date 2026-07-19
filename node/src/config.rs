@@ -27,6 +27,8 @@
 //! | `ENVOIR_JMAP_APP_PASSWORDS` | `jmap_app_passwords` | *(empty ⇒ no client can authenticate, fail-closed)* |
 //! | `ENVOIR_JMAP_ACCOUNT`  | `jmap_account`  | *(first name, else base64url(ik))* |
 //! | `ENVOIR_JMAP_BASE_URL` | `jmap_base_url` | *(derived from `jmap_bind`)* |
+//! | `ENVOIR_PUB_SERVE`     | `pub_serve_enabled` | `false` (opt-in — the operator is choosing to make public objects readable by anyone, §22.6.1) |
+//! | `ENVOIR_PUB_BIND`      | `pub_bind`      | `0.0.0.0:4680` (public surface — unlike JMAP, meant to be reachable off-box) |
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -43,6 +45,10 @@ const DEFAULT_SEND_API_BIND: &str = "0.0.0.0:4610";
 /// client on the same machine (a Tauri app) reaches it over `127.0.0.1`; any off-localhost bind
 /// requires a TLS front (enforced fail-closed in the daemon).
 const DEFAULT_JMAP_BIND: &str = "127.0.0.1:4700";
+/// The default bind for the DMTAP-PUB gateway (`ENVOIR_PUB_BIND`, spec §22.5/§22.6). Unlike JMAP,
+/// this surface is **meant** to be reached by other peers off-box (public reads are anonymous —
+/// §22.5.1), so it defaults to all-interfaces like the mesh/Send-API binds, not loopback.
+const DEFAULT_PUB_BIND: &str = "0.0.0.0:4680";
 
 /// Fully-resolved daemon configuration.
 #[derive(Debug, Clone)]
@@ -94,6 +100,16 @@ pub struct NodeConfig {
     /// The externally-reachable base URL advertised in the JMAP Session resource (its `apiUrl` /
     /// `downloadUrl` / … are built from it). `None` ⇒ derived from [`jmap_bind`](Self::jmap_bind).
     pub jmap_base_url: Option<String>,
+    /// Whether to serve the DMTAP-PUB gateway (spec §22.5/§22.6) — the node's optional public-object
+    /// HTTP surface (feed head/range, announce, manifest, chunk). **Off by default**: a node that
+    /// never advertises `pub-1` is never expected to serve public objects (§22.6.1), and public
+    /// objects are not blind — the operator can read what it serves — so this is an explicit opt-in
+    /// via `ENVOIR_PUB_SERVE`.
+    pub pub_serve_enabled: bool,
+    /// `host:port` the DMTAP-PUB listener binds when [`pub_serve_enabled`](Self::pub_serve_enabled).
+    /// Unlike JMAP this surface is meant to be reachable off-box (reads are anonymous, §22.5.1), so
+    /// it defaults to all-interfaces rather than loopback.
+    pub pub_bind: String,
 }
 
 impl Default for NodeConfig {
@@ -115,6 +131,8 @@ impl Default for NodeConfig {
             jmap_app_passwords: Vec::new(),
             jmap_account: None,
             jmap_base_url: None,
+            pub_serve_enabled: false,
+            pub_bind: DEFAULT_PUB_BIND.to_string(),
         }
     }
 }
@@ -178,6 +196,14 @@ impl NodeConfig {
         }
         c.jmap_account = std::env::var("ENVOIR_JMAP_ACCOUNT").ok().filter(|s| !s.is_empty());
         c.jmap_base_url = std::env::var("ENVOIR_JMAP_BASE_URL").ok().filter(|s| !s.is_empty());
+        if let Ok(v) = std::env::var("ENVOIR_PUB_SERVE") {
+            c.pub_serve_enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("ENVOIR_PUB_BIND") {
+            if !v.is_empty() {
+                c.pub_bind = v;
+            }
+        }
         c
     }
 
@@ -296,6 +322,16 @@ mod tests {
     fn csv_parsing_trims_and_drops_empties() {
         assert_eq!(split_csv("a, b ,,c"), vec!["a", "b", "c"]);
         assert!(split_csv("  ,  ").is_empty());
+    }
+
+    #[test]
+    fn pub_serve_is_off_by_default_and_binds_all_interfaces() {
+        let c = NodeConfig::default();
+        // The DMTAP-PUB gateway is opt-in (§22.6.1: a node never advertising `pub-1` is never
+        // expected to serve public objects) — and unlike JMAP its default bind is NOT loopback,
+        // since the surface is meant to be reachable off-box (anonymous reads, §22.5.1).
+        assert!(!c.pub_serve_enabled);
+        assert_eq!(c.pub_bind, "0.0.0.0:4680");
     }
 
     #[test]
