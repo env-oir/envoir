@@ -7,18 +7,30 @@ import _ "embed"
 // engineWasm is the sync engine: dmtap-sync and dmtap-core compiled to WebAssembly through the
 // raw-ABI surface of crates/dmtap-sync-wasm (its src/abi.rs), with wasm-opt -Oz applied.
 //
-// # It is generated, not committed
+// # It is committed, and tied to its source by a test
 //
-// dmtap_sync_abi.wasm is build output and is gitignored. Produce it with:
+// dmtap_sync_abi.wasm is checked in, so `go get` works and this module compiles from a plain proxy
+// fetch. Rebuild it after changing the Rust with:
 //
 //	crates/dmtap-sync-wasm/build-abi.sh     # or: go generate ./bindings/go
+//	go run ./bindings/go/internal/genprovenance
 //
-// which writes straight to this path. A fresh checkout therefore does not compile until that script
-// has run once — deliberately. The alternative, checking the module into git, was tried and cost a
-// real bug: the committed module went stale against a fix in src/abi.rs, and every response whose
-// Rust-side String capacity outran its length aborted the module's allocator on free. Nothing in
-// git ties a binary blob to the source that produced it, so the drift was invisible until it
-// crashed. A missing file is a build error you cannot ignore; a stale one is a bug you can ship.
+// Committing it was not the first choice. Gitignoring it was, on the reasoning that a missing file
+// is a build error you cannot ignore while a stale one is a bug you can ship — and that reasoning
+// came from a real incident: a committed module went stale against a fix in src/abi.rs, and every
+// response whose Rust-side String capacity outran its length aborted the allocator on free. The
+// drift was invisible because nothing in git ties a binary blob to the code that produced it.
+//
+// What overruled it is that a Go module has no build step. `go get` runs neither `go generate` nor
+// build-abi.sh, so a gitignored artifact makes this package uncompilable for anyone consuming it
+// the normal way. Both products that adopted the engine hit exactly that and vendored the file by
+// hand — each re-accepting the same staleness risk, privately, with no shared guard.
+//
+// So the blob is tied to its source explicitly instead of implicitly. wasm_provenance.json records
+// a digest over every Rust input; provenance_test.go recomputes it and fails when the source has
+// moved. It hashes rather than rebuilds, so it needs no Rust toolchain, and it skips cleanly when
+// the crates/ tree is absent (a standalone module fetch has nothing to check). Adopters no longer
+// need to vendor, and the guard lives here once instead of in each of them.
 //
 // Do not substitute a module built any other way. The whole value of this binding is that these are
 // the same bytes of algebra the native Rust runner and the browser binding execute, which

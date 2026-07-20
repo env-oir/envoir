@@ -13,4 +13,3 @@ dist/
 # to the code that produced it. Generating them at build time makes that class of drift impossible.
 crates/dmtap-sync-wasm/pkg/
 crates/dmtap-sync-wasm/pkg-node/
-bindings/go/dmtap_sync_abi.wasm

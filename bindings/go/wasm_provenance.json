@@ -1,0 +1,27 @@
+{
+  "_": "Provenance for the committed dmtap_sync_abi.wasm. See embed.go and provenance_test.go.",
+  "artifact_bytes": 426890,
+  "artifact_sha256": "dd7787106934346138b3569522224ddae24034e424d957cbf7726f4903ea6bb7",
+  "built_from_commit": "5e8c35789ecbae13a2cb5cee6e3c3713f8b8a633",
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "source_digest": "c5a529dd5fb9ac0cc952510337233013bde434606b14e5c59e0dc7db7a5bb5df",
+  "sources": {
+    "crates/dmtap-sync-wasm/Cargo.toml": "58e5b1df890359be52f0b681047afb5e2e2732396e9e136fa64e99977ea83ebb",
+    "crates/dmtap-sync-wasm/build-abi.sh": "bb99c338ebe741dd85f54f62b02d6e1216a17cf10dcb0d9b9fa49eb088016b94",
+    "crates/dmtap-sync-wasm/src/abi.rs": "cf414cfd26acd8fa7f7e509f1021ea6999ae28c6d8ccb4a83556df1d26498f5c",
+    "crates/dmtap-sync-wasm/src/entropy.rs": "89d2b3dc9ae145698d31861f85cd749700e084bd228268928a21240e247924de",
+    "crates/dmtap-sync-wasm/src/err.rs": "9074c77ab64e4d5418fe0ccb8c4992b1ad80b8ab2fc0bae4173a4645c46df035",
+    "crates/dmtap-sync-wasm/src/jsonval.rs": "675379b6b8187e196a18b783b25a79331bc508e0455c8fc2c94888833c6745c9",
+    "crates/dmtap-sync-wasm/src/lib.rs": "b4b82a3cae2795e4b3f3176c5fa53a9d49f06b16090307305be9b25a4409e741",
+    "crates/dmtap-sync/src/body.rs": "498475e3032c043a2bfc167cb1a16c4c84972971e73b63f5d3e412eb780f9c93",
+    "crates/dmtap-sync/src/cose.rs": "6d9175513b50aeb1189908f2f74d79ce799e71a84071926e0ad4655b9fd282dd",
+    "crates/dmtap-sync/src/crdt.rs": "71b65ec8a81da4ef8bcb71570ad52e6ec2138d274037e7ff9b9e494a1338b4fc",
+    "crates/dmtap-sync/src/detcbor.rs": "e590a33baa456bb35be013fa5df2c86dff5de82c8ff6f60c9b03d380ae77ab4e",
+    "crates/dmtap-sync/src/error.rs": "612bdfe3d2ce345fdcb064d7bbc27ccc11e5346477d5a8bb81ca9e0ad7e56974",
+    "crates/dmtap-sync/src/lib.rs": "bec0f108a381542951c2f661c0d4bf1b96119468141fee5cb7d389e494621683",
+    "crates/dmtap-sync/src/recon.rs": "6fb7cd2597051a296a888fad375e73882e5cacbe7845906ae11a956eea3a38b5",
+    "crates/dmtap-sync/src/snapshot.rs": "1c89a83a84632fff07f750d2b9d0f2fec51af82b3441483b8165923d87c236c9",
+    "crates/dmtap-sync/src/state.rs": "5e6e670c06fdf24edf7fa8e6134fb6d746faa0d861965d45ba0e102234fbcfbb",
+    "crates/dmtap-sync/src/wire.rs": "373184acd38e2650cc23c18eeb42f5b927a1186d3926a278e97baf6528a9acf3"
+  }
+}
