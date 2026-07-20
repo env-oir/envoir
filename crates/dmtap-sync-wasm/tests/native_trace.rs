@@ -841,23 +841,6 @@ fn hlc_of_hex(h: &str) -> Hlc {
     Hlc::from_sval(decode(&unhex(h)).expect("hlc CBOR")).expect("Hlc")
 }
 
-/// A minimal but genuine §6.1.2 `SnapshotBody` signed by `sk` — one LWW op, the same shape
-/// `SYNC-SNAP-03` freezes. Used where a vector freezes a response ENCODING but predates C-09's
-/// body type: the encoding assertions run against the frozen bytes, adoption runs against this.
-fn conformant_body(sk: &IdentityKey) -> Vec<u8> {
-    let op = SyncOp {
-        kind: dmtap_sync::OP_LWW_SET,
-        ns: String::new(),
-        target: "doc1".into(),
-        field: Some("title".into()),
-        value: Some(SVal::Text("n".into())),
-        hlc: Hlc { wall: 1_700_000_100_000, counter: 4, author: sk.public() },
-        observed: None,
-        reference: None,
-    };
-    SnapshotBody::new(vec![cose::sign_op(sk, &op).expect("sign_op")]).det_cbor()
-}
-
 /// `{2: FastJoin}` — the §5.2.1 pull envelope.
 fn pull_envelope(fj: &FastJoin) -> Vec<u8> {
     encode(&SVal::Map(vec![(2, decode(&fj.det_cbor()).expect("own FastJoin encoding"))]))
@@ -867,7 +850,7 @@ fn sync_fastjoin_pull_response(v: &Value) -> Case {
     let i = &v["input"];
     let seed: [u8; 32] = unhex(s(i, "snapshot_signer_seed_hex")).try_into().unwrap();
     let sk = IdentityKey::from_seed(&seed);
-    let body = unhex(s(i, "observable_state_cbor_hex"));
+    let state_body = unhex(s(i, "observable_state_cbor_hex"));
 
     let mut snapshot = dmtap_sync::Snapshot {
         v: 0,
@@ -883,38 +866,51 @@ fn sync_fastjoin_pull_response(v: &Value) -> Case {
     snapshot.sig = sk.sign_domain(&[], &preimage);
     let floor = hlc_of_hex(s(i, "floor_hlc_cbor_hex"));
 
+    // C-11: key 3 now carries a REAL §6.1.2 SnapshotBody — ten individually-signed ops (§6.2's
+    // retention set for this state) whose fold reproduces the UNCHANGED `snapshot_root_hex`. It
+    // previously carried `observable_state_cbor_hex` — a state document, and the one value §6.1.2
+    // forbids adopting — frozen even though C-09's own note claimed this field was untouched.
+    let real_body = unhex(s(i, "snapshot_body_cbor_hex"));
+
     let by_ref = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: None };
     let inline =
-        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(body.clone()) };
+        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(real_body.clone()) };
 
-    // Adoption runs against a CONFORMANT §6.1.2 body — an op set — because this vector's frozen
-    // `observable_state_cbor_hex` is a state DOCUMENT and predates C-09 (its own note still reads
-    // "?3: inline det_cbor(ObservableState)"). The response ENCODING assertions above are unchanged
-    // by C-09 and still reproduce the frozen bytes; only adoption moved.
-    let op_body = conformant_body(&sk);
-    let op_root = {
-        let folded = SnapshotBody::from_det_cbor(&op_body).unwrap().fold(Some(""), RECEIVER_NOW_MS).unwrap();
-        ObservableState::of(&folded).root()
-    };
-    let mut op_snapshot = snapshot.clone();
-    op_snapshot.root = op_root.clone();
-    op_snapshot.sig = sk.sign_domain(&[], &op_snapshot.signing_preimage());
+    // THE FOLD: adopted straight off the vector's own conformant body, against the vector's own
+    // (unchanged) root — no synthetic body or re-signed snapshot needed any more, since the real
+    // retention-set body folds to exactly the root this vector already froze.
+    let empty = VersionVector::new();
+    let adopted = inline
+        .adopt(&empty, &[], &[], RECEIVER_NOW_MS, |_| None)
+        .expect("the vector's own conformant inline body must adopt");
 
-    // The corrupted inline hint: discarded in favour of a fetch, never adopted.
-    let mut corrupt = op_body.clone();
+    // A corrupted inline hint is discarded in favour of a fetch, never adopted as-is.
+    let mut corrupt = real_body.clone();
     let last = corrupt.len() - 1;
     corrupt[last] ^= 0xff;
-    let hinted = FastJoin { snapshot: op_snapshot.clone(), floor, state: Some(corrupt) };
-    let empty = VersionVector::new();
-    let adopted = hinted
-        .adopt(&empty, &[], &[], RECEIVER_NOW_MS, |_| Some(op_body.clone()))
+    let hinted = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(corrupt) };
+    let root_addr = snapshot.root.clone();
+    let adopted_via_fetch = hinted
+        .adopt(&empty, &[], &[], RECEIVER_NOW_MS, |addr| {
+            (addr.as_bytes() == root_addr.as_bytes()).then(|| real_body.clone())
+        })
         .expect("a corrupted inline hint must fall back to the fetched body");
+
+    // C-11's non-conformant artifact: the pre-C-09 `state` document, proven REJECTED by a
+    // conformant caller rather than merely unused (mirrors how the C-06 bstr-wrapped op is
+    // handled).
+    let pre_c09 = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: None };
+    let pre_c09_rejected = refusal(
+        pre_c09
+            .adopt(&empty, &[], &[], RECEIVER_NOW_MS, |_| Some(state_body.clone()))
+            .expect_err("det_cbor(ObservableState) was adopted as a SnapshotBody"),
+    );
 
     Case::from([
         ("snapshot_preimage".into(), hex(&preimage)),
         ("snapshot_sig".into(), hex(&snapshot.sig)),
         ("snapshot_cbor".into(), hex(&snapshot.det_cbor())),
-        ("state_root".into(), hex(dmtap_sync::state_root_of(&body).as_bytes())),
+        ("state_root".into(), hex(dmtap_sync::state_root_of(&state_body).as_bytes())),
         ("fastjoin_cbor".into(), hex(&by_ref.det_cbor())),
         ("pull_cbor".into(), hex(&pull_envelope(&by_ref))),
         ("pull_inline_cbor".into(), hex(&pull_envelope(&inline))),
@@ -925,7 +921,8 @@ fn sync_fastjoin_pull_response(v: &Value) -> Case {
         ("state_address".into(), hex(snapshot.root.as_bytes())),
         ("adopted_state".into(), hex(&adopted.observable.det_cbor())),
         ("adopted_root".into(), hex(adopted.observable.root().as_bytes())),
-        ("op_body_cbor".into(), hex(&op_body)),
+        ("adopted_via_fetch_root".into(), hex(adopted_via_fetch.observable.root().as_bytes())),
+        ("op_body_cbor".into(), hex(&real_body)),
         (
             "corrupt_hint_unfetchable".into(),
             refusal(
@@ -934,6 +931,7 @@ fn sync_fastjoin_pull_response(v: &Value) -> Case {
                     .expect_err("adopted unverified bytes"),
             ),
         ),
+        ("pre_c09_state_document_rejected".into(), pre_c09_rejected),
         (
             "caller_at_covers_below_floor".into(),
             dmtap_sync::caller_is_below_floor(

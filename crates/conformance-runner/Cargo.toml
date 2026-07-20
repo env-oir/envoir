@@ -27,6 +27,11 @@ dmtap-clustersync = { path = "../dmtap-clustersync" }
 # `dmtap-core::pubobj` drives `pub_vectors.json`.
 dmtap-sync = { path = "../dmtap-sync" }
 envoir-gateway = { path = "../../gateway" }
+# `syncserve::SYNC1_EXT_VALUE_2` — checked against `SYNC.md` §4.1.2's frozen `sync-1/ext-value-2`
+# sub-token (correction C-13b) in `sync_ext_value_validate`, so a spelling drift between this node's
+# local convention and the now-normative wire spelling fails a test rather than going unnoticed.
+# The package is `envoir-node`; its `[lib]` target is named `dmtap`, so `use dmtap::...` below.
+envoir-node = { path = "../../node" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ciborium = "0.2"

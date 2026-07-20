@@ -841,72 +841,55 @@ func execFastJoinPullResponse(d driver, v any) map[string]string {
 	}
 	stateHex := str(in, "observable_state_cbor_hex")
 	byRef := mk(nil)
-	inline := mk(&stateHex)
 
-	// Adoption runs against a CONFORMANT §6.1.2 body — an op set — because this vector's frozen
-	// `observable_state_cbor_hex` is a state DOCUMENT and predates C-09. The response ENCODING
-	// assertions above are unchanged by C-09 and still reproduce the frozen bytes; only adoption
-	// moved.
-	opBody := d.conformantBody(str(in, "snapshot_signer_seed_hex"), str(in, "snapshot_signer_pubkey_hex"))
-	opRoot := must(d.in.ObservableStateRoot(must(d.in.SnapshotBodyFold(opBody, "", receiverNowMS))))
-	opUnsigned := unsigned
-	opUnsigned.Root = hexs(opRoot)
-	opSnapshot := must(d.in.SnapshotAssemble(opUnsigned,
-		sign(str(in, "snapshot_signer_seed_hex"), must(d.in.SnapshotSigningInput(opUnsigned)))))
-	opDecoded := must(d.in.SnapshotDecode(opSnapshot))
-	mkOp := func(state *string) []byte {
-		return must(d.in.FastJoinEncode(
-			dmtapsync.FastJoin{Snapshot: opDecoded, Floor: floor, State: state}))
-	}
+	// C-11: key 3 now carries a REAL §6.1.2 SnapshotBody — ten individually-signed ops (§6.2's
+	// retention set for this state) whose fold reproduces the UNCHANGED `snapshot_root_hex`. It
+	// previously carried `observable_state_cbor_hex` — a state document, and the one value §6.1.2
+	// forbids adopting — frozen even though C-09's own note claimed this field was untouched.
+	realBodyHex := str(in, "snapshot_body_cbor_hex")
+	realBody := unhex(realBodyHex)
+	inline := mk(&realBodyHex)
+	stateBody := unhex(stateHex)
+
+	// THE FOLD: adopted straight off the vector's own conformant body, against the vector's own
+	// (unchanged) root — no synthetic body or re-signed snapshot needed any more, since the real
+	// retention-set body folds to exactly the root this vector already froze.
+	adopted := must(d.in.FastJoinAdopt(inline, []dmtapsync.Mark{}, nil, nil, receiverNowMS, nil))
 
 	// A corrupted inline hint must be DISCARDED in favour of the fetched body, not adopted...
-	corrupt := append([]byte{}, opBody...)
+	corrupt := append([]byte{}, realBody...)
 	corrupt[len(corrupt)-1] ^= 0xff
 	corruptHex := hexs(corrupt)
-	hinted := mkOp(&corruptHex)
-	body := unhex(stateHex)
-	adopted := must(d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, receiverNowMS, opBody))
+	hinted := mk(&corruptHex)
+	adoptedViaFetch := must(d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, receiverNowMS, realBody))
 
 	// ...and with nothing fetchable, the same unverifiable hint fails CLOSED.
 	_, unfetchableErr := d.in.FastJoinAdopt(hinted, []dmtapsync.Mark{}, nil, nil, receiverNowMS, nil)
 
+	// C-11's non-conformant artifact: the pre-C-09 `state` document, proven REJECTED by a
+	// conformant caller rather than merely unused (mirrors how the C-06 bstr-wrapped op is
+	// handled).
+	_, preC09Err := d.in.FastJoinAdopt(byRef, []dmtapsync.Mark{}, nil, nil, receiverNowMS, stateBody)
+
 	return map[string]string{
-		"snapshot_preimage":        hexs(preimage),
-		"snapshot_sig":             hexs(sig),
-		"snapshot_cbor":            hexs(snapshot),
-		"state_root":               hexs(must(d.in.ObservableStateRoot(body))),
-		"fastjoin_cbor":            hexs(byRef),
-		"pull_cbor":                hexs(d.pullEnvelope(byRef)),
-		"pull_inline_cbor":         hexs(d.pullEnvelope(inline)),
-		"fastjoin_roundtrip":       hexs(must(d.in.FastJoinEncode(must(d.in.FastJoinDecode(byRef))))),
-		"state_address":            hexs(must(d.in.FastJoinStateAddress(byRef))),
-		"adopted_state":            hexs(adopted),
-		"adopted_root":             hexs(must(d.in.ObservableStateRoot(adopted))),
-		"op_body_cbor":             hexs(opBody),
-		"corrupt_hint_unfetchable": refusal(unfetchableErr),
+		"snapshot_preimage":               hexs(preimage),
+		"snapshot_sig":                    hexs(sig),
+		"snapshot_cbor":                   hexs(snapshot),
+		"state_root":                      hexs(must(d.in.ObservableStateRoot(stateBody))),
+		"fastjoin_cbor":                   hexs(byRef),
+		"pull_cbor":                       hexs(d.pullEnvelope(byRef)),
+		"pull_inline_cbor":                hexs(d.pullEnvelope(inline)),
+		"fastjoin_roundtrip":              hexs(must(d.in.FastJoinEncode(must(d.in.FastJoinDecode(byRef))))),
+		"state_address":                   hexs(must(d.in.FastJoinStateAddress(byRef))),
+		"adopted_state":                   hexs(adopted),
+		"adopted_root":                    hexs(must(d.in.ObservableStateRoot(adopted))),
+		"adopted_via_fetch_root":          hexs(must(d.in.ObservableStateRoot(adoptedViaFetch))),
+		"op_body_cbor":                    hexs(realBody),
+		"corrupt_hint_unfetchable":        refusal(unfetchableErr),
+		"pre_c09_state_document_rejected": refusal(preC09Err),
 		"caller_at_covers_below_floor": boolStr(must(d.in.CallerIsBelowFloor(
 			snapshot, d.coversMarks(str(in, "snapshot_covers_cbor_hex"))))),
 	}
-}
-
-// conformantBody builds a minimal but genuine §6.1.2 SnapshotBody: one signed LWW op, the same
-// shape SYNC-SNAP-03 freezes. Used where a vector freezes a response ENCODING but predates C-09's
-// body type.
-//
-// The op is signed through the DETACHED path, like everything else here — the seed never enters
-// the module (the no-raw-key rule).
-func (d driver) conformantBody(seedHex, authorHex string) []byte {
-	op := must(d.in.EncodeOp(dmtapsync.Op{
-		Kind:   3,
-		NS:     "",
-		Target: "doc1",
-		Field:  ptr("title"),
-		Value:  tagged(map[string]any{"tstr": "n"}),
-		HLC:    dmtapsync.HLC{Wall: 1700000100000, Counter: 4, Author: authorHex},
-	}))
-	si := must(d.in.OpSigningInput(op))
-	cose := must(d.in.OpAttachSignature(op, sign(seedHex, unhex(si.SigStructure))))
-	return must(d.in.SnapshotBodyEncode([]string{hexs(cose)}))
 }
 
 // SYNC-VAL-01 — the ext-value boundary from both sides (§4.1/§4.1.1, C-08).

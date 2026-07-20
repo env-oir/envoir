@@ -63,10 +63,11 @@
 //! detect that from the other end — a refusal is indistinguishable from an op that never arrived.
 //!
 //! So it is a **deployment** obligation, expressed where capability negotiation lives (the `sync-1`
-//! capability, `envoir-node`'s `syncserve`), not a runtime check: see
-//! [`EXT_VALUE_PROFILE`]. Until every engine in a namespace is on profile `2`, a
-//! product SHOULD keep carrying structured content as an opaque payload (§4.1.1) — which is exactly
-//! what the first adopter did, and why C-08 was found.
+//! capability, `envoir-node`'s `syncserve`), not a runtime check: see [`EXT_VALUE_PROFILE`] and
+//! `SYNC.md` §4.1.2's `sync-1/ext-value-2` sub-token (correction C-13b — the mechanism this note
+//! originally said the specification lacked). Until every engine in a namespace is confirmed on
+//! profile `2`, a product SHOULD keep carrying structured content as an opaque payload (§4.1.1) —
+//! which is exactly what the first adopter did, and why C-08 was found.
 
 #![forbid(unsafe_code)]
 
@@ -76,13 +77,13 @@
 /// * `2` — §18.3.6's full recursive `ext-value`: heterogeneous arrays **and** text-keyed maps,
 ///   bounded by [`detcbor::MAX_NESTING_DEPTH`]. **This crate is profile 2.**
 ///
-/// The number is this implementation's handle on the widening, **not** a wire field frozen by
-/// `SYNC.md`: the specification records C-08's mixed-deployment hazard and says a product SHOULD
-/// wait until every engine is updated, but does not define a sub-token, header or version field
-/// that would let one replica *ask* another which profile it is on. A deployment that needs the
-/// answer must carry it out of band — see `envoir-node`'s `syncserve::SYNC1_EXT_VALUE_2` for how
-/// this node expresses it as a `sync-1` sub-resource, and treat that spelling as a local convention
-/// until the specification freezes one.
+/// The number is this implementation's handle on the widening; the wire form of the same fact is
+/// now frozen by `SYNC.md` §4.1.2 (correction C-13b) as the `sync-1` sub-token `sync-1/ext-value-2`
+/// — see `envoir-node`'s `syncserve::SYNC1_EXT_VALUE_2`, whose spelling the specification adopted
+/// verbatim. It is carried in the `sync-1` capability token and/or the `GET /sync/vector` response's
+/// OPTIONAL `profiles` member (key 4), and is specified **observational, never a gate**: absence
+/// means "unknown", never "profile 1", and no node may refuse, downgrade or narrow its own
+/// validation on it.
 pub const EXT_VALUE_PROFILE: u8 = 2;
 
 pub mod body;

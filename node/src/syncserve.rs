@@ -41,25 +41,24 @@ pub const SYNC1_RESOURCE: &str = "sync-1";
 /// The ability verb paired with [`SYNC1_RESOURCE`] — the bearer is authorized to reconcile.
 pub const SYNC1_ABILITY: &str = "sync";
 
-/// The `sync-1` **sub-resource** by which a peer asserts it runs an engine on `ext-value` profile
-/// `2` — §18.3.6's full recursive type, text-keyed maps and heterogeneous arrays included
-/// (`SYNC.md` §14 C-08, [`dmtap_sync::EXT_VALUE_PROFILE`]).
+/// The `sync-1` **sub-token** by which a peer asserts it runs an engine on `ext-value` profile
+/// `2` — §18.3.6's full recursive type, text-keyed maps and heterogeneous arrays included. Now
+/// **normative** (`SYNC.md` §4.1.2, frozen by correction C-13b — this repo's own spelling became the
+/// spec's), carried in the `sync-1` capability token and/or [`vector_response`]'s `profiles` (key 4).
+/// [`dmtap_sync::EXT_VALUE_PROFILE`] is the same fact expressed as a version integer.
 ///
 /// # Why this exists, and what it is not
 ///
 /// C-08 is a **widening**, and a widening diverges by *rejection*: an engine on profile `1` answers
 /// `0x0A03` to an op a profile-`2` engine accepts, so the two hold different op sets while only one
-/// of them saw an error. The specification records that hazard and says a product SHOULD wait until
-/// every engine is updated — but it defines **no** sub-token, header or version field for asking a
-/// peer which profile it is on, so there is nothing frozen to implement. §4.1 mentions `sync-1`
-/// sub-tokens only for the (unrelated) per-op-vs-frame signing choice.
-///
-/// This constant is therefore a **local deployment convention**, spelled in the one place this node
-/// negotiates anything — the `sync-1` capability — so an operator running a mixed fleet has a
-/// handle to gate on, rather than a silent assumption. It is deliberately **not** enforced by
-/// [`sync1_authorizes`]: refusing to reconcile with a profile-`1` peer would break every deployment
-/// that has no nested values at all, which is most of them. Treat the spelling as provisional until
-/// `SYNC.md` freezes one.
+/// of them saw an error. §4.1.2 states the fix as **observational, never a gate**: absence means
+/// "unknown", never "profile 1", and a node MUST NOT refuse, downgrade or narrow its own validation
+/// on it — refusing profile-`1` peers would break every deployment with no nested values at all,
+/// which is most of them, and ops relay transitively, so even a peer that observes profile `2` on
+/// every direct neighbour has no proof about a replica two hops out. This node's one conformant use
+/// of the signal is exactly what [`sync1_peer_accepts_widened_ext_value`] is for: a **producer**
+/// deciding whether it is safe to mint a nested value at all. It is deliberately **not** consulted by
+/// [`sync1_authorizes`] — capability admission never depends on it.
 pub const SYNC1_EXT_VALUE_2: &str = "sync-1/ext-value-2";
 
 /// Whether `token` asserts its bearer runs an `ext-value` profile-`2` engine
@@ -564,13 +563,23 @@ pub fn handle(
     }
 }
 
-/// `GET /sync/vector` → `{1: node ik-pub, 2: [ns], 3: VersionVector}` (§5.2).
+/// `GET /sync/vector` → `{1: node ik-pub, 2: [ns], 3: VersionVector, ?4: [profiles]}` (§5.2, §4.1.2
+/// / C-13b).
+///
+/// Key `4` is the OPTIONAL `profiles` member new §4.1.2 adds: an array of `sync-1` sub-tokens this
+/// node's engine accepts. This crate's decoder implements §18.3.6's full recursive `ext-value` (C-08)
+/// unconditionally — there is no narrower profile-`1` mode anywhere in it — so every response
+/// advertises [`SYNC1_EXT_VALUE_2`] here. This is observational, never a gate (§4.1.2): a peer that
+/// does not send it back is not refused, downgraded, or narrowed against; the field exists only so a
+/// mixed-fleet operator has something to poll instead of an out-of-band belief.
 fn vector_response(gw: &SyncGateway) -> SyncResponse {
     let ns = SVal::Array(gw.replica.namespaces().into_iter().map(SVal::Text).collect());
+    let profiles = SVal::Array(vec![SVal::Text(SYNC1_EXT_VALUE_2.to_string())]);
     SyncResponse::cbor(encode(&SVal::Map(vec![
         (1, SVal::Bytes(gw.node.clone())),
         (2, ns),
         (3, gw.replica.vector().to_sval()),
+        (4, profiles),
     ])))
 }
 

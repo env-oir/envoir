@@ -1058,10 +1058,21 @@ fn fastjoin_pull_response(v: &Vector) -> Result<Verdict, String> {
     )?;
 
     // Inline (key 3): the bounded optimization, same descriptor, state carried alongside.
-    let inline =
-        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(state_body.clone()) };
+    //
+    // Correction C-11 regenerated this field's frozen bytes: key 3 now carries a real §6.1.2
+    // `SnapshotBody` — ten individually-signed ops, §6.2's retention set for this snapshot's state —
+    // where it previously carried `det_cbor(ObservableState)`, the one value §6.1.2 forbids
+    // adopting. `snapshot_body_cbor_hex` is that body; `observable_state_cbor_hex`/`state_body`
+    // (above) is the pre-C-09 shape, kept below only as the labelled non-conformant artifact this
+    // test proves is rejected.
+    let real_body_bytes = unhex(s(&v.input, "snapshot_body_cbor_hex")?)?;
+    let inline = FastJoin {
+        snapshot: snapshot.clone(),
+        floor: floor.clone(),
+        state: Some(real_body_bytes.clone()),
+    };
     eq(
-        "pull response with inline state",
+        "pull response with inline state (C-11 regenerated)",
         hex(&pull_envelope(&inline)).as_str(),
         s(&v.expected, "pull_response_with_inline_state_cbor_hex")?,
     )?;
@@ -1085,52 +1096,111 @@ fn fastjoin_pull_response(v: &Vector) -> Result<Verdict, String> {
     eq("state fetch address", s(&v.expected, "state_fetch_address_hex")?, s(&v.input, "snapshot_root_hex")?)?;
     eq("state fetch endpoint", s(&v.expected, "state_fetch_endpoint")?, "GET /sync/state/<root>")?;
 
-    // --- adoption: the body is an OP SET (§6.1.2 / C-09), not this vector's state document ------
+    // --- adoption: the body is a REAL §6.1.2 SnapshotBody, straight from the vector (C-11) --------
     //
-    // What this vector freezes is the RESPONSE ENCODING, and that is unchanged by C-09: key 3 is a
-    // `bstr` wrapping whatever the body bytes are, so every assertion above still reproduces
-    // byte-for-byte. What it CANNOT be used for any more is adoption. Its `observable_state_cbor_hex`
-    // is `det_cbor(ObservableState)` and its `snapshot_root_hex` is the hash of exactly those bytes
-    // — the pre-C-09 shape — and the vector was not regenerated when §6.1.2 landed (its own note
-    // still reads "?3: inline det_cbor(ObservableState)"). §10's row claims the C-09 change "does
-    // not change this vector's bytes — key 3 is absent here", which holds for
-    // `pull_response_cbor_hex` but NOT for `pull_response_with_inline_state_cbor_hex`, which the
-    // vector still carries. Recorded, not worked around: this repo does not own the vector file.
-    //
-    // So the adoption paths are exercised on a body that IS conformant — a real `SnapshotBody`
-    // built here from signed ops — and the frozen bytes are asserted to be unadoptable, which is
-    // the executable form of the statement above.
+    // Correction C-11 regenerated this vector: key 3 of `pull_response_with_inline_state_cbor_hex`
+    // used to carry `det_cbor(ObservableState)` — the one value §6.1.2 forbids adopting, and a
+    // *frozen* vector was pinning it, despite C-09's own note claiming the field was untouched
+    // ("key 3 is absent here" — true of `pull_response_cbor_hex`, false of this one). It now carries
+    // ten individually-signed ops — §6.2's retention set for this snapshot's state — whose FOLD
+    // reproduces the UNCHANGED `snapshot_root_hex`. The old framing survives only as a labelled
+    // non-conformant artifact (`inline_state_document_would_be_nonconformant_cbor_hex`), the same
+    // discipline C-06 uses for the `bstr`-wrapped op — and it is asserted REJECTED below, not merely
+    // unused.
     let caller = vector_from_hex(s(&v.input, "snapshot_covers_cbor_hex")?)?;
     // A caller that lacks everything: an empty vector is below any non-empty `covers`.
     let behind = VersionVector::new();
 
-    let (op_body, op_body_root) = conformant_body(&sk)?;
-    let mut op_snapshot = snapshot.clone();
-    op_snapshot.root = op_body_root.clone();
-    op_snapshot.sig = sk.sign_domain(&[], &op_snapshot.signing_preimage());
+    // `real_body_bytes` and `inline` are the ones built above for the encoding assertion; reused
+    // here for the adoption assertions, so there is exactly one `SnapshotBody` under test.
+    eq(
+        "snapshot_body_op_count",
+        v.input.get("snapshot_body_op_count").and_then(Value::as_u64),
+        Some(10),
+    )?;
+    let real_body = SnapshotBody::from_det_cbor(&real_body_bytes)
+        .map_err(|e| format!("the vector's own SnapshotBody does not decode: {e}"))?;
+    eq("real body member count", real_body.members().len(), 10)?;
+    eq(
+        "real body round-trips",
+        hex(&real_body.det_cbor()).as_str(),
+        s(&v.input, "snapshot_body_cbor_hex")?,
+    )?;
+    eq(
+        "inline_body_cbor_hex == snapshot_body_cbor_hex",
+        s(&v.expected, "inline_body_cbor_hex")?,
+        s(&v.input, "snapshot_body_cbor_hex")?,
+    )?;
+
+    // Every member is independently authentic — a malicious signer can omit an op from the body,
+    // never forge one — and its op-id matches what the vector lists.
+    for (member, want) in real_body.members().iter().zip(arr(&v.input, "snapshot_body_ops")?) {
+        let op = dmtap_sync::verify_op(member)
+            .map_err(|e| format!("a snapshot_body member is not an authentic COSE_Sign1: {e}"))?;
+        eq("op-id", hex(op.op_id().as_bytes()).as_str(), s(want, "op_id_hex")?)?;
+    }
+
+    // --- THE FOLD. This is the materially stronger check C-11 makes possible: fold the ten ops
+    // through the ordinary §4 op path and recompute — proving they PRODUCE the committed state,
+    // not merely that someone shipped the promised bytes. `root` is UNCHANGED by this correction.
+    let adopted_from_real =
+        real_body.verify_against_root(&snapshot.root, Some(&snapshot.ns), RECEIVER_NOW_MS).map_err(
+            |e| format!("the vector's own retention-set body does not fold to its own root: {e}"),
+        )?;
+    eq(
+        "folded state == vector's observable_state_cbor_hex",
+        hex(&adopted_from_real.observable.det_cbor()).as_str(),
+        s(&v.input, "observable_state_cbor_hex")?,
+    )?;
+    eq(
+        "folded root == inline_body_folds_to_root_hex",
+        hex(adopted_from_real.observable.root().as_bytes()).as_str(),
+        s(&v.expected, "inline_body_folds_to_root_hex")?,
+    )?;
+    eq(
+        "inline_body_folds_to_root_hex == snapshot_root_hex (UNCHANGED by C-11)",
+        s(&v.expected, "inline_body_folds_to_root_hex")?,
+        s(&v.input, "snapshot_root_hex")?,
+    )?;
+    eq(
+        "inline_body_is_an_op_set_not_a_state_document",
+        v.expected.get("inline_body_is_an_op_set_not_a_state_document").and_then(Value::as_bool),
+        Some(true),
+    )?;
+
+    // Adopted through the real `FastJoin::adopt` path — the inline hint verifies on its own, so the
+    // fetcher is never called.
+    let adopted = inline
+        .adopt(&behind, &[], &[], RECEIVER_NOW_MS, |_| None)
+        .map_err(|e| format!("the vector's own conformant inline body was not adopted: {e}"))?;
+    eq(
+        "adopted root == snapshot root (unchanged)",
+        hex(adopted.observable.root().as_bytes()).as_str(),
+        s(&v.input, "snapshot_root_hex")?,
+    )?;
+    eq(
+        "inline_body_is_cache_hint_verified_by_fold_then_recompute",
+        v.expected
+            .get("inline_body_is_cache_hint_verified_by_fold_then_recompute")
+            .and_then(Value::as_bool),
+        Some(true),
+    )?;
 
     // A corrupted inline hint is DISCARDED in favour of the by-reference fetch — one verification
     // path, and the hint is never a second source of truth.
-    let mut corrupted = op_body.clone();
+    let mut corrupted = real_body_bytes.clone();
     let last = corrupted.len() - 1;
     corrupted[last] ^= 0xff;
-    let hinted =
-        FastJoin { snapshot: op_snapshot.clone(), floor: floor.clone(), state: Some(corrupted) };
-    let adopted = hinted
+    let hinted = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(corrupted) };
+    let adopted_via_fetch = hinted
         .adopt(&behind, &[], &[], RECEIVER_NOW_MS, |addr| {
-            (addr.as_bytes() == op_body_root.as_bytes()).then(|| op_body.clone())
+            (addr.as_bytes() == snapshot.root.as_bytes()).then(|| real_body_bytes.clone())
         })
         .map_err(|e| format!("a corrupted inline hint was not discarded in favour of a fetch: {e}"))?;
-    // Fold-then-recompute, not hash-the-bytes: the adopted state is the one the ops PRODUCE.
     eq(
-        "adopted root == snapshot root",
-        hex(adopted.observable.root().as_bytes()).as_str(),
-        hex(op_body_root.as_bytes()).as_str(),
-    )?;
-    eq(
-        "inline_state_is_cache_hint_verified_against_root",
-        v.expected.get("inline_state_is_cache_hint_verified_against_root").and_then(Value::as_bool),
-        Some(true),
+        "fetched adoption root == snapshot root",
+        hex(adopted_via_fetch.observable.root().as_bytes()).as_str(),
+        s(&v.input, "snapshot_root_hex")?,
     )?;
     // ...and with no fetcher available, the SAME corrupted hint fails CLOSED (0x0A0C), never
     // adopting the bytes it could not verify.
@@ -1139,19 +1209,31 @@ fn fastjoin_pull_response(v: &Vector) -> Result<Verdict, String> {
         Err(e) => return Err(format!("unfetchable body gave {e}, want 0x0A0C")),
         Ok(_) => return Err("an unverifiable inline body was adopted".into()),
     }
-    // The C-09 statement, executed: this vector's frozen key-3 bytes are a state DOCUMENT, and a
-    // conformant caller cannot adopt them — a six-section array is not an array of COSE_Sign1
-    // envelopes, so it is refused at the framing rather than folded.
-    let pre_c09 = FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: None };
+
+    // --- C-11's non-conformant artifact, REJECTED not merely ignored --------------------------
+    //
+    // Reconstruct the pre-C-09 framing this vector used to freeze (key 3 = `det_cbor(ObservableState)`
+    // instead of a `SnapshotBody`), confirm it matches the vector's own labelled bytes byte-for-byte,
+    // and then run it through the real `adopt` path — mirroring how the C-06 bstr-wrapped-op case is
+    // handled — to prove a conformant caller refuses it rather than silently declining to use it.
+    let pre_c09 =
+        FastJoin { snapshot: snapshot.clone(), floor: floor.clone(), state: Some(state_body.clone()) };
+    eq(
+        "the NON-conformant pre-C-09 inline pull response",
+        hex(&pull_envelope(&pre_c09)).as_str(),
+        s(&v.expected, "inline_state_document_would_be_nonconformant_cbor_hex")?,
+    )?;
     match pre_c09.adopt(&behind, &[], &[], RECEIVER_NOW_MS, |_| Some(state_body.clone())) {
         Err(_) => {}
         Ok(_) => {
             return Err(
-                "det_cbor(ObservableState) was adopted as a SnapshotBody — the exact C-09 defect"
+                "det_cbor(ObservableState) was adopted as a SnapshotBody — the exact C-09 defect, \
+                 the one thing C-11 regenerated this vector to stop pinning"
                     .into(),
             )
         }
     }
+
     // A caller already at `covers` is NOT below the floor and must not be fast-joined at all.
     if caller_is_below_floor(&snapshot, &caller) {
         return Err("a caller at `covers` was judged below the floor".into());
@@ -1205,6 +1287,81 @@ fn ext_value_validate(v: &Vector) -> Result<Verdict, String> {
     )?;
     eq("reject error code", s(&v.expected, "reject_error_code")?, SyncError::OpInvalid.code_hex().as_str())?;
     eq("reject error name", s(&v.expected, "reject_error_name")?, SyncError::OpInvalid.name())?;
+
+    // --- C-14: the empty map 0xa0, and its non-empty int-keyed sibling still rejected ------------
+    //
+    // The two are already exercised by the accept/reject loops above (`map_empty`/`array_empty` in
+    // `accept`, `int_keyed_map` in `reject`) — this section ties that generic pass to the vector's
+    // own declarative statement of *why*: `0xa0` is key-type-agnostic on the wire (no entries to
+    // disagree about), so this decoder's choice to decode it as `SVal::Map([])` and treat the empty
+    // map as an ext-value regardless of key type is the vacuous-ambiguity resolution C-14 requires,
+    // not an accident of one decode path.
+    let empty_map = decode(&unhex(s(&v.expected, "empty_map_cbor_hex")?)?)
+        .map_err(|e| format!("empty_map_cbor_hex does not decode: {e}"))?;
+    eq("decoded empty map is SVal::Map([])", &empty_map, &SVal::Map(Vec::new()))?;
+    eq("empty map is_ext_value", empty_map.is_ext_value(), true)?;
+    eq(
+        "empty_map_is_ext_value",
+        v.expected.get("empty_map_is_ext_value").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    eq(
+        "empty_map_key_type_is_undeterminable",
+        v.expected.get("empty_map_key_type_is_undeterminable").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    // A map with an entry has a determinable key type, and the int-keyed case is STILL rejected —
+    // the vacuous ambiguity does not widen into a general "assume text keys" rule.
+    eq(
+        "nonempty_int_keyed_map_still_rejected",
+        v.expected.get("nonempty_int_keyed_map_still_rejected").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    if SVal::Map(vec![(1, SVal::Uint(1))]).is_ext_value() {
+        return Err("a non-empty integer-keyed map validated as an ext-value".into());
+    }
+
+    // --- C-14: the depth ceiling is 64, a MUST, checked before recursing, for ALL sync decoding ---
+    //
+    // Not just `value`: every sync object this crate decodes (ops, `PullResponse`, `SnapshotBody`,
+    // fingerprint requests) goes through the same `detcbor::decode`/`Decoder::item`, which enforces
+    // `MAX_NESTING_DEPTH` before it recurses — so the ceiling is a property of the decoder, not of
+    // one call site. Confirmed here directly against the frozen number, and demonstrated on a
+    // non-`value` decode path (a `SnapshotBody`, §6.1.2) so "all sync decoding" is not asserted only
+    // in the abstract.
+    eq(
+        "max_nesting_depth",
+        v.expected.get("max_nesting_depth").and_then(Value::as_u64),
+        Some(u64::from(dmtap_sync::detcbor::MAX_NESTING_DEPTH)),
+    )?;
+    eq("max_nesting_depth == 64", dmtap_sync::detcbor::MAX_NESTING_DEPTH, 64)?;
+    eq(
+        "max_nesting_depth_is_a_MUST",
+        v.expected.get("max_nesting_depth_is_a_MUST").and_then(Value::as_bool),
+        Some(true),
+    )?;
+    // A hostile `SnapshotBody` byte string nested one level past the ceiling is refused BEFORE
+    // recursion completes — `0x0A03`, never a stack exhaustion — proving the ceiling reaches a
+    // decode path other than the bare `value` grammar C-08 widened.
+    let mut over_deep = vec![0x81u8; dmtap_sync::detcbor::MAX_NESTING_DEPTH as usize + 2];
+    over_deep.push(0x00); // innermost: uint 0
+    match SnapshotBody::from_det_cbor(&over_deep) {
+        Err(_) => {}
+        Ok(_) => return Err("an over-deep byte string decoded as a SnapshotBody".into()),
+    }
+
+    // --- C-13(b): the `sync-1/ext-value-2` sub-token — observational, never a gate -----------------
+    eq("value_profile_subtoken", s(&v.expected, "value_profile_subtoken")?, "sync-1/ext-value-2")?;
+    eq(
+        "value_profile_subtoken == this engine's local convention",
+        s(&v.expected, "value_profile_subtoken")?,
+        dmtap::syncserve::SYNC1_EXT_VALUE_2,
+    )?;
+    eq(
+        "value_profile_subtoken_is_a_gate",
+        v.expected.get("value_profile_subtoken_is_a_gate").and_then(Value::as_bool),
+        Some(false),
+    )?;
 
     // The carrier op: the intended end-to-end shape — one LWW register per (slide, object), with
     // nesting used for REPRESENTATION while §4.1.1's merge boundary stays at the whole value.
@@ -1342,27 +1499,6 @@ fn snapshot_body_fold(v: &Vector) -> Result<Verdict, String> {
         s(&v.input, "observable_state_cbor_hex")?,
     )?;
     Ok(Verdict::Pass)
-}
-
-/// A minimal but genuine §6.1.2 [`SnapshotBody`] signed by `sk`, plus the root its fold produces.
-///
-/// Used where a vector freezes a *response encoding* but predates C-09's body type: the encoding
-/// assertions run against the frozen bytes, the adoption assertions run against this.
-fn conformant_body(sk: &IdentityKey) -> Result<(Vec<u8>, dmtap_core::id::ContentId), String> {
-    let op = SyncOp {
-        kind: dmtap_sync::OP_LWW_SET,
-        ns: String::new(),
-        target: "doc1".into(),
-        field: Some("title".into()),
-        value: Some(SVal::Text("n".into())),
-        hlc: Hlc { wall: 1_700_000_100_000, counter: 4, author: sk.public() },
-        observed: None,
-        reference: None,
-    };
-    let signed = dmtap_sync::sign_op(sk, &op).map_err(|e| format!("sign_op: {e}"))?;
-    let body = SnapshotBody::new(vec![signed]);
-    let state = body.fold(Some(""), RECEIVER_NOW_MS).map_err(|e| format!("fold: {e}"))?;
-    Ok((body.det_cbor(), dmtap_sync::state_root(&state)))
 }
 
 /// The §5.2.1 `pull` envelope for a fast-join answer: `{2: FastJoin}`.

@@ -537,40 +537,38 @@ const executors = {
         JSON.stringify({ snapshot: JSON.parse(sync.snapshot_decode(snapshot)), floor: floorHlc, state }),
       );
     const byRef = mk(null);
-    const inline = mk(i.observable_state_cbor_hex);
 
-    // Adoption runs against a CONFORMANT §6.1.2 body — an op set — because this vector's frozen
-    // `observable_state_cbor_hex` is a state DOCUMENT and predates C-09. The response ENCODING
-    // above is unchanged by C-09 and still reproduces the frozen bytes; only adoption moved.
-    const opBody = conformantBody(sign, i.snapshot_signer_seed_hex, i.snapshot_signer_pubkey_hex);
-    const opRoot = sync.observable_state_root(sync.snapshot_body_fold(opBody, '', RECEIVER_NOW_MS));
-    const opUnsigned = { ...unsigned, root: hex(opRoot) };
-    const opPre = JSON.parse(sync.snapshot_signing_input(JSON.stringify(opUnsigned))).preimage;
-    const opSnapshot = sync.snapshot_assemble(
-      JSON.stringify(opUnsigned),
-      sign(i.snapshot_signer_seed_hex, unhex(opPre)),
-    );
-    const mkOp = (state) =>
-      sync.fastjoin_encode(
-        JSON.stringify({
-          snapshot: JSON.parse(sync.snapshot_decode(opSnapshot)),
-          floor: floorHlc,
-          state,
-        }),
-      );
+    // C-11: key 3 now carries a REAL §6.1.2 SnapshotBody — ten individually-signed ops (§6.2's
+    // retention set for this state) whose fold reproduces the UNCHANGED `snapshot_root_hex`. It
+    // previously carried `observable_state_cbor_hex` — a state document, and the one value §6.1.2
+    // forbids adopting — frozen even though C-09's own note claimed this field was untouched.
+    const realBody = unhex(i.snapshot_body_cbor_hex);
+    const inline = mk(i.snapshot_body_cbor_hex);
+    const stateBody = unhex(i.observable_state_cbor_hex);
+
+    // THE FOLD: adopted straight off the vector's own conformant body, against the vector's own
+    // (unchanged) root — no synthetic body or re-signed snapshot needed any more, since the real
+    // retention-set body folds to exactly the root this vector already froze.
+    const adopted = sync.fastjoin_adopt(inline, '[]', '[]', '[]', RECEIVER_NOW_MS, undefined);
 
     // A corrupted inline hint must be DISCARDED in favour of the fetched body, not adopted...
-    const corrupt = Array.from(opBody);
+    const corrupt = Array.from(realBody);
     corrupt[corrupt.length - 1] ^= 0xff;
-    const hinted = mkOp(hex(new Uint8Array(corrupt)));
-    const body = unhex(i.observable_state_cbor_hex);
-    const adopted = sync.fastjoin_adopt(hinted, '[]', '[]', '[]', RECEIVER_NOW_MS, opBody);
+    const hinted = mk(hex(new Uint8Array(corrupt)));
+    const adoptedViaFetch = sync.fastjoin_adopt(hinted, '[]', '[]', '[]', RECEIVER_NOW_MS, realBody);
+
+    // C-11's non-conformant artifact: the pre-C-09 `state` document, proven REJECTED by a
+    // conformant caller rather than merely unused (mirrors how the C-06 bstr-wrapped op is
+    // handled).
+    const preC09Rejected = refusal(() =>
+      sync.fastjoin_adopt(byRef, '[]', '[]', '[]', RECEIVER_NOW_MS, stateBody),
+    );
 
     return {
       snapshot_preimage: preimage,
       snapshot_sig: hex(sig),
       snapshot_cbor: hex(snapshot),
-      state_root: hex(sync.observable_state_root(body)),
+      state_root: hex(sync.observable_state_root(stateBody)),
       fastjoin_cbor: hex(byRef),
       pull_cbor: hex(pullEnvelope(byRef)),
       pull_inline_cbor: hex(pullEnvelope(inline)),
@@ -578,11 +576,13 @@ const executors = {
       state_address: hex(sync.fastjoin_state_address(byRef)),
       adopted_state: hex(adopted),
       adopted_root: hex(sync.observable_state_root(adopted)),
-      op_body_cbor: hex(opBody),
+      adopted_via_fetch_root: hex(sync.observable_state_root(adoptedViaFetch)),
+      op_body_cbor: hex(realBody),
       // ...and with nothing fetchable, the same unverifiable hint fails CLOSED.
       corrupt_hint_unfetchable: refusal(() =>
         sync.fastjoin_adopt(hinted, '[]', '[]', '[]', RECEIVER_NOW_MS, undefined),
       ),
+      pre_c09_state_document_rejected: String(preC09Rejected),
       caller_at_covers_below_floor: String(
         sync.caller_is_below_floor(snapshot, JSON.stringify(coversMarks(i.snapshot_covers_cbor_hex))),
       ),
@@ -802,29 +802,6 @@ const executors = {
     };
   },
 };
-
-/**
- * A minimal but genuine §6.1.2 `SnapshotBody`: one signed LWW op, the same shape `SYNC-SNAP-03`
- * freezes. Used where a vector freezes a response ENCODING but predates C-09's body type.
- *
- * The op is signed through the DETACHED path, like everything else here — the seed never enters
- * the module (`substrate/BINDINGS.md` §3, the no-raw-key rule).
- */
-function conformantBody(sign, seedHex, authorHex) {
-  const op = sync.encode_op(
-    JSON.stringify({
-      kind: 3,
-      ns: '',
-      target: 'doc1',
-      field: 'title',
-      value: { tstr: 'n' },
-      hlc: { wall: 1700000100000, counter: 4, author: authorHex },
-    }),
-  );
-  const si = JSON.parse(sync.op_signing_input(op));
-  const cose = sync.op_attach_signature(op, sign(seedHex, unhex(si.sig_structure)));
-  return sync.snapshot_body_encode(JSON.stringify([hex(cose)]));
-}
 
 /** `{2: FastJoin}` — the §5.2.1 pull envelope, built with the generic CBOR helpers. */
 const pullEnvelope = (fastjoinBytes) =>

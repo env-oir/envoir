@@ -327,36 +327,61 @@ test('SYNC-FJ-01 — the frozen FastJoin / pull response, snapshot signed outsid
   assert.equal(got.state_root, v.input.snapshot_root_hex, 'the root IS the address of the body');
   assert.equal(got.fastjoin_cbor, v.expected.fastjoin_cbor_hex);
   assert.equal(got.pull_cbor, v.expected.pull_response_cbor_hex);
-  assert.equal(got.pull_inline_cbor, v.expected.pull_response_with_inline_state_cbor_hex);
+  assert.equal(
+    got.pull_inline_cbor,
+    v.expected.pull_response_with_inline_state_cbor_hex,
+    'C-11 regenerated this field: key 3 now carries a real SnapshotBody, not det_cbor(ObservableState)',
+  );
   assert.equal(got.fastjoin_roundtrip, got.fastjoin_cbor, 'decode/encode changed the FastJoin');
   assert.equal(got.state_address, v.expected.state_fetch_address_hex);
   assert.deepEqual(v.expected.pull_response_keys, [2], 'keys 1 and 2 are mutually exclusive');
   assert.equal(v.expected.ops_key_present, false);
-  // The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body.
-  //
-  // Adoption here runs against a CONFORMANT §6.1.2 body (an op set), not this vector's frozen
-  // `observable_state_cbor_hex`, which is a state DOCUMENT and predates C-09 — the vector was not
-  // regenerated when §6.1.2 landed. Every byte-exact ENCODING assertion above is unaffected and
-  // still holds; what moved is what a body IS.
-  assert.ok(got.op_body_cbor.length > 0, 'adoption must be exercised against a real op-set body');
+
+  // --- C-11: adoption runs against the vector's OWN real §6.1.2 body (ten signed ops), which
+  // folds to the UNCHANGED `snapshot_root_hex` — the materially stronger proof this correction
+  // makes possible, in place of the encoding-only check it replaces.
+  assert.equal(
+    got.op_body_cbor,
+    v.input.snapshot_body_cbor_hex,
+    'the traced body must be the vector\'s own frozen SnapshotBody, not a synthetic stand-in',
+  );
+  assert.equal(
+    got.adopted_root,
+    v.input.snapshot_root_hex,
+    'THE FOLD: the real retention-set body must reproduce the UNCHANGED snapshot root',
+  );
   assert.equal(
     got.adopted_root,
     hex(sync.observable_state_root(unhex(got.adopted_state))),
-    'the adopted state must be the one the fetched ops PRODUCE',
-  );
-  assert.notEqual(
-    got.adopted_state,
-    v.input.observable_state_cbor_hex,
-    'this vector predates C-09; its state document must not be adoptable as a body',
+    'the adopted root must be the one the folded ops PRODUCE, not a hash of the transferred bytes',
   );
   assert.equal(
     got.adopted_state,
-    hex(sync.snapshot_body_fold(unhex(got.op_body_cbor), '', RECEIVER_NOW_MS)),
-    'a corrupted inline hint must be discarded in favour of the fetched body, not adopted',
+    v.input.observable_state_cbor_hex,
+    'the fold of the real body must reproduce the SAME observable state the snapshot commits to',
   );
-  assert.equal(v.expected.inline_state_is_cache_hint_verified_against_root, true);
+  // The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body —
+  // and the fetch-fallback path reproduces the same (unchanged) root too.
+  assert.equal(
+    got.adopted_via_fetch_root,
+    v.input.snapshot_root_hex,
+    'a corrupted inline hint must fall back to a fetch of the SAME conformant body',
+  );
+  assert.equal(v.expected.inline_body_is_cache_hint_verified_by_fold_then_recompute, true);
   // ...and with nothing fetchable it fails CLOSED rather than trusting what it could not verify.
   assert.match(got.corrupt_hint_unfetchable, /0x0A0C/);
+
+  // --- C-11's non-conformant artifact: the pre-C-09 `state` document, REJECTED not merely unused.
+  assert.ok(
+    v.expected.inline_state_document_would_be_nonconformant_cbor_hex.length > 0,
+    'the labelled non-conformant artifact must be present in the vector',
+  );
+  assert.match(
+    got.pre_c09_state_document_rejected,
+    /^0x0A/,
+    'det_cbor(ObservableState) must be REFUSED as a SnapshotBody, the exact C-09 defect',
+  );
+
   assert.equal(
     got.caller_at_covers_below_floor,
     'false',
@@ -469,6 +494,34 @@ test('SYNC-VAL-01 — the whole recursive ext-value, accepted and refused from b
   // §4.1.1: nesting is REPRESENTATION. The merge unit is the whole value, so a concurrent write of
   // a different nested map replaces it entire — there is no per-key merge at this boundary.
   assert.equal(got.whole_value_wins, hex(sync.encode_value(JSON.stringify({ tmap: [['x', { int: 99 }]] }))));
+
+  // --- C-14: the empty map 0xa0 (key-type-ambiguous but vacuously so) and its non-empty int-keyed
+  // sibling, still rejected. Already exercised generically by the accept/reject loops above
+  // (`map_empty`/`array_empty` in accept, `int_keyed_map` in reject); this ties that pass to the
+  // vector's own declarative statement.
+  assert.equal(v.expected.empty_map_is_ext_value, true);
+  assert.equal(v.expected.empty_map_cbor_hex, 'a0');
+  assert.equal(v.expected.empty_map_key_type_is_undeterminable, true);
+  assert.equal(v.expected.nonempty_int_keyed_map_still_rejected, true);
+  assert.equal(got.accept_map_empty, 'true');
+  assert.equal(got.accept_array_empty, 'true');
+  assert.equal(got.reject_int_keyed_map, 'validates: false');
+
+  // --- C-14: the depth ceiling is 64, a MUST, checked before recursing, for ALL sync decoding —
+  // demonstrated here on a decode path OTHER than the bare `value` grammar (a SnapshotBody, §6.1.2)
+  // so "all sync decoding" is not asserted only in the abstract.
+  assert.equal(v.expected.max_nesting_depth, 64);
+  assert.equal(v.expected.max_nesting_depth_is_a_MUST, true);
+  const overDeep = new Uint8Array([...Array(66).fill(0x81), 0x00]);
+  assert.match(
+    refusal(() => sync.snapshot_body_decode(overDeep)),
+    /0x0A03/,
+    'a SnapshotBody nested past the ceiling must be refused BEFORE recursion completes',
+  );
+
+  // --- C-13(b): the `sync-1/ext-value-2` sub-token — observational, never a gate ------------------
+  assert.equal(v.expected.value_profile_subtoken, 'sync-1/ext-value-2');
+  assert.equal(v.expected.value_profile_subtoken_is_a_gate, false);
 });
 
 test('SYNC-SNAP-03 — the body is an op set, and a projection-adopter diverges', () => {

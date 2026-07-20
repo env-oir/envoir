@@ -418,6 +418,7 @@ dependencies = [
  "dmtap-naming",
  "dmtap-sync",
  "envoir-gateway",
+ "envoir-node",
  "serde",
  "serde_json",
 ]

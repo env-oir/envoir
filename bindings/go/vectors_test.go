@@ -503,33 +503,39 @@ func TestSyncFJ01FrozenFastJoinAndPullResponse(t *testing.T) {
 	eq(t, got["fastjoin_cbor"], str(exp, "fastjoin_cbor_hex"), "fastjoin")
 	eq(t, got["pull_cbor"], str(exp, "pull_response_cbor_hex"), "pull response")
 	eq(t, got["pull_inline_cbor"], str(exp, "pull_response_with_inline_state_cbor_hex"),
-		"pull response with inline state")
+		"pull response with inline state (C-11 regenerated: key 3 is now a real SnapshotBody)")
 	eq(t, got["fastjoin_roundtrip"], got["fastjoin_cbor"], "decode/encode changed the FastJoin")
 	eq(t, got["state_address"], str(exp, "state_fetch_address_hex"), "state fetch address")
 
-	// The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body.
-	//
-	// Adoption here runs against a CONFORMANT §6.1.2 body (an op set), not this vector's frozen
-	// `observable_state_cbor_hex`, which is a state DOCUMENT and predates C-09 — the vector was not
-	// regenerated when §6.1.2 landed. Every byte-exact ENCODING assertion above is unaffected and
-	// still holds; what moved is what a body IS.
-	if got["op_body_cbor"] == "" {
-		t.Error("adoption must be exercised against a real op-set body")
-	}
-	if got["adopted_state"] == str(in, "observable_state_cbor_hex") {
-		t.Error("this vector predates C-09; its state document must not be adoptable as a body")
-	}
+	// --- C-11: adoption runs against the vector's OWN real §6.1.2 body (ten signed ops), which
+	// folds to the UNCHANGED `snapshot_root_hex` — the materially stronger proof this correction
+	// makes possible, in place of the encoding-only check it replaces.
+	eq(t, got["op_body_cbor"], str(in, "snapshot_body_cbor_hex"),
+		"the traced body must be the vector's own frozen SnapshotBody, not a synthetic stand-in")
+	eq(t, got["adopted_root"], str(in, "snapshot_root_hex"),
+		"THE FOLD: the real retention-set body must reproduce the UNCHANGED snapshot root")
 	eq(t, got["adopted_root"],
 		hexs(must(f.in.ObservableStateRoot(unhex(got["adopted_state"])))),
-		"the adopted state must be the one the fetched ops PRODUCE")
-	eq(t, got["adopted_state"],
-		hexs(must(f.in.SnapshotBodyFold(unhex(got["op_body_cbor"]), "", receiverNowMS))),
-		"a corrupted inline hint must be discarded in favour of the fetched body, not adopted")
-	if m(exp, "inline_state_is_cache_hint_verified_against_root") != true {
+		"the adopted root must be the one the folded ops PRODUCE, not a hash of the transferred bytes")
+	eq(t, got["adopted_state"], str(in, "observable_state_cbor_hex"),
+		"the fold of the real body must reproduce the SAME observable state the snapshot commits to")
+	// The inline copy is a cache hint: corrupted, it is discarded in favour of the fetched body —
+	// and the fetch-fallback path reproduces the same (unchanged) root too.
+	eq(t, got["adopted_via_fetch_root"], str(in, "snapshot_root_hex"),
+		"a corrupted inline hint must fall back to a fetch of the SAME conformant body")
+	if m(exp, "inline_body_is_cache_hint_verified_by_fold_then_recompute") != true {
 		t.Error("the vector's own premise does not hold")
 	}
 	// ...and with nothing fetchable it fails CLOSED rather than trusting what it could not verify.
 	matches(t, got["corrupt_hint_unfetchable"], `0x0A0C`, "unverifiable hint, nothing fetchable")
+
+	// --- C-11's non-conformant artifact: the pre-C-09 `state` document, REJECTED not merely unused.
+	if str(exp, "inline_state_document_would_be_nonconformant_cbor_hex") == "" {
+		t.Error("the labelled non-conformant artifact must be present in the vector")
+	}
+	matches(t, got["pre_c09_state_document_rejected"], `^0x0A`,
+		"det_cbor(ObservableState) must be REFUSED as a SnapshotBody, the exact C-09 defect")
+
 	eq(t, got["caller_at_covers_below_floor"], "false",
 		"a caller already at `covers` is not below the floor")
 }
@@ -576,6 +582,54 @@ func TestSyncVAL01TheWholeRecursiveExtValue(t *testing.T) {
 	// of a different nested map replaces it entire — there is no per-key merge at this boundary.
 	rival := must(f.in.EncodeValue(json.RawMessage(`{"tmap":[["x",{"int":99}]]}`)))
 	eq(t, got["whole_value_wins"], hexs(rival), "the whole value must win, never a per-key merge")
+
+	// --- C-14: the empty map 0xa0 (key-type-ambiguous but vacuously so) and its non-empty
+	// int-keyed sibling, still rejected. Already exercised generically by the accept/reject loops
+	// above (`map_empty`/`array_empty` in accept, `int_keyed_map` in reject); this ties that pass
+	// to the vector's own declarative statement.
+	if m(exp, "empty_map_is_ext_value") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	eq(t, str(exp, "empty_map_cbor_hex"), "a0", "empty map bytes")
+	if m(exp, "empty_map_key_type_is_undeterminable") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	if m(exp, "nonempty_int_keyed_map_still_rejected") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	eq(t, got["accept_map_empty"], "true", "the empty map must be accepted as an ext-value")
+	eq(t, got["accept_array_empty"], "true", "the empty array must be accepted as an ext-value")
+	eq(t, got["reject_int_keyed_map"], "validates: false", "a non-empty int-keyed map is still rejected")
+
+	// --- C-14: the depth ceiling is 64, a MUST, checked before recursing, for ALL sync decoding —
+	// demonstrated here on a decode path OTHER than the bare `value` grammar (a SnapshotBody,
+	// §6.1.2) so "all sync decoding" is not asserted only in the abstract.
+	if numStr(exp, "max_nesting_depth") != "64" {
+		t.Errorf("max_nesting_depth: got %s, want 64", numStr(exp, "max_nesting_depth"))
+	}
+	if m(exp, "max_nesting_depth_is_a_MUST") != true {
+		t.Error("the vector's own premise does not hold")
+	}
+	overDeep := append([]byte{}, bytesOf(66, 0x81)...)
+	overDeep = append(overDeep, 0x00)
+	_, overDeepErr := f.in.SnapshotBodyDecode(overDeep)
+	matches(t, refusal(overDeepErr), `0x0A03`,
+		"a SnapshotBody nested past the ceiling must be refused BEFORE recursion completes")
+
+	// --- C-13(b): the `sync-1/ext-value-2` sub-token — observational, never a gate ----------------
+	eq(t, str(exp, "value_profile_subtoken"), "sync-1/ext-value-2", "the frozen sub-token spelling")
+	if m(exp, "value_profile_subtoken_is_a_gate") != false {
+		t.Error("the vector's own premise does not hold")
+	}
+}
+
+// bytesOf returns n copies of b.
+func bytesOf(n int, b byte) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = b
+	}
+	return out
 }
 
 func TestSyncSNAP03TheBodyIsAnOpSet(t *testing.T) {
