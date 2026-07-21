@@ -3,9 +3,10 @@
 //! (you are your own gateway).
 //!
 //! This ties to the fairness/accountability model (spec §7.7, §9): a gateway attributes abuse
-//! to an anonymous-but-accountable credential (ARC token / postage / operator stake) rather
-//! than an IP, which is what makes a shared or open gateway economically viable. The seam lets
-//! an operator plug in billing/quota + accountability checks; self-host imposes none.
+//! to an anonymous-but-accountable credential (ARC token / postage / attested operator identity
+//! and measured reputation) rather than an IP, which is what makes a shared or open gateway
+//! economically viable. The seam lets an operator plug in quota + accountability checks;
+//! self-host imposes none.
 
 use crate::AccountId;
 

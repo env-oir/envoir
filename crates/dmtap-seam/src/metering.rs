@@ -17,7 +17,10 @@ pub struct UsageEvent {
 }
 
 /// The metered dimensions — the genuine cost centers (spec §7, §9). Deliberately small.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Hash` is derived so an operator-side usage queue/accumulator (e.g. `dmtap-operator`) can key a
+/// dedup set or a running-total map on `(account, kind, ...)` without redefining this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageKind {
     /// Legacy egress: one message bridged DMTAP → SMTP. Carries the IP-reputation cost.
     GatewaySend,

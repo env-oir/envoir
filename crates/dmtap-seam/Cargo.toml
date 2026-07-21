@@ -2,8 +2,8 @@
 name = "dmtap-seam"
 version = "0.0.1"
 edition = "2021"
-license = "MIT"
-description = "The DMTAP operator seam — metering, provisioning, policy, and gateway-authz hooks with self-host defaults, consumed by a hosted control-plane (envoir-cloud) over a documented contract"
+license = "MIT OR Apache-2.0"
+description = "The DMTAP operator seam — metering, provisioning, policy, gateway-authz, and an optional billing-export hook, all with fully-functional self-host defaults, for any third-party operator over a documented contract"
 
 # std-only scaffold; no external deps so it builds offline.
 
