@@ -926,6 +926,47 @@ pub fn recovery_change_is_weakening(prev: &RecoveryPolicy, next: &RecoveryPolicy
         || threshold_min(&next.rotate_threshold) < threshold_min(&prev.rotate_threshold)
 }
 
+/// §1.4 rules 3–4, history-aware: is `next` a weakening change **given the policy chain so far**?
+///
+/// [`recovery_change_is_weakening`] compares only against the immediately-prior version, and that
+/// is not sufficient. Re-adding a factor that an earlier version **evicted** reads as purely
+/// additive against `prev`, so the eviction could be undone with `IK` alone — no guardian quorum,
+/// no veto window — silently reversing a change that required both to make.
+///
+/// The escalation that makes this matter: an attacker who transiently holds `IK` cannot *weaken*
+/// the policy (rule 3 forbids `IK`-alone weakening), but under the pairwise check they could
+/// **re-add a factor they control that was previously evicted**. The owner then detects the `IK`
+/// compromise and rotates `IK` (§1.5) — and the attacker's factor survives the rotation, because
+/// it is in the recovery policy rather than in the key. A temporary key compromise becomes a
+/// durable foothold in recovery.
+///
+/// So eviction must be **durable**: a method whose key material appears in any *earlier* version
+/// of the chain but not in the version immediately before `next` has been evicted, and re-adding
+/// it is a weakening change — quorum-gated and veto-able exactly like the eviction it undoes.
+///
+/// `history` is the chain in order, oldest first, ending at the version `next` supersedes. A
+/// verifier that holds only `prev` MUST NOT treat a re-addition as additive; if it cannot obtain
+/// the chain it MUST fail closed rather than assume (§1.4).
+pub fn recovery_change_is_weakening_vs_history(
+    history: &[RecoveryPolicy],
+    next: &RecoveryPolicy,
+) -> bool {
+    let Some(prev) = history.last() else {
+        return false; // genesis: nothing to weaken
+    };
+    if recovery_change_is_weakening(prev, next) {
+        return true;
+    }
+    // Every method that ever appeared but is absent from `prev` was evicted at some point.
+    let evicted: Vec<&RecoveryMethod> = history
+        .iter()
+        .flat_map(|p| p.methods.iter())
+        .filter(|m| !prev.methods.iter().any(|pm| pm == *m))
+        .collect();
+    // Re-introducing any of them undoes an eviction, so it is weakening.
+    next.methods.iter().any(|nm| evicted.iter().any(|em| *em == nm))
+}
+
 /// Authorize a recovery-policy change under the §1.4 rules 3–4 / §16.8 weakening guard. Clock and
 /// veto-window are **explicit parameters** — this core never reads a wall clock (§16.1).
 ///
@@ -1979,5 +2020,77 @@ mod recovery_threshold_order_tests {
         };
         pol.sign(&ik);
         assert_eq!(pol.verify(), Err(IdentityError::RecoveryThresholdInvalid));
+    }
+}
+
+#[cfg(test)]
+mod eviction_durability_tests {
+    use super::*;
+
+    fn pol(ik: &IdentityKey, version: u64, methods: Vec<RecoveryMethod>) -> RecoveryPolicy {
+        RecoveryPolicy {
+            suite: Suite::Classical,
+            ik: ik.public().to_vec(),
+            version,
+            methods,
+            recover_threshold: Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+            rotate_threshold: Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+            prev: None,
+            ts: 1_700_000_000_000,
+            sig: vec![],
+        }
+    }
+
+    /// Evicting a factor is correctly a WEAKENING change (quorum + veto window, §1.4 rules 3–4).
+    #[test]
+    fn eviction_is_weakening() {
+        let ik = IdentityKey::generate();
+        let a = RecoveryMethod::Device { device_key: vec![0xAA; 32], label: "a".into() };
+        let b = RecoveryMethod::Device { device_key: vec![0xBB; 32], label: "b".into() };
+        let v1 = pol(&ik, 1, vec![a.clone(), b.clone()]);
+        let v2 = pol(&ik, 2, vec![b.clone()]); // a evicted
+        assert!(recovery_change_is_weakening(&v1, &v2), "evicting a factor must be weakening");
+    }
+
+    /// FINDING: re-adding a PREVIOUSLY EVICTED factor reads as purely additive against the
+    /// immediately-prior version, so the eviction can be undone with `IK` alone — no quorum, no
+    /// veto window. That converts a temporary `IK` compromise into a durable foothold in the
+    /// recovery policy which survives the `IK` rotation the owner performs to recover.
+    #[test]
+    fn readding_an_evicted_factor_is_not_caught_against_prev_alone() {
+        let ik = IdentityKey::generate();
+        let a = RecoveryMethod::Device { device_key: vec![0xAA; 32], label: "a".into() };
+        let b = RecoveryMethod::Device { device_key: vec![0xBB; 32], label: "b".into() };
+        let v2 = pol(&ik, 2, vec![b.clone()]);            // a already evicted
+        let v3 = pol(&ik, 3, vec![b.clone(), a.clone()]); // a re-added
+        assert!(
+            !recovery_change_is_weakening(&v2, &v3),
+            "documents the gap: pairwise comparison sees re-addition as additive"
+        );
+    }
+
+    /// The history-aware check closes it: re-adding a factor evicted anywhere in the chain is
+    /// weakening, and therefore quorum-gated and veto-able like the eviction it undoes.
+    #[test]
+    fn readding_an_evicted_factor_is_weakening_against_history() {
+        let ik = IdentityKey::generate();
+        let a = RecoveryMethod::Device { device_key: vec![0xAA; 32], label: "a".into() };
+        let b = RecoveryMethod::Device { device_key: vec![0xBB; 32], label: "b".into() };
+        let v1 = pol(&ik, 1, vec![a.clone(), b.clone()]);
+        let v2 = pol(&ik, 2, vec![b.clone()]);
+        let v3 = pol(&ik, 3, vec![b.clone(), a.clone()]);
+        assert!(recovery_change_is_weakening_vs_history(&[v1, v2], &v3));
+    }
+
+    /// A factor never evicted may still be added freely — the rule must not make ordinary
+    /// additive hygiene quorum-gated.
+    #[test]
+    fn adding_a_never_evicted_factor_stays_additive() {
+        let ik = IdentityKey::generate();
+        let b = RecoveryMethod::Device { device_key: vec![0xBB; 32], label: "b".into() };
+        let c = RecoveryMethod::Device { device_key: vec![0xCC; 32], label: "c".into() };
+        let v1 = pol(&ik, 1, vec![b.clone()]);
+        let v2 = pol(&ik, 2, vec![b.clone(), c.clone()]);
+        assert!(!recovery_change_is_weakening_vs_history(&[v1], &v2));
     }
 }
