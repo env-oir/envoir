@@ -2,7 +2,7 @@
 
 Envoir is one implementation of **DMTAP** — the Decentralized Message Transfer & Access Protocol.
 The normative specification is **not** in this repository; it lives in the sibling
-**[env-oir/dmtap](https://github.com/env-oir/dmtap)** repo as 22 markdown sections plus a compiled
+**[env-oir/dmtap](https://github.com/vul-os/dmtap)** repo as 22 markdown sections plus a compiled
 `dmtap.pdf`, grounded against current standards (MLS, HPKE, JMAP, libp2p, Privacy Pass, WebAuthn,
 and more). Conformance is checked mechanically by
 [`crates/conformance-runner`](../crates/conformance-runner) against the spec's own conformance

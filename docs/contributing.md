@@ -6,7 +6,7 @@ Independent implementations must be buildable from the DMTAP specification alone
 reference in this repository (`node/`, `gateway/`, `crates/*`) is a proof and a set of libraries,
 **not** normative. Where the reference and the spec disagree, the spec governs, and the
 discrepancy is a bug. The spec lives in the sibling
-**[env-oir/dmtap](https://github.com/env-oir/dmtap)** repository; changes to protocol behavior
+**[env-oir/dmtap](https://github.com/vul-os/dmtap)** repository; changes to protocol behavior
 should generally start there, not in this repo's code.
 
 ## Before you start

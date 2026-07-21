@@ -12,7 +12,7 @@
   <a href="LICENSE-MIT"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-4C4DFF"></a>
   <a href="node/Cargo.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-1.75%2B-9A4DFF?logo=rust&logoColor=white"></a>
   <img alt="Status" src="https://img.shields.io/badge/status-pre--alpha%20reference-00E0C7">
-  <a href="https://github.com/env-oir/dmtap"><img alt="Spec: DMTAP" src="https://img.shields.io/badge/spec-DMTAP-4C4DFF"></a>
+  <a href="https://github.com/vul-os/dmtap"><img alt="Spec: DMTAP" src="https://img.shields.io/badge/spec-DMTAP-4C4DFF"></a>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 ## What is Envoir
 
-Envoir is the open-source reference implementation of **[DMTAP](https://github.com/env-oir/dmtap)**
+Envoir is the open-source reference implementation of **[DMTAP](https://github.com/vul-os/dmtap)**
 (the Decentralized Message Transfer & Access Protocol): one sovereign **keypair identity** for mail,
 chat, calendar, contacts, files, and groups, delivered over a peer-to-peer mesh and mixnet so that
 not even a global observer sees who talks to whom. A human address like `you@envoir.org` is only a
@@ -282,7 +282,7 @@ for `envoir-node`) is available — see its own [`README.md`](deploy/README.md) 
 ## Spec
 
 The normative specification is **not** in this repository — it lives in the sibling
-**[env-oir/dmtap](https://github.com/env-oir/dmtap)** repo: 22 markdown sections (identity, MOTE,
+**[env-oir/dmtap](https://github.com/vul-os/dmtap)** repo: 22 markdown sections (identity, MOTE,
 naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance, and more), a
 registry of **132 error codes** (§21.3–§21.11), grounded against current standards, plus a
 compiled **`dmtap.pdf`**. This repo is one implementation of that spec; conformance is checked

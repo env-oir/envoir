@@ -228,4 +228,4 @@ covered in the conformance suite.
   to "your own domain," and the gateway's own key-derived alias for reaching the legacy world with
   no naming lookup at all.
 - Spec §3, §3.12, §3.13, §21.3 (error codes `0x011E`/`0x011F`) in the sibling
-  [env-oir/dmtap](https://github.com/env-oir/dmtap) repository.
+  [env-oir/dmtap](https://github.com/vul-os/dmtap) repository.
