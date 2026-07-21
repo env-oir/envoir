@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE-MIT"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-4C4DFF"></a>
+  <a href="LICENSE-MIT"><img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-4C4DFF"></a>
   <a href="node/Cargo.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-1.75%2B-9A4DFF?logo=rust&logoColor=white"></a>
   <img alt="Status" src="https://img.shields.io/badge/status-pre--alpha%20reference-00E0C7">
   <a href="https://github.com/env-oir/dmtap"><img alt="Spec: DMTAP" src="https://img.shields.io/badge/spec-DMTAP-4C4DFF"></a>
@@ -311,6 +311,6 @@ is the gate before any production deployment. Treat everything here as pre-alpha
 
 ## License
 
-MIT — see [`LICENSE-MIT`](LICENSE-MIT). Some crate manifests currently declare
-`Apache-2.0 OR MIT` while dual-licensing (for its explicit patent grant) is under consideration; the
-project ships as MIT today.
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) — © VulOS. Dual-licensed (Apache
+adds an explicit patent grant); source and issues at
+[github.com/vul-os/envoir](https://github.com/vul-os/envoir).

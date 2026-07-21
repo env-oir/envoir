@@ -15,4 +15,4 @@ members = [
 
 [workspace.metadata.dmtap]
 spec = "../dmtap/"   # the DMTAP spec repo (sibling; the spec no longer lives in this repo)
-license = "MIT"
+license = "MIT OR Apache-2.0"
