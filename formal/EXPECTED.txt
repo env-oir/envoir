@@ -96,3 +96,35 @@ committer_fork.pv             false  not event(ForkDetected(k,pos_1,x,y))
 # property over accumulated per-member state — the same no-mutable-state wall
 # documented for suite_ratchet.pv above. It wants Tamarin. Partition healing is
 # out for the same reason.
+
+# --- cold-sender gate proof binding (§2.7 step 6/8(b2), §9.2a) ----------------
+# §2.7 checks the anti-abuse proof in the CLEARTEXT envelope, before decryption,
+# so every on-path observer sees it and could lift it. The ordering is safe only
+# because of a binding, and these rows are about the binding.
+#
+# (B) an ARC/PoW/stamp proof is bound to the envelope's ephemeral `sender_key`,
+# so a lifted proof is worthless under any other ephemeral.
+cold_gate_binding.pv          true   event(ColdGatePassed(k)) ==> event(ProofIssuedFor(k))
+cold_gate_binding.pv          false  not event(ColdGatePassed(k))
+#
+# (V1) the VOUCH is the one proof that structurally CANNOT be bound to
+# `sender_key` (the voucher cannot know a key the vouchee has not generated, and
+# a cleartext PoP over it would break sealed sender §6.2). It is bound to the
+# subject it names instead — §2.7 step 8(b2), ERR_VOUCH_SUBJECT_MISMATCH 0x0126.
+cold_gate_binding.pv          true   event(VouchAcceptedStrict(f)) ==> event(VoucherVouchedFor(f))
+cold_gate_binding.pv          false  not event(VouchAcceptedStrict(f))
+#
+# (V2) MUST BE FALSE, AND ITS FALSITY IS THE POINT. This is the same query against
+# the recipient §9.2a USED to specify, before the text was corrected. ProVerif
+# refutes it and prints the derivation:
+#
+#   goal reachable: b-event(VoucherVouchedFor(pk(skV[]))) && attacker(k)
+#                     -> event(VouchAcceptedLegacy(pk(k)))
+#
+# i.e. the voucher vouched for skV, and the pre-fix recipient accepts ANY key the
+# attacker holds. §9.2a had argued no binding was needed because a stolen vouch
+# "still fails identity authentication at step 8" — but step 8(a) verifies
+# Payload.sig under Payload.from, a field the THIEF chooses and signs, so it
+# succeeds. If this row ever turns TRUE, step 8(b2) has been removed from the
+# model and (V1) above has become a restatement rather than a result.
+cold_gate_binding.pv          false  event(VouchAcceptedLegacy(f)) ==> event(VoucherVouchedFor(f))

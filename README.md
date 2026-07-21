@@ -319,28 +319,36 @@ for `envoir-node`) is available — see its own [`README.md`](deploy/README.md) 
 ## Spec
 
 The normative specification is **not** in this repository — it lives in the sibling
-**[env-oir/dmtap](https://github.com/vul-os/dmtap)** repo: 22 markdown sections (identity, MOTE,
+**[env-oir/dmtap](https://github.com/vul-os/dmtap)** repo: 26 markdown sections (identity, MOTE,
 naming, transport, messaging, privacy, gateway, clients, anti-abuse, conformance, and more), a
-registry of **132 error codes** (§21.3–§21.11), grounded against current standards, plus a
+registry of **176 error codes** (§21 plus the extension profiles that register their own),
+grounded against current standards, plus a
 compiled **`dmtap.pdf`**. This repo is one implementation of that spec; conformance is checked
 mechanically by [`crates/conformance-runner`](crates/conformance-runner) against the spec's own
-**157-case conformance catalog** — see [Security & honesty](#security--honesty).
+**352-case conformance catalog** — see [Security & honesty](#security--honesty).
 
 ## Security & honesty
 
 Envoir's privacy model is **honest, not absolute**: recovery is a first-class, versioned, signed
 policy (spec §1.4) built from phrase, linked-device, and Shamir'd social-guardian factors that the
 owner composes and rotates — never a silent key-escrow backdoor. (The web client's onboarding shows
-a 12-word demo phrase; a real client uses the full SLIP-0039 word list.) Six ceremonies and
+a 12-word demo phrase; a real client uses the full SLIP-0039 word list.) Nine ceremonies and
 composed primitives — the deniable 1:1 handshake and its offline deniability, DMTAP-Auth sign-in,
-the MLS group key schedule, key-transparency append-only logs, and mixnet unlinkability — have
+the MLS group key schedule, key-transparency append-only logs, mixnet unlinkability, the §1.3
+suite-downgrade ratchet, §5.1 group-committer fork evidence, and the §2.7/§9.2a cold-sender gate
+binding — have
 machine-checked **ProVerif symbolic models** in [`formal/`](formal) (secrecy, mutual
 authentication, forward secrecy, deniability, replay/origin-binding, post-compromise security,
-inclusion/no-rollback/split-view soundness — see its README for exact property statements and
-honest limitations); the wire-format
-decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **157-case conformance
-suite** runs 148 cases to a pass today (0 failures, the other 9 each skipped with a documented
-reason) via [`crates/conformance-runner`](crates/conformance-runner); the node's anti-rollback/anti-abuse state
+inclusion/no-rollback/split-view soundness, fork-evidence soundness — see its README for exact
+property statements and honest limitations, including the stateful invariants ProVerif
+structurally cannot express and which are therefore *not* claimed), gated in CI by
+[`formal/check.sh`](formal/check.sh) against recorded verdicts so a proof that silently breaks
+fails the build instead of printing; the wire-format
+decoders are exercised by **`cargo-fuzz`** targets in [`fuzz/`](fuzz); a **352-case conformance
+suite** runs 171 cases to a pass today (0 failures; the other 181 are construction recipes each
+skipped with a documented reason rather than silently counted) via
+[`crates/conformance-runner`](crates/conformance-runner), alongside 84 generated wire vectors and
+39 pub/sync substrate vectors; the node's anti-rollback/anti-abuse state
 survives a restart instead of resetting to a weaker baseline; and `cargo test` (the default,
 non-patala workspace members) passes with every test green. [`integration/`](integration) adds
 dedicated adversarial tests on top. None of this substitutes for an **independent external

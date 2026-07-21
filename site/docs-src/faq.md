@@ -45,8 +45,9 @@ perfectly — hardened against a *global active* one. Read [privacy.md](privacy.
 quantified version of this answer; don't trust a shorter one, including this one.
 
 **Is this audited?**
-Not yet. Formal (ProVerif) proofs exist for the two hardest cryptographic ceremonies, every wire
-decoder is fuzzed, and a 157-case conformance suite exists (148 executing, 0 failures) — but none of that substitutes for the
+Not yet. Eight machine-checked ProVerif models cover the hardest cryptographic ceremonies, every wire
+decoder is fuzzed, and a 352-case conformance suite exists (171 executing, 0 failures; the other
+181 are construction recipes skipped with a documented reason) — but none of that substitutes for the
 independent external audit the project treats as a hard gate before any production deployment.
 See [security.md](security.md).
 

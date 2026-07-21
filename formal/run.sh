@@ -23,6 +23,7 @@ MODELS=(
   "mixnet_unlinkability.pv"
   "suite_ratchet.pv"
   "committer_fork.pv"
+  "cold_gate_binding.pv"
 )
 if [ "$#" -ge 1 ]; then MODELS=("$@"); fi
 

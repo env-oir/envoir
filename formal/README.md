@@ -9,8 +9,11 @@ properties against an active network attacker, with perfect cryptography
 abstracted as an equational theory.
 
 **Status: every query obtained a definitive result under ProVerif 2.05** — all
-security queries hold; the five non-vacuity controls are deliberately, and
-verifiably, *reachable* (see [Results](#results)). The verdicts are **gated**,
+security queries hold, and every deliberate control lands where it should — the
+seven non-vacuity controls are verifiably *reachable*, and the one **refutation**
+(`cold_gate_binding.pv`'s pre-fix recipient) is verifiably *broken*, which is why
+the fix above it is a result rather than a restatement (see
+[Results](#results)). The verdicts are **gated**,
 not merely printed: `./check.sh` compares a live run against `EXPECTED.txt` and
 fails on any deviation *in either direction*.
 
@@ -28,6 +31,9 @@ Spec sources (read-only):
   suite.
 - `../../dmtap/05-messaging.md` §5.1 — the per-group **committer** and the
   fork evidence that indicts an equivocating one.
+- `../../dmtap/02-mote.md` §2.7 and `../../dmtap/09-anti-abuse.md` §9.2a — the
+  **cold-sender gate**, and the binding that makes checking an anti-abuse proof
+  in the cleartext envelope safe against theft.
 
 Three models (`mls_group_keys`, `kt_append_only`, `mixnet_unlinkability`) are
 **tractable symbolic abstractions of the composed primitives** — an MLS-style
@@ -55,6 +61,7 @@ not claimed. See [Limitations](#limitations-of-the-symbolic-model-honest).
 | `mixnet_unlinkability.pv` | One honest mixnet hop, 2 inputs | observational equivalence | passive input↔output unlinkability |
 | `suite_ratchet.pv` | Suite high-water mark (§1.3) | reachability (correspondence) | authenticated mark advance, replay-resistance (A) — *not* monotonicity |
 | `committer_fork.pv` | Group committer fork evidence (§5.1) | reachability (correspondence) | evidence soundness (S) — an honest committer cannot be framed |
+| `cold_gate_binding.pv` | Cold-sender gate proof binding (§2.7, §9.2a) | reachability (correspondence) | bound-proof theft resistance (B), vouch subject binding (V1), **refutation** of the pre-fix recipient (V2) |
 
 **Why deniability is a separate file.** Deniability is an
 *indistinguishability* property, not a reachability one, so it is a ProVerif
@@ -306,6 +313,60 @@ can ever hold the quorum" is a statement about global state across a network
 split. Both hit the no-mutable-state wall. **Do not read this model as covering
 them.**
 
+### `cold_gate_binding.pv`
+
+§2.7 orders validation "cheapest-and-anonymous first" so a flood of cold junk is
+rejected before any asymmetric decryption. That ordering forces the anti-abuse
+proof to be checked in the **cleartext** envelope — so every on-path observer
+sees it, and §9.2a states the consequence plainly: a proof valid *in isolation*
+can be stripped from a victim's MOTE and re-attached to the attacker's own. The
+ordering is safe only because of a **binding**, and this model is about the
+binding rather than the ordering.
+
+**Proved (B) — bound proofs resist lifting.** ARC / PoW / stamp proofs are bound
+to the envelope's ephemeral `sender_key`, so passing the gate under a key implies
+the proof was issued *for that key*. A lifted proof is worthless under any other
+ephemeral.
+
+**Proved (V1) — vouch subject binding closes the remaining gap.** A vouch is the
+one proof that structurally **cannot** be bound to `sender_key`: the voucher
+cannot know a key the vouchee has not yet generated, and a cleartext
+proof-of-possession over it would break sealed sender (§6.2). It is bound to the
+subject it names instead — §2.7 step 8(b2), `ERR_VOUCH_SUBJECT_MISMATCH`
+(`0x0126`). With that check, an accepted vouch-backed sender really was vouched
+for.
+
+**Refuted (V2) — and the refutation is the point.** The same query against the
+recipient §9.2a *used to* specify comes back **false**, with the derivation:
+
+```
+goal reachable: b-event(VoucherVouchedFor(pk(skV[]))) && attacker(k)
+                  -> event(VouchAcceptedLegacy(pk(k)))
+```
+
+The voucher vouched for `skV`; the pre-fix recipient accepts **any** key the
+attacker holds. §9.2a had argued no binding was needed because a stolen vouch
+"still fails identity authentication at step 8" — but step 8(a) verifies
+`Payload.sig` under `Payload.from`, a field the *thief* chooses and signs with
+their own key, so it succeeds. An on-path observer could therefore lift a vouch
+and acquire, at zero cost, the tier §9.7 calls the only one an adversary "cannot
+buy with either compute or money".
+
+`legacy_recipient` is kept executable deliberately: it is not dead code and not
+an alternative implementation, it is the **retracted claim kept refutable**. A
+regression test for a fix is worth more when it can demonstrate the failure it
+prevents — if step 8(b2) were ever dropped, (V1) would fall to exactly the
+derivation printed for (V2).
+
+**Not modelled.** The ordering itself is not a ProVerif property: "cheap before
+expensive" is about computational cost, and the symbolic model has no notion of
+expense — writing the steps in order would prove only the order they were typed
+in. The decryption-DoS defence is a performance argument evidenced by benchmarks.
+The **post-decryption residual** §9.2a discloses is also unmodelled: because the
+subject check necessarily lands after decryption (`from` is not visible earlier),
+a lifted vouch still costs the recipient one decryption before rejection. This
+model proves the vouch is *rejected*, not that it was rejected *cheaply*.
+
 ## How to run
 
 Requires **ProVerif** (`opam install proverif`) — or Docker. `run.sh` resolves,
@@ -314,8 +375,8 @@ in order: a native `proverif` on `PATH`; else the local Docker image
 ProVerif via opam.
 
 ```sh
-./check.sh                            # run all eight, GATE against EXPECTED.txt
-./run.sh                              # all eight models, print output only
+./check.sh                            # run all nine, GATE against EXPECTED.txt
+./run.sh                              # all nine models, print output only
 ./run.sh mls_group_keys.pv            # one model
 proverif deniable_1to1.pv             # or invoke ProVerif directly
 proverif deniable_1to1_deniability.pv # equivalence: expect "true"
@@ -327,8 +388,11 @@ Reading the output: for a reachability `query`, ProVerif prints
 authenticated). For the equivalence models, expect
 `RESULT Observational equivalence is true`. A `false` result comes with an
 attack derivation — which for a *deliberate non-vacuity control* (the two
-`appMsg1/appMsg3` and the two `kt` reachability queries) is the intended,
-documented outcome, not a security failure.
+`appMsg1/appMsg3` queries, the two `kt` ones, `committer_fork`'s and the two in
+`cold_gate_binding`) is the intended, documented outcome, not a security failure.
+One `false` is stronger than a control: `cold_gate_binding`'s (V2) is a genuine
+**refutation** of a claim §9.2a has since retracted, kept executable so the fix
+that replaced it stays falsifiable.
 
 **Prefer `./check.sh` over reading the output.** `run.sh` invokes every model
 with `|| true`, so it exits 0 whether every property holds or one silently
@@ -445,6 +509,27 @@ RESULT not event(ForkDetected(k,pos_1,x,y)) is false.
   forks are *reachable*, i.e. an equivocating committer really can sign two
   conflicting Commits. Without this the soundness implication would hold over
   the empty set and prove nothing while reporting success.
+
+**`cold_gate_binding.pv`** (proof binding at the cold-sender gate):
+
+```
+RESULT event(ColdGatePassed(k)) ==> event(ProofIssuedFor(k)) is true.
+RESULT not event(ColdGatePassed(k)) is false.
+RESULT event(VouchAcceptedStrict(f)) ==> event(VoucherVouchedFor(f)) is true.
+RESULT not event(VouchAcceptedStrict(f)) is false.
+RESULT event(VouchAcceptedLegacy(f)) ==> event(VoucherVouchedFor(f)) is false.
+```
+- **(B)** a proof bound to the envelope's ephemeral `sender_key` cannot be lifted
+  onto another envelope — the theft §9.2a describes fails.
+- **(V1)** with §2.7 step 8(b2), an accepted vouch-backed sender really was
+  vouched for.
+- the two `not event(...) is false` lines — **non-vacuity controls**: honest
+  traffic does pass the gate, and step 8(b2) is a subject check rather than a
+  blanket rejection.
+- **(V2) `... is false` is the intended and load-bearing result** — the pre-fix
+  recipient is *refuted*, with an attack derivation showing the thief accepted
+  under any attacker-held key. It is what makes (V1) a result and not a
+  restatement of the code above it.
 
 **`mixnet_unlinkability.pv`** (passive input↔output unlinkability of one hop):
 

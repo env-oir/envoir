@@ -50,11 +50,14 @@ perfectly — hardened against a *global active* one. Read [privacy.md](privacy.
 quantified version of this answer; don't trust a shorter one, including this one.
 
 **Is this audited?**
-Not yet. Six machine-checked ProVerif models cover the deniable-1:1 handshake, DMTAP-Auth
-sign-in, MLS group keys, key-transparency append-only logs, and mixnet unlinkability; every wire
-decoder is fuzzed; a 157-case conformance suite exists (drawn against the spec's own registered
-error-code catalog), with 148 of 157 cases executing and passing today (0 failures); and
-`cargo test --workspace` runs 771 passing tests — but none of that substitutes for the independent
+Not yet. Nine machine-checked ProVerif models cover the deniable-1:1 handshake, DMTAP-Auth
+sign-in, MLS group keys, key-transparency append-only logs, mixnet unlinkability, the §1.3
+suite-downgrade ratchet, §5.1 group-committer fork evidence, and the §2.7/§9.2a cold-sender gate
+binding; every wire
+decoder is fuzzed; a 352-case conformance suite exists (drawn against the spec's own registered
+error-code catalog), with 171 of 352 cases executing and passing today (0 failures; the rest are
+construction recipes skipped with a documented reason); and
+`cargo test --workspace` runs 1493 passing tests across 95 binaries — but none of that substitutes for the independent
 external audit the project treats as a hard gate before any production deployment. See
 [security.md](security.md).
 

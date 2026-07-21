@@ -1,0 +1,195 @@
+(* ============================================================================
+   DMTAP cold-sender gate — proof binding  (spec: dmtap/02-mote.md §2.7,
+                                                  dmtap/09-anti-abuse.md §9.2a)
+   ----------------------------------------------------------------------------
+   WHAT IS AT STAKE. §2.7 orders validation "cheapest-and-anonymous first" so a
+   flood of cold junk is rejected before any asymmetric decryption. That ordering
+   forces the anti-abuse proof (§9, step 6) to be checked in the CLEARTEXT
+   envelope, before decryption — which means every on-path observer sees it.
+   §9.2a states the consequence plainly: a proof that is valid *in isolation*
+   can be stripped from a victim's MOTE and re-attached to the attacker's own.
+
+   So the ordering is only safe because of a BINDING, and this model is about the
+   binding, not the ordering.
+
+     (B) PROVEN -- BOUND PROOFS RESIST LIFTING. An ARC/PoW/stamp proof is bound
+         to the envelope's ephemeral `sender_key` (§9.2a), so passing the cold
+         gate under a given ephemeral key implies the proof was actually issued
+         for THAT key. Lifting it onto a freshly minted ephemeral fails.
+
+     (V1) PROVEN -- VOUCH SUBJECT BINDING CLOSES THE GAP. With §2.7 step 8(b2)
+         (`Payload.from == VouchToken.subject`), an accepted vouch-backed MOTE's
+         sender really was vouched for.
+
+     (V2) DELIBERATELY FALSE -- AND THE POINT OF THE FILE. The same query against
+         the PRE-FIX recipient, which §9.2a used to specify, is refuted with an
+         attack derivation: the thief is accepted while never having been
+         vouched for.
+
+   WHY (V2) IS MODELLED AT ALL. §9.2a previously argued that a stolen vouch
+   needs no binding because "the message still fails identity authentication at
+   §2.7 step 8". That reasoning was wrong, and wrong in a way that reads as
+   correct: step 8(a) verifies `Payload.sig` under `Payload.from` — a field the
+   THIEF chooses and signs with their own key, so it succeeds. A vouch travels in
+   the cleartext envelope by construction, so anyone on path can lift one and
+   obtain the strongest standing in the protocol (§9.7 bypasses VDF/PoW/stamp
+   entirely) at zero cost — in the tier §9.7 calls the one an adversary "cannot
+   buy with either compute or money".
+
+   A regression test for a fix is worth more when it can demonstrate the failure
+   it prevents. `legacy_recipient` is that demonstration: it is not dead code and
+   not an alternative implementation, it is the refuted claim kept executable, so
+   that if step 8(b2) were ever dropped the strict query would fall to exactly
+   the derivation printed for the legacy one.
+
+   WHY THE VOUCH IS THE EXCEPTION. §9.2a: a vouch CANNOT be bound to `sender_key`
+   at mint time — the voucher cannot know a key the vouchee has not yet
+   generated, and a cleartext proof-of-possession over `sender_key` would break
+   sealed sender (§6.2). It is bound to the SUBJECT IT NAMES instead, and that
+   check necessarily lands after decryption because `from` is not visible before
+   it. The contrast between (B) and (V1) is the whole design: bound proofs are
+   checked cheap-and-early, the vouch is the one that structurally cannot be, and
+   step 8(b2) is what pays for the exception.
+
+   HONEST SCOPE — what this model does NOT cover, and why.
+
+     * THE ORDERING ITSELF is not a ProVerif property. "Cheap checks before
+       expensive ones" is a statement about computational cost and control flow;
+       the symbolic model has no notion of expense, and writing the steps in
+       order would prove only the order they were typed in. The decryption-DoS
+       defence is a performance argument, evidenced by benchmarks, not by proof.
+     * THE POST-DECRYPTION RESIDUAL (§9.2a) is real and unmodelled: because the
+       subject check lands after decryption, a lifted vouch still costs the
+       recipient ONE decryption before rejection. §9.2a discloses this; the
+       model proves the vouch is rejected, not that it was rejected cheaply.
+     * PoW/stamp mechanics (epoch beacons, single-use redemption) are abstracted
+       to "a proof bound to one ephemeral key". Their own anti-replay is §9.4's
+       and §9.5.1's business.
+
+   Tool: ProVerif.   Run:  proverif cold_gate_binding.pv
+   ============================================================================ *)
+
+(* ---------- signatures ----------------------------------------------------- *)
+type skey.
+type pkey.
+fun  pk(skey): pkey.
+fun  sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksign(sign(m, k), pk(k)) = m.
+
+(* Randomized public-key encryption — the sealed `ciphertext` of §2.2. Randomized
+   because sealed sender (§6.2) requires that two seals of the same payload be
+   indistinguishable; a deterministic one would be linkable by re-encryption. *)
+fun  penc(bitstring, pkey, bitstring): bitstring.
+reduc forall m: bitstring, k: skey, r: bitstring; pdec(penc(m, pk(k), r), k) = m.
+
+(* pkey <-> bitstring, so identity keys can sit inside signed/sealed payloads. *)
+fun  kb(pkey): bitstring [data, typeConverter].
+
+free c: channel.
+
+(* ---------- events --------------------------------------------------------- *)
+event ProofIssuedFor(pkey).      (* an ARC/PoW/stamp proof minted for this sender_key *)
+event ColdGatePassed(pkey).      (* §2.7 step 6 accepted a bound proof under it        *)
+event VoucherVouchedFor(pkey).   (* the voucher really did vouch for this identity     *)
+event VouchAcceptedStrict(pkey). (* accepted WITH    §2.7 step 8(b2)                   *)
+event VouchAcceptedLegacy(pkey). (* accepted WITHOUT §2.7 step 8(b2) — the old text    *)
+
+(* ============================ bound proofs (§9.2a) ========================== *)
+
+(* An honest cold sender mints a FRESH ephemeral `sender_key` per message (§2.2)
+   and holds a proof bound to it. The proof is public the moment it is sent —
+   that is the premise of §9.2a, not a modelling shortcut. *)
+let bound_sender(skIssuer: skey) =
+  new skE: skey;                                   (* ephemeral sender_key       *)
+  event ProofIssuedFor(pk(skE));
+  out(c, (pk(skE), sign(kb(pk(skE)), skIssuer))).  (* envelope: key + its proof  *)
+
+(* §2.7 step 6, run BEFORE decryption. The proof is accepted only if the issuer
+   bound it to the very ephemeral key carrying it. An attacker holding a lifted
+   proof must present it under a key of their own, and this equality fails. *)
+let bound_gate(pkIssuer: pkey) =
+  in(c, (skpub: pkey, prf: bitstring));
+  let (=kb(skpub)) = checksign(prf, pkIssuer) in
+  event ColdGatePassed(skpub).
+
+(* ============================ the vouch path (§9.7) ======================== *)
+
+(* The voucher vouches for ONE honest identity. A vouch is a signed statement
+   naming its subject, and it travels in the cleartext envelope (§9.2a), so it is
+   handed straight to the attacker. *)
+let voucher(skW: skey, honest: pkey) =
+  event VoucherVouchedFor(honest);
+  out(c, sign(kb(honest), skW)).
+
+(* An honest vouched sender: seals a Payload whose `from` is its own identity and
+   whose `Payload.sig` verifies under that identity (§2.7 step 8(a)). *)
+let vouched_sender(skV: skey, pkR: pkey) =
+  new r: bitstring;
+  out(c, penc((kb(pk(skV)), sign(kb(pk(skV)), skV)), pkR, r)).
+
+(* ---- recipient WITH §2.7 step 8(b2) — the specified behaviour -------------- *)
+let strict_recipient(skR: skey, pkW: pkey) =
+  in(c, (token: bitstring, ct: bitstring));
+  (* step 6: the vouch is well-formed and from a voucher we accept *)
+  let kb(subj: pkey) = checksign(token, pkW) in
+  (* step 7: decrypt (the vouch could not be subject-checked before this) *)
+  let (kb(from: pkey), psig: bitstring) = pdec(ct, skR) in
+  (* step 8(a): Payload.sig under Payload.from — succeeds for the thief too *)
+  let (=kb(from)) = checksign(psig, from) in
+  (* step 8(b2): Payload.from == VouchToken.subject — the check under test *)
+  if from = subj then
+    event VouchAcceptedStrict(from).
+
+(* ---- recipient WITHOUT step 8(b2) — the claim §9.2a retracted -------------- *)
+(* Identical but for the missing subject check. Kept executable so the refutation
+   stays a live, printed attack derivation rather than a paragraph of prose. *)
+let legacy_recipient(skR: skey, pkW: pkey) =
+  in(c, (token: bitstring, ct: bitstring));
+  let kb(subj: pkey) = checksign(token, pkW) in
+  let (kb(from: pkey), psig: bitstring) = pdec(ct, skR) in
+  let (=kb(from)) = checksign(psig, from) in
+  event VouchAcceptedLegacy(from).
+
+(* ===================== queries ============================================ *)
+
+(* (B) BOUND-PROOF THEFT RESISTANCE. Passing the cold gate under an ephemeral key
+   implies the proof was issued for that key — a lifted proof is worthless under
+   any other ephemeral, which is exactly what §9.2a requires of ARC/PoW/stamp. *)
+query k: pkey;
+  event(ColdGatePassed(k)) ==> event(ProofIssuedFor(k)).
+
+(* (B-R) NON-VACUITY CONTROL — MUST be false. Honest traffic must actually pass
+   the gate, or (B) holds because nothing is ever accepted. *)
+query k: pkey;
+  event(ColdGatePassed(k)).
+
+(* (V1) VOUCH SUBJECT BINDING. With step 8(b2), an accepted vouch-backed sender
+   really was vouched for. *)
+query f: pkey;
+  event(VouchAcceptedStrict(f)) ==> event(VoucherVouchedFor(f)).
+
+(* (V1-R) NON-VACUITY CONTROL — MUST be false. The honest vouched sender is
+   accepted; step 8(b2) is a subject check, not a blanket rejection. *)
+query f: pkey;
+  event(VouchAcceptedStrict(f)).
+
+(* (V2) THE RETRACTED CLAIM — MUST be false, with an attack derivation. Without
+   step 8(b2), a thief who lifted the cleartext vouch is accepted while never
+   having been vouched for. This is the hole 0x0126 exists to close; its falsity
+   is what makes (V1) a result rather than a restatement. *)
+query f: pkey;
+  event(VouchAcceptedLegacy(f)) ==> event(VoucherVouchedFor(f)).
+
+(* ===================== main =============================================== *)
+process
+  new skIssuer: skey;      (* ARC issuer / PoW-beacon authority (§9.3, §9.4) *)
+  new skW: skey;           (* the voucher (§9.7)                             *)
+  new skV: skey;           (* the honest vouched sender's identity key       *)
+  new skR: skey;           (* the recipient                                  *)
+  out(c, pk(skIssuer)); out(c, pk(skW)); out(c, pk(skR));
+  ( !bound_sender(skIssuer)
+  | !bound_gate(pk(skIssuer))
+  | !voucher(skW, pk(skV))
+  | !vouched_sender(skV, pk(skR))
+  | !strict_recipient(skR, pk(skW))
+  | !legacy_recipient(skR, pk(skW)) )
