@@ -1170,10 +1170,17 @@ impl<T: Transport> Node<T> {
         // record the keyset entry so the mark is enumerated into the durable snapshot below.
         self.suite_contacts.insert(payload.from.clone());
 
-        let uid = self
-            .store
-            .deliver_mote(&payload, "INBOX", self.now)
-            .expect("INBOX always exists");
+        // §6.7: a `sensitive` payload is surfaced for an ephemeral view and never enters the store.
+        // It is still acked (see `InboundOutcome::acked`) — it was delivered, just not retained.
+        let uid = match self.store.deliver_mote(&payload, "INBOX", self.now) {
+            dmtap_mail::store::Delivery::Stored(u) => u,
+            dmtap_mail::store::Delivery::Ephemeral(_) => {
+                self.seen.record(id.as_bytes().to_vec(), from.to_vec(), self.now);
+                self.checkpoint();
+                return InboundOutcome::EphemeralDelivered { id: id.clone() };
+            }
+            dmtap_mail::store::Delivery::NoSuchMailbox => unreachable!("INBOX always exists"),
+        };
         self.seen.record(id.as_bytes().to_vec(), from.to_vec(), self.now);
         // dedup set grew and the suite mark advanced — persist so a post-restart redelivery is still
         // re-acked and a post-restart downgrade below this sender's mark is still rejected.
@@ -1386,7 +1393,7 @@ impl<T: Transport> Node<T> {
         for (group_id, result) in self.poll_group_messages() {
             if let Ok(plaintext) = result {
                 let payload = group_message_payload(&group_id, &plaintext);
-                if self.store.deliver_mote(&payload, "INBOX", self.now).is_some() {
+                if self.store.deliver_mote(&payload, "INBOX", self.now).is_stored() {
                     delivered += 1;
                 }
             }

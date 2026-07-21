@@ -58,15 +58,30 @@ pub enum InboundOutcome {
     /// is a storage-**operation** cap, never a crypto/access gate — §12.3). Self-host never reaches
     /// this: the default [`crate::UnlimitedStorage`] quota admits every write.
     StorageDenied { id: ContentId, reason: String },
+    /// §6.7 `sensitive`: decrypted and surfaced for an **ephemeral view**, deliberately never
+    /// written to the durable store. Acked, because it really was delivered — see [`Self::acked`].
+    EphemeralDelivered { id: ContentId },
     /// Cryptographically invalid/forged — discarded silently, **no** ack (§2.7a).
     Dropped(DropReason),
 }
 
 impl InboundOutcome {
     /// Whether this disposition sent an `ack` back to the sender. Ack is owed **only** for inbox
-    /// delivery (`Stored`) or a dedup of one already held (`Duplicate`); a `Deferred` cold MOTE and
-    /// a `Dropped` one are both unacked, differing only in retention (§19.3.1 step 9, §2.7a, §20.2).
+    /// delivery (`Stored`), a dedup of one already held (`Duplicate`), or a §6.7 `sensitive` message
+    /// surfaced ephemerally (`EphemeralDelivered`); a `Deferred` cold MOTE and a `Dropped` one are
+    /// both unacked, differing only in retention (§19.3.1 step 9, §2.7a, §20.2).
+    ///
+    /// `EphemeralDelivered` acks because the message WAS delivered — the recipient decrypted it and
+    /// showed it. Withholding the ack would make the sender retry until EXPIRED and report a
+    /// delivery failure for a message the recipient actually read, which would make `sensitive`
+    /// unusable in practice. The ack axis is "delivered", not "still on disk"; §6.7 changes the
+    /// retention, not the delivery.
     pub fn acked(&self) -> bool {
-        matches!(self, InboundOutcome::Stored { .. } | InboundOutcome::Duplicate { .. })
+        matches!(
+            self,
+            InboundOutcome::Stored { .. }
+                | InboundOutcome::Duplicate { .. }
+                | InboundOutcome::EphemeralDelivered { .. }
+        )
     }
 }

@@ -422,6 +422,37 @@ fn decode_state_map(token: &str) -> Option<BTreeMap<String, ModSeq>> {
     Some(map)
 }
 
+/// The outcome of projecting a decrypted MOTE into the store.
+///
+/// An enum rather than `Option<Uid>` so that "not persisted, by policy" cannot be confused with
+/// "no such mailbox" — and so the compiler makes every caller decide what to do about a §6.7
+/// `sensitive` message instead of silently treating it as a failed delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    /// Filed into the mailbox at this UID.
+    Stored(Uid),
+    /// §6.7 `sensitive`: rendered for an ephemeral view and deliberately **NOT** persisted. The
+    /// caller may show these bytes and MUST NOT write them to a durable store.
+    Ephemeral(Vec<u8>),
+    /// The named mailbox does not exist.
+    NoSuchMailbox,
+}
+
+impl Delivery {
+    /// The UID if the message was actually persisted. `Ephemeral` deliberately yields `None`.
+    pub fn uid(&self) -> Option<Uid> {
+        match self {
+            Delivery::Stored(u) => Some(*u),
+            _ => None,
+        }
+    }
+
+    /// Whether the message reached the store. False for both `Ephemeral` and `NoSuchMailbox`.
+    pub fn is_stored(&self) -> bool {
+        matches!(self, Delivery::Stored(_))
+    }
+}
+
 /// In-memory reference MailStore. Deterministic UIDVALIDITY, INBOX + the five SPECIAL-USE
 /// folders created up front (so a fresh client sees the standard layout).
 #[derive(Debug, Clone)]
@@ -466,11 +497,32 @@ impl MemoryStore {
     /// The MOTE is rendered to RFC 5322 by [`mime::render_rfc5322`] and filed into `mailbox`
     /// (default INBOX). This is the concrete MOTE-store → mailbox mapping of spec §8.2:
     /// "the node decrypts MOTEs and presents normal RFC 5322/MIME to the authenticated client."
-    pub fn deliver_mote(&mut self, payload: &Payload, mailbox: &str, ts: TimestampMs) -> Option<Uid> {
+    ///
+    /// **§6.7 `sensitive` is honored here**, and this is the right place for it: every decrypted
+    /// payload that becomes a stored message passes through this one funnel, so refusing here means
+    /// a `sensitive` MOTE never enters the store at all — rather than being written and deleted,
+    /// which is not the same thing on any real medium. The rendered bytes are still returned, as
+    /// [`Delivery::Ephemeral`], because §6.7 asks for an ephemeral *view*, not for the message to be
+    /// discarded: "held in memory for an ephemeral view and dropped, never written to the durable
+    /// MOTE store".
+    pub fn deliver_mote(
+        &mut self,
+        payload: &Payload,
+        mailbox: &str,
+        ts: TimestampMs,
+    ) -> Delivery {
         let raw = mime::render_rfc5322(payload, ts);
+        // Check BEFORE touching the mailbox. Honoring the flag is cooperative (§6.6 item 8) — a
+        // compromised recipient can still copy what it can read — but a conformant one must not
+        // create the durable artifact in the first place.
+        if payload.headers.sensitive == Some(true) {
+            return Delivery::Ephemeral(raw);
+        }
         let flags = vec![Flag::Recent];
-        let mb = self.mailboxes.get_mut(mailbox)?;
-        Some(mb.append(raw, flags, ts))
+        match self.mailboxes.get_mut(mailbox) {
+            Some(mb) => Delivery::Stored(mb.append(raw, flags, ts)),
+            None => Delivery::NoSuchMailbox,
+        }
     }
 
     /// File raw RFC 5322 bytes (from SMTP submission / IMAP APPEND) into a mailbox.
@@ -550,6 +602,64 @@ mod tests {
         assert!(s.mailbox("INBOX").is_some());
         assert_eq!(s.by_role(SpecialUse::Sent), Some("Sent"));
         assert_eq!(s.by_role(SpecialUse::Trash), Some("Trash"));
+    }
+
+    /// §6.7 (`sensitive`, MAY-send / MUST-honor): a message marked `sensitive` MUST NOT be written
+    /// to the durable store. It is rendered for an ephemeral view and dropped.
+    ///
+    /// Enforced at `deliver_mote` because that is the single funnel every decrypted payload passes
+    /// through on its way to becoming a stored message — so refusing here means the message never
+    /// enters the store at all, rather than being written and then deleted, which is not the same
+    /// thing on any real medium.
+    #[test]
+    fn a_sensitive_mote_is_rendered_but_never_stored() {
+        use dmtap_core::mote::{Headers, Payload};
+        let mk = |sensitive: Option<bool>| Payload {
+            from: vec![9u8; 32],
+            sig: vec![0u8; 64],
+            headers: Headers {
+                thread: None,
+                subject: Some("private".into()),
+                mime: None,
+                cc: vec![],
+                ext: vec![],
+                sensitive,
+            },
+            body: b"burn after reading".to_vec(),
+            refs: vec![],
+            attach: vec![],
+            expires: None,
+        };
+
+        let mut s = MemoryStore::empty();
+
+        // Positive control: an ordinary message IS stored, so the assertion below is about the flag
+        // and not about a delivery path that never worked.
+        let ordinary = s.deliver_mote(&mk(None), "INBOX", 1_700_000_000_000);
+        assert!(ordinary.is_stored(), "an unflagged message must be stored");
+        assert_eq!(s.mailbox("INBOX").unwrap().exists(), 1);
+
+        // sensitive = Some(false) is an explicit "not sensitive" and must behave like absent.
+        assert!(s.deliver_mote(&mk(Some(false)), "INBOX", 1_700_000_000_000).is_stored());
+        assert_eq!(s.mailbox("INBOX").unwrap().exists(), 2);
+
+        // The flag itself: rendered, not retained.
+        let out = s.deliver_mote(&mk(Some(true)), "INBOX", 1_700_000_000_000);
+        match &out {
+            Delivery::Ephemeral(raw) => {
+                assert!(
+                    !raw.is_empty(),
+                    "§6.7 asks for an ephemeral VIEW — the bytes must still be produced, not discarded"
+                );
+            }
+            other => panic!("a sensitive message must not be stored, got {other:?}"),
+        }
+        assert_eq!(out.uid(), None, "an unstored message has no UID to report");
+        assert_eq!(
+            s.mailbox("INBOX").unwrap().exists(),
+            2,
+            "the store must be untouched — the sensitive message never entered it"
+        );
     }
 
     #[test]

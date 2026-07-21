@@ -20,7 +20,7 @@ use dmtap::auth::{
 use dmtap::dmtap_core::deniable::DeniablePayload;
 use dmtap::identity::{DeviceCert, Identity, IdentityKey};
 use dmtap::inbound::InboundOutcome;
-use dmtap::mote::{Headers, Kind, SealKeypair};
+use dmtap::mote::{Headers, Kind, MoteDraft, SealKeypair};
 use dmtap::names::{DmtapTxtRecord, InMemoryKeyPackages, InMemoryKtLog, InMemoryResolver};
 use dmtap::naming::{seal_key_bundle, ResolveError};
 use dmtap::node::Node;
@@ -749,4 +749,57 @@ fn boxed_transport_reports_local_addr_and_unreachable() {
     assert_eq!(boxed.local_addr(), b"alice".to_vec(), "boxed transport forwards local_addr");
     // Unknown peer is unreachable — the trait-object forwards send() faithfully.
     assert_eq!(boxed.send(b"ghost", Frame::Ack(vec![1])), Err(TransportError::Unreachable));
+}
+
+/// §6.7 `sensitive` (MAY-send / MUST-honor), end-to-end across two real nodes: the message is
+/// delivered and ACKED, but never enters the recipient's durable store.
+///
+/// Both halves matter and they pull in opposite directions. Not persisting is the point of the
+/// flag. Still ACKING is what keeps it usable: the ack axis is "was this delivered", not "is it
+/// still on disk", so withholding the ack would make the sender retry to EXPIRED and report a
+/// delivery failure for a message the recipient actually read.
+#[test]
+fn a_sensitive_message_is_delivered_and_acked_but_never_stored() {
+    let net = InMemoryNetwork::new();
+    let bob_ik = IdentityKey::generate();
+    let bob_seal = SealKeypair::generate();
+    let bob_ik_pub = bob_ik.public();
+    let bob_seal_pub = *bob_seal.public();
+    let mut bob_node = Node::with_identity(bob_ik, bob_seal, net.endpoint(bob_ik_pub.clone()));
+
+    let alice_ik = IdentityKey::generate();
+    let alice_seal = SealKeypair::generate();
+    let alice_ik_pub = alice_ik.public();
+    let alice_seal_pub = *alice_seal.public();
+    let mut alice = Node::with_identity(alice_ik, alice_seal, net.endpoint(alice_ik_pub.clone()));
+    bob_node.add_contact(&alice_ik_pub, alice_seal_pub);
+    alice.add_contact(&bob_ik_pub, bob_seal_pub);
+
+    // Positive control first: an ordinary message IS stored, so the assertion below is about the
+    // flag rather than about a delivery path that never worked in this fixture.
+    let mut plain = MoteDraft::new(Kind::Mail, 1_700_000_000_000, b"ordinary".to_vec());
+    plain.headers.subject = Some("ordinary".into());
+    alice.send_with_draft(&bob_ik_pub, plain).expect("send ordinary");
+    let out = bob_node.poll();
+    assert!(matches!(out[0], InboundOutcome::Stored { .. }));
+    assert_eq!(bob_node.inbox().exists(), 1);
+
+    // Now the flagged one.
+    let mut secret = MoteDraft::new(Kind::Mail, 1_700_000_000_001, b"burn after reading".to_vec());
+    secret.headers.subject = Some("private".into());
+    secret.headers.sensitive = Some(true);
+    alice.send_with_draft(&bob_ik_pub, secret).expect("send sensitive");
+
+    let out = bob_node.poll();
+    assert!(
+        matches!(out[0], InboundOutcome::EphemeralDelivered { .. }),
+        "a sensitive MOTE must be surfaced ephemerally, got {:?}",
+        out[0]
+    );
+    assert!(out[0].acked(), "it WAS delivered — withholding the ack would retry it to EXPIRED");
+    assert_eq!(
+        bob_node.inbox().exists(),
+        1,
+        "the inbox must still hold only the ordinary message — the sensitive one was never stored"
+    );
 }
