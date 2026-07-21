@@ -42,6 +42,10 @@ pub enum IdentityError {
     BadKeyLength,
     #[error("canonical CBOR decode failed: {0}")]
     BadEncoding(#[from] CborError),
+    /// §1.4 rule 2 (`ERR_RECOVERY_THRESHOLD_INVALID`, `0x010C`): some kind of factor can ROTATE
+    /// the policy more cheaply than it can RECOVER — the stolen-factor lockout the rule forbids.
+    #[error("rotate_threshold is weaker than recover_threshold for some factor kind (§1.4 rule 2)")]
+    RecoveryThresholdInvalid,
 }
 
 // --- low-level Ed25519 helpers -------------------------------------------------------------
@@ -592,6 +596,50 @@ pub enum MethodPredicate {
 }
 
 impl MethodPredicate {
+    /// The factor KIND, ignoring any count. Kinds are incomparable to one another (§1.4 rule 2).
+    fn kind(&self) -> u8 {
+        match self {
+            MethodPredicate::Phrase => 0,
+            MethodPredicate::Devices(_) => 1,
+            MethodPredicate::Guardians(_) => 2,
+            MethodPredicate::Ik => 3,
+        }
+    }
+
+    /// How many factors of this kind the predicate demands (1 for the count-less kinds).
+    fn count(&self) -> u8 {
+        match self {
+            MethodPredicate::Devices(n) | MethodPredicate::Guardians(n) => *n,
+            MethodPredicate::Phrase | MethodPredicate::Ik => 1,
+        }
+    }
+}
+
+impl Threshold {
+    /// §1.4 rule 2: is `self` (rotate) at least as strong as `other` (recover)?
+    ///
+    /// `any_of` is a DISJUNCTION over heterogeneous predicates, so it admits no total order —
+    /// `{Phrase}` and `{Ik, Guardians(2)}` are incomparable and "which is greater" has no answer.
+    /// §1.4 therefore defines the comparison narrowly: for every same-KIND pair, rotate's count
+    /// must be >= recover's. Different kinds impose no constraint on each other.
+    ///
+    /// This catches the shape the rule exists to forbid — the same kind of factor rotating more
+    /// cheaply than it recovers, e.g. recover={Guardians(2)} with rotate={Guardians(1)}, under
+    /// which any two guardians could evict the owner — while admitting policies that are safe
+    /// under the rule's own rationale, such as recover={Phrase} with rotate={Ik, Guardians(2)}
+    /// (the phrase-holder recovers but cannot rotate). An earlier attempt at this check used
+    /// subset semantics and rejected exactly that policy, which is how the ambiguity surfaced.
+    pub fn at_least_as_strong_as(&self, other: &Threshold) -> bool {
+        other.any_of.iter().all(|p| {
+            self.any_of
+                .iter()
+                .filter(|q| q.kind() == p.kind())
+                .all(|q| q.count() >= p.count())
+        })
+    }
+}
+
+impl MethodPredicate {
     fn to_cv(&self) -> Cv {
         let (method, count) = match self {
             MethodPredicate::Phrase => ("phrase", 1u64),
@@ -703,13 +751,19 @@ impl RecoveryPolicy {
 
     /// Verify the policy signature under `ik`. Does not itself evaluate the (reactive) quorum
     /// path — that lives in the recovery flow (§1.4). Also fails closed if the structural
-    /// invariant `rotate_threshold ⊇ recover_threshold` is obviously violated (empty rotate).
+    /// invariant `rotate_threshold ≥ recover_threshold` is violated (§1.4 rule 2, `0x010C`).
     pub fn verify(&self) -> Result<(), IdentityError> {
         if !self.suite.is_supported() {
             return Err(IdentityError::UnsupportedSuite(self.suite.as_u8()));
         }
         if self.rotate_threshold.any_of.is_empty() {
             return Err(IdentityError::Malformed("rotate_threshold must not be empty"));
+        }
+        // §1.4 rule 2, ERR_RECOVERY_THRESHOLD_INVALID (0x010C). Only the degenerate empty-rotate
+        // case was checked before, because "rotate >= recover" was stated over a structure with no
+        // total order and so could not be implemented; §1.4 now defines the comparison.
+        if !self.rotate_threshold.at_least_as_strong_as(&self.recover_threshold) {
+            return Err(IdentityError::RecoveryThresholdInvalid);
         }
         verify_domain(&self.ik, RECOVERY_POLICY_DS, &self.signing_body(), &self.sig)
     }
@@ -1855,5 +1909,75 @@ mod tests {
             prefer_rotation_fork(&attacker_branch, false, &honest_branch, false),
             Err(IdentityError::BrokenChain)
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_threshold_order_tests {
+    use super::*;
+
+    fn th(preds: Vec<MethodPredicate>) -> Threshold {
+        Threshold { any_of: preds }
+    }
+
+    /// §1.4 rule 2 forbids a factor kind that ROTATES more cheaply than it RECOVERS.
+    #[test]
+    fn same_kind_weaker_rotate_is_rejected() {
+        // recover needs 2 guardians; rotate needs only 1 — any two guardians could evict the owner.
+        assert!(!th(vec![MethodPredicate::Guardians(1)])
+            .at_least_as_strong_as(&th(vec![MethodPredicate::Guardians(2)])));
+        assert!(!th(vec![MethodPredicate::Devices(1)])
+            .at_least_as_strong_as(&th(vec![MethodPredicate::Devices(3)])));
+    }
+
+    /// Different kinds are INCOMPARABLE and impose no constraint. This is the policy an earlier,
+    /// subset-based attempt at this check wrongly rejected: the phrase-holder can recover but
+    /// cannot rotate, which is exactly what rule 2 wants.
+    #[test]
+    fn cross_kind_predicates_are_unconstrained() {
+        assert!(
+            th(vec![MethodPredicate::Ik, MethodPredicate::Guardians(2)])
+                .at_least_as_strong_as(&th(vec![MethodPredicate::Phrase])),
+            "recover={{Phrase}}, rotate={{Ik, Guardians(2)}} is safe under rule 2's own rationale"
+        );
+    }
+
+    /// "≥" permits equality; rule 3 independently requires a quorum for any WEAKENING change, so
+    /// an equal threshold cannot be used to erode recovery unilaterally.
+    #[test]
+    fn equal_thresholds_are_permitted() {
+        assert!(th(vec![MethodPredicate::Phrase])
+            .at_least_as_strong_as(&th(vec![MethodPredicate::Phrase])));
+        assert!(th(vec![MethodPredicate::Guardians(3)])
+            .at_least_as_strong_as(&th(vec![MethodPredicate::Guardians(3)])));
+    }
+
+    /// A mixed policy fails if ANY shared kind is weaker on the rotate side.
+    #[test]
+    fn one_weak_kind_fails_the_whole_policy() {
+        assert!(!th(vec![MethodPredicate::Devices(1), MethodPredicate::Ik])
+            .at_least_as_strong_as(&th(vec![
+                MethodPredicate::Devices(2),
+                MethodPredicate::Phrase
+            ])));
+    }
+
+    /// End to end: verify() now raises the §21 code that was registered but unreachable.
+    #[test]
+    fn verify_rejects_a_rule_2_violating_policy() {
+        let ik = IdentityKey::generate();
+        let mut pol = RecoveryPolicy {
+            suite: Suite::Classical,
+            ik: ik.public().to_vec(),
+            version: 1,
+            methods: vec![],
+            recover_threshold: th(vec![MethodPredicate::Guardians(2)]),
+            rotate_threshold: th(vec![MethodPredicate::Guardians(1)]),
+            prev: None,
+            ts: 1_700_000_000_000,
+            sig: vec![],
+        };
+        pol.sign(&ik);
+        assert_eq!(pol.verify(), Err(IdentityError::RecoveryThresholdInvalid));
     }
 }
