@@ -300,6 +300,32 @@ fn skip_reason(id: &str, operation: &str) -> String {
             'high-value recipient' policy tier, and no second, stronger verification path to select \
             between — so 'requires the KT-anchored form at high assurance' has no distinct code path \
             to construct against; the crate always does the one thing it does.",
+        "DMTAP-HYBRID-01" => "dmtap-core has no working hybrid (suite 0x02, PqHybrid) signature path \
+            at all: `Suite::PqHybrid.is_supported()` is hard-coded `false` (suite.rs, asserted by the \
+            crate's own unit tests) and every verifier that checks `suite.is_supported()` (Identity:: \
+            verify, KeyRotation::verify, RecoveryPolicy::verify, …) rejects a PqHybrid-suite object \
+            outright before any component-level check. There is no dual classical+PQ signature \
+            structure, no AND-composition verifier, and no X-Wing KEM combiner anywhere in this \
+            workspace to construct 'PQ component missing/fails, classical component alone accepts' \
+            against — the reference simply has nothing hybrid to under- or over-accept.",
+        "DMTAP-FLOOR-02" | "DMTAP-FLOOR-04" => "dmtap_core::policy::CallerPolicy (policy.rs) has no \
+            N_floor / cold-sender-admission-floor concept at all — only duplicate-id, timestamp-skew, \
+            expiry and repin checks. There is no function anywhere in this workspace that validates a \
+            standing cold-sender acceptance policy against a §16.5 minimum floor or rejects a \
+            VDF-only policy, so 'a sub-floor or VDF-only policy is refused' has no code path to \
+            construct against.",
+        "DMTAP-TIER-02" => "dmtap_core::push (push.rs) defines the provider tag constants (WEB_PUSH, \
+            APNS, FCM, …) and the wire `PushSubscription` object, but has no provider-SELECTION \
+            function anywhere — no code anywhere in this workspace expresses an 'open provider \
+            preferred, closed bridge is the platform-mandated fallback' policy for this crate to \
+            drive; provider choice is entirely a caller/client decision with no reference \
+            implementation here.",
+        "DMTAP-SEAM-01" => "dmtap-seam's gateway_authz.rs ships exactly one reference GatewayAuthz \
+            implementation, `OpenGatewayAuthz`, which unconditionally `Allow`s every credential (the \
+            self-host default) — it has no unreachable-operator/fail-closed-to-established-contacts \
+            behavior to construct the case's central claim against. `GatewayAuthz` is a trait an \
+            operator implements themselves; the crate provides no second, fail-safe-on-unreachable \
+            reference implementation to drive.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
