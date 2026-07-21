@@ -23,7 +23,9 @@ use dmtap_core::deniable::{
 use dmtap_core::directory::{DomainDirectory, DomainDirectoryError, Visibility};
 use dmtap_core::id::ContentId;
 use dmtap_core::identity::{
-    verify_domain, Cap, DeviceCert, Identity, IdentityError, IdentityKey, KeyPackageBundleRef,
+    authorize_key_rotation, verify_domain, Cap, DeviceCert, Identity, IdentityError, IdentityKey,
+    KeyPackageBundleRef, KeyRotation, KeyRotationError, MethodPredicate, MoveRecord,
+    RecoveryMethod, RecoveryPolicy, Threshold,
 };
 use dmtap_core::kt::{
     identity_leaf_for, verify_consistency, ConsistencyProof, InclusionProof, KtError, MerkleTree,
@@ -32,9 +34,9 @@ use dmtap_core::kt::{
 use dmtap_core::mixnet::{MixDescriptorError, MixDirectory, MixKeyEntry, MixNodeDescriptor};
 use dmtap_core::mote::{
     self, build_mote, check_file_available, file_tier, spool_admit, tier_enforce, DeliveryTag,
-    Durability, DurabilityClass, Envelope, FileTier, Headers, Hpke, Kind, Manifest, ManifestRef,
-    MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair, Tier,
-    TierEnforcementError, ValidateError, ENVELOPE_SENDER_DS, MOTE_VERSION, PAYLOAD_SIG_DS,
+    Durability, DurabilityClass, Envelope, FileTier, Headers, Hpke, Kind, KeyPackageRef, Manifest,
+    ManifestRef, MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair,
+    Tier, TierEnforcementError, ValidateError, ENVELOPE_SENDER_DS, MOTE_VERSION, PAYLOAD_SIG_DS,
 };
 use dmtap_core::policy::{CallerPolicy, PolicyError};
 use dmtap_core::cad::{
@@ -59,7 +61,7 @@ use dmtap_core::TimestampMs;
 // API is the honest way to execute those cases rather than leaving them skipped.
 use dmtap_auth::{
     create_login, verify_login, AuthError, Challenge, Clock as AuthClock, DeviceCertAuthorizer,
-    InMemoryReplayCache, TrustedClientStub,
+    InMemoryReplayCache, SignedAssertion, TrustedClientStub,
 };
 use dmtap_deniable::{initiate, DeniableIdentity, DeniableResponder};
 use dmtap_mls::Member;
@@ -94,6 +96,13 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
     let result: Option<Result<(), String>> = match case.id.as_str() {
         "DMTAP-CBOR-11" => Some(cbor_null_optional_rejected()),
         "DMTAP-CBOR-12" => Some(cbor_signed_unknown_key_rejected()),
+        "DMTAP-CADASM-01" => Some(cad_assembly_empty_or_zero_quantity_rejected()),
+        "DMTAP-WIRE-01" => Some(keypackageref_missing_field_rejected()),
+        "DMTAP-WIRE-02" => Some(keypackagebundleref_missing_id_rejected()),
+        "DMTAP-WIRE-05" => Some(keyrotation_missing_field_and_unquorumed_rejected()),
+        "DMTAP-WIRE-06" => Some(moverecord_missing_field_rejected()),
+        "DMTAP-WIRE-09" => Some(challenge_missing_field_rejected()),
+        "DMTAP-WIRE-10" => Some(assertion_missing_cnf_rejected()),
         "DMTAP-IDENT-01" => Some(ident_tampered_sig_rejected()),
         "DMTAP-IDENT-02" => Some(ident_rollback_rejected()),
         "DMTAP-IDENT-03" => Some(ident_broken_prev_chain_rejected()),
@@ -250,6 +259,33 @@ fn skip_reason(id: &str, operation: &str) -> String {
             advertised deniable-1:1' to a deniable-session refusal — a caller simply has no \
             `DeniablePrekeyBundle` to call `initiate()` with in that case, which is a structural absence \
             of input, not an executable 'refuse and notify' decision this crate makes.",
+        "DMTAP-WIRE-03" => "RecoveryPolicy::verify() (identity.rs) checks only that rotate_threshold's \
+            `any_of` is non-empty — it does NOT compare rotate_threshold's strength against \
+            recover_threshold's (no `ERR_RECOVERY_THRESHOLD_INVALID`/0x010C variant exists anywhere in \
+            IdentityError/RecoveryGuardError), so 'rotate_threshold weaker than recover_threshold at \
+            decode/verify time' is not a check this crate performs on a single policy object — the private \
+            `threshold_min` comparator is only ever applied cross-VERSION (weakening detection between two \
+            policies), never as a same-object structural invariant. This is a genuine reference gap, not an \
+            honestly-constructible rejection: see the conformance-runner report.",
+        "DMTAP-WIRE-04" => "genuine reference gap, not an honest skip of convenience: \
+            `recovery_change_is_weakening` (identity.rs) treats re-adding a previously-evicted \
+            `RecoveryMethod` (identical key material) as a purely ADDITIVE change when compared only \
+            against the immediately-prior policy version — B (phrase evicted) -> C (same phrase \
+            re-added) is not flagged as weakening, so `authorize_recovery_change` lets it through on \
+            IK alone with no rotate_threshold quorum and no veto window, even though the factor's \
+            eviction was never really enforced. Catching this needs comparing against every PRIOR \
+            version a factor was ever removed from, which no function in this crate does. Reported \
+            prominently as a spec-vs-implementation gap rather than silently constructed around.",
+        "DMTAP-WIRE-07" => "no `GroupState` CBOR wire type exists anywhere in this workspace. \
+            dmtap-mls (committer.rs/session.rs/member.rs) models `LogEntry`/`Committer`/`Session`/ \
+            `Handshake` as in-process abstractions, not the §18.6.1 committer-signed CBOR projection \
+            object (group_id/suite/epoch/committer/posting_model/membership_visibility/join_policy/ \
+            roster/log_head/version/ts/committer_sig/group_identity). There is no det_cbor/from_det_cbor \
+            surface to decode against, so this is a genuine missing-type gap, not a caller-logic gap.",
+        "DMTAP-WIRE-08" => "no `GroupEvent` CBOR wire type exists anywhere in this workspace, for the \
+            same reason as DMTAP-WIRE-07: dmtap-mls's `LogEntry` (committer.rs) is the closest analogue \
+            but does not carry an opaque verbatim MLSMessage blob (`mls`) plus `log_seq`/`prev` in the \
+            §18.6.2 wire shape — it is an internal ordering primitive, not this wire object.",
         _ => {
             return format!(
                 "unrecognized construction-todo case (operation `{operation}`) — not yet triaged by \
@@ -381,6 +417,73 @@ fn cbor_signed_unknown_key_rejected() -> Result<(), String> {
     }
 }
 
+/// Remove `inner_key` from the sub-map value stored under `outer_key` in a canonical map's decoded
+/// `Cv`, re-encoding the whole structure. Used to build "required field absent" fixtures for wire
+/// objects that are only ever embedded inside another signed object and have no public standalone
+/// `from_det_cbor` of their own (`KeyPackageRef` inside `Envelope`, `KeyPackageBundleRef` inside
+/// `Identity`) — the embedding object's own decoder is what actually enforces the sub-object's
+/// required fields, so splicing at the outer object's bytes is the honest way to exercise it.
+fn remove_inner_key(bytes: &[u8], outer_key: u64, inner_key: u64) -> Result<Vec<u8>, String> {
+    let cv = cbor::decode(bytes).map_err(|e| format!("decode base object: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base object is not an integer-keyed map".into()),
+    };
+    let Some((_, inner)) = pairs.iter_mut().find(|(k, _)| *k == outer_key) else {
+        return Err(format!("outer key {outer_key} not present in base object"));
+    };
+    let Cv::Map(inner_pairs) = inner else {
+        return Err(format!("outer key {outer_key}'s value is not a map"));
+    };
+    let before = inner_pairs.len();
+    inner_pairs.retain(|(k, _)| *k != inner_key);
+    if inner_pairs.len() == before {
+        return Err(format!("inner key {inner_key} not present under outer key {outer_key}"));
+    }
+    Ok(cbor::encode(&Cv::Map(pairs)))
+}
+
+/// DMTAP-WIRE-01 (§18.3.4/§5.3/§1.3): `KeyPackageRef` — the per-message one-time-KeyPackage
+/// reference embedded in `Envelope` key 8 (`mote.rs`) — requires its `reference` (key 1) and
+/// `suite` (key 2); `loc` (key 3) is an informational hint whose absence changes nothing. Removing
+/// `reference` from an otherwise-valid envelope carrying a `keypkg` MUST reject at decode. Positive
+/// control: the `loc`-absent instance decodes cleanly.
+///
+/// NOTE (spec-vs-implementation gap, reported prominently rather than constructed around): the
+/// case's other described invariant — "`KeyPackageRef.suite` MUST equal `Envelope.suite`" — is NOT
+/// cross-checked anywhere in `dmtap-core`. `Envelope::from_det_cbor` decodes `keypkg.suite`
+/// independently and never compares it against the envelope's own `suite` field, so a KeyPackageRef
+/// advertising a different (even unsupported) suite than its enclosing Envelope currently decodes
+/// without error.
+fn keypackageref_missing_field_rejected() -> Result<(), String> {
+    let sender = IdentityKey::generate();
+    let ephemeral = IdentityKey::generate();
+    let recipient = IdentityKey::generate();
+    let seal = SealKeypair::generate();
+    let mut draft = MoteDraft::new(Kind::Mail, 1_700_000_000_000, b"wire-01 fixture".to_vec());
+    draft.keypkg = Some(KeyPackageRef {
+        reference: ContentId::of(b"one-time-keypackage"),
+        suite: Suite::Classical,
+        loc: None, // positive control: `loc` absent must still decode.
+    });
+    let env = build_mote(&Hpke, &sender, &ephemeral, &recipient.public(), seal.public(), draft)
+        .map_err(|e| format!("build_mote with a valid keypkg must succeed: {e}"))?;
+    let bytes = env.det_cbor();
+
+    // Positive control: `loc`-absent keypkg still decodes.
+    Envelope::from_det_cbor(&bytes)
+        .map_err(|e| format!("positive control: loc-absent keypkg must decode, got {e:?}"))?;
+
+    // Negative: splice out `reference` (inner key 1) from the embedded KeyPackageRef (outer key 8).
+    let spliced = remove_inner_key(&bytes, 8, 1)?;
+    match Envelope::from_det_cbor(&spliced) {
+        Err(CborError::MissingKey(1)) => Ok(()),
+        other => {
+            Err(format!("expected Err(MissingKey(1)) for a keypkg missing `reference`, got {other:?}"))
+        }
+    }
+}
+
 // ============================================================================================
 // IDENT (§1.3, §1.2)
 // ============================================================================================
@@ -390,6 +493,35 @@ fn sample_keypkg_ref(tag: &str) -> KeyPackageBundleRef {
         format!("mesh://conformance-runner-fixture/{tag}"),
         ContentId::of(format!("keypkg-bundle-fixture-{tag}").as_bytes()),
     )
+}
+
+/// DMTAP-WIRE-02 (§18.4.3/§5.3/§1.3): `KeyPackageBundleRef` — the identity's whole published
+/// KeyPackage-bundle pointer, embedded in `Identity` key 5 (`identity.rs`) — requires `loc` (key 1)
+/// and `id` (key 2); `suites` (key 3) is OPTIONAL. Removing `id` from an otherwise-valid Identity
+/// MUST reject at decode.
+///
+/// NOTE (spec-vs-implementation gap, reported prominently rather than constructed around): the
+/// case's other described invariant — a bundle's advertised `suites`, when present, MUST be a
+/// subset of `Identity.suites` — is NOT cross-checked anywhere in `dmtap-core`. `Identity::
+/// from_det_cbor`/`verify` never compare `keypkgs.suites` against the identity's own `suites` list,
+/// so a bundle claiming a suite the identity never advertised currently decodes without error.
+fn keypackagebundleref_missing_id_rejected() -> Result<(), String> {
+    let ik = IdentityKey::generate();
+    let id = Identity::create_classical(
+        &ik, 0, vec![], sample_keypkg_ref("wire-02"), ContentId::of(b"recovery-policy-fixture"),
+        vec!["alice@abc.example".into()], None, 1_700_000_000_000,
+    );
+    let bytes = id.det_cbor();
+    Identity::from_det_cbor(&bytes)
+        .map_err(|e| format!("sanity: the base identity must decode: {e:?}"))?;
+
+    let spliced = remove_inner_key(&bytes, 5, 2)?;
+    match Identity::from_det_cbor(&spliced) {
+        Err(IdentityError::BadEncoding(CborError::MissingKey(2))) => Ok(()),
+        other => Err(format!(
+            "expected Err(BadEncoding(MissingKey(2))) for a keypkgs missing `id`, got {other:?}"
+        )),
+    }
 }
 
 /// DMTAP-IDENT-01: "cbor_identity with a tampered sig entry" — an Identity whose sig (any suite
@@ -473,6 +605,121 @@ fn device_cert_tampered_sig_rejected() -> Result<(), String> {
     match cert.verify() {
         Err(IdentityError::BadSignature) => Ok(()),
         other => Err(format!("expected Err(BadSignature), got {other:?}")),
+    }
+}
+
+/// DMTAP-WIRE-05 (§18.4.5/§1.5): two independently-implemented `KeyRotation` MUSTs, both real and
+/// both distinct from the compound case's headline `old_ik`-pin-mismatch scenario (see the NOTE
+/// below): (a) `reason` (key 4) is a REQUIRED field — a rotation missing it MUST reject at decode;
+/// (b) a rotation against an identity with a published `RecoveryPolicy` that carries no
+/// `rotate_quorum` and has not cleared the §16.8 veto window is `KeyRotationError::Unauthorized`
+/// (`ERR_KEYROTATION_UNAUTHORIZED`, `0x0121`) — the §1.5 stolen-`IK` takeover defense — via
+/// `authorize_key_rotation`, the real reference function for that guard.
+///
+/// NOTE (spec-vs-implementation gap, reported prominently rather than constructed around): the
+/// case's headline `expect` (`0x0104 ERR_IDENTITY_CHAIN_BROKEN`, "old_ik MUST be the
+/// currently-pinned IK") has NO cross-check anywhere in `dmtap-core`. `KeyRotation::verify()` only
+/// checks the rotation's OWN embedded `sig` against its OWN embedded `old_ik` (self-consistency); no
+/// function in this crate compares a `KeyRotation.old_ik` against an externally-pinned `Identity`'s
+/// current key. A forger can mint a self-consistent `KeyRotation` naming any `old_ik`/`new_ik` pair
+/// they hold both keys for, and nothing here catches the substitution — that cross-check would have
+/// to live in a caller that also holds the pinned `Identity`, and no such function exists in this
+/// workspace.
+fn keyrotation_missing_field_and_unquorumed_rejected() -> Result<(), String> {
+    let old = IdentityKey::generate();
+    let new = IdentityKey::generate();
+
+    // (a) `reason` (key 4) missing → decode-time reject.
+    let mut good = KeyRotation {
+        suite: Suite::Classical,
+        old_ik: old.public(),
+        new_ik: new.public(),
+        reason: "device-compromise".into(),
+        ts: 1_700_000_000_000,
+        prev: None,
+        sig: Vec::new(),
+        rotate_quorum: None,
+    };
+    good.sign(&old);
+    KeyRotation::from_det_cbor(&good.det_cbor())
+        .map_err(|e| format!("sanity: a well-formed rotation must decode: {e:?}"))?;
+
+    let cv = cbor::decode(&good.det_cbor()).map_err(|e| format!("decode base rotation: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base rotation is not a map".into()),
+    };
+    pairs.retain(|(k, _)| *k != 4); // drop `reason`
+    let missing_reason = cbor::encode(&Cv::Map(pairs));
+    match KeyRotation::from_det_cbor(&missing_reason) {
+        Err(IdentityError::BadEncoding(CborError::MissingKey(4))) => {}
+        other => {
+            return Err(format!(
+                "expected Err(BadEncoding(MissingKey(4))) for a rotation missing `reason`, got {other:?}"
+            ))
+        }
+    }
+
+    // (b) unquorumed rotation against a published RecoveryPolicy → Unauthorized (0x0121).
+    let guardians: Vec<IdentityKey> =
+        (0..3).map(|_| IdentityKey::generate()).collect();
+    let mut policy = RecoveryPolicy {
+        suite: Suite::Classical,
+        ik: old.public(),
+        version: 0,
+        methods: vec![RecoveryMethod::Social {
+            guardians: guardians.iter().map(|g| g.public()).collect(),
+            threshold: 2,
+        }],
+        recover_threshold: Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+        rotate_threshold: Threshold { any_of: vec![MethodPredicate::Guardians(2)] },
+        prev: None,
+        ts: 1_700_000_000_000,
+        sig: Vec::new(),
+    };
+    policy.sign(&old);
+    match authorize_key_rotation(&good, Some(&policy), &[], &[], 1_700_000_000_000, 1_700_000_000_100) {
+        Err(KeyRotationError::Unauthorized) => Ok(()),
+        other => Err(format!(
+            "expected Err(Unauthorized) (0x0121) for an unquorumed rotation with no elapsed veto \
+             window, got {other:?}"
+        )),
+    }
+}
+
+/// DMTAP-WIRE-06 (§18.4.6/§1.6): `MoveRecord.to` (key 4) is a REQUIRED field — a name-migration
+/// record missing it MUST reject at decode. Positive control: a genuine, fully-signed move decodes
+/// and verifies.
+///
+/// NOTE (spec-vs-implementation gap, reported prominently rather than constructed around): the
+/// case's headline `expect` (`0x010A ERR_MOVE_RECORD_INVALID`, "a MoveRecord presenting a different
+/// ik [than the pinned one], or signed by anything other than the pinned key") has NO cross-check
+/// anywhere in `dmtap-core`, and no `ERR_MOVE_RECORD_INVALID`/`0x010A` variant exists on
+/// `IdentityError` at all. `MoveRecord::verify()` only checks the record's OWN embedded `sig`
+/// against its OWN embedded `ik` (self-consistency): a forger who generates a fresh keypair, sets
+/// `ik` to that key's public half, and signs with the matching private half produces a `MoveRecord`
+/// that verifies perfectly — `verify()` has no way to know this `ik` is not the identity's real,
+/// previously-pinned one. Catching the substitution needs a caller that holds the pinned `Identity`
+/// and cross-checks `MoveRecord.ik` against it; no such function exists in this workspace.
+fn moverecord_missing_field_rejected() -> Result<(), String> {
+    let ik = IdentityKey::generate();
+    let good = MoveRecord::create(&ik, "alice@abc.example", "alice@xyz.example", 1_700_000_000_000, None);
+    good.verify().map_err(|e| format!("sanity: a genuine move must verify: {e:?}"))?;
+    MoveRecord::from_det_cbor(&good.det_cbor())
+        .map_err(|e| format!("sanity: a well-formed move record must decode: {e:?}"))?;
+
+    let cv = cbor::decode(&good.det_cbor()).map_err(|e| format!("decode base move record: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base move record is not a map".into()),
+    };
+    pairs.retain(|(k, _)| *k != 4); // drop `to`
+    let spliced = cbor::encode(&Cv::Map(pairs));
+    match MoveRecord::from_det_cbor(&spliced) {
+        Err(IdentityError::BadEncoding(CborError::MissingKey(4))) => Ok(()),
+        other => Err(format!(
+            "expected Err(BadEncoding(MissingKey(4))) for a move record missing `to`, got {other:?}"
+        )),
     }
 }
 
@@ -1213,6 +1460,45 @@ fn cad_no_index_is_authoritative() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// DMTAP-CADASM-01 (§23.6.1/§23.6.2): an `AssemblyStructure` with zero children, and one whose sole
+/// child carries `quantity = 0`, are both malformed for this profile — `children` is REQUIRED with
+/// >= 1 entry, and a zero count is expressed by omitting the child, never by a zero quantity.
+/// Positive control: a well-formed single-child assembly decodes.
+fn cad_assembly_empty_or_zero_quantity_rejected() -> Result<(), String> {
+    // Positive control: >= 1 child, quantity >= 1, decodes cleanly.
+    let good = AssemblyStructure {
+        children: vec![AssemblyChild {
+            ref_kind: ref_kind::PIN,
+            reference: ContentId::of(b"child-part-manifest-root"),
+            quantity: 4,
+            transform: None,
+        }],
+    };
+    AssemblyStructure::from_det_cbor(&good.det_cbor())
+        .map_err(|e| format!("positive control: a well-formed assembly must decode, got {e:?}"))?;
+
+    // Negative (a): zero children.
+    let empty = AssemblyStructure { children: vec![] };
+    match AssemblyStructure::from_det_cbor(&empty.det_cbor()) {
+        Err(CadError::Structural(_)) => {}
+        other => return Err(format!("expected Err(Structural) for zero children, got {other:?}")),
+    }
+
+    // Negative (b): a child with quantity = 0.
+    let zero_qty = AssemblyStructure {
+        children: vec![AssemblyChild {
+            ref_kind: ref_kind::TRACK,
+            reference: ContentId::of(b"child-part-announce-id"),
+            quantity: 0,
+            transform: None,
+        }],
+    };
+    match AssemblyStructure::from_det_cbor(&zero_qty.det_cbor()) {
+        Err(CadError::Structural(_)) => Ok(()),
+        other => Err(format!("expected Err(Structural) for quantity=0, got {other:?}")),
+    }
 }
 
 /// DMTAP-FILE-05: "the content address is over ciphertext: the same plaintext under two different
@@ -3237,6 +3523,63 @@ fn auth_session_bound_only_to_cnf() -> Result<(), String> {
     }
 }
 
+/// DMTAP-WIRE-09 (§18.7.1/§13.3/§16.1): `Challenge`'s `rp_origin`/`nonce`/`issued_at`/`exp`/`aud`
+/// are all REQUIRED (`scope`, key 6, is OPTIONAL); `dmtap_auth::Challenge::from_det_cbor` fails
+/// closed on any missing field. Removing `aud` from an otherwise-valid, freshly-minted challenge
+/// MUST reject at decode. (The note's other two branches — a replayed nonce and a late assertion —
+/// are already proven end-to-end by DMTAP-AUTH-03/DMTAP-AUTH-04 against the real RP-side verifier;
+/// this case's incremental value is the wire-level required-field completeness those two don't
+/// individually exercise.)
+fn challenge_missing_field_rejected() -> Result<(), String> {
+    let challenge = Challenge::new("https://mail.example.invalid", "mail.example.invalid", 1_700_000_000_000, None);
+    let bytes = challenge.det_cbor();
+    Challenge::from_det_cbor(&bytes)
+        .map_err(|e| format!("sanity: a well-formed challenge must decode: {e:?}"))?;
+
+    let cv = cbor::decode(&bytes).map_err(|e| format!("decode base challenge: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base challenge is not a map".into()),
+    };
+    pairs.retain(|(k, _)| *k != 5); // drop `aud`
+    let spliced = cbor::encode(&Cv::Map(pairs));
+    match Challenge::from_det_cbor(&spliced) {
+        Err(AuthError::Malformed(_)) => Ok(()),
+        other => Err(format!("expected Err(Malformed) for a challenge missing `aud`, got {other:?}")),
+    }
+}
+
+/// DMTAP-WIRE-10 (§18.7.2/§13.3/§18.9.8): `SignedAssertion`'s `rp_origin`/`nonce`/`issued_at`/`exp`/
+/// `aud`/`from`/`sig`/`cnf` are all REQUIRED (`scope`, key 9, is OPTIONAL, encoded only when
+/// non-empty); `dmtap_auth::SignedAssertion::from_det_cbor` fails closed on any missing field.
+/// Removing `cnf` — the field that binds the assertion to the session key and closes the
+/// session-hijack path (§13.4) — from an otherwise-genuine, freshly-signed assertion MUST reject at
+/// decode. (The case's headline origin-mismatch branch is already proven end-to-end against the
+/// real RP-side verifier by DMTAP-AUTH-02; this case's incremental value, per its own note, is
+/// exactly the missing-`cnf` wire-completeness check DMTAP-AUTH-02 doesn't exercise.)
+fn assertion_missing_cnf_rejected() -> Result<(), String> {
+    let rp_origin = "https://mail.example.invalid";
+    let ik = IdentityKey::generate();
+    let challenge = Challenge::new(rp_origin, "mail.example.invalid", 1_700_000_000_000, None);
+    let client = TrustedClientStub::new(rp_origin);
+    let login = create_login(&client, &challenge, &ik).map_err(|e| format!("create_login: {e}"))?;
+    let bytes = login.assertion.det_cbor();
+    SignedAssertion::from_det_cbor(&bytes)
+        .map_err(|e| format!("sanity: a well-formed assertion must decode: {e:?}"))?;
+
+    let cv = cbor::decode(&bytes).map_err(|e| format!("decode base assertion: {e}"))?;
+    let mut pairs = match cv {
+        Cv::Map(m) => m,
+        _ => return Err("base assertion is not a map".into()),
+    };
+    pairs.retain(|(k, _)| *k != 8); // drop `cnf`
+    let spliced = cbor::encode(&Cv::Map(pairs));
+    match SignedAssertion::from_det_cbor(&spliced) {
+        Err(AuthError::Malformed(_)) => Ok(()),
+        other => Err(format!("expected Err(Malformed) for an assertion missing `cnf`, got {other:?}")),
+    }
+}
+
 // ============================================================================================
 // DENIABLE (continued) — the real Double-Ratchet session (dmtap-deniable), not just the wire
 // frames dmtap-core models (§5.2.1(b), §18.9.10).
@@ -3519,7 +3862,9 @@ fn leg_outbound_open_relay_refused() -> Result<(), String> {
 /// table honest against each other and against `suite.json`).
 pub fn recognized_ids() -> BTreeMap<&'static str, ()> {
     [
-        "DMTAP-CBOR-11", "DMTAP-CBOR-12", "DMTAP-IDENT-01", "DMTAP-IDENT-02", "DMTAP-IDENT-03",
+        "DMTAP-CBOR-11", "DMTAP-CBOR-12", "DMTAP-CADASM-01", "DMTAP-WIRE-01", "DMTAP-WIRE-02",
+        "DMTAP-WIRE-05", "DMTAP-WIRE-06", "DMTAP-WIRE-09", "DMTAP-WIRE-10",
+        "DMTAP-IDENT-01", "DMTAP-IDENT-02", "DMTAP-IDENT-03",
         "DMTAP-IDENT-05", "DMTAP-PRIV-01", "DMTAP-PRIV-02", "DMTAP-FILE-01", "DMTAP-FILE-02",
         "DMTAP-FILE-03", "DMTAP-FILE-04", "DMTAP-FILE-05", "DMTAP-VAL-01", "DMTAP-VAL-02",
         "DMTAP-VAL-03", "DMTAP-VAL-04", "DMTAP-VAL-06", "DMTAP-VAL-07", "DMTAP-VAL-08",
