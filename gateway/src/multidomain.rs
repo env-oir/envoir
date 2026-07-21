@@ -13,17 +13,18 @@
 //!   ([`GatewayAliasMap`], §7.10.2), and the stateless forwarded encoding ([`crate::forwarded_addr`],
 //!   reused verbatim by callers).
 //! - **Per-domain quota + a fail-closed blocklist / user-suspension list**, plus a shared usage
-//!   [`GatewayMeter`] ([`UsageMeter`]) the private billing layer (envoir-cloud) reads.
+//!   [`GatewayMeter`] ([`UsageMeter`]) an operator's own billing/usage-tracking system reads,
+//!   if one is attached at all.
 //!
 //! Everything is **off by default and fail-closed** (§18.9.11): a fresh [`MultiDomainGateway`] serves
 //! **no** domains — every route is [`RouteError::NoSuchDomain`], every DKIM request is refused — until
 //! a domain is explicitly added (through the authenticated admin API, [`crate::admin`]). The gateway
-//! itself never prices or bills; it only exposes the meter (the OSS/closed split of the two repos).
+//! itself never prices or bills; it only exposes the meter to whatever an operator attaches.
 //!
 //! This module is the **model + routing**; [`crate::admin`] is the authenticated control surface that
 //! mutates it. The gateway stays stateless in the §7.4 sense (no mail queue); the small amount of
 //! state here (which domains, keys, aliases, blocks) is control-plane configuration, re-driven by
-//! envoir-cloud on restart, not message durability.
+//! an operator's own tooling on restart, not message durability.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -202,7 +203,7 @@ impl MultiDomainGateway {
 
     /// Add a served domain with a DKIM key (a freshly generated seed if `dkim_seed` is `None`) under
     /// `selector`. Fail-closed: an invalid domain or one already served is refused. Returns the
-    /// 32-byte DKIM seed actually used, so the caller (envoir-cloud) can persist it and re-supply it
+    /// 32-byte DKIM seed actually used, so the caller (an operator's own tooling) can persist it and re-supply it
     /// on restart (the gateway holds no durable state of its own).
     pub fn add_domain(
         &mut self,
@@ -615,7 +616,7 @@ mod tests {
         let mut gw = MultiDomainGateway::new();
         let seed = gw.add_domain("host.net", None, "sel9").unwrap();
         // Re-adding with the SAME seed (after removal) yields the same publishable public key —
-        // the seed round-trips, so envoir-cloud can persist and re-supply it on restart.
+        // the seed round-trips, so an operator's own tooling can persist and re-supply it on restart.
         let pub1 = gw.tenant("host.net").unwrap().dkim_public_p_tag();
         gw.remove_domain("host.net");
         gw.add_domain("host.net", Some(seed), "sel9").unwrap();

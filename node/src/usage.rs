@@ -1,23 +1,24 @@
 //! Hosted-node **storage** seam — the node side of the operator seam (spec §12.2, §12.3, §12.4).
 //!
-//! The private control-plane (`envoir-cloud`, a **separate repo**) sells three usage meters:
-//! *alias*, *gateway*, and *node*. "Node usage" is **hosted-mailbox storage** — the durable bytes a
-//! node holds on an account's behalf. This module is the OSS half of that meter, and it mirrors the
-//! shape the gateway already uses ([`GatewayAuthz`] + [`GatewayMeter`], §7.9): the whole cloud
-//! relationship reduces to exactly **two traits** —
+//! A third-party operator hosting nodes for other people has a real "node usage" cost center:
+//! **hosted-mailbox storage** — the durable bytes a node holds on an account's behalf. This
+//! module is the OSS half of that meter (mirroring the shape the gateway already uses,
+//! [`GatewayAuthz`] + [`GatewayMeter`], §7.9), and the whole operator relationship it exposes
+//! reduces to exactly **two traits** —
 //!
 //! 1. [`StorageQuota`] — a **Policy** decision (§12.2): given an account and a proposed storage
 //!    delta, may the node durably accept it, and what allowance remains? The self-host default
 //!    ([`UnlimitedStorage`]) is **unlimited** and never denies.
 //! 2. [`NodeUsageMeter`] — a **Metering** sink (§12.2): an append-only stream of usage events
-//!    (stored-bytes delta / eviction / message-accepted) the operator turns into a bill. The
-//!    self-host default ([`NullUsageMeter`]) is a no-op.
+//!    (stored-bytes delta / eviction / message-accepted) an operator may turn into a bill if they
+//!    choose to. The self-host default ([`NullUsageMeter`]) is a no-op.
 //!
 //! ## No money, no plans, no pricing here
 //! The seam carries **events and a yes/no** — nothing about currency, plans, or prices. The node
-//! links **no** cloud or billing crate; a cloud impl *drops into* these traits from the outside. The
-//! OSS defaults make the node run **identically with the cloud off**: self-host stores everything and
-//! bills no one (§12.2 "self-host default is unlimited/no-op").
+//! links **no** billing crate; an operator's own tooling *drops into* these traits from the
+//! outside. The OSS defaults make the node run **identically with no operator attached**:
+//! self-host stores everything and is billed by no one (§12.2 "self-host default is
+//! unlimited/no-op").
 //!
 //! ## The inviolable rule (§12.3) — this seam gates operations, never protection
 //! A denied store refuses to **durably add new inbound** to the mailbox. It does **not** — and MUST
@@ -145,10 +146,10 @@ impl UsageEvent {
     }
 }
 
-/// The **Metering** capability envoir-cloud consumes (§12.2). The node calls [`Self::record`] once per
-/// real storage cost event; the sink is append-only and holds no policy. Like [`StorageQuota`], it
-/// carries no `Send + Sync` bound (single-threaded node actor) and no cloud dependency — a billing
-/// backend implements it from the outside.
+/// The **Metering** capability an operator's own tooling consumes (§12.2). The node calls
+/// [`Self::record`] once per real storage cost event; the sink is append-only and holds no
+/// policy. Like [`StorageQuota`], it carries no `Send + Sync` bound (single-threaded node actor)
+/// and no billing dependency — a billing backend implements it from the outside, if one exists.
 pub trait NodeUsageMeter {
     /// Append `event` to the usage stream. Best-effort and non-blocking: metering MUST NOT break
     /// user-facing storage (§12.2 "fail-open to function") — an unrecordable event is dropped/queued

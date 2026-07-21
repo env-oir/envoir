@@ -1,11 +1,12 @@
 //! Authenticated admin API for the multi-tenant public gateway (spec §7 "gateway as a business").
 //!
-//! This is the **control surface** envoir-cloud (the separate, private billing repo) drives to manage
-//! a running [`MultiDomainGateway`](crate::multidomain::MultiDomainGateway): add/remove served
-//! domains (+ their DKIM keys), manage per-domain recipients and aliases (vanity + random), block or
+//! This is the **control surface** an operator's own tooling drives to manage a running
+//! [`MultiDomainGateway`](crate::multidomain::MultiDomainGateway): add/remove served domains
+//! (+ their DKIM keys), manage per-domain recipients and aliases (vanity + random), block or
 //! unblock senders, suspend or reinstate local users, set per-domain quotas, and read per-domain
 //! usage off the [`UsageMeter`](crate::multidomain::UsageMeter). It is **OSS and billing-free**: it
-//! exposes the meter; it never turns usage into money (that lives in envoir-cloud).
+//! exposes the meter; it never turns usage into money — that is entirely the attaching operator's
+//! own, external system, if they run one at all.
 //!
 //! ## Fail-closed authentication (§18.9.11)
 //! Every request is authenticated with a **bearer admin token** (`Authorization: Bearer <token>`),

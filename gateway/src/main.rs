@@ -49,7 +49,7 @@ fn serve(cfg: &PersonalConfig) -> std::io::Result<()> {
 /// shutdown. Fail-closed and off-by-default — refuses to start without an admin token AND a TLS
 /// cert/key pair (the token must never travel in cleartext, and an unauthenticated control surface is
 /// never brought up). Domains, keys, aliases, and quotas are all managed at runtime through the admin
-/// API (envoir-cloud drives it); the gateway itself serves no domain until one is added.
+/// API (an operator's own tooling drives it); the gateway itself serves no domain until one is added.
 fn serve_public() -> std::io::Result<()> {
     use envoir_gateway::{AdminApi, AdminAuth, AdminServer, MultiDomainGateway, UsageMeter};
     use std::sync::{Arc, Mutex};
@@ -130,10 +130,11 @@ fn main() {
             }
         }
         "public" => {
-            // The multi-tenant PUBLIC gateway "as a business" (spec §7): serve MANY domains, each
-            // added at runtime through the authenticated admin API (envoir-cloud drives it). Everything
-            // is fail-closed and off by default — this mode requires an admin token AND TLS, and serves
-            // no domain until one is added via the API. Configured from GATEWAY_ADMIN_* env vars.
+            // The multi-tenant PUBLIC gateway (spec §7): serve MANY domains, each added at runtime
+            // through the authenticated admin API (an operator's own tooling drives it — Envoir
+            // names no vendor here). Everything is fail-closed and off by default — this mode
+            // requires an admin token AND TLS, and serves no domain until one is added via the API.
+            // Configured from GATEWAY_ADMIN_* env vars.
             if let Err(e) = serve_public() {
                 eprintln!("gateway: fatal: {e}");
                 std::process::exit(1);

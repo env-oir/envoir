@@ -10,6 +10,13 @@ binary alongside the node's `envoir-node`. The two shared libraries it needs, `d
 standalone repository — see [`SEPARATION.md`](SEPARATION.md) for that history and the boundary
 discipline that keeps a future re-split cheap.
 
+Spec §0.2 also allows running the gateway **as a mode of the node binary**: `envoir-node --gateway
+<args>` (equivalently `envoir-node gateway <args>`) execs this same `envoir-gateway` binary as a
+genuinely separate OS process — never in-process, so a gateway invocation never shares memory with
+one holding the node's identity key. Every command below works identically whether you invoke
+`envoir-gateway` directly or through `envoir-node gateway`/`envoir-node --gateway`; see the root
+[`README.md`](../README.md#one-binary-roles-as-flags) for why that split exists.
+
 See the normative DMTAP spec, §7 "Gateway", in the spec repo:
 [`vul-os/dmtap` → `07-gateway.md`](https://github.com/vul-os/dmtap/blob/main/07-gateway.md). A node
 with no legacy correspondents never uses a gateway; at full DMTAP adoption it is unnecessary.
@@ -190,8 +197,8 @@ user's node retry queue. The gateway holds no queue and no mailbox — restart i
 
 **IP reputation** (warmup, feedback loops, blocklist remediation, abuse handling). This is the
 only operationally heavy part of the whole system, and it is quarantined here and only to
-legacy traffic. Per-identity accountability + operator stake keep a decentralized gateway pool
-safe; postage (spec §9) can fund outbound sending.
+legacy traffic. Per-identity accountability + attested operator identity/reputation keep a
+decentralized gateway pool safe; postage (spec §9) can fund outbound sending.
 
 ## Status
 
@@ -250,3 +257,10 @@ Licensed under either of
 at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for
 inclusion in this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
 without any additional terms or conditions.
+
+---
+
+<p align="center">
+  <a href="https://vulos.org"><img src="../docs/assets/vulos-logo.png" alt="vulos" height="20"></a><br>
+  <sub><a href="https://vulos.org"><b>vulos</b></a> — open by design</sub>
+</p>

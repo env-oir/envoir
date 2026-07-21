@@ -18,10 +18,11 @@
 //! - [`GatewayAuthz`] (§7.9, §12.2) — the policy seam gating whether a self-hosted `@host.net`
 //!   domain may relay legacy mail **through** this gateway. Native mesh delivery never reaches
 //!   this seam (it does not use the gateway), so it is never gated and never billed (§7.9, §12.3).
-//! - [`GatewayMeter`] (§7.9, §12.2, §12.6) — the metering seam envoir-cloud consumes. It is
-//!   incremented **only** on an actual gateway relay (the billable event); a pure-mesh message
-//!   never calls into the gateway, so it never meters. This closes the §12.7 loop: exactly the
-//!   messages carrying a verifiable [`GatewayAttestation`] are the ones a bill can reference.
+//! - [`GatewayMeter`] (§7.9, §12.2, §12.6) — the metering seam an operator's own tooling consumes.
+//!   It is incremented **only** on an actual gateway relay (the billable event, if the operator
+//!   bills at all); a pure-mesh message never calls into the gateway, so it never meters. This
+//!   closes the §12.7 loop: exactly the messages carrying a verifiable [`GatewayAttestation`] are
+//!   the ones a bill can reference.
 //!
 //! Fail-closed throughout (§18.9.11): a tampered attestation, an unknown discriminator, a
 //! digest that does not bind the delivered bytes, or a key not published under the domain all
@@ -489,9 +490,10 @@ pub struct MeterEvent {
     pub at: TimestampMs,
 }
 
-/// The metering seam envoir-cloud consumes (§12.2, §12.6). The gateway calls [`Self::record`]
-/// exactly once per gateway relay; the backend (a **separate repo**) turns events into a bill. The
-/// gateway itself is stateless (§7.4) and holds nothing after emitting.
+/// The metering seam an operator's own tooling consumes (§12.2, §12.6). The gateway calls
+/// [`Self::record`] exactly once per gateway relay; whatever backend an operator attaches (if any)
+/// turns events into a bill. The gateway itself is stateless (§7.4) and holds nothing after
+/// emitting.
 pub trait GatewayMeter {
     fn record(&self, event: &MeterEvent);
 }
