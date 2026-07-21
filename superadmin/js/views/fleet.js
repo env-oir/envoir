@@ -3,7 +3,7 @@
 // (domain-anchored §7.2a for nodes+gateways; operator-diversity §4.4.8 for mix nodes), reputation
 // (§9.6 for gateways+mix), per-kind operational metrics, and enroll / decommission actions.
 
-import { state, component, liveFleet, byKind, uid, persist, KIND, REGIONS, regionName, regionFlag, counts } from '../store.js';
+import { state, component, liveFleet, byKind, uid, persist, KIND, REGIONS, regionName, regionFlag, counts, SELF_OPERATOR } from '../store.js';
 import { bus } from '../bus.js';
 import {
   el, esc, icon, healthDot, healthPill, attestBadge, repBar, meter, sparkline, emptyState,
@@ -197,7 +197,7 @@ function enrollModal() {
       const now = Date.now();
       const c = {
         id: uid(kind), kind, host, region, status: 'up', version: '0.4.2', uptime: 100, load: 0.05, cpu: 4, memGB: kind === 'node' ? 16 : 4,
-        enrolledAt: now, lastSeen: now, operator: 'envoir-cloud',
+        enrolledAt: now, lastSeen: now, operator: SELF_OPERATOR,
         attest: kind === 'relay' ? { status: 'n/a' } : { status: 'stale', key: 'pending-verification', verifiedAt: now },
         rep: kind === 'gateway' || kind === 'mix' ? 80 : null,
         loadHistory: Array.from({ length: 24 }, () => 4 + Math.random() * 6),

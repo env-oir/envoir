@@ -1,8 +1,8 @@
-// shell.js — the superadmin shell: left rail (Overview · Fleet · Billing · Abuse ops ·
+// shell.js — the superadmin shell: left rail (Overview · Fleet · Usage & metering · Abuse ops ·
 // Provisioning), a topbar with the operator identity, fleet-health summary + search, and view
 // dispatch. Fills the bus so views trigger re-renders without importing the shell (no cycle).
 
-import { state, persist, wipe, counts, seed, openIncidents } from './store.js';
+import { state, persist, wipe, counts, seed, openIncidents, SELF_OPERATOR } from './store.js';
 import { esc, icon, brandMark, openModal, closeModal, toast, healthDot } from './ui.js';
 import { bus } from './bus.js';
 
@@ -15,7 +15,7 @@ import { render as renderProvisioning } from './views/provisioning.js';
 const VIEWS = [
   { id: 'overview', name: 'Overview', icon: 'home', render: renderOverview },
   { id: 'fleet', name: 'Fleet', icon: 'fleet', render: renderFleet, search: 'Search hosts, regions, operators' },
-  { id: 'billing', name: 'Billing', icon: 'billing', render: renderBilling, search: 'Search accounts' },
+  { id: 'billing', name: 'Usage & metering', icon: 'billing', render: renderBilling, search: 'Search accounts' },
   { id: 'abuse', name: 'Abuse ops', icon: 'abuse', render: renderAbuse, search: 'Search signals' },
   { id: 'provisioning', name: 'Provisioning', icon: 'provision', render: renderProvisioning },
 ];
@@ -34,7 +34,7 @@ export function mountShell() {
     </nav>
     <div class="workspace">
       <header class="topbar">
-        <div class="op-chip" id="op-chip" title="Operator control plane">${icon('globe')}<b class="mono">envoir-cloud</b><span class="op-scope mono" title="Fleet scope">fleet</span></div>
+        <div class="op-chip" id="op-chip" title="Operator control plane">${icon('globe')}<b class="mono">${esc(SELF_OPERATOR)}</b><span class="op-scope mono" title="Fleet scope">fleet</span></div>
         <div class="fleet-glance" id="fleet-glance"></div>
         <div class="topbar-search hidden" id="topbar-search" role="search">
           ${icon('search')}
@@ -117,7 +117,7 @@ function sessionMenu() {
   const card = openModal(`
     <div class="modal-head"><h2>${icon('shield')} Operator session</h2><button class="icon-btn" id="sx" aria-label="Close">${icon('x')}</button></div>
     <div class="modal-body">
-      <p class="modal-note">${icon('info')} You are signed in as a <b>platform superadmin</b> for the <span class="mono">envoir-cloud</span> fleet. This console's enrollment registry, <span class="mono">dmtap-seam</span> metering/provisioning endpoints and alert bus are <b>simulated</b> and held in your browser.</p>
+      <p class="modal-note">${icon('info')} You are signed in as a <b>platform superadmin</b> for the <span class="mono">${esc(SELF_OPERATOR)}</span> fleet — a placeholder identity for whichever third-party operator runs this instance (Envoir sells and operates nothing). This console's enrollment registry, <span class="mono">dmtap-seam</span> metering/provisioning endpoints and alert bus are <b>simulated</b> and held in your browser.</p>
       <p class="modal-note warn">${icon('lock')} <span><b>Content-blind by construction.</b> Nothing in this console can read a mailbox, a message, a recipient set, or a user's keys. It meters <b>operations</b> and aggregates <b>anti-abuse signals</b> only — the inviolable rule (spec §12.3, dmtap-seam CONTRACT).</span></p>
       <div class="sess-row"><div><b>Reseed demo fleet</b><small>Regenerate the simulated fleet, billing and incidents from a fresh snapshot.</small></div><button class="btn danger" id="reset">${icon('refresh')} Reseed</button></div>
     </div>`, { label: 'Operator session' });

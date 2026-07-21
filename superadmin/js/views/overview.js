@@ -5,7 +5,7 @@
 
 import {
   state, counts, byKind, liveFleet, KIND, REGIONS, regionName, regionFlag, meterTotals, openIncidents,
-  ktWitnessFresh, ktWitnessSplit, ktStaleCount, ktSplitCount, ktReverify,
+  ktWitnessFresh, ktWitnessSplit, ktStaleCount, ktSplitCount, ktReverify, SELF_OPERATOR,
 } from '../store.js';
 import { bus } from '../bus.js';
 import { esc, icon, healthDot, emptyState, timeAgo, fmtBytes, fmtNum, toast } from '../ui.js';
@@ -40,7 +40,7 @@ export function render(root) {
     <header class="page-head">
       <div>
         <h1>Overview</h1>
-        <p class="page-sub">Fleet health for the <span class="mono">envoir-cloud</span> control plane — nodes, gateways, mix nodes and relays across ${regions.length} regions. Operations only; never content.</p>
+        <p class="page-sub">Fleet health for the <span class="mono">${esc(SELF_OPERATOR)}</span> control plane — nodes, gateways, mix nodes and relays across ${regions.length} regions. Operations only; never content.</p>
       </div>
       <div class="page-head-aside">
         <span class="content-blind" title="The inviolable rule (spec §12.3)">${icon('lock')} content-blind</span>
@@ -93,7 +93,7 @@ export function render(root) {
           ${meterTile('tag', 'Managed domains', fmtNum(mt.domains))}
           ${meterTile('zap', 'Native messages', fmtNum(mt.messages_sent))}
         </div>
-        <button class="btn ghost sm meters-more" data-go="billing">Open billing metrics →</button>
+        <button class="btn ghost sm meters-more" data-go="billing">Open usage &amp; metering →</button>
       </div>
     </section>
 

@@ -50,10 +50,14 @@ Keep the gateway loosely coupled so extracting it is a `git filter-repo` plus a 
 - **Own wire objects via `dmtap-core`.** `GatewayAttestation` / `ProvenanceRecord` come from
   `dmtap-core`; the gateway consumes, it does not redefine.
 - **Config/authz/quota/usage-tracking are self-contained** (`GatewayAuthz`, `GatewayMeter`); billing
-  is an external concern (the private `envoir-cloud` layer reads the meter — never a build dep here).
+  is an external concern — an operator's own tooling reads the meter (see `crates/dmtap-seam`'s
+  `BillingSink` boundary and the reference machinery in `crates/dmtap-operator`) — never a build
+  dep here. Envoir sells and operates nothing itself; there is no privately-run billing layer this
+  crate answers to.
 
-If a change would make the gateway depend on `node`, on another crate's internals, or on the billing
-layer, treat it as a smell and route it through `dmtap-core`'s public API or a trait seam instead.
+If a change would make the gateway depend on `node`, on another crate's internals, or on an
+operator's billing/control-plane system, treat it as a smell and route it through `dmtap-core`'s
+public API or a trait seam instead.
 
 ## When to actually split it out
 
@@ -136,8 +140,9 @@ cargo build --release -p envoir-gateway --bin envoir-gateway
 ```
 
 Then, in the monorepo, delete `gateway/` and remove `"gateway"` from the root `Cargo.toml`
-`[workspace] members`. The `crates/dmtap-seam` / `envoir-cloud` billing seam is untouched — it never
-build-depended on the gateway.
+`[workspace] members`. The `crates/dmtap-seam` operator seam (and `crates/dmtap-operator`, and any
+operator's own billing built on the `BillingSink` boundary) is untouched — it never build-depended
+on the gateway.
 
 ### What moves with it (everything under `gateway/`, nothing else)
 
@@ -158,7 +163,17 @@ beyond the dependency lines and the standalone-workspace boilerplate.
 
 ```
 dmtap           the protocol specification
-envoir          native core: dmtap-core + crates + node + client + mesh + mail-engine
+envoir          native core: dmtap-core + crates (incl. dmtap-seam, dmtap-operator, the optional
+                dmtap-postage-patala) + node + client + mesh + mail-engine
 envoir-gateway  the legacy bridge (this component, once split out)
-envoir-cloud    private, thin billing layer
 ```
+
+There is no `envoir-cloud` repository in this shape, past or future. An earlier prototype by that
+name — a commercial control-plane — was retired; its non-commercial operator machinery (the usage-
+metering queue, gateway authorization, quota policy, gateway-domain DNS records) was folded back
+into this monorepo as `crates/dmtap-operator`. The fold was deletion-heavy: the price book, billing
+periods/proration, dunning, the multi-tenant superadmin/revenue reports, and the single-vendor VM
+provisioner were all dropped, not ported. Envoir sells and operates nothing: any operator who wants
+to run a billing/control-plane system for their own fleet builds or buys one separately and attaches
+it at the `dmtap-seam` `BillingSink`/`PostageProvider` boundaries — that system is never part of
+this project's repositories.

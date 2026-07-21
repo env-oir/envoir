@@ -1,8 +1,10 @@
-// views/billing.js — the billing seam metrics view. Reads the SIMULATED dmtap-seam Metering +
+// views/billing.js — the "Usage & metering" view. Reads the SIMULATED dmtap-seam Metering +
 // Provisioning read model (crates/dmtap-seam): per-account metered OPERATIONS — hosted storage,
 // gateway sends, inbound legacy, relayed bytes, managed domains, native messages — plus tier and
 // suspend/resume. It surfaces the inviolable rule loudly: privacy/crypto is NEVER metered or gated
-// (there is deliberately no quota for "encryption" or "metadata privacy"). Content-blind billing.
+// (there is deliberately no quota for "encryption" or "metadata privacy"). Content-blind metering —
+// Envoir computes no price or invoice here; an operator's own billing (if any) attaches externally
+// at the `dmtap-seam` `BillingSink` boundary.
 
 import { state, meterTotals, persist } from '../store.js';
 import { bus } from '../bus.js';
@@ -36,7 +38,7 @@ export function render(root) {
   <div class="page">
     <header class="page-head">
       <div>
-        <h1>Billing metrics <span class="pill accent sm">dmtap-seam</span></h1>
+        <h1>Usage &amp; metering <span class="pill accent sm">dmtap-seam</span></h1>
         <p class="page-sub">Per-account metered <b>operations</b> from the <span class="mono">Metering</span> + <span class="mono">Provisioning</span> seam — the genuine cost centers. ${state.accounts.length} accounts · ${suspended} suspended.</p>
       </div>
       <div class="page-head-aside"><span class="content-blind" title="The inviolable rule (spec §12.3)">${icon('lock')} content-blind</span></div>

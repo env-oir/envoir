@@ -34,6 +34,12 @@ export const state = {
   ui: { search: '', theme: 'dark', selNode: null, fleetKind: 'all', billingSort: 'storage', ackd: {} },
 };
 
+// The operator identity this simulated superadmin instance itself represents — a plain,
+// obviously-placeholder domain (RFC 2606 .example), not "envoir-cloud" or any Envoir brand.
+// Envoir sells and operates nothing; this console is tooling any third-party operator runs for
+// their own fleet, so the chrome should never claim to BE a specific named product.
+export const SELF_OPERATOR = 'operator.example';
+
 export const REGIONS = [
   { id: 'eu-central', name: 'EU · Frankfurt', flag: '🇩🇪', primary: true },
   { id: 'eu-west', name: 'EU · Amsterdam', flag: '🇳🇱' },
@@ -125,7 +131,10 @@ export function seed() {
   const series = (base, jitter, n = 24, floor = 0) => Array.from({ length: n }, () => Math.max(floor, base + (rnd() - 0.5) * jitter));
 
   const VER = ['0.4.2', '0.4.2', '0.4.2', '0.4.1', '0.4.3-rc1', '0.4.0'];
-  const OPERATORS = ['envoir-cloud', 'nym-collective', 'c3-mix-e.V.', 'sovrn.host', 'lantern-ops', 'meshworks'];
+  // Fictional third-party operators sharing this fleet view — deliberately no "Envoir" or
+  // "cloud" branded entry here: Envoir sells and operates nothing, so the reference operator
+  // identity below (SELF_OPERATOR) is a plain placeholder domain, one operator among many.
+  const OPERATORS = [SELF_OPERATOR, 'nym-collective', 'c3-mix-e.V.', 'sovrn.host', 'lantern-ops', 'meshworks'];
 
   const mkComp = (kind, host, region, opts = {}) => {
     const status = opts.status || pick(['up', 'up', 'up', 'up', 'up', 'up', 'degraded', 'down']);

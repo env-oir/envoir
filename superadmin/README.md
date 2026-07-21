@@ -1,7 +1,10 @@
 # Envoir Superadmin
 
-The open-source **operator / platform control plane** for whoever runs Envoir Cloud (or any
-fleet of Envoir/DMTAP infrastructure). It is the third admin surface in the suite — where
+The open-source **operator / platform control plane** for whoever operates a fleet of
+Envoir/DMTAP infrastructure — nodes, gateways, mix nodes, relays. There is no Envoir-run cloud to
+sign up for: Envoir sells and operates nothing, so this is tooling any third-party operator runs
+for their own fleet (see [`crates/dmtap-operator`](../crates/dmtap-operator) for the reference
+seam machinery it would read from). It is the third admin surface in the suite — where
 [`../client`](../client) answers *"I am one sovereign identity"* and [`../console`](../console)
 answers *"I administer a domain full of them"*, the superadmin answers *"I operate the fleet that
 carries them all"*.
@@ -32,7 +35,7 @@ across reloads). "Reseed demo fleet" (top-right ⋯) regenerates it.
 |--------|------|--------------|
 | **Overview** | §7, §9, §3.5 | Fleet health at a glance — counts by component kind (nodes · gateways · mix nodes · relays), up / degraded / down, a per-region rollup, aggregate metered operations, **Key Transparency log health** (tree size, published root, per-witness gossip freshness, split-view detection), and the incident feed. A standing **content-blind** marker. |
 | **Fleet** | §7.2a, §4.4.8, §9.6 | A filterable directory of every component with a detail pane: health + load + uptime, version, region, operator, **attestation** (domain-anchored §7.2a for nodes+gateways, operator-diversity §4.4.8 for mix nodes), **reputation** (§9.6 for gateways+mix), per-kind operational metrics, and **enroll / decommission**. |
-| **Billing** | `dmtap-seam` | Per-account metered **operations** from the `Metering` + `Provisioning` seam — hosted storage, gateway sends, inbound legacy, relayed bytes, managed domains, native messages — with tier and suspend/resume. Loudly surfaces that **privacy is never metered**. |
+| **Usage & metering** | `dmtap-seam` | Per-account metered **operations** from the `Metering` + `Provisioning` seam — hosted storage, gateway sends, inbound legacy, relayed bytes, managed domains, native messages — with tier and suspend/resume. Loudly surfaces that **privacy is never metered**. Envoir computes no price or invoice here; an operator's own billing (if any) attaches externally at the `BillingSink` boundary. |
 | **Abuse ops** | §9, §9.6, §6.2 | Aggregate anti-abuse **signals** (rate ceilings, ARC-token revocations, bounce/complaint spikes, spam-trap hits, PoW clearances) and **operator reputation** for gateways + mix operators. Accountability **without content**: every signal is attributed to an anonymous accountable credential, never a message or a sender identity in clear. |
 | **Provisioning** | — | Warm-pool / capacity per region (active · warm · target · claims, provider mix) plus the incident / alert feed with resolve. Mirrors the generic-box warm-pool / claim / attach model. |
 
@@ -41,11 +44,12 @@ across reloads). "Reseed demo fleet" (top-right ⋯) regenerates it.
 The point of an operator console is that it could be tempted to look inside. This one is built so it
 structurally cannot, and says so in three places:
 
-1. A persistent **content-blind** marker on the Overview, Billing and Abuse headers.
-2. The **billing** view states plainly that the seam has quotas for storage / sends / domains / rate
-   and **deliberately none** for encryption, metadata privacy or key access — no billing state gates
-   a protocol capability. Suspending an account stops new metered operations; it never touches the
-   account's keys or contents.
+1. A persistent **content-blind** marker on the Overview, Usage & metering and Abuse headers.
+2. The **Usage & metering** view states plainly that the seam has quotas for storage / sends /
+   domains / rate and **deliberately none** for encryption, metadata privacy or key access — no
+   metering state gates a protocol capability, and Envoir renders no price or invoice here.
+   Suspending an account stops new metered operations; it never touches the account's keys or
+   contents.
 3. The **abuse** view attributes every signal to an anonymous **accountable credential** (ARC token /
    postage / PoW), preserving sealed sender (spec §6.2) — you can throttle a credential, never learn
    who is behind it or what they sent.
@@ -71,7 +75,7 @@ index.html               mount point + global overlays (modal / toast)
 css/superadmin.css        the Aurora Indigo design system — all components, light + dark
 
 js/app.js                 boot: load a persisted fleet snapshot or seed one, then mount the shell
-js/shell.js               rail (Overview · Fleet · Billing · Abuse ops · Provisioning), topbar glance, dispatch
+js/shell.js               rail (Overview · Fleet · Usage & metering · Abuse ops · Provisioning), topbar glance, dispatch
 js/bus.js                 late-bound rerender/setView dispatch (no import cycle)
 js/store.js               THE SIMULATED SEAM: fleet + accounts + signals + incidents + warm-pool + KT log health (witness gossip, split-view/freshness); persistence
 js/ui.js                  DOM helpers, icon set, health dots/pills, attestation + reputation badges, meters, sparkline, modal, toast, empty/loading/error
@@ -93,8 +97,15 @@ collapses to a single pane (with a back affordance) from phone width up. Full li
 ## Local testing
 
 Every screen and every primary interaction — overview drill-downs, fleet filtering + node/gateway/
-mix/relay detail + attestation re-verify + enroll + decommission, billing sorts + account
+mix/relay detail + attestation re-verify + enroll + decommission, usage sorts + account
 suspend/resume, abuse throttle, provisioning incident resolve, theme toggle, session menu — was
 driven headlessly in Chrome, asserting **zero page-level console errors** (`console.error` /
 `pageerror` / `requestfailed` / HTTP ≥ 400 all captured) and **no horizontal overflow** at desktop
 (1440px) and phone (390px), across light and dark.
+
+---
+
+<p align="center">
+  <a href="https://vulos.org"><img src="../docs/assets/vulos-logo.png" alt="vulos" height="20"></a><br>
+  <sub><a href="https://vulos.org"><b>vulos</b></a> — open by design</sub>
+</p>
