@@ -9,8 +9,10 @@ properties against an active network attacker, with perfect cryptography
 abstracted as an equational theory.
 
 **Status: every query obtained a definitive result under ProVerif 2.05** — all
-security queries hold; the two group/transparency non-vacuity controls are
-deliberately, and verifiably, *reachable* (see [Results](#results)).
+security queries hold; the five non-vacuity controls are deliberately, and
+verifiably, *reachable* (see [Results](#results)). The verdicts are **gated**,
+not merely printed: `./check.sh` compares a live run against `EXPECTED.txt` and
+fails on any deviation *in either direction*.
 
 Spec sources (read-only):
 
@@ -21,12 +23,25 @@ Spec sources (read-only):
   (origin-bound challenge; `cnf = H(session_pubkey)` bound before signing;
   RP binds the session only to `cnf`; DS-tag `DMTAP-v0/auth-assertion`).
 
-The three newer models (`mls_group_keys`, `kt_append_only`,
-`mixnet_unlinkability`) are **tractable symbolic abstractions of the composed
-primitives** — an MLS-style group key schedule, a Key-Transparency log, and one
-mixnet hop — not of a specific DMTAP section; each honestly abstracts the one
-cryptographic property it depends on (a one-way key schedule, a
-collision-resistant Merkle combine, randomized onion encryption).
+- `../../dmtap/01-identity.md` §1.1, §1.3 — the **suite high-water-mark
+  ratchet** that stops a PQ-capable peer being talked back down to the classical
+  suite.
+- `../../dmtap/05-messaging.md` §5.1 — the per-group **committer** and the
+  fork evidence that indicts an equivocating one.
+
+Three models (`mls_group_keys`, `kt_append_only`, `mixnet_unlinkability`) are
+**tractable symbolic abstractions of the composed primitives** — an MLS-style
+group key schedule, a Key-Transparency log, and one mixnet hop — not of a
+specific DMTAP section; each honestly abstracts the one cryptographic property
+it depends on (a one-way key schedule, a collision-resistant Merkle combine,
+randomized onion encryption).
+
+Two models (`suite_ratchet`, `committer_fork`) each prove **the cryptographic
+half of a mechanism whose other half is local bookkeeping**, and say so in their
+headers rather than dressing the bookkeeping in a proof. ProVerif's applied
+pi-calculus has **no mutable state**, so a stored value evolving over time — the
+ratchet's high-water mark, a `> n/2` roster quorum — is not expressible and is
+not claimed. See [Limitations](#limitations-of-the-symbolic-model-honest).
 
 ## Files
 
@@ -38,6 +53,8 @@ collision-resistant Merkle combine, randomized onion encryption).
 | `mls_group_keys.pv` | MLS-style group key schedule (3 epochs) | reachability (+ phase compromise) | group-key secrecy, forward secrecy (FS), post-compromise security (PCS) |
 | `kt_append_only.pv` | Key-Transparency log + gossip auditor | reachability (correspondence) | inclusion soundness (I), no-rollback extension (X), split-view detection soundness (D) |
 | `mixnet_unlinkability.pv` | One honest mixnet hop, 2 inputs | observational equivalence | passive input↔output unlinkability |
+| `suite_ratchet.pv` | Suite high-water mark (§1.3) | reachability (correspondence) | authenticated mark advance, replay-resistance (A) — *not* monotonicity |
+| `committer_fork.pv` | Group committer fork evidence (§5.1) | reachability (correspondence) | evidence soundness (S) — an honest committer cannot be framed |
 
 **Why deniability is a separate file.** Deniability is an
 *indistinguishability* property, not a reachability one, so it is a ProVerif
@@ -235,6 +252,60 @@ trivially linking them; randomized encryption (the re-encryption / probabilistic
   ciphertexts to a next hop the observer cannot open, which is what makes the two
   outputs interchangeable.
 
+### `suite_ratchet.pv`
+
+§1.1 makes the PQ-hybrid suite `0x02` the REQUIRED originating suite because
+mail is the most archival medium there is and a harvest-now-decrypt-later
+adversary is recording today. That argument is worth nothing unless a peer who
+has once used `0x02` **cannot later be talked back down** to `0x01`. §1.3
+supplies the guarantee with a per-contact high-water mark.
+
+**Proved (A) — authenticated mark advance.** The mark moves only on a message
+the genuine contact actually signed, and a **replay cannot count as a second
+advance** (injective agreement, §2.6 content-address de-duplication). The attack
+here is *not* forgery: once a contact has legitimately sent at the classical
+suite, that signed artifact exists forever and verifies perfectly under their
+key, so an attacker who captured it can offer it again after the contact
+migrates. Signature checking cannot stop that; only the mark can.
+
+**Not proved here — monotonicity**, i.e. the ratchet actually refusing a
+below-mark suite. It is a statement about a stored value evolving over time.
+Encoding it in ProVerif degenerates in *both* directions: write the rejection in
+and the model proves the `if` that was just typed; leave it out and the
+forbidden branch is trivially reachable, because the attacker really can deliver
+a PQ message then a classical one — what a conformant node does at that point is
+precisely the thing under test. It is a stateful invariant, wants Tamarin, and
+is covered meanwhile by the SUITE high-water-mark conformance cases.
+
+### `committer_fork.pv`
+
+MLS (RFC 9420) trusts the Delivery Service for exactly one thing: a **total
+order** on group Commits. A leaderless mesh has no natural serialization point,
+so §5.1 elects a per-group **committer** that serializes handshake messages into
+an append-only hash-chained log, and declares that two Commits at the same log
+position with the same predecessor are proof of misbehavior — members **MUST
+halt and alert**.
+
+**Proved (S) — evidence soundness.** A halt implies the committer *really did*
+sign both conflicting Commits. An equivocating committer signs its own
+indictment; an honest one cannot be framed.
+
+**Why soundness is the property that matters.** The naive reading is that
+detection is the valuable half. But detection failing is a *liveness* problem —
+the group runs on with a fork until someone notices. Evidence being **forgeable**
+is a *safety* problem and strictly worse: any single malicious member could
+manufacture two Commits, present them as a fork, and halt an entire group at
+will, for the cost of one message and indistinguishably from the honest case the
+halt exists to serve. §5.1's own phrase is "self-contained, transferable proof
+of misbehavior" — and transferable proof is exactly what must not be forgeable.
+
+**Not modelled — the takeover quorum (§5.1, §16.8) and partition healing.**
+Deterministic successor selection plus a `> n/2` apply-ack roster quorum is a
+*counting* property over accumulated per-member state, and "only one partition
+can ever hold the quorum" is a statement about global state across a network
+split. Both hit the no-mutable-state wall. **Do not read this model as covering
+them.**
+
 ## How to run
 
 Requires **ProVerif** (`opam install proverif`) — or Docker. `run.sh` resolves,
@@ -243,7 +314,8 @@ in order: a native `proverif` on `PATH`; else the local Docker image
 ProVerif via opam.
 
 ```sh
-./run.sh                              # all six models
+./check.sh                            # run all eight, GATE against EXPECTED.txt
+./run.sh                              # all eight models, print output only
 ./run.sh mls_group_keys.pv            # one model
 proverif deniable_1to1.pv             # or invoke ProVerif directly
 proverif deniable_1to1_deniability.pv # equivalence: expect "true"
@@ -257,6 +329,17 @@ authenticated). For the equivalence models, expect
 attack derivation — which for a *deliberate non-vacuity control* (the two
 `appMsg1/appMsg3` and the two `kt` reachability queries) is the intended,
 documented outcome, not a security failure.
+
+**Prefer `./check.sh` over reading the output.** `run.sh` invokes every model
+with `|| true`, so it exits 0 whether every property holds or one silently
+broke — an *executed* proof, not an *enforced* one. `check.sh` re-runs the
+models, extracts every `RESULT` line, and diffs the verdicts against
+`EXPECTED.txt`. A security query turning `false` is an obvious regression; a
+non-vacuity control turning `true` is a silent and worse one, because it means
+the model can no longer reach the state it reasons about and its other proofs
+have gone vacuous *while still reporting success*. Both directions fail the
+gate. `EXPECTED.txt` documents why each row is there; changing one is a
+deliberate act that belongs in a commit message.
 
 ## Results
 
@@ -338,6 +421,31 @@ Query not event(ClientExtend(oldRoot_1,leaf_3,newRoot_1)) is false.
   **is** accepted (liveness). `is false` here means *reachable*, i.e. the
   intended outcome — it certifies the model is not vacuous.
 
+**`suite_ratchet.pv`** (authenticated high-water-mark advance):
+
+```
+RESULT inj-event(MarkAdvanced(cc,s,n)) ==> inj-event(ContactSent(cc,s,n)) is true.
+```
+- **injective** agreement — the per-contact mark advances only on something the
+  genuine contact signed, and a captured earlier classical message replayed
+  after the contact migrated to PQ cannot count as a fresh advance. Monotonicity
+  itself is deliberately absent; see the model section above.
+
+**`committer_fork.pv`** (fork-evidence soundness):
+
+```
+RESULT event(ForkDetected(k,pos_1,x,y)) ==> event(CommitterSigned(k,pos_1,prev_1,x)) && event(CommitterSigned(k,pos_1,prev_1,y)) is true.
+RESULT not event(ForkDetected(k,pos_1,x,y)) is false.
+```
+- the `... is true` correspondence — **(S)** every §5.1 halt implies the
+  committer genuinely signed both conflicting Commits at that position on that
+  predecessor. Fork evidence cannot be fabricated, so the mandated HALT cannot
+  be turned into a one-message group-wide denial of service.
+- `not event(ForkDetected(...)) is false` — **deliberate non-vacuity control**:
+  forks are *reachable*, i.e. an equivocating committer really can sign two
+  conflicting Commits. Without this the soundness implication would hold over
+  the empty set and prove nothing while reporting success.
+
 **`mixnet_unlinkability.pv`** (passive input↔output unlinkability of one hop):
 
 ```
@@ -406,6 +514,17 @@ RESULT Observational equivalence is true.
   `coins` the equivalence would (correctly) fail, since a deterministic onion is
   linkable by re-encryption. ProVerif completes with `Termination warning`s on
   the biprocess disequality clauses but still returns a definitive result.
+- **No mutable state, so no stateful invariants.** ProVerif's applied
+  pi-calculus reasons about what an attacker can *derive* or *cause*, not about
+  a stored value evolving over time. Three load-bearing DMTAP mechanisms are
+  therefore only half-covered here, and each says so in its own header rather
+  than quietly claiming the whole: the §1.3 **suite ratchet's monotonicity**
+  (the mark never decreasing), the §5.1 **takeover quorum** (`> n/2` apply-acks,
+  a counting property) and **partition healing** (a global-state property across
+  a split). These want a stateful tool — Tamarin's multiset-rewriting state
+  facts express exactly this shape — and are covered meanwhile by conformance
+  cases against a real implementation, not by proof. A reader should not infer
+  from "the ratchet is modelled" that the ratchet is proved.
 - These are **bounded well-formed models of the ceremonies/primitives as
   specified**, not of any particular implementation. An implementation can still
   be insecure while the protocol is sound.

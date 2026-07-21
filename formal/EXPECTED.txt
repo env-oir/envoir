@@ -76,3 +76,23 @@ mixnet_unlinkability.pv       true   Observational equivalence
 # Tamarin, and is covered meanwhile by the SUITE conformance cases. Adding a
 # monotonicity row here would be a proof that assumes its own conclusion.
 suite_ratchet.pv              true   inj-event(MarkAdvanced(cc,s,n)) ==> inj-event(ContactSent(cc,s,n))
+
+# --- group committer fork evidence (§5.1): the HALT cannot be weaponised -------
+# §5.1 says two Commits at one log position with the same predecessor are proof of
+# committer misbehavior and members MUST halt. A halt stops the whole group, so
+# the load-bearing property is not detection rate but EVIDENCE SOUNDNESS: an
+# honest committer cannot be framed. If evidence were forgeable, any one member
+# could halt any group for the cost of a single message, and the response §5.1
+# mandates would itself be the cheapest attack on the group.
+committer_fork.pv             true   event(ForkDetected(k,pos_1,x,y)) ==> event(CommitterSigned(k,pos_1,prev_1,x)) && event(CommitterSigned(k,pos_1,prev_1,y))
+# NON-VACUITY CONTROL — MUST stay false. Forks must be REACHABLE: an equivocating
+# committer really can sign two conflicting Commits (that is the whole premise of
+# §5.1). If this turns true, nothing in the model ever detects a fork and the
+# soundness implication above holds over the empty set.
+committer_fork.pv             false  not event(ForkDetected(k,pos_1,x,y))
+#
+# THE TAKEOVER QUORUM (§5.1, §16.8) IS NOT MODELLED and no row here covers it.
+# Deterministic successor selection plus a `> n/2` apply-ack quorum is a counting
+# property over accumulated per-member state — the same no-mutable-state wall
+# documented for suite_ratchet.pv above. It wants Tamarin. Partition healing is
+# out for the same reason.

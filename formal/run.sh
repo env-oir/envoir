@@ -22,6 +22,7 @@ MODELS=(
   "kt_append_only.pv"
   "mixnet_unlinkability.pv"
   "suite_ratchet.pv"
+  "committer_fork.pv"
 )
 if [ "$#" -ge 1 ]; then MODELS=("$@"); fi
 

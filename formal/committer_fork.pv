@@ -1,0 +1,114 @@
+(* ============================================================================
+   DMTAP group committer — fork evidence  (spec: dmtap/05-messaging.md §5.1)
+   ----------------------------------------------------------------------------
+   WHAT IS AT STAKE. MLS (RFC 9420) trusts the Delivery Service for exactly one
+   thing: a TOTAL ORDER on group Commits. A leaderless mesh has no natural
+   serialization point, so §5.1 elects a per-group COMMITTER that serializes
+   handshake messages into an append-only, hash-chained log. §6.6 item 7 already
+   discloses that this concentrates handshake metadata; what it does NOT discuss
+   is what happens when the committer is caught cheating.
+
+   §5.1's answer: "two Commits at the same log position with the same predecessor
+   is proof of committer misbehavior; members MUST halt and alert." That is a
+   strong response — a HALT stops the whole group — which makes the soundness of
+   the evidence load-bearing in a way the detection rate is not.
+
+     (S) PROVEN -- EVIDENCE SOUNDNESS. Fork evidence cannot be fabricated. If a
+         member presents two conflicting Commits at one position and honest
+         members halt, then the committer REALLY DID sign both. An equivocating
+         committer signs its own indictment; an honest one cannot be framed.
+
+     (R) PROVEN (non-vacuity control, MUST be false) -- forks are REACHABLE in
+         this model. Without this, (S) could hold trivially because nothing ever
+         detects anything, and a model that proves a property about an
+         unreachable state proves nothing while reporting success.
+
+   WHY (S) IS THE PROPERTY THAT MATTERS. The naive reading is that detection is
+   the valuable half — catching the cheat. But detection failing is a liveness
+   problem: the group runs on with a fork until someone notices. Evidence being
+   FORGEABLE is a safety problem and strictly worse: any single malicious member
+   could manufacture two Commits, present them as a fork, and halt an entire
+   group at will — a denial of service that costs one message and is
+   indistinguishable from the honest case the halt exists to serve. §5.1's own
+   phrase for this is "self-contained, transferable proof of misbehavior", and
+   transferable proof is exactly what must not be forgeable.
+
+   HONEST SCOPE — what this model does NOT cover, and why.
+
+     * THE TAKEOVER QUORUM (§5.1, §16.8) is not modelled. Deterministic successor
+       selection plus a `> n/2` apply-ack roster quorum is a COUNTING property
+       over accumulated per-member state, and ProVerif's applied pi-calculus has
+       no mutable state — the same wall documented in suite_ratchet.pv. It wants
+       Tamarin. Do not read this file as covering it.
+     * PARTITION HEALING is not modelled, for the same reason: "only one
+       partition can ever hold the quorum" is a statement about global state
+       across a network split.
+     * The committer's METADATA concentration (§6.6 item 7) is a privacy property,
+       not a safety one, and is disclosed there rather than proven here.
+
+   So this file establishes that the fork RESPONSE cannot be weaponised, not that
+   the ordering mechanism as a whole is correct. That distinction is the honest
+   one and the review that prompted this model named §5.1 as the largest
+   unexamined surface precisely because the rest of it resists symbolic methods.
+
+   Tool: ProVerif.   Run:  proverif committer_fork.pv
+                     Expect: RESULT event(ForkDetected(...)) ==>
+                               event(CommitterSigned(...)) && ... is true.
+                             RESULT not event(ForkDetected(...)) is false.
+   ============================================================================ *)
+
+(* ---------- signatures ----------------------------------------------------- *)
+type skey.
+type pkey.
+fun  pk(skey): pkey.
+fun  sign(bitstring, skey): bitstring.
+reduc forall m: bitstring, k: skey; checksign(sign(m, k), pk(k)) = m.
+
+free c: channel.
+
+(* A Commit is bound to its log POSITION and its PREDECESSOR — that binding is
+   what makes "same position, same predecessor, different content" a detectable
+   contradiction rather than two unrelated messages (§5.1 hash-chained log). *)
+event CommitterSigned(pkey, bitstring, bitstring, bitstring). (* committer, pos, prev, commit *)
+event ForkDetected(pkey, bitstring, bitstring, bitstring).    (* committer, pos, c1, c2      *)
+
+(* ---------- the committer -------------------------------------------------- *)
+(* Free to behave honestly (one Commit per position) or to equivocate (two). The
+   model does not assume it is honest — an assumed-honest committer would make
+   the whole exercise vacuous. *)
+let committer(skK: skey) =
+  in(c, (pos: bitstring, prev: bitstring, commit: bitstring));
+  event CommitterSigned(pk(skK), pos, prev, commit);
+  out(c, sign((pos, prev, commit), skK)).
+
+(* ---------- an honest member checking presented evidence ------------------- *)
+(* Accepts a fork claim only if BOTH Commits verify under the committer's key, sit
+   at the SAME position with the SAME predecessor, and DIFFER. Anything less is
+   not a contradiction: two Commits at different positions are an ordinary log,
+   and one signature plus one fabrication is just a fabrication. *)
+let member(pkK: pkey) =
+  in(c, (e1: bitstring, e2: bitstring));
+  let (pos1: bitstring, prev1: bitstring, c1: bitstring) = checksign(e1, pkK) in
+  let (pos2: bitstring, prev2: bitstring, c2: bitstring) = checksign(e2, pkK) in
+  if pos1 = pos2 && prev1 = prev2 && c1 <> c2 then
+    (* §5.1: HALT and ALERT. The evidence is self-contained and transferable. *)
+    event ForkDetected(pkK, pos1, c1, c2).
+
+(* ===================== queries ============================================ *)
+
+(* (S) EVIDENCE SOUNDNESS — an honest committer cannot be framed. A halt implies
+   the committer genuinely signed both conflicting Commits. *)
+query k: pkey, pos: bitstring, prev: bitstring, x: bitstring, y: bitstring;
+  event(ForkDetected(k, pos, x, y)) ==>
+    (event(CommitterSigned(k, pos, prev, x)) && event(CommitterSigned(k, pos, prev, y))).
+
+(* (R) NON-VACUITY CONTROL — MUST be false. Forks must be REACHABLE, or (S) holds
+   over an empty set and this file proves nothing while reporting success. *)
+query k: pkey, pos: bitstring, x: bitstring, y: bitstring;
+  event(ForkDetected(k, pos, x, y)).
+
+(* ===================== main =============================================== *)
+process
+  new skK: skey;
+  out(c, pk(skK));                     (* the committer identity is public (§5.1) *)
+  ( !committer(skK) | !member(pk(skK)) )
