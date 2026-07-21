@@ -76,6 +76,24 @@ pub enum MoteError {
     #[error("envelope kind/ts/to do not match the context bound in Payload.sig \
              (ERR_ENVELOPE_CONTEXT_MISMATCH, 0x0211)")]
     EnvelopeContextMismatch,
+    /// The accepted `challenge` was a **vouch**, but `Payload.from` is not the `VouchToken.subject`
+    /// it names — a lifted vouch (`ERR_VOUCH_SUBJECT_MISMATCH`, `0x0126`, §2.7 step 8(b2), §9.2a).
+    /// DROP_SILENT, and deliberately **not** acked: acking would confirm the address to the thief.
+    ///
+    /// Unlike an ARC token, a PoW solution or a postage stamp, a vouch CANNOT be bound to the
+    /// envelope's ephemeral `sender_key` at mint time — the voucher cannot know a key the vouchee
+    /// has not yet generated, and a cleartext proof-of-possession over `sender_key` would break
+    /// sealed sender (§6.2). §9.2a once concluded from this that a stolen vouch needs no binding
+    /// because "the message still fails identity authentication at step 8". That was wrong: step
+    /// 8(a) verifies `Payload.sig` under `Payload.from`, a field the THIEF chooses and signs with
+    /// their own key, so it succeeds. A vouch travels in the cleartext envelope by construction, so
+    /// anyone on path can lift one and obtain the strongest standing in the protocol (§9.7 bypasses
+    /// VDF/PoW/stamp entirely) at zero cost. Binding the vouch to the subject it names is the only
+    /// check that closes this, and it necessarily lands here, after decryption, because `from` is
+    /// not visible before it.
+    #[error("Payload.from is not the vouch's subject — lifted vouch \
+             (ERR_VOUCH_SUBJECT_MISMATCH, 0x0126)")]
+    VouchSubjectMismatch,
     #[error("payload decryption failed")]
     DecryptFailed,
     #[error("payload sealing failed")]
@@ -125,6 +143,7 @@ impl MoteError {
     pub fn code(&self) -> Option<u16> {
         match self {
             MoteError::EnvelopeContextMismatch => Some(0x0211),
+            MoteError::VouchSubjectMismatch => Some(0x0126),
             MoteError::FileUnavailable => Some(0x0809),
             MoteError::FileManifestInvalid => Some(0x080A),
             MoteError::FileRetentionExpired => Some(0x080B),
@@ -1782,6 +1801,18 @@ pub fn validate(
         return Err(MoteError::BadSignature);
     }
 
+    // 8(b2). Vouch subject binding (§2.7 step 8(b2), §9.2a). If the proof accepted at step 6 was a
+    //        VOUCH, the authenticated sender MUST be the subject that vouch names. Every other
+    //        proof kind is bound to the ephemeral `sender_key` at mint time and so cannot be lifted
+    //        onto another envelope; a vouch structurally cannot be, which is why it alone needs a
+    //        check here — and why the check must run after decryption, since `from` is the field it
+    //        compares and `from` is not visible any earlier.
+    if let Some(ChallengeResponse::Vouch(v)) = &env.challenge {
+        if payload.from != v.subject {
+            return Err(MoteError::VouchSubjectMismatch);
+        }
+    }
+
     // 9. (Caller applies expires/refs/kind semantics + the step-8 suite pin — see
     //     `validate_pinned` — then stores and acks.)
     Ok(Outcome::Accepted(Box::new(payload)))
@@ -2183,6 +2214,72 @@ mod tests {
             sender_is_known: false, // cold sender, draft had no challenge
         };
         assert!(matches!(validate(&Hpke, &env, &ctx).unwrap(), Outcome::Deferred));
+    }
+
+    /// §2.7 step 8(b2) / §9.2a (`ERR_VOUCH_SUBJECT_MISMATCH`, `0x0126`): a LIFTED vouch is unusable
+    /// by the thief.
+    ///
+    /// The attack this closes is not forgery. A vouch rides in the CLEARTEXT envelope by
+    /// construction (it must be checkable before decryption, §2.7 step 6), so anyone on path can
+    /// copy one. The thief then mints their own ephemeral `sender_key`, seals their own payload,
+    /// and signs `Payload.sig` with their OWN key under their OWN `from` — so step 8(a) succeeds.
+    /// §9.2a once argued that identity authentication at step 8 was therefore sufficient; it is not,
+    /// because the thief chooses both sides of that check. Only comparing `from` against the
+    /// subject the vouch NAMES closes it.
+    #[test]
+    fn a_lifted_vouch_is_rejected_and_its_subject_is_accepted() {
+        let voucher = IdentityKey::generate();
+        let subject = IdentityKey::generate();
+        let thief = IdentityKey::generate();
+        let recipient = IdentityKey::generate();
+        let seal = SealKeypair::generate();
+
+        // One VouchToken, naming `subject`. The same token is used by both senders below — that is
+        // the whole point: it is lifted verbatim, not forged.
+        let vouch = ChallengeResponse::Vouch(Vouch {
+            voucher: voucher.public(),
+            subject: subject.public(),
+            recipient: recipient.public(),
+            exp: 9_999,
+            sig: vec![7u8; 64],
+        });
+
+        let build = |sender: &IdentityKey| {
+            let mut draft = MoteDraft::new(Kind::Mail, 1, b"vouched first contact".to_vec());
+            draft.challenge = Some(vouch.clone());
+            build_mote(
+                &Hpke,
+                sender,
+                &IdentityKey::generate(), // a FRESH ephemeral, as any sender mints
+                &recipient.public(),
+                seal.public(),
+                draft,
+            )
+            .expect("build_mote must succeed")
+        };
+        let ctx = RecipientCtx {
+            our_ik: &recipient.public(),
+            seal_secret: seal.secret(),
+            sender_is_known: false, // cold: the vouch is what gets them in
+        };
+
+        // (a) presented by its named subject — accepted.
+        let honest = build(&subject);
+        assert!(
+            matches!(validate(&Hpke, &honest, &ctx).unwrap(), Outcome::Accepted(_)),
+            "the subject a vouch names must be admitted by it"
+        );
+
+        // (b) the SAME token lifted onto the thief's own envelope. Everything the thief controls
+        // verifies — fresh ephemeral, valid sender_sig, payload sealed and signed under their own
+        // from — so only the subject binding can catch it.
+        let lifted = build(&thief);
+        assert_eq!(
+            validate(&Hpke, &lifted, &ctx).unwrap_err(),
+            MoteError::VouchSubjectMismatch,
+            "a lifted vouch must not admit the thief"
+        );
+        assert_eq!(MoteError::VouchSubjectMismatch.code(), Some(0x0126));
     }
 
     #[test]

@@ -1676,7 +1676,11 @@ fn drop_reason(e: MoteError) -> DropReason {
         // A §2.7-step-8 envelope-context mismatch (`0x0211`): the envelope `kind`/`ts`/`to` were
         // altered after `Payload.sig` was signed (a re-emit of the sealed ciphertext). Like the
         // other decode/authenticity failures it drops silently; map it defensively to Malformed.
-        MoteError::EnvelopeContextMismatch
+        // A lifted vouch (`0x0126`, §2.7 step 8(b2)): the vouch admitted the sender at the cold gate
+        // but names a different subject than `Payload.from`. DROP_SILENT and — load-bearing — NOT
+        // acked: an ack would confirm the address to whoever stole the token off the wire.
+        MoteError::VouchSubjectMismatch
+        | MoteError::EnvelopeContextMismatch
         | MoteError::SealFailed
         | MoteError::BadEncoding(_)
         | MoteError::FileManifestInvalid

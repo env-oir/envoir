@@ -34,7 +34,8 @@ use dmtap_core::kt::{
 };
 use dmtap_core::mixnet::{MixDescriptorError, MixDirectory, MixKeyEntry, MixNodeDescriptor};
 use dmtap_core::mote::{
-    self, build_mote, check_file_available, file_tier, spool_admit, tier_enforce, DeliveryTag,
+    self, build_mote, check_file_available, file_tier, spool_admit, tier_enforce, ChallengeResponse,
+    DeliveryTag, Vouch,
     Durability, DurabilityClass, Envelope, FileTier, Headers, Hpke, Kind, KeyPackageRef, Manifest,
     ManifestRef, MoteDraft, MoteError, Outcome, Payload, PayloadSeal, RecipientCtx, SealKeypair,
     Tier, TierEnforcementError, ValidateError, ENVELOPE_SENDER_DS, MOTE_VERSION, PAYLOAD_SIG_DS,
@@ -115,6 +116,7 @@ pub fn run_construction_case(case: &SuiteCase) -> CaseOutcome {
         "DMTAP-IDENT-90" => Some(recovery_threshold_same_kind_ordering()),
         "DMTAP-IDENT-91" => Some(eviction_is_durable_against_the_chain()),
         "DMTAP-WIRE-03" => Some(recovery_policy_required_fields_and_ordering()),
+        "DMTAP-ABUSE-06" => Some(vouch_subject_binding_rejects_a_lifted_vouch()),
         "DMTAP-PUBSUB-01" => Some(pubsub_subscription_signing_preimage()),
         "DMTAP-PUBSUB-02" => Some(pubsub_subscription_signer_authorization()),
         "DMTAP-PUBSUB-03" | "DMTAP-PUBSUB-14" => Some(pubsub_subscription_required_fields()),
@@ -604,6 +606,56 @@ fn ident_tampered_sig_rejected() -> Result<(), String> {
     match id.verify(None) {
         Err(IdentityError::BadSignature) => Ok(()),
         other => Err(format!("expected Err(BadSignature), got {other:?}")),
+    }
+}
+
+/// DMTAP-ABUSE-06 (§2.7 step 8(b2), §9.2a, §9.7): a LIFTED vouch is unusable by the thief
+/// (`ERR_VOUCH_SUBJECT_MISMATCH`, `0x0126`, DROP_SILENT).
+///
+/// A vouch is the one proof that cannot be bound to the envelope's ephemeral `sender_key` at mint
+/// time — the voucher cannot know a key the vouchee has not generated, and a cleartext
+/// proof-of-possession over it would break sealed sender. It rides in the CLEARTEXT envelope by
+/// construction, so anyone on path can copy one; and every check the thief controls (fresh
+/// ephemeral, valid `sender_sig`, payload signed under their own `from`) succeeds. Only comparing
+/// `Payload.from` against the subject the vouch NAMES catches it.
+fn vouch_subject_binding_rejects_a_lifted_vouch() -> Result<(), String> {
+    let voucher = IdentityKey::generate();
+    let subject = IdentityKey::generate();
+    let thief = IdentityKey::generate();
+    let recipient = IdentityKey::generate();
+    let seal = SealKeypair::generate();
+
+    // ONE token, naming `subject`, used verbatim by both senders — lifted, not forged.
+    let vouch = ChallengeResponse::Vouch(Vouch {
+        voucher: voucher.public(),
+        subject: subject.public(),
+        recipient: recipient.public(),
+        exp: 9_999,
+        sig: vec![7u8; 64],
+    });
+    let build = |sender: &IdentityKey| -> Result<Envelope, String> {
+        let mut draft = MoteDraft::new(Kind::Mail, 1, b"vouched first contact".to_vec());
+        draft.challenge = Some(vouch.clone());
+        build_mote(&Hpke, sender, &IdentityKey::generate(), &recipient.public(), seal.public(), draft)
+            .map_err(|e| format!("build_mote must succeed: {e:?}"))
+    };
+    let ctx = RecipientCtx {
+        our_ik: &recipient.public(),
+        seal_secret: seal.secret(),
+        sender_is_known: false, // cold — the vouch is what admits them
+    };
+
+    // (a) presented by its named subject → accepted.
+    match mote::validate(&Hpke, &build(&subject)?, &ctx) {
+        Ok(Outcome::Accepted(_)) => {}
+        other => return Err(format!("(a) the vouch's own subject must be admitted, got {other:?}")),
+    }
+
+    // (b) the same token lifted onto a third party's envelope → rejected, and NOT acked (an ack
+    // would confirm the address to the thief).
+    match mote::validate(&Hpke, &build(&thief)?, &ctx) {
+        Err(MoteError::VouchSubjectMismatch) => Ok(()),
+        other => Err(format!("(b) a lifted vouch must be rejected 0x0126, got {other:?}")),
     }
 }
 
