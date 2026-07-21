@@ -1,8 +1,13 @@
 # Envoir OSS monorepo — Cargo workspace.
 # Reference implementation of the Decentralized Message Transfer & Access Protocol.
-# Fully open source (MIT). The private billing/management control-plane lives in the
-# separate `envoir-cloud` repo and consumes the operator seam (crates/dmtap-seam) over a
-# documented contract — it is NOT part of this workspace.
+# Fully open source, dual-licensed MIT OR Apache-2.0. Envoir is not a business and runs no
+# control plane: the node binary carries every role (including the optional legacy gateway,
+# `envoir-node --gateway`/`envoir-gateway`, a separate OS process — see node/src/main.rs), and a
+# third-party operator who wants quotas, usage accounting, or authorization attaches at the
+# `crates/dmtap-seam` boundary (reference impls in `crates/dmtap-operator`) — never by forking
+# the protocol. `crates/dmtap-seam::postage` is the same story for optional prepaid postage
+# credit: provider-agnostic, off by default, with `crates/dmtap-postage-patala` as one isolated,
+# non-default reference adapter.
 
 [workspace]
 resolver = "2"
@@ -11,6 +16,38 @@ members = [
     "gateway",     # the optional legacy SMTP/IMAP/POP3 bridge (spec §7) — builds the envoir-gateway binary
     "integration", # cross-component end-to-end tests (test-only crate)
     "crates/*",    # shared libraries incl. dmtap-seam (the operator seam) + dmtap-mls (§5 groups)
+]
+
+# `crates/dmtap-postage-patala` is a real member (matched by the `crates/*` glob above) but is
+# deliberately left OUT of `default-members`: it path-depends on the sibling `patala` repo
+# (`../../patala/{patala-core,patala-stellar}`), an OPTIONAL reference payment-provider adapter for
+# `dmtap-seam`'s provider-agnostic `postage::PostageProvider` seam — never a hard dependency of
+# `dmtap-seam` or envoir. This mirrors exactly the trick `patala`'s OWN workspace uses for
+# `patala-solana`/`patala-stellar`/`patala-hyperswitch`: plain `cargo build`/`cargo test` at this
+# workspace root never pulls patala in; only `cargo build -p dmtap-postage-patala` /
+# `cargo test -p dmtap-postage-patala` does. `dmtap-seam` alone stays the default, dependency-free
+# postage seam (see `crates/dmtap-seam/src/postage.rs`).
+default-members = [
+    "node",
+    "gateway",
+    "integration",
+    "crates/conformance-runner",
+    "crates/dmtap-auth",
+    "crates/dmtap-clustersync",
+    "crates/dmtap-core",
+    "crates/dmtap-deniable",
+    "crates/dmtap-mail",
+    "crates/dmtap-mls",
+    "crates/dmtap-namechain-rpc",
+    "crates/dmtap-naming",
+    "crates/dmtap-operator",
+    "crates/dmtap-p2p",
+    "crates/dmtap-seam",
+    "crates/dmtap-send",
+    "crates/dmtap-sync",
+    "crates/dmtap-sync-wasm",
+    "crates/downgrade-tests",
+    "crates/netsim",
 ]
 
 [workspace.metadata.dmtap]

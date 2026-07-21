@@ -1,0 +1,51 @@
+[package]
+name = "dmtap-postage-patala"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "OPTIONAL patala-backed reference implementation of dmtap-seam's PostageProvider (spec §9.5): ONE possible prepaid-postage payment provider (Stellar micropayment top-ups via patala), never a hard dependency of dmtap-seam, envoir, or any gateway. UNVERIFIED AGAINST LIVE STELLAR — see README.md."
+repository = "https://github.com/vul-os/envoir"
+
+# ── Why this crate exists, and why it is deliberately isolated ──────────────────────────────
+#
+# `dmtap-seam::postage::PostageProvider` (the trait this crate implements) names NO payment
+# provider — see that module's docs. `patala` (a separate, sibling repo: ../../../patala, a
+# non-custodial, provider-agnostic payment-rail substrate — see ../../../patala/PATALA.md) is
+# simply ONE way an operator could implement it; its Stellar rail suits prepaid micropayment
+# top-ups (~$0.0001/tx, 3-5s finality). An operator who wants Stripe, M-Pesa, or their own ledger
+# instead writes their own ~3-method impl of `PostageProvider` and never touches this crate.
+#
+# This crate lives under `crates/*` (matched by the envoir workspace's member glob) but is
+# deliberately left OUT of that workspace's `default-members` (see the root Cargo.toml) — exactly
+# the trick patala's OWN workspace uses for `patala-solana`/`patala-stellar`/`patala-hyperswitch`.
+# Plain `cargo build`/`cargo test` at the envoir workspace root therefore never pulls in patala or
+# any of its crypto/network dependencies; only `cargo build -p dmtap-postage-patala` /
+# `cargo test -p dmtap-postage-patala` does. `dmtap-seam` alone stays the offline, dependency-free
+# default (see that crate's Cargo.toml).
+
+[dependencies]
+# The seam trait this crate implements.
+dmtap-seam = { path = "../dmtap-seam" }
+
+# The sibling patala repo (NOT part of this workspace) — path deps to its published seam +
+# the one reference rail this adapter demonstrates (Stellar: cheap, fast-finality, Ed25519-native
+# so the same identity key can double as the receiving wallet, PATALA.md §6).
+patala-core = { path = "../../../patala/patala-core" }
+patala-stellar = { path = "../../../patala/patala-stellar" }
+
+# Errors, not billing logic (PostagePatalaError carries no price/plan/invoice).
+thiserror = "1"
+
+[dev-dependencies]
+# Only `patala_core::PaymentRail` methods are `async fn` (via `async-trait`); this adapter's own
+# `PostageProvider` impl stays fully synchronous (see src/lib.rs). Tests exercise the async
+# `credit_from_receipt` entry point, so they need a minimal executor — mirrors patala-stellar's
+# own dev-dependency exactly.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Only to let one test define a fake `PaymentRail` (an operational-failure double for
+# `verify`) — the same macro patala-core itself uses to define the trait.
+async-trait = "0.1"
+
+[lib]
+name = "dmtap_postage_patala"
+path = "src/lib.rs"
