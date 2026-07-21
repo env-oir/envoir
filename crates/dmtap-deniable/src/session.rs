@@ -139,15 +139,28 @@ impl DeniableResponder {
         // flood of forged/garbage last-resort inits that fail AEAD can never grow the cache.
         const MAX_LASTRESORT_REPLAY: usize = 4096;
         let mut lastresort_tag: Option<Vec<u8>> = None;
+        // The opk is RESERVED here and COMMITTED only after the init authenticates (below), for
+        // exactly the reason the last-resort tag is: step 7 (this DH) precedes step 8 (identity
+        // authentication), so anything spent here is spent by an UNAUTHENTICATED sender. A one-time
+        // prekey is an exhaustible resource, so removing it eagerly let a cold sender burn one per
+        // garbage message and drain the bundle — after which every peer falls back to the
+        // last-resort key and the whole point of the opk (replay resistance, §5.2.1) is gone.
+        //
+        // Deferring costs nothing: `accept` takes `&mut self`, so calls are serialized, and a
+        // second init referencing the same opk can only be processed after the first has either
+        // committed it (gone ⇒ `X3dhFailed`) or failed (never consumed). The replay defense is
+        // therefore preserved unchanged — a replayed *successful* init still finds the prekey gone.
+        let mut pending_opk_ref: Option<Vec<u8>> = None;
         let opk_secret: Option<StaticSecret> = match &init.opk_ref {
             Some(opk_ref) => {
-                // Consuming path: the one-time prekey must still be unspent; reuse ⇒ reject
-                // (this also rejects a replayed opk-consuming init, since it is now gone).
-                Some(
-                    self.opks
-                        .remove(opk_ref.as_bytes())
-                        .ok_or(DeniableError::X3dhFailed)?,
-                )
+                // Consuming path: the one-time prekey must still be unspent; reuse ⇒ reject.
+                let secret = self
+                    .opks
+                    .get(opk_ref.as_bytes())
+                    .cloned()
+                    .ok_or(DeniableError::X3dhFailed)?;
+                pending_opk_ref = Some(opk_ref.as_bytes().to_vec());
+                Some(secret)
             }
             None => {
                 // Last-resort / signed-prekey-only path.
@@ -194,6 +207,11 @@ impl DeniableResponder {
         // so a garbage-init flood can no longer grow `consumed_lastresort`.
         if let Some(tag) = lastresort_tag {
             self.consumed_lastresort.insert(tag);
+        }
+        // COMMIT the one-time prekey on the same terms, and for the same reason: only an
+        // authenticated init may spend an exhaustible resource.
+        if let Some(opk_ref) = pending_opk_ref {
+            self.opks.remove(&opk_ref);
         }
 
         let session = DeniableSession { ratchet, ad };

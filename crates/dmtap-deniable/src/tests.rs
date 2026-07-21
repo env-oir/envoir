@@ -345,6 +345,63 @@ fn forged_last_resort_init_does_not_commit_or_poison_the_replay_cache() {
     assert!(matches!(bob.accept(&good), Err(DeniableError::ReplayRejected)));
 }
 
+/// §5.2.1 / §19.3.1 (DMTAP-DENIABLE-06): a one-time prekey is RESERVED at step 7 and COMMITTED
+/// only after step 8 succeeds, so an UNAUTHENTICATED cold sender cannot burn one per message.
+///
+/// Step 7 (the X3DH DH) necessarily precedes step 8 (identity authentication), so anything spent at
+/// step 7 is spent by a sender nobody has authenticated yet. The opk was previously `remove`d the
+/// moment it was referenced — so N garbage inits, each naming a real `opk_ref`, drained the bundle
+/// for free. Once drained every peer falls back to the last-resort key, which is precisely the
+/// replay-resistance the opk exists to provide: the exhaustion attack does not just deny service,
+/// it DOWNGRADES the handshake for everyone.
+///
+/// The last-resort tag in the same function already committed only after authentication; this makes
+/// the opk path symmetric.
+#[test]
+fn forged_inits_cannot_drain_the_one_time_prekey_pool() {
+    let (alice, mut bob) = setup(4);
+    let before = bob.opks_remaining();
+
+    // (a) N cold inits, each with a FRESH ek_a/idk_a (a fresh identity per message, as a flooder
+    //     would), each naming a real opk_ref, each failing step 8 on a flipped ciphertext byte.
+    for i in 0..8u8 {
+        let stranger = DeniableIdentity::new(ik(0xC0 + i));
+        let (_s, good) = initiate(&stranger, bob.bundle(), &payload(&stranger.ik_public(), "x"))
+            .expect("initiate");
+        assert!(good.opk_ref.is_some(), "the flood must reference a real one-time prekey");
+        let mut ct = good.msg.ct.clone();
+        ct[0] ^= 0xff;
+        let forged = DeniableInit { msg: DeniableMessage { ct, ..good.msg.clone() }, ..good };
+        assert!(bob.accept(&forged).is_err(), "a forged init must fail");
+    }
+    assert_eq!(
+        bob.opks_remaining(),
+        before,
+        "ZERO prekeys may be permanently spent by unauthenticated inits — every reservation released"
+    );
+
+    // (b) the same forged init resubmitted verbatim must not consume a second prekey either.
+    let (_s, good) = initiate(&alice, bob.bundle(), &payload(&alice.ik_public(), "hi"))
+        .expect("initiate");
+    let mut ct = good.msg.ct.clone();
+    ct[0] ^= 0xff;
+    let forged = DeniableInit { msg: DeniableMessage { ct, ..good.msg.clone() }, ..good.clone() };
+    assert!(bob.accept(&forged).is_err());
+    assert!(bob.accept(&forged).is_err());
+    assert_eq!(bob.opks_remaining(), before, "a replayed forgery consumes nothing");
+
+    // The genuine init still authenticates, and NOW the prekey is spent — deferring the commit
+    // must not break the success path or the one-time property.
+    let (_b, first) = bob.accept(&good).expect("the genuine init is still accepted");
+    assert_eq!(first.body, b"hi");
+    assert_eq!(bob.opks_remaining(), before - 1, "an AUTHENTICATED init does spend its prekey");
+
+    // ...and replaying that authenticated init is still rejected: the prekey is gone, which is the
+    // replay defense the eager removal used to provide, preserved unchanged.
+    assert!(matches!(bob.accept(&good), Err(DeniableError::X3dhFailed)));
+    assert_eq!(bob.opks_remaining(), before - 1);
+}
+
 #[test]
 fn last_resort_rejected_while_a_one_time_prekey_is_available() {
     // If Bob still has an unspent opk, a last-resort-only init MUST be rejected (prefer-OPK rule),

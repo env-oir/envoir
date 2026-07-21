@@ -284,6 +284,18 @@ fn skip_reason(id: &str, operation: &str) -> String {
             key); there is no identity_validate/cross-source check anywhere in this workspace that could \
             catch a lying-but-well-formed entry, so this stays an honest skip rather than substituting the \
             structurally-different 'missing field' case.",
+        "DMTAP-DENIABLE-06" => "PARTIALLY closed, and reported rather than claimed. Branches (a), (b) \
+            and (d) now hold and are gated by dmtap-deniable's \
+            `forged_inits_cannot_drain_the_one_time_prekey_pool`: the one-time prekey is reserved at \
+            step 7 and committed only after step 8 authenticates, so unauthenticated inits spend \
+            ZERO prekeys, a replayed forgery consumes none either, and (d) is vacuous under this \
+            design because nothing is held — there is no reservation to expire. Branch (c), \
+            'cold-sender consumption capped per §16.5 window with overflow served from the \
+            last-resort path', is NOT implemented: `DeniableResponder::accept` has no notion of a \
+            cold vs known sender (that classification lives at §2.7 step 5, above this crate) and no \
+            §16.5 window parameter, so there is nothing here to drive a per-window cap against. \
+            Executing the case would mean asserting three of its four branches and calling it a \
+            pass, so it stays a skip until the cold-sender cap exists.",
         "DMTAP-DENIABLE-02" => "dmtap-deniable's session.rs (now a dependency of this crate) has no \
             session-establishment/capability-gating function; CapabilityAnnouncement (dmtap-core's \
             capability.rs) advertises capability sets generically but nothing ties 'peer has not \

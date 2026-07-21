@@ -113,7 +113,7 @@ fn unsolicited_init_flood_is_throttled_and_opk_pool_preserved() {
 
         match bob.deniable_accept(&mallory_ik, &certified) {
             Err(DeniableRouteError::RateLimited) => throttled += 1,
-            _ => admitted += 1, // passed the gate (and burned opks[i], success or later decrypt-fail)
+            _ => admitted += 1, // passed the gate (spends a prekey only if it AUTHENTICATES)
         }
         let _ = i;
     }
@@ -121,8 +121,22 @@ fn unsolicited_init_flood_is_throttled_and_opk_pool_preserved() {
     assert_eq!(admitted, 3, "the global burst capped the flood at 3 accepts");
     assert_eq!(throttled, opks.len() - 3, "every further unsolicited init was throttled");
 
+    // Exactly ONE prekey is spent, not three. Swapping `opk_ref` points each init at a prekey that
+    // is NOT the one its X3DH actually used, so DH4 is wrong and the AEAD fails — only the init
+    // whose swapped ref happens to match the prekey the reference initiator picked (`opks[0]`)
+    // authenticates. Since §5.2.1's one-time prekey is now RESERVED at step 7 and COMMITTED only
+    // after step 8 succeeds, the two that fail to authenticate spend nothing.
+    //
+    // This assertion previously read `opks.len() - 3` — it encoded the pre-fix behaviour in which a
+    // decrypt-failing init still burned a prekey, which is precisely the exhaustion attack this
+    // test's own name says it is guarding against. The gate capped the flood at 3; the reservation
+    // discipline is what makes 2 of those 3 cost nothing.
     let remaining = bob.deniable_opks_remaining().unwrap();
-    assert_eq!(remaining, opks.len() - 3, "at most `global_burst` OPKs were consumed");
+    assert_eq!(
+        remaining,
+        opks.len() - 1,
+        "only the ONE init that authenticated may spend a prekey"
+    );
     assert!(remaining >= 5, "OPK pool preserved ({remaining} left) — last-resort NOT forced");
 }
 
@@ -154,8 +168,16 @@ fn a_throttled_genuine_init_succeeds_on_retry_after_refill() {
     let mut minit = mstock.init.clone();
     minit.opk_ref = Some(ContentId::of(opks.last().unwrap()));
     let mcert = CertifiedInit { init: minit, cert: mstock.cert };
-    let _ = bob.deniable_accept(&mallory_ik, &mcert); // admitted; drains the token, burns opks[last]
-    assert_eq!(bob.deniable_opks_remaining(), Some(opks.len() - 1));
+    // Mallory passes the gate and drains the token, but her init does NOT authenticate: she pointed
+    // `opk_ref` at a different prekey than her X3DH used, so DH4 is wrong and the AEAD fails. She
+    // therefore spends NO prekey — the reservation is released. Draining the rate-limit token is the
+    // only cost she imposes, which is the whole point of separating the two resources.
+    let _ = bob.deniable_accept(&mallory_ik, &mcert);
+    assert_eq!(
+        bob.deniable_opks_remaining(),
+        Some(opks.len()),
+        "an init that fails to authenticate spends no prekey"
+    );
 
     // Alice opens a genuine session; her first delivery lands while the gate is empty ⇒ throttled,
     // with NO prekey consumed (the gate returns before X3DH touches the pool).
@@ -167,7 +189,7 @@ fn a_throttled_genuine_init_succeeds_on_retry_after_refill() {
     ));
     assert_eq!(
         bob.deniable_opks_remaining(),
-        Some(opks.len() - 1),
+        Some(opks.len()),
         "a throttled init consumes no prekey"
     );
 
@@ -175,7 +197,11 @@ fn a_throttled_genuine_init_succeeds_on_retry_after_refill() {
     bob.set_now(NOW + 30_000);
     let got = bob.deniable_accept(&alice_ik, &init).expect("genuine init admitted after refill");
     assert_eq!(got, first, "the genuine first MOTE round-trips once admitted");
-    assert_eq!(bob.deniable_opks_remaining(), Some(opks.len() - 2), "now the genuine OPK is consumed");
+    assert_eq!(
+        bob.deniable_opks_remaining(),
+        Some(opks.len() - 1),
+        "now the genuine OPK is consumed — an AUTHENTICATED init does spend one"
+    );
 }
 
 /// A rejected (throttled) init performs NO checkpoint, while an admitted init still persists. This
