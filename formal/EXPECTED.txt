@@ -1,0 +1,63 @@
+# Expected ProVerif verdicts — the gate for formal/check.sh
+#
+# Format:  <model.pv> <true|false> <substring uniquely identifying the query>
+#
+# WHY THIS FILE EXISTS. `run.sh` runs every model with `|| true` and prints the
+# output, so it exits 0 whether a security property holds or silently breaks. The
+# proofs were executed but never *gated* — the same "it exists, nothing enforces
+# it" gap that let a conformance vector assert the opposite of §1.1 while every
+# test stayed green. check.sh compares an actual run against this file and fails
+# on any deviation, in EITHER direction.
+#
+# BOTH DIRECTIONS MATTER, and the `false` rows are the reason:
+#
+#   A security query flipping true -> false is an obvious regression.
+#
+#   A non-vacuity control flipping false -> true is a SILENT one, and worse. Those
+#   controls assert that a party legitimately holding an epoch key CAN read that
+#   epoch's message, and that equivocation IS reachable in the model. If one of
+#   them starts proving "true", the model has stopped being able to reach the
+#   states it reasons about — and a model that proves everything because nothing
+#   happens in it proves nothing at all, while reporting total success. That is
+#   the failure mode a proof artifact is least likely to be checked for.
+#
+# So: a line here is a claim about the model's *shape* as much as its security.
+# Changing one is a deliberate act that must be justified in the commit message.
+
+# --- deniable 1:1 (§5.2.1): secrecy + injective agreement both directions ------
+deniable_1to1.pv              true   not attacker_p1(msgAB[])
+deniable_1to1.pv              true   inj-event(RecvResp(a,b,n)) ==> inj-event(SendInit(a,b,n))
+deniable_1to1.pv              true   inj-event(AcceptA(a,b,n)) ==> inj-event(ConfirmB(a,b,n))
+
+# --- deniability (§5.2.1): transcript is simulatable, so it is not evidence -----
+deniable_1to1_deniability.pv  true   Observational equivalence
+
+# --- DMTAP-Auth (§13.3): unforgeability + replay + origin binding, and PoP ------
+# The injective agreement carries (origin, nonce, cnf) so it proves all three at
+# once; the secrecy query is the DPoP property — a captured assertion without the
+# session private key is useless.
+dmtap_auth.pv                 true   inj-event(RPAccepts(u,o,n,cnf_4)) ==> inj-event(UserSigned(u,o,n,cnf_4))
+dmtap_auth.pv                 true   not attacker(secretResource[])
+
+# --- MLS group keys (§5.1): PCS/FS across an epoch change ----------------------
+# HEADLINE: epoch-2 secret survives compromise on BOTH sides of it.
+mls_group_keys.pv             true   not attacker_p1(appMsg2[])
+# NON-VACUITY CONTROLS — MUST stay false. A holder of epoch 1's / epoch 3's key
+# can read that epoch's message. If either turns true the separation proved above
+# is empty rather than real.
+mls_group_keys.pv             false  not attacker_p1(appMsg1[])
+mls_group_keys.pv             false  not attacker_p1(appMsg3[])
+
+# --- KT append-only (§3.5): inclusion, consistency, equivocation-detection -----
+kt_append_only.pv             true   event(ClientInclusion(prev_2,leaf_3,root_2)) ==> event(LogAppend(prev_2,leaf_3,root_2))
+kt_append_only.pv             true   event(ClientExtend(oldRoot_1,leaf_3,newRoot_1)) ==> event(LogAppend(oldRoot_1,leaf_3,newRoot_1))
+kt_append_only.pv             true   event(Equivocation(prev_2,r1_1,r2_1)) ==> event(LogAppend(prev_2,leaf1,r1_1)) && event(LogAppend(prev_2,leaf2,r2_1))
+# NON-VACUITY CONTROLS — MUST stay false. Equivocation must be REACHABLE (a v0
+# single log can split-view, §6.6 item 6 — the claim is that it is *detectable*,
+# not impossible), and a client must actually be able to extend, or the two
+# implications above would hold vacuously.
+kt_append_only.pv             false  not event(Equivocation(prev_2,r1_1,r2_1))
+kt_append_only.pv             false  not event(ClientExtend(oldRoot_1,leaf_3,newRoot_1))
+
+# --- mixnet unlinkability (§4.4, §6): sender-recipient pairing is indistinguishable
+mixnet_unlinkability.pv       true   Observational equivalence

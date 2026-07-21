@@ -1,0 +1,44 @@
+# Gate the symbolic (ProVerif) models against their expected verdicts.
+#
+# run.sh executes the models with `|| true` and prints the output — it exits 0
+# whether every property holds or one silently broke. check.sh compares an actual
+# run to formal/EXPECTED.txt and fails on any deviation in EITHER direction:
+# a security query turning false is a regression, and a non-vacuity control
+# turning true means the model stopped reaching the states it reasons about, so
+# its proofs went vacuous while still reporting success.
+#
+# Separate from ci.yml because ProVerif is slow and its toolchain is unrelated to
+# the Rust build — a formal regression should be legible on its own.
+name: formal
+
+on:
+  push:
+    branches: [main, dev]
+    paths: ["formal/**"]
+  pull_request:
+    branches: [main, dev]
+    paths: ["formal/**"]
+  workflow_dispatch:
+
+jobs:
+  proverif:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # run.sh resolves proverif in order: PATH, a local docker image, then a
+      # throwaway ocaml/opam container. Installing to PATH here takes the fast
+      # path and keeps the log readable.
+      - name: Install ProVerif
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq opam
+          opam init --disable-sandboxing -y --bare
+          opam switch create default ocaml-system 2>/dev/null || opam switch default
+          eval $(opam env)
+          opam install -y proverif
+          echo "$(opam var bin)" >> "$GITHUB_PATH"
+
+      - name: Verify models against EXPECTED.txt
+        run: ./formal/check.sh

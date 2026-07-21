@@ -1,0 +1,57 @@
+# Build and test gate for the Envoir reference implementation.
+#
+# This repo had no CI. 1462 tests and six machine-checked formal proofs existed
+# and nothing ran them on a push — which is how a committed conformance vector
+# came to assert the opposite of spec §1.1 while every local run stayed green.
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # NON-BLOCKING, deliberately. Both currently fail on pre-existing debt:
+      # ~2600 rustfmt diffs and ~79 clippy findings, none introduced by the work
+      # that added this CI. Gating on them today would mean landing a 2600-diff
+      # reformat as a prerequisite — a commit that buries real changes and makes
+      # `git blame` useless across the whole crate tree. A gate whose precondition
+      # is that commit is not a gate, it is a blocker.
+      #
+      # So they report and do not fail. Promote to blocking (drop the
+      # continue-on-error) once the debt is paid down in its own commit, which is
+      # tracked in ../DMTAP-BACKLOG.md.
+      - name: Format (report only)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (report only)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The postage seam must stay provider-agnostic: the DEFAULT build carries no
+      # payment provider at all. This is the one property the seam exists for, so
+      # it is asserted rather than assumed.
+      - name: Postage seam is provider-agnostic
+        run: |
+          if cargo tree --workspace 2>/dev/null | grep -q patala; then
+            echo "::error::default build pulled a payment provider — the seam is no longer agnostic"
+            exit 1
+          fi
+          echo "default build has no patala dependency"
