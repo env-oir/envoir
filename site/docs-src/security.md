@@ -67,7 +67,7 @@ the fuzz target with the strict flag set finds nothing. See
 
 ## Conformance suite
 
-The [conformance suite](https://github.com/env-oir/dmtap/tree/main/conformance) in the spec repo
+The [conformance suite](https://github.com/vul-os/dmtap/tree/main/conformance) in the spec repo
 is the **operational definition** of "DMTAP-compatible" — an implementation conforms at a level
 if and only if it passes that level's `MUST` cases, not if it merely "resembles the reference." It
 ships as three coupled artifacts: a normative case catalog (`SUITE.md`), the same cases as

@@ -11,7 +11,7 @@ standalone repository — see [`SEPARATION.md`](SEPARATION.md) for that history 
 discipline that keeps a future re-split cheap.
 
 See the normative DMTAP spec, §7 "Gateway", in the spec repo:
-[`env-oir/dmtap` → `07-gateway.md`](https://github.com/env-oir/dmtap/blob/main/07-gateway.md). A node
+[`vul-os/dmtap` → `07-gateway.md`](https://github.com/vul-os/dmtap/blob/main/07-gateway.md). A node
 with no legacy correspondents never uses a gateway; at full DMTAP adoption it is unnecessary.
 
 ## Quickstart — a personal gateway for your own domain (2 commands)
@@ -225,7 +225,7 @@ Both `personal` and `run` are **real long-running daemons** that bind the MX lis
 
 ## Repo split
 
-This is the split-out `envoir-gateway` repository. It was extracted from the `env-oir/envoir`
+This is the split-out `envoir-gateway` repository. It was extracted from the `vul-os/envoir`
 monorepo; the mechanical extraction runbook and the precondition that had to hold first (a published
 monorepo tag for the shared crates) are recorded in [`SEPARATION.md`](SEPARATION.md) for history. The
 gateway now depends on `dmtap-core` / `dmtap-mail` via a git tag rather than sibling path deps.
