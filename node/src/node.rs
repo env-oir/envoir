@@ -91,6 +91,15 @@ const REQUESTS_MAILBOX: &str = "Junk";
 /// mirroring the transport's `MAX_INBOX_FRAMES`.
 const MAX_GROUP_INBOX: usize = 1024;
 
+/// Cap on §6.7 ephemeral (`sensitive`) messages held in memory awaiting a client read.
+///
+/// A sensitive MOTE is acked and never persisted, so memory is the only resource it consumes —
+/// which makes an unbounded buffer the one way this feature could be turned into a cost. Oldest are
+/// dropped first: a client that is not reading is not going to read the backlog either, and losing
+/// the oldest unread ephemeral message is strictly less bad than an unbounded queue, since the
+/// message is by definition one the recipient agreed not to retain.
+const MAX_EPHEMERAL_HELD: usize = 256;
+
 /// Why a [`Node::send_mail`] could not admit a MOTE for delivery.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SendError {
@@ -139,6 +148,17 @@ pub struct Node<T: Transport> {
     seal_public: [u8; 32],
     /// The MOTE-store projection every mail client is a view of (§8).
     store: MemoryStore,
+    /// §6.7 ephemeral view buffer: rendered `sensitive` messages, held **in memory only**.
+    ///
+    /// This is deliberately NOT part of [`Node::snapshot`] and is never handed to the journal, so a
+    /// restart drops it — which is the point, not an oversight. It is the "held in memory for an
+    /// ephemeral view and dropped" half of §6.7; the store refusal is only the "never written" half,
+    /// and without this the message would be acked as delivered and then be unreadable.
+    ///
+    /// Bounded by [`MAX_EPHEMERAL_HELD`]: a sensitive MOTE is acked and never persisted, so memory
+    /// is the only resource it consumes, and an unbounded buffer would turn that into the cost.
+    /// Oldest are dropped first.
+    ephemeral: Vec<(ContentId, Vec<u8>)>,
     /// Dedup / replay set (§2.6): a re-delivered `id` is acked without reprocessing. **Bounded** by a
     /// sliding receive-time window + a hard LRU cap ([`SeenSet`]) so it — and the durable snapshot it
     /// feeds (§19.3.3) — cannot grow without limit on a long-running or flooded node.
@@ -255,6 +275,7 @@ impl<T: Transport> Node<T> {
             seal_secret,
             seal_public,
             store: MemoryStore::new(),
+            ephemeral: Vec::new(),
             seen: SeenSet::new(),
             outbound: HashMap::new(),
             contacts: HashSet::new(),
@@ -628,6 +649,21 @@ impl<T: Transport> Node<T> {
     /// the queue is committed — e.g. before reporting a send accepted).
     pub fn flush(&self) -> Result<(), JournalError> {
         self.journal.save(&self.snapshot())
+    }
+
+    /// §6.7 ephemeral view: take (and clear) the rendered `sensitive` messages delivered since the
+    /// last call.
+    ///
+    /// Read-once by design — this is the "ephemeral view, then dropped" of §6.7. A client renders
+    /// what it gets and the node no longer holds it; nothing here was ever written to the store or
+    /// the journal, so there is no second copy to forget about.
+    pub fn take_ephemeral(&mut self) -> Vec<(ContentId, Vec<u8>)> {
+        std::mem::take(&mut self.ephemeral)
+    }
+
+    /// How many §6.7 ephemeral messages are currently held unread. Never persisted.
+    pub fn ephemeral_pending(&self) -> usize {
+        self.ephemeral.len()
     }
 
     /// The INBOX mailbox (delivered, accepted MOTEs).
@@ -1174,7 +1210,16 @@ impl<T: Transport> Node<T> {
         // It is still acked (see `InboundOutcome::acked`) — it was delivered, just not retained.
         let uid = match self.store.deliver_mote(&payload, "INBOX", self.now) {
             dmtap_mail::store::Delivery::Stored(u) => u,
-            dmtap_mail::store::Delivery::Ephemeral(_) => {
+            dmtap_mail::store::Delivery::Ephemeral(raw) => {
+                // Hold the rendered message for an ephemeral view. Bounded: oldest first, so a
+                // flood of sensitive MOTEs costs a fixed amount of memory rather than unbounded
+                // growth — they are acked and never persisted, so memory is their only cost.
+                if self.ephemeral.len() >= MAX_EPHEMERAL_HELD {
+                    self.ephemeral.remove(0);
+                }
+                self.ephemeral.push((id.clone(), raw));
+                // The dedup record IS persisted: a redelivery of the same id must still be re-acked
+                // after a restart rather than reprocessed. Only the CONTENT is ephemeral.
                 self.seen.record(id.as_bytes().to_vec(), from.to_vec(), self.now);
                 self.checkpoint();
                 return InboundOutcome::EphemeralDelivered { id: id.clone() };
