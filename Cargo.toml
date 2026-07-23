@@ -1,9 +1,12 @@
 # Envoir OSS monorepo — Cargo workspace.
 # Reference implementation of the Decentralized Message Transfer & Access Protocol.
 # Fully open source, dual-licensed MIT OR Apache-2.0. Envoir is not a business and runs no
-# control plane: the node binary carries every role (including the optional legacy gateway,
-# `envoir-node --gateway`/`envoir-gateway`, a separate OS process — see node/src/main.rs), and a
-# third-party operator who wants quotas, usage accounting, or authorization attaches at the
+# control plane: the node binary carries every mesh role. The optional legacy mail gateway has
+# MOVED OUT of this repo to the Wakala broker repo (github.com/vul-os/wakala, the `gateway`
+# coordinator kind); envoir is node-only. The node keeps only a thin dispatch shim
+# (`envoir-node --gateway`, see node/src/main.rs) that execs an externally-built gateway binary
+# via `ENVOIR_GATEWAY_BIN` — it no longer builds or contains the gateway. A third-party operator
+# who wants quotas, usage accounting, or authorization attaches at the
 # `crates/dmtap-seam` boundary (reference impls in `crates/dmtap-operator`) — never by forking
 # the protocol. `crates/dmtap-seam::postage` is the same story for optional prepaid postage
 # credit: provider-agnostic, off by default, with `crates/dmtap-postage-patala` as one isolated,
