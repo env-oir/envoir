@@ -10,7 +10,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # Ed25519 (COSE_Sign1 signing/verification) and the §18.1.5 v0 content address (0x1e ‖ BLAKE3-256)
 # come from core; this crate adds NO new third-party dependency.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 
 [dev-dependencies]
 # The §5.6 single-owner device-cluster reference. Used ONLY by the parity tests

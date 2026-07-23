@@ -12,11 +12,11 @@ use conformance_runner::{
 };
 
 fn vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../dmtap-core/vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors.json")
 }
 
 fn suite_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/suite.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/suite.json")
 }
 
 /// The DMTAP-PUB (§22) / CAD-profile (§23) known-answer vectors live in a SEPARATE file in the
@@ -25,7 +25,7 @@ fn suite_path() -> PathBuf {
 /// The runner recomputes them via `dmtap_core::pubobj`, so a passing run proves the Rust reference
 /// reproduces the Python reference byte-for-byte.
 fn pub_vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/pub_vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/vectors/pub_vectors.json")
 }
 
 /// Load `vectors.json` and, when the sibling spec repo is present, merge in `pub_vectors.json`.
@@ -253,13 +253,13 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
         "construction-todo cases FAILED their construction (not just skipped): {failed:?}"
     );
     assert!(
-        executed.len() >= 77,
-        "expected at least 77 construction-todo cases to be actually executed (against dmtap-core \
-         directly, plus more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/dmtap-clustersync/ \
-         envoir-gateway — see the Cargo.toml comment; this floor rose from 71 when the suite- \
-         negotiation, tier-enforcement, mix-descriptor-freshness, pinned-domain-directory and \
-         random-mode gateway-alias cases were wired), got {} ({executed:?}) — did \
-         construction::run_construction_case regress?",
+        executed.len() >= 65,
+        "expected at least 65 construction-todo cases to be actually executed (against dmtap-core \
+         directly, plus more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/dmtap-clustersync \
+         — see the Cargo.toml comment; this floor dropped from 77 to 65 when the 12 legacy-SMTP- \
+         gateway cases (DMTAP-GWALIAS-*/DMTAP-GWATT-*/DMTAP-GWNAME-*/DMTAP-LEG-*) were removed \
+         along with `envoir-gateway`, which moved out of this repo to the Wakala broker repo), got \
+         {} ({executed:?}) — did construction::run_construction_case regress?",
         executed.len()
     );
 }

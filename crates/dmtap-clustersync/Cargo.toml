@@ -12,4 +12,4 @@ repository = "https://example.invalid/envoir"
 # content addressing (ContentId = BLAKE3-256, the suite hash), identity + DeviceCert membership
 # authentication, and the DeniablePayload guard — is public API of core. This crate adds NO new
 # third-party dependency: it is std + dmtap-core only.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }

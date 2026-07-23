@@ -10,7 +10,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # The DMTAP core primitives: the capability token (§13.5/§18.7.3), the identity key (§1),
 # the MOTE object + HPKE sealing (§2), and content addressing (§2.2). All real crypto.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # The thin HTTP surface (`POST /v1/send`) parses a JSON request body — no web framework.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

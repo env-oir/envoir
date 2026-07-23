@@ -10,7 +10,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # The wire objects (DeniablePrekeyBundle / DeniableInit / DeniableFrame / DeniableMessage /
 # DeniablePayload), identity signing, content addressing, canonical CBOR — all live in core.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # X25519 for the dedicated deniable-identity DH key `idk`, prekeys, and the DH ratchet (RFC 7748).
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 # HKDF-SHA256 for the X3DH root, the root/chain KDFs, and per-message key derivation.

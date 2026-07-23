@@ -8,7 +8,7 @@ description = "DMTAP MLS group layer (spec §5): real RFC 9420 groups via openml
 repository = "https://example.invalid/envoir"
 
 [dependencies]
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 
 # Zeroize the exported MLS secret after deriving the SFrame key (§27.5): the exporter output is
 # the group's epoch secret material, and leaving it in a dropped Vec keeps call media keys

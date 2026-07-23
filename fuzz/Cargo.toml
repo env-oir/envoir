@@ -17,7 +17,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 
 [dependencies.dmtap-core]
-path = "../crates/dmtap-core"
+workspace = true
 
 [dependencies.dmtap-naming]
 path = "../crates/dmtap-naming"
@@ -29,13 +29,10 @@ path = "../crates/dmtap-clustersync"
 
 # --- node key-derived gateway alias (§3.9, §7) — `envoir-node`'s library crate is named `dmtap`
 # (see `../node/Cargo.toml` `[lib]`); every existing consumer in this workspace (`integration`,
-# `dmtap-p2p`) imports it the same way, as `dmtap::...`.
+# `dmtap-p2p`) imports it the same way, as `dmtap::...`. Note this is the node's OWN key-derived
+# alias codec (naming.rs), not the (now out-of-repo, moved to Wakala) legacy SMTP gateway crate.
 [dependencies.envoir-node]
 path = "../node"
-
-# --- gateway admission challenge + local-part allocation (§7.9, §7.10, §9) ---
-[dependencies.envoir-gateway]
-path = "../gateway"
 
 [workspace]
 members = ["."]
@@ -292,13 +289,6 @@ bench = false
 [[bin]]
 name = "gateway_alias"
 path = "fuzz_targets/gateway_alias.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "gateway_admission"
-path = "fuzz_targets/gateway_admission.rs"
 test = false
 doc = false
 bench = false

@@ -33,7 +33,7 @@ abi = ["getrandom_02/custom"]
 [dependencies]
 # The algebra. Everything this crate returns is produced by these two crates; the binding marshals
 # arguments and never re-implements a merge, a hash or an encoding (BINDINGS.md §4).
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 dmtap-sync = { path = "../dmtap-sync" }
 # The JS boundary + the structured argument/result encoding. `serde_json` is already a workspace
 # dependency (conformance-runner), so this adds no new third-party crate to the tree.

@@ -1,12 +1,13 @@
 //! Cross-component integration tests for the Envoir DMTAP reference stack.
 //!
 //! This crate has no library surface of its own — it exists to host end-to-end tests under
-//! `tests/` that compose the **real** crates (`envoir-node`, `dmtap-mail`, `envoir-gateway`,
-//! `dmtap-core`) with no mocks between components. See the individual test files:
+//! `tests/` that compose the **real** crates (`envoir-node`, `dmtap-mail`, `dmtap-core`) with no
+//! mocks between components. envoir is now node-only: the legacy SMTP/IMAP/POP3 gateway (spec §7,
+//! `envoir-gateway`) moved out to the Wakala broker repo, taking its own gateway-composing
+//! integration coverage (formerly `legacy_to_dmtap.rs`, `full_roundtrip.rs`, `gateway_provenance.rs`,
+//! `gateway_authz_antispam.rs`) with it. What remains here is everything that exercises this
+//! repo's own node/mesh/naming/deniable/MLS stack. See the individual test files:
 //!
-//! - `legacy_to_dmtap.rs` — an RFC 5322 message through the gateway inbound, sealed into a MOTE,
-//!   delivered into a real node, and read back through a `dmtap-mail` JMAP view; the gateway
-//!   attestation is verified end-to-end.
 //! - `dmtap_to_dmtap.rs` — two real nodes exchange an encrypted MOTE + ack over the TCP transport.
 //! - `adversarial.rs` — a tampered/forged MOTE is rejected before decryption; a deferred cold MOTE
 //!   is held but not acked (matching the reconciled no-ack-for-deferred rule, §2.7a / §19.3.1).
@@ -19,14 +20,6 @@
 //! - `deniable_repudiation.rs` — a `dmtap-deniable` 1:1 exchange proving the repudiation property
 //!   holds after a real `dmtap-core::deniable::DeniableFrame` wire round trip, not just as an
 //!   in-memory struct comparison.
-//! - `full_roundtrip.rs` — the whole naming → seal → mesh → mail chain in one composition: a
-//!   node's own `resolve_and_pin` (real `dmtap-naming` KT verification) pins a recipient, `send_mail`
-//!   HPKE-seals a real MOTE (`dmtap-core`) to the resolved key, delivery rides the real libp2p mesh
-//!   (`dmtap-p2p`), and the content is read back through a real `dmtap-mail` JMAP view.
-//! - `gateway_provenance.rs` — a gateway-bridged legacy message and a pure-mesh message land in the
-//!   same recipient inbox; only the bridged one produces a verifiable `envoir-gateway` attestation
-//!   (`captured.len()` distinguishes them), a bit-flipped signature and an attestation lifted onto a
-//!   different delivered MOTE both fail closed.
 //! - `mls_group_over_real_mesh.rs` — a real RFC 9420 MLS group (`dmtap-mls`) forms and exchanges an
 //!   application message over the real libp2p mesh (`dmtap-p2p`), a member is removed, and the
 //!   removed member's stale state cannot decrypt a message created after removal (post-compromise
@@ -37,19 +30,10 @@
 //!   (`dmtap_naming::InMemoryNameChain`) does the same on a bidirectional binding match — while a
 //!   hijacked/mismatched chain record fails closed (`NameChainBindingUnverified`, wire code `0x011E`)
 //!   and is proven, concretely, to be delivered nowhere.
-//! - `gateway_alias_roundtrip.rs` — a live `Node::gateway_alias()` local-part decodes back to the
-//!   exact identity key at two independently-constructed "gateways" (no shared state), and a real
-//!   MOTE addressed via the decoded key reaches the node over the mesh.
-//! - `gateway_authz_antispam.rs` — `envoir-gateway`'s authz + anti-spam modules composed for real
-//!   across outbound and inbound: a domain-authorized sender's account drives a real
-//!   `OutboundSenderGuard` (rate limit → volume cap → reputation backoff) governing a real,
-//!   DKIM-verifiable `OutboundGateway` relay, while a forged admission signature is rejected; and a
-//!   real `ColdSenderGate` (not the permissive `AllowAllAbuse` the other gateway tests use) greylists
-//!   a cold sender before `DATA` and only a legitimate retry reaches a real node's inbox. The
-//!   valid-admission / unregistered-`UnknownKey` halves of challenge–response are a documented,
-//!   explained gap (see that file's module doc) rather than a fake pass: they need
-//!   `envoir_gateway::authz`'s private admission domain-separation tag, which this crate has no
-//!   public way to reach.
+//! - `gateway_alias_roundtrip.rs` — a live `Node::gateway_alias()` local-part (the node's OWN
+//!   key-derived alias codec, `node/src/naming.rs` — not the extracted `envoir-gateway` crate)
+//!   decodes back to the exact identity key at two independently-constructed "gateways" (no shared
+//!   state), and a real MOTE addressed via the decoded key reaches the node over the mesh.
 //!
 //! ## Scenarios considered and deliberately not added here
 //! - **Suite-downgrade / capability-rollback rejection through a live node.** `dmtap_core::suite`'s

@@ -1,6 +1,6 @@
-//! Stable (non-nightly, `cargo test`-only) property/round-trip tests mirroring the four new
+//! Stable (non-nightly, `cargo test`-only) property/round-trip tests mirroring the
 //! `cargo-fuzz` targets added alongside this file (`naming_classify`, `namechain_resolve`,
-//! `gateway_alias`, `gateway_admission`) — see each target's doc comment in `fuzz_targets/` for the
+//! `gateway_alias`) — see each target's doc comment in `fuzz_targets/` for the
 //! full rationale. `cargo +nightly fuzz build`/`run` needs the nightly toolchain + libFuzzer
 //! sanitizer instrumentation; this file re-checks the identical properties with a small dependency-
 //! free pseudo-random driver so the same coverage is real on **any** stable toolchain, not only one
@@ -16,8 +16,6 @@ use dmtap_naming::namechain::{InMemoryNameChain, NameChainResolver};
 use dmtap_naming::restype::{classify, Chain, ResolverType};
 
 use dmtap::naming::{gateway_alias_local, ik_from_gateway_alias};
-
-use envoir_gateway::authz::{AdmissionError, IdentityRegistry};
 
 /// A tiny, dependency-free splitmix64-based PRNG — good enough to generate varied byte strings
 /// deterministically (no external `rand`/`proptest` dependency; reproducible across runs from a
@@ -181,28 +179,5 @@ fn gateway_alias_round_trips_arbitrary_32_byte_keys() {
             Some(ik.as_slice()),
             "case-folded alias must still decode to the same key"
         );
-    }
-}
-
-// --- gateway admission challenge (mirrors gateway_admission.rs) ---------------------------------
-
-#[test]
-fn gateway_admission_never_panics_on_arbitrary_key_and_signature_bytes() {
-    let mut rng = Rng(0xADD1_71ED);
-    let reg = IdentityRegistry::key_registered();
-    let challenge = reg.issue_challenge([0x11; 32], 1_000_000);
-
-    for _ in 0..ITERS {
-        let presented_key = rng.bytes(96);
-        let sig = rng.bytes(96);
-        match reg.admit(&challenge, &presented_key, &sig, 1_000_100) {
-            Ok(_) | Err(AdmissionError::BadSignature) | Err(AdmissionError::UnknownKey) => {}
-            Err(AdmissionError::ChallengeExpired) => {
-                panic!("fixed challenge/now are inside the default TTL window")
-            }
-            Err(AdmissionError::UnknownOrConsumedChallenge) => {
-                panic!("random bytes never verify, so the single-use nonce is never consumed")
-            }
-        }
     }
 }

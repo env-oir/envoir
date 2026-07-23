@@ -8,12 +8,13 @@ description = "Executable §18-conformance proof: drives dmtap-core's committed 
 publish = false
 
 [dependencies]
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # Additional workspace crates driven by `construction.rs` so more `suite.json` construction-todo
 # cases can be honestly EXECUTED against real reference code, rather than left skipped, when the
 # behavior the case describes lives outside dmtap-core proper (auth ceremony, name resolution/KT
-# quorum+freshness, MLS groups, the legacy gateway) — see the module docs on each construction
-# function for exactly what is proven and why the dependency is the honest way to test it.
+# quorum+freshness, MLS groups) — see the module docs on each construction function for exactly
+# what is proven and why the dependency is the honest way to test it. The legacy SMTP gateway (§7)
+# and its own conformance coverage moved out of this repo entirely, to the Wakala broker repo.
 dmtap-auth = { path = "../dmtap-auth" }
 dmtap-naming = { path = "../dmtap-naming" }
 dmtap-deniable = { path = "../dmtap-deniable" }
@@ -26,7 +27,6 @@ dmtap-clustersync = { path = "../dmtap-clustersync" }
 # sibling spec repo's `sync_vectors.json` through real code (see `src/sync.rs`), exactly as
 # `dmtap-core::pubobj` drives `pub_vectors.json`.
 dmtap-sync = { path = "../dmtap-sync" }
-envoir-gateway = { path = "../../gateway" }
 # `syncserve::SYNC1_EXT_VALUE_2` — checked against `SYNC.md` §4.1.2's frozen `sync-1/ext-value-2`
 # sub-token (correction C-13b) in `sync_ext_value_validate`, so a spelling drift between this node's
 # local convention and the now-normative wire spelling fails a test rather than going unnoticed.

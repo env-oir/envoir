@@ -26,9 +26,8 @@ path = "src/lib.rs"
 # The real components under test (depended on by their published paths, not re-implemented).
 # envoir-node's library crate is named `dmtap` (see node/Cargo.toml [lib]); import it as `dmtap`.
 envoir-node = { path = "../node" }
-dmtap-core = { path = "../crates/dmtap-core" }
-dmtap-mail = { path = "../crates/dmtap-mail" }
-envoir-gateway = { path = "../gateway" }
+dmtap-core = { workspace = true }
+dmtap-mail = { workspace = true }
 dmtap-p2p = { path = "../crates/dmtap-p2p" }
 dmtap-naming = { path = "../crates/dmtap-naming" }
 dmtap-deniable = { path = "../crates/dmtap-deniable" }

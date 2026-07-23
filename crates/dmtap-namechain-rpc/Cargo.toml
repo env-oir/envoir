@@ -13,7 +13,7 @@ repository = "https://example.invalid/envoir"
 dmtap-naming = { path = "../dmtap-naming" }
 # Only used transitively via dmtap-naming's public API surface; kept explicit so the classical-IK
 # byte convention this crate returns stays pinned to the same core types.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # ENS namehash (EIP-137) + ABI 4-byte selectors are Ethereum **Keccak-256** (pre-NIST), which is
 # `sha3::Keccak256` — NOT NIST SHA3-256. digest 0.10 is already resolved in the workspace tree.
 sha3 = "0.10"

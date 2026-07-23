@@ -10,7 +10,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # Shared DMTAP core primitives — Identity/IdentityKey, the KT objects (SignedTreeHead,
 # InclusionProof, ConsistencyProof, identity_leaf_hash), ContentId, Suite (spec §1, §3.5).
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # The RFC 6962 tree/node hash is BLAKE3-256 (spec §18.9.5) — the same hash the leaf-hash rule and
 # content addressing use, so the resolver folds audit paths with the protocol's own hash.
 blake3 = "1"

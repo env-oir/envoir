@@ -10,7 +10,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # The identity/crypto substrate DMTAP-Auth reuses (spec §13.2): IK/device Ed25519 signing,
 # domain-separated signatures, canonical integer-keyed CBOR, and BLAKE3 content addressing.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 # BLAKE3-256 for the §18.9.8 auth_hash preimage (raw, un-prefixed digest that is signed).
 blake3 = "1"
 # CSPRNG for single-use challenge nonces and DPoP jti (rand_core::OsRng).

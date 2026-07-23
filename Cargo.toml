@@ -13,7 +13,6 @@
 resolver = "2"
 members = [
     "node",        # the whole client side; it IS the mesh
-    "gateway",     # the optional legacy SMTP/IMAP/POP3 bridge (spec §7) — builds the envoir-gateway binary
     "integration", # cross-component end-to-end tests (test-only crate)
     "crates/*",    # shared libraries incl. dmtap-seam (the operator seam) + dmtap-mls (§5 groups)
 ]
@@ -29,14 +28,11 @@ members = [
 # postage seam (see `crates/dmtap-seam/src/postage.rs`).
 default-members = [
     "node",
-    "gateway",
     "integration",
     "crates/conformance-runner",
     "crates/dmtap-auth",
     "crates/dmtap-clustersync",
-    "crates/dmtap-core",
     "crates/dmtap-deniable",
-    "crates/dmtap-mail",
     "crates/dmtap-mls",
     "crates/dmtap-namechain-rpc",
     "crates/dmtap-naming",
@@ -49,6 +45,16 @@ default-members = [
     "crates/downgrade-tests",
     "crates/netsim",
 ]
+
+# The substrate core + mail-protocol layer were carved OUT of this repo into the KOTVA repo
+# (`kotva-core` / `kotva-mail`) and are now consumed as a *tag-pinned* dependency, never a moving
+# path dep (the isango churn lesson). envoir keeps its existing `use dmtap_core::…` / `use
+# dmtap_mail::…` source unchanged via cargo's dependency-rename (`package = "kotva-core"`). The
+# legacy mail gateway moved to the Wakala broker repo (the `gateway` coordinator kind); envoir is
+# now node-only.
+[workspace.dependencies]
+dmtap-core = { package = "kotva-core", git = "https://github.com/vul-os/kotva", tag = "core-v0.2.0" }
+dmtap-mail = { package = "kotva-mail", git = "https://github.com/vul-os/kotva", tag = "core-v0.2.0" }
 
 [workspace.metadata.dmtap]
 spec = "../dmtap/"   # the DMTAP spec repo (sibling; the spec no longer lives in this repo)

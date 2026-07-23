@@ -19,34 +19,34 @@ use conformance_runner::{
 };
 
 fn vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../dmtap-core/vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors.json")
 }
 
 /// The sibling spec repo's DMTAP-PUB (§22) / CAD (§23) known-answer vectors — a SEPARATE file from
 /// `vectors.json`, recomputed here via `dmtap_core::pubobj`. Merged into the run when present so the
 /// §22/§23 suite cases resolve their `pub_*` vectors.
 fn pub_vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/pub_vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/vectors/pub_vectors.json")
 }
 
 /// The sibling spec repo's **Sync substrate** (`substrate/SYNC.md` §10) known-answer vectors —
 /// again a SEPARATE file, recomputed here via the `dmtap-sync` reference crate.
 fn sync_vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/sync_vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/vectors/sync_vectors.json")
 }
 
 /// The sibling spec repo's **DMTAP-PUBSUB** (§25) known-answer vectors — a SEPARATE file from
 /// `vectors.json`, recomputed here via `dmtap_core::pubsub`. Merged into the run when present so
 /// the PUBSUB suite cases resolve their `pubsub_*` vectors, exactly like `pub_vectors_path`.
 fn pubsub_vectors_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/vectors/pubsub_vectors.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/vectors/pubsub_vectors.json")
 }
 
 /// The sibling spec repo's conformance-suite catalog. Optional: this harness's mandatory proof
 /// (vectors.json) does not depend on it, but when present we cross-reference it for extra
 /// coverage reporting.
 fn suite_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dmtap/conformance/suite.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../kotva/conformance/suite.json")
 }
 
 fn main() {

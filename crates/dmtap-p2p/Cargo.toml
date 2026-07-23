@@ -26,7 +26,7 @@ envoir-node = { path = "../../node" }
 # protocol object with a canonical wire form, not a libp2p detail: the record is minted and
 # verified in `dmtap-core` so the same bytes round-trip through any substrate (§21.24), and this
 # crate only carries them to and from the DHT.
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
 
 # The spec's chosen substrate (§4.1). Current 0.5x. Feature set = the §4 stack.
 libp2p = { version = "0.56", features = [

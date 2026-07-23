@@ -17,7 +17,7 @@ repository = "https://example.invalid/envoir"
 [dependencies]
 # --- Shared DMTAP core primitives (identity, MOTE, key-name, suites, content addressing) ---
 # Moved out of this crate into the workspace-shared library; the node re-exports it (spec §1, §2, §3.9).
-dmtap-core = { path = "../crates/dmtap-core" }
+dmtap-core = { workspace = true }
 
 # --- Envoir Send (spec §13.5.1): the capability-token send service the node exposes over HTTP ---
 # The reusable core of the "sovereign/private Resend": an API key IS a scoped, rotatable, revocable
@@ -30,7 +30,7 @@ dmtap-send = { path = "../crates/dmtap-send" }
 # The node is native-only (§8.5): it projects the one MOTE store to JMAP and does NOT serve the
 # legacy IMAP/POP/SMTP protocols, so the `net` feature (the crate's blocking legacy TCP listeners,
 # used only by the separate gateway) is intentionally NOT enabled here.
-dmtap-mail = { path = "../crates/dmtap-mail" }
+dmtap-mail = { workspace = true }
 
 # --- The Sync substrate (substrate/SYNC.md): the CRDT algebra, signed-op envelope, snapshots and
 # range-Merkle reconciliation. The node binds its §5.2/§5.3 wire protocol to HTTP (`node::syncserve`).

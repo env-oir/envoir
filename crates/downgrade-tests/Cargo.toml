@@ -14,4 +14,4 @@ publish = false
 # Read-only: this crate exercises dmtap-core's public API and never modifies it (spec §10.4: the
 # reference is not normative, but *this* crate's job is to lock the reference's own fail-closed
 # behavior so a regression there is caught immediately).
-dmtap-core = { path = "../dmtap-core" }
+dmtap-core = { workspace = true }
