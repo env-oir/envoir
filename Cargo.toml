@@ -2,7 +2,7 @@
 # Reference implementation of the Decentralized Message Transfer & Access Protocol.
 # Fully open source, dual-licensed MIT OR Apache-2.0. Envoir is not a business and runs no
 # control plane: the node binary carries every mesh role. The optional legacy mail gateway has
-# MOVED OUT of this repo to the Wakala broker repo (github.com/vul-os/wakala, the `gateway`
+# MOVED OUT of this repo to the Ephor broker repo (github.com/vul-os/ephor, the `gateway`
 # coordinator kind); envoir is node-only. The node keeps only a thin dispatch shim
 # (`envoir-node --gateway`, see node/src/main.rs) that execs an externally-built gateway binary
 # via `ENVOIR_GATEWAY_BIN` — it no longer builds or contains the gateway. A third-party operator
@@ -53,7 +53,7 @@ default-members = [
 # (`kotva-core` / `kotva-mail`) and are now consumed as a *tag-pinned* dependency, never a moving
 # path dep (the isango churn lesson). envoir keeps its existing `use dmtap_core::…` / `use
 # dmtap_mail::…` source unchanged via cargo's dependency-rename (`package = "kotva-core"`). The
-# legacy mail gateway moved to the Wakala broker repo (the `gateway` coordinator kind); envoir is
+# legacy mail gateway moved to the Ephor broker repo (the `gateway` coordinator kind); envoir is
 # now node-only.
 [workspace.dependencies]
 dmtap-core = { package = "kotva-core", git = "https://github.com/vul-os/kotva", tag = "core-v0.2.0" }

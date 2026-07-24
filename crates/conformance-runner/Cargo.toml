@@ -14,7 +14,7 @@ dmtap-core = { workspace = true }
 # behavior the case describes lives outside dmtap-core proper (auth ceremony, name resolution/KT
 # quorum+freshness, MLS groups) — see the module docs on each construction function for exactly
 # what is proven and why the dependency is the honest way to test it. The legacy SMTP gateway (§7)
-# and its own conformance coverage moved out of this repo entirely, to the Wakala broker repo.
+# and its own conformance coverage moved out of this repo entirely, to the Ephor broker repo.
 dmtap-auth = { path = "../dmtap-auth" }
 dmtap-naming = { path = "../dmtap-naming" }
 dmtap-deniable = { path = "../dmtap-deniable" }

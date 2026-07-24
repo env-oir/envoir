@@ -258,7 +258,7 @@ fn a_meaningful_share_of_construction_todo_cases_are_executed() {
          directly, plus more via dmtap-auth/dmtap-naming/dmtap-deniable/dmtap-mls/dmtap-clustersync \
          — see the Cargo.toml comment; this floor dropped from 77 to 65 when the 12 legacy-SMTP- \
          gateway cases (DMTAP-GWALIAS-*/DMTAP-GWATT-*/DMTAP-GWNAME-*/DMTAP-LEG-*) were removed \
-         along with `envoir-gateway`, which moved out of this repo to the Wakala broker repo), got \
+         along with `envoir-gateway`, which moved out of this repo to the Ephor broker repo), got \
          {} ({executed:?}) — did construction::run_construction_case regress?",
         executed.len()
     );
